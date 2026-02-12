@@ -20,7 +20,7 @@ from loguru import logger
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.queue import MessageBus
-from nanobot.config.loader import convert_keys, load_config, save_config
+from nanobot.config.loader import convert_keys, ensure_initial_config, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.services.system_status_service import SystemStatusService
@@ -48,14 +48,17 @@ class NanobotWebAPI:
         self.gateway_process = None
         self.start_time = time.time()
         # Logging configured by setup_logging() in CLI main callback
-        config = load_config()
+        config = ensure_initial_config()
 
         model = config.agents.defaults.model
         api_key = config.get_api_key(model)
         api_base = config.get_api_base(model)
         is_bedrock = model.startswith("bedrock/")
         if not api_key and not is_bedrock:
-            raise RuntimeError("No API key configured. Please set providers.*.apiKey in ~/.nanobot/config.json")
+            logger.warning(
+                "No API key configured. Web UI will start; configure providers.*.apiKey in ~/.nanobot/config.json "
+                "or via the Config page to use chat."
+            )
 
         provider = LiteLLMProvider(
             api_key=api_key,
@@ -103,7 +106,7 @@ class NanobotWebAPI:
         api_base = config.get_api_base(model)
         is_bedrock = model.startswith("bedrock/")
         if not api_key and not is_bedrock:
-            raise RuntimeError("No API key configured. Please set providers.*.apiKey in ~/.nanobot/config.json")
+            logger.warning("No API key configured; agent will not be able to process chat until configured.")
         provider = LiteLLMProvider(
             api_key=api_key,
             api_base=api_base,

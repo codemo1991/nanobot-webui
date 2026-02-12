@@ -6,12 +6,34 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from nanobot.config.schema import Config
 
 
 def get_config_path() -> Path:
     """Get the default configuration file path."""
     return Path.home() / ".nanobot" / "config.json"
+
+
+def ensure_initial_config(config_path: Path | None = None) -> Config:
+    """
+    确保 .nanobot 目录和配置文件存在；若不存在则创建默认配置和工作空间。
+    用于首次启动 web-ui 时自动初始化，用户无需先执行 nanobot onboard。
+    """
+    path = config_path or get_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        config = Config()
+        save_config(config, path)
+        # 创建工作空间目录
+        ws_path = config.workspace_path
+        ws_path.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "已创建默认配置 ~/.nanobot/config.json 和工作空间目录，请在配置页添加 API Key 以使用对话功能"
+        )
+        return config
+    return load_config(path)
 
 
 def get_data_dir() -> Path:
