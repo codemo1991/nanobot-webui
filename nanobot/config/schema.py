@@ -1,0 +1,217 @@
+"""Configuration schema using Pydantic."""
+
+from pathlib import Path
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
+
+
+class WhatsAppConfig(BaseModel):
+    """WhatsApp channel configuration."""
+    enabled: bool = False
+    bridge_url: str = "ws://localhost:3001"
+    allow_from: list[str] = Field(default_factory=list)  # Allowed phone numbers
+
+
+class TelegramConfig(BaseModel):
+    """Telegram channel configuration."""
+    enabled: bool = False
+    token: str = ""  # Bot token from @BotFather
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
+    proxy: str | None = None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
+
+
+class FeishuConfig(BaseModel):
+    """Feishu/Lark channel configuration using WebSocket long connection."""
+    enabled: bool = False
+    app_id: str = ""  # App ID from Feishu Open Platform
+    app_secret: str = ""  # App Secret from Feishu Open Platform
+    encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
+    verification_token: str = ""  # Verification Token for event subscription (optional)
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
+
+
+class DiscordConfig(BaseModel):
+    """Discord channel configuration using Gateway WebSocket."""
+    enabled: bool = False
+    token: str = ""  # Bot token from Discord Developer Portal
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
+    gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+    intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
+
+
+class QQConfig(BaseModel):
+    """QQ channel configuration using botpy SDK."""
+    enabled: bool = False
+    app_id: str = ""  # 机器人 ID (AppID) from q.qq.com
+    secret: str = ""  # 机器人密钥 (AppSecret) from q.qq.com
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public)
+
+
+class DingTalkConfig(BaseModel):
+    """DingTalk channel configuration using Stream Mode."""
+    enabled: bool = False
+    client_id: str = ""  # AppKey from DingTalk Open Platform
+    client_secret: str = ""  # AppSecret from DingTalk Open Platform
+    allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
+
+
+class ChannelsConfig(BaseModel):
+    """Configuration for chat channels."""
+    whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
+    telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    feishu: FeishuConfig = Field(default_factory=FeishuConfig)
+    discord: DiscordConfig = Field(default_factory=DiscordConfig)
+    qq: QQConfig = Field(default_factory=QQConfig)
+    dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
+
+
+class AgentDefaults(BaseModel):
+    """Default agent configuration."""
+    workspace: str = "~/.nanobot/workspace"
+    model: str = "anthropic/claude-opus-4-5"
+    max_tokens: int = 8192
+    temperature: float = 0.7
+    max_tool_iterations: int = 20
+
+
+class AgentsConfig(BaseModel):
+    """Agent configuration."""
+    defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+
+
+class ProviderConfig(BaseModel):
+    """LLM provider configuration."""
+    api_key: str = ""
+    api_base: str | None = None
+
+
+class ProvidersConfig(BaseModel):
+    """Configuration for LLM providers."""
+    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
+    openai: ProviderConfig = Field(default_factory=ProviderConfig)
+    openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
+    deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
+    groq: ProviderConfig = Field(default_factory=ProviderConfig)
+    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
+    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # Qwen via Aliyun DashScope
+    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
+    gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+
+
+class GatewayConfig(BaseModel):
+    """Gateway/server configuration."""
+    host: str = "0.0.0.0"
+    port: int = 18790
+
+
+class WebSearchConfig(BaseModel):
+    """Web search tool configuration."""
+    api_key: str = ""  # Brave Search API key
+    max_results: int = 5
+
+
+class WebToolsConfig(BaseModel):
+    """Web tools configuration."""
+    search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+
+
+class ExecToolConfig(BaseModel):
+    """Shell exec tool configuration."""
+    timeout: int = 60
+    restrict_to_workspace: bool = False  # If true, block commands accessing paths outside workspace
+
+
+class FilesystemToolConfig(BaseModel):
+    """Filesystem tools (read_file, write_file, edit_file, list_dir) configuration."""
+    restrict_to_workspace: bool = False  # If true, only allow paths inside workspace
+
+
+class McpServerConfig(BaseModel):
+    """MCP (Model Context Protocol) server configuration."""
+    id: str = ""
+    name: str = ""
+    transport: str = "stdio"  # stdio | http | sse | streamable_http
+    command: str | None = None  # Required for stdio
+    args: list[str] = Field(default_factory=list)
+    url: str | None = None  # Required for http/sse/streamable_http
+    enabled: bool = True
+
+
+class ToolsConfig(BaseModel):
+    """Tools configuration."""
+    web: WebToolsConfig = Field(default_factory=WebToolsConfig)
+    exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    filesystem: FilesystemToolConfig = Field(default_factory=FilesystemToolConfig)
+
+
+class Config(BaseSettings):
+    """Root configuration for nanobot."""
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    mcps: list[McpServerConfig] = Field(default_factory=list)
+    
+    @property
+    def workspace_path(self) -> Path:
+        """Get expanded workspace path."""
+        return Path(self.agents.defaults.workspace).expanduser()
+    
+    def get_api_key(self, model: str | None = None) -> str | None:
+        """
+        Get API key for the given model, or first available in priority order.
+        When model is specified, returns the key for the matching provider.
+        """
+        model_lower = (model or self.agents.defaults.model).lower()
+        if model_lower.startswith("openrouter/") or "openrouter" in model_lower:
+            return self.providers.openrouter.api_key or None
+        if model_lower.startswith(("zhipu/", "zai/")) or "glm" in model_lower or "zhipu" in model_lower:
+            return self.providers.zhipu.api_key or None
+        if model_lower.startswith("dashscope/") or "qwen" in model_lower or "dashscope" in model_lower:
+            return self.providers.dashscope.api_key or None
+        if model_lower.startswith("deepseek/") or "deepseek" in model_lower:
+            return self.providers.deepseek.api_key or None
+        if model_lower.startswith("anthropic/") or "claude" in model_lower:
+            return self.providers.anthropic.api_key or None
+        if model_lower.startswith("openai/") or "gpt" in model_lower:
+            return self.providers.openai.api_key or None
+        if model_lower.startswith("gemini/") or "gemini" in model_lower:
+            return self.providers.gemini.api_key or None
+        if model_lower.startswith("groq/") or "groq" in model_lower:
+            return self.providers.groq.api_key or None
+        if model_lower.startswith("vllm/") or "vllm" in model_lower:
+            return self.providers.vllm.api_key or None
+        # Fallback: first available key in priority order
+        return (
+            self.providers.openrouter.api_key or
+            self.providers.deepseek.api_key or
+            self.providers.anthropic.api_key or
+            self.providers.openai.api_key or
+            self.providers.gemini.api_key or
+            self.providers.zhipu.api_key or
+            self.providers.dashscope.api_key or
+            self.providers.groq.api_key or
+            self.providers.vllm.api_key or
+            None
+        )
+
+    def get_api_base(self, model: str | None = None) -> str | None:
+        """
+        Get API base URL for the given model.
+        When model is specified, returns the base for the matching provider.
+        """
+        model_lower = (model or self.agents.defaults.model).lower()
+        if model_lower.startswith("openrouter/") or "openrouter" in model_lower:
+            return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
+        if model_lower.startswith(("zhipu/", "zai/")) or "glm" in model_lower or "zhipu" in model_lower:
+            return self.providers.zhipu.api_base  # Zhipu uses default endpoint when None
+        if model_lower.startswith("dashscope/") or "qwen" in model_lower or "dashscope" in model_lower:
+            return self.providers.dashscope.api_base  # DashScope uses default when None
+        if model_lower.startswith("vllm/") or "vllm" in model_lower:
+            return self.providers.vllm.api_base
+        return None
+    
+    class Config:
+        env_prefix = "NANOBOT_"
+        env_nested_delimiter = "__"
