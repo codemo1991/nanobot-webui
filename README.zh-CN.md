@@ -139,6 +139,21 @@ nanobot onboard   # 初始化配置
 nanobot agent -m "Hello!"
 ```
 
+### Docker
+
+```bash
+# 构建镜像
+docker build -t nanobot-webui .
+
+# 启动（推荐挂载数据卷以持久化配置）
+docker run -d -p 6788:6788 -v nanobot-data:/root/.nanobot --name nanobot nanobot-webui
+
+# 或使用宿主机路径存放配置
+docker run -d -p 6788:6788 -v ~/.nanobot:/root/.nanobot --name nanobot nanobot-webui
+```
+
+然后访问 http://127.0.0.1:6788。首次启动时会自动创建 `~/.nanobot/config.json`，可在 Web 界面的配置页中添加 API Key。
+
 ---
 
 ## 🖥️ Web 界面说明

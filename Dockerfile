@@ -36,6 +36,9 @@ WORKDIR /app/web-ui
 RUN npm install && npm run build
 WORKDIR /app
 
+# Point nanobot to built frontend (avoids path resolution issues with uv/pip install location)
+ENV NANOBOT_STATIC_DIR=/app/web-ui/dist
+
 # Create config directory
 RUN mkdir -p /root/.nanobot
 
