@@ -1378,10 +1378,14 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
     # Determine static directory
     if static_dir is None:
         # Try to find built web-ui
+        import os
+        env_static = os.environ.get("NANOBOT_STATIC_DIR", "").strip()
         possible_locations = [
+            Path(env_static) if env_static else None,
             Path(__file__).parent.parent.parent / "web-ui" / "dist",  # Development
             Path(__file__).parent / "static",  # Installed package
         ]
+        possible_locations = [p for p in possible_locations if p is not None]
         for loc in possible_locations:
             if loc.exists() and (loc / "index.html").exists():
                 static_dir = loc

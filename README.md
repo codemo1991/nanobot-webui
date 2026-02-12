@@ -136,6 +136,21 @@ nanobot onboard   # Initialize config
 nanobot agent -m "Hello!"
 ```
 
+### Docker
+
+```bash
+# Build the image
+docker build -t nanobot-webui .
+
+# Run (recommended: mount volume for config persistence)
+docker run -d -p 6788:6788 -v nanobot-data:/root/.nanobot --name nanobot nanobot-webui
+
+# Or use host path for config
+docker run -d -p 6788:6788 -v ~/.nanobot:/root/.nanobot --name nanobot nanobot-webui
+```
+
+Then open http://127.0.0.1:6788. On first launch, the app auto-creates `~/.nanobot/config.json`; add your API key via the Config page in the Web UI.
+
 ---
 
 ## 🖥️ Web UI Details
