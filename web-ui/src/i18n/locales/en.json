@@ -278,6 +278,7 @@
     "shangChooseA": "Choose A",
     "shangChooseB": "Choose B",
     "shangRegenerateImages": "Regenerate Images",
+    "shangRegenerateBtn": "Swap",
     "shangRetryGenerate": "Retry Generation",
     "shangRegenerating": "Regenerating...",
     "shangRegenerateSuccess": "Images regenerated",
@@ -316,7 +317,11 @@
     "guideWu": "Explore your inner self through propositions; AI gives prompts and questions your feelings and stance.",
     "guideBian": "Debate with AI on values, test consistency of views, expose cognitive biases.",
     "guideShang": "Aesthetic intuition: AI generates two images; choose by intuition and attribute.",
-    "guideWo": "Generate your psychological profile (Big Five, archetype, drivers) from Wu, Bian, Shang data."
+    "guideWo": "Generate your psychological profile (Big Five, archetype, drivers) from Wu, Bian, Shang data.",
+    "deleteConfirm": "Delete this record?",
+    "deleteOk": "OK",
+    "deleteCancel": "Cancel",
+    "deleteFailed": "Failed to delete record"
   },
   "skillBuilder": {
     "title": "Skill Builder",

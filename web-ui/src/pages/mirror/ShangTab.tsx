@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Button, Spin, Empty, Input, Modal, Select, message as antMessage } from 'antd'
-import { EyeOutlined, CheckOutlined, SyncOutlined, ZoomInOutlined } from '@ant-design/icons'
+import { Button, Spin, Empty, Input, Modal, Select, Popconfirm, message as antMessage } from 'antd'
+import { EyeOutlined, CheckOutlined, ZoomInOutlined, DeleteOutlined, PlusOutlined } from '@ant-design/icons'
 import { api } from '../../api'
 import type { ShangRecord } from '../../types'
 
@@ -82,7 +82,11 @@ function ShangTab() {
       const record = await api.startShang()
       setTodayRecord(record)
       setSelectedRecord(record)
-      setTodayDone(false) // still in choosing phase
+      setTodayDone(false)
+      setRecords((prev) => {
+        const exists = prev.find((r) => r.id === record.id)
+        return exists ? prev : [record, ...prev]
+      })
     } catch {
       antMessage.error(t('mirror.loadFailed'))
     } finally {
@@ -127,6 +131,22 @@ function ShangTab() {
     }
   }
 
+  const handleDeleteRecord = async (recordId: string) => {
+    try {
+      await api.deleteShangRecord(recordId)
+      setRecords((prev) => prev.filter((r) => r.id !== recordId))
+      if (selectedRecord?.id === recordId) {
+        setSelectedRecord(null)
+      }
+      if (todayRecord?.id === recordId) {
+        setTodayRecord(null)
+      }
+      antMessage.success(t('chat.sessionDeleted'))
+    } catch {
+      antMessage.error(t('mirror.deleteFailed'))
+    }
+  }
+
   const filteredRecords = useMemo(() => {
     return records.filter((r) => {
       if (filterTopic.trim()) {
@@ -164,6 +184,15 @@ function ShangTab() {
       <div className="mirror-sidebar">
         <div className="mirror-sidebar-header">
           <h3>{t('mirror.shangHistory')}</h3>
+          <Button
+            type="primary"
+            size="small"
+            icon={<PlusOutlined />}
+            onClick={handleStartShang}
+            loading={generating}
+          >
+            {t('mirror.newSession')}
+          </Button>
         </div>
         <div style={{ padding: '0 12px 8px' }}>
           <Input
@@ -204,6 +233,22 @@ function ShangTab() {
                   <span>{r.date}</span>
                   <span>选{r.choice || '?'}</span>
                 </div>
+                <Popconfirm
+                  title={t('mirror.deleteConfirm')}
+                  onConfirm={(e) => { e?.stopPropagation(); handleDeleteRecord(r.id) }}
+                  onCancel={(e) => e?.stopPropagation()}
+                  okText={t('mirror.deleteOk')}
+                  cancelText={t('mirror.deleteCancel')}
+                >
+                  <Button
+                    type="text"
+                    size="small"
+                    danger
+                    icon={<DeleteOutlined />}
+                    className="mirror-session-edit-btn"
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                </Popconfirm>
               </div>
             ))
           )}
@@ -271,48 +316,33 @@ function ShangTab() {
                 </div>
                 <div className="shang-image-desc">{todayRecord.descriptionA}</div>
               </div>
-              {/* B 图片 + 上方重新生成按钮 */}
-              <div className="shang-image-b-wrap">
-                <Button
-                  size="small"
-                  type={(!todayRecord.imageA || !todayRecord.imageB) ? 'primary' : 'default'}
-                  danger={!todayRecord.imageA && !todayRecord.imageB}
-                  icon={<SyncOutlined spin={regenerating} />}
-                  onClick={handleRegenerate}
-                  loading={regenerating}
-                  className="shang-regenerate-above-b"
-                >
-                  {(!todayRecord.imageA || !todayRecord.imageB)
-                    ? t('mirror.shangRetryGenerate')
-                    : t('mirror.shangRegenerateImages')}
-                </Button>
-                <div
-                  className={`shang-image-card shang-image-card-selectable ${selectedChoice === 'B' ? 'selected' : ''}`}
-                  onClick={() => setSelectedChoice('B')}
-                >
-                  <div className="shang-image-wrapper">
-                    {todayRecord.imageB ? (
-                      <>
-                        <img src={todayRecord.imageB} alt="B" loading="lazy" />
-                        <Button
-                          type="text"
-                          size="small"
-                          className="shang-zoom-btn"
-                          icon={<ZoomInOutlined />}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            const fullUrl = todayRecord.imageB!.startsWith('/') ? `${window.location.origin}${todayRecord.imageB}` : todayRecord.imageB!
-                            setZoomingImage(fullUrl)
-                          }}
-                          title={t('mirror.shangZoomHint')}
-                        />
-                      </>
-                    ) : (
-                      <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f0f0', fontSize: 24, fontWeight: 700, color: '#999' }}>B</div>
-                    )}
-                  </div>
-                  <div className="shang-image-desc">{todayRecord.descriptionB}</div>
+              {/* B 图片 */}
+              <div
+                className={`shang-image-card shang-image-card-selectable ${selectedChoice === 'B' ? 'selected' : ''}`}
+                onClick={() => setSelectedChoice('B')}
+              >
+                <div className="shang-image-wrapper">
+                  {todayRecord.imageB ? (
+                    <>
+                      <img src={todayRecord.imageB} alt="B" loading="lazy" />
+                      <Button
+                        type="text"
+                        size="small"
+                        className="shang-zoom-btn"
+                        icon={<ZoomInOutlined />}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          const fullUrl = todayRecord.imageB!.startsWith('/') ? `${window.location.origin}${todayRecord.imageB}` : todayRecord.imageB!
+                          setZoomingImage(fullUrl)
+                        }}
+                        title={t('mirror.shangZoomHint')}
+                      />
+                    </>
+                  ) : (
+                    <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f0f0', fontSize: 24, fontWeight: 700, color: '#999' }}>B</div>
+                  )}
                 </div>
+                <div className="shang-image-desc">{todayRecord.descriptionB}</div>
               </div>
             </div>
 
@@ -339,6 +369,16 @@ function ShangTab() {
                 disabled={!selectedChoice}
               >
                 {t('mirror.shangSubmitBtn')}
+              </Button>
+              <Button
+                shape="circle"
+                size="large"
+                className="shang-regenerate-round-btn"
+                onClick={handleRegenerate}
+                loading={regenerating}
+                title={(!todayRecord.imageA || !todayRecord.imageB) ? t('mirror.shangRetryGenerate') : t('mirror.shangRegenerateImages')}
+              >
+                {t('mirror.shangRegenerateBtn')}
               </Button>
             </div>
             <Modal

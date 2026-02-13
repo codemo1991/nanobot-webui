@@ -387,6 +387,11 @@ export const api = {
       { method: 'POST' }
     ),
 
+  deleteMirrorSession: (sessionId: string, type: 'wu' | 'bian') =>
+    request<{ deleted: boolean }>(`/mirror/sessions/${sessionId}?type=${type}`, {
+      method: 'DELETE',
+    }),
+
   /** 悟/辩首次回复：新建会话后 AI 自动给出命题或辩题，流式返回 */
   async getMirrorFirstReplyStream(
     sessionId: string,
@@ -469,5 +474,10 @@ export const api = {
     request<import('./types').ShangRecord>(`/mirror/shang/${recordId}/choose`, {
       method: 'POST',
       body: JSON.stringify({ choice, attribution: attribution ?? '' }),
+    }),
+
+  deleteShangRecord: (recordId: string) =>
+    request<{ deleted: boolean }>(`/mirror/shang/records/${recordId}`, {
+      method: 'DELETE',
     }),
 }
