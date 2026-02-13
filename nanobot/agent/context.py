@@ -110,7 +110,8 @@ a command (e.g. open an app, start a browser, execute a script), use exec direct
 batch files or scripts for the user to run manually - exec the command yourself.
 
 Always be helpful, accurate, and concise. When using tools, explain what you're doing.
-When remembering something, write to {workspace_path}/memory/MEMORY.md"""
+
+MEMORY: When user says 记住/请记住/remember or asks you to remember something, you MUST call the remember tool to save it. Do NOT just reply "我记住了" in text — that does not persist. Only the remember tool writes to memory/MEMORY.md."""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""

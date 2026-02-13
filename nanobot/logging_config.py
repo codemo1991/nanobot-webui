@@ -77,3 +77,43 @@ def setup_logging(
 
     if capture_unhandled:
         sys.excepthook = _excepthook
+
+
+def reconfigure_logging(level: str) -> None:
+    """
+    Reconfigure console log level at runtime.
+
+    Args:
+        level: New log level for console (DEBUG, INFO, WARNING, ERROR, TRACE)
+    """
+    level = level.upper()
+    # Remove existing console sink (stderr, keep file sink)
+    # loguru 的 sink 存储在 logger._core.handlers 中
+    # 更简单的方式：移除所有 sink，重新添加
+    import os
+    log_file = os.environ.get("NANOBOT_LOG_FILE") or Path.home() / ".nanobot" / "nanobot.log"
+
+    logger.remove()
+
+    # Re-add console with new level
+    logger.add(
+        sys.stderr,
+        format=LOG_FORMAT,
+        level=level,
+        colorize=True,
+    )
+
+    # Re-add file sink (always DEBUG)
+    try:
+        logger.add(
+            str(log_file),
+            format=LOG_FORMAT,
+            level="DEBUG",
+            rotation="10 MB",
+            retention="5 days",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass  # 文件 sink 可能已存在，忽略错误
+
+    logger.debug(f"Log level reconfigured to {level}")

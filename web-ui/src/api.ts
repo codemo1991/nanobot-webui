@@ -1,5 +1,5 @@
 import i18n from './i18n'
-import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse } from './types'
+import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, TokenUsage } from './types'
 
 const API_BASE = '/api/v1'
 
@@ -58,6 +58,14 @@ export const api = {
     return request<Message[]>(`/chat/sessions/${sessionId}/messages?${params}`)
   },
 
+  getSessionTokenSummary: (sessionId: string) =>
+    request<TokenUsage>(`/chat/sessions/${sessionId}/token-summary`),
+
+  resetSessionTokenSummary: (sessionId: string) =>
+    request<{ reset: boolean; scope: 'session'; sessionId: string }>(`/chat/sessions/${sessionId}/token-summary/reset`, {
+      method: 'POST',
+    }),
+
   sendMessage: (sessionId: string, content: string, signal?: AbortSignal) =>
     request<ChatResponse>(`/chat/sessions/${sessionId}/messages`, {
       method: 'POST',
@@ -65,8 +73,72 @@ export const api = {
       signal,
     }),
 
+  /** Stream chat with SSE; calls onEvent for each progress event. Rejects on error. */
+  async sendMessageStream(
+    sessionId: string,
+    content: string,
+    onEvent: (evt: StreamEvent) => void,
+    signal?: AbortSignal
+  ): Promise<ChatResponse> {
+    const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/messages?stream=1`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      signal,
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err?.error?.message || i18n.t('api.requestFailed'))
+    }
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('Stream not supported')
+    const dec = new TextDecoder()
+    let buf = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n\n')
+        buf = lines.pop() ?? ''
+        for (const block of lines) {
+          // SSE: data can be multi-line; collapse all "data:" lines
+          const dataParts = block.split('\n')
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+          const dataStr = dataParts.join('\n')
+          if (!dataStr) continue
+          try {
+            const evt = JSON.parse(dataStr) as StreamEvent
+            onEvent(evt)
+            if (evt.type === 'done') {
+              return {
+                content: 'content' in evt ? evt.content ?? '' : '',
+                assistantMessage: 'assistantMessage' in evt ? evt.assistantMessage ?? null : null,
+              }
+            }
+            if (evt.type === 'error') {
+              throw new Error('message' in evt ? evt.message : 'Stream error')
+            }
+          } catch (e) {
+            if (e instanceof Error) throw e
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    throw new Error('Stream ended without done event')
+  },
+
   // Configuration
   getConfig: () => request<import('./types').ConfigData>('/config'),
+
+  updateAgentConfig: (agent: Partial<import('./types').AgentConfig>) =>
+    request<import('./types').AgentConfig>('/config/agent', {
+      method: 'PUT',
+      body: JSON.stringify(agent),
+    }),
   
   // IM Channels (WhatsApp, Telegram, Feishu)
   getChannels: () => request<import('./types').ChannelsConfig>('/channels'),
@@ -174,6 +246,11 @@ export const api = {
 
   // System
   getSystemStatus: () => request<import('./types').SystemStatus>('/system/status'),
+
+  resetGlobalTokenSummary: () =>
+    request<{ reset: boolean; scope: 'global' }>('/system/token-summary/reset', {
+      method: 'POST',
+    }),
   
   getSystemLogs: () => request<{ lines: string[] }>('/system/logs'),
   
@@ -191,5 +268,116 @@ export const api = {
     request<{ success: boolean; workspace: string }>('/system/config/import', {
       method: 'POST',
       body: JSON.stringify({ config, reloadWorkspace }),
+    }),
+
+  // ==================== Mirror Room ====================
+
+  // Profile (吾)
+  getMirrorProfile: () =>
+    request<import('./types').MirrorProfile | null>('/mirror/profile'),
+
+  // Mirror sessions (悟 / 辩)
+  getMirrorSessions: (type: import('./types').MirrorSessionType, page = 1, pageSize = 20) =>
+    request<{ items: import('./types').MirrorSession[]; total: number }>(
+      `/mirror/sessions?type=${type}&page=${page}&pageSize=${pageSize}`
+    ),
+
+  createMirrorSession: (
+    type: import('./types').MirrorSessionType,
+    options?: { attackLevel?: import('./types').AttackLevel; topic?: string }
+  ) =>
+    request<import('./types').MirrorSession>('/mirror/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ type, ...options }),
+    }),
+
+  getMirrorMessages: (sessionId: string, limit = 50) =>
+    request<import('./types').MirrorMessage[]>(`/mirror/sessions/${sessionId}/messages?limit=${limit}`),
+
+  sendMirrorMessage: (sessionId: string, content: string, signal?: AbortSignal) =>
+    request<ChatResponse>(`/mirror/sessions/${sessionId}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+      signal,
+    }),
+
+  /** Stream chat for mirror session */
+  async sendMirrorMessageStream(
+    sessionId: string,
+    content: string,
+    onEvent: (evt: StreamEvent) => void,
+    signal?: AbortSignal
+  ): Promise<ChatResponse> {
+    const res = await fetch(`${API_BASE}/mirror/sessions/${sessionId}/messages?stream=1`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+      signal,
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err?.error?.message || i18n.t('api.requestFailed'))
+    }
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('Stream not supported')
+    const dec = new TextDecoder()
+    let buf = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n\n')
+        buf = lines.pop() ?? ''
+        for (const block of lines) {
+          const dataParts = block.split('\n')
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+          const dataStr = dataParts.join('\n')
+          if (!dataStr) continue
+          try {
+            const evt = JSON.parse(dataStr) as StreamEvent
+            onEvent(evt)
+            if (evt.type === 'done') {
+              return {
+                content: 'content' in evt ? evt.content ?? '' : '',
+                assistantMessage: 'assistantMessage' in evt ? evt.assistantMessage ?? null : null,
+              }
+            }
+            if (evt.type === 'error') {
+              throw new Error('message' in evt ? evt.message : 'Stream error')
+            }
+          } catch (e) {
+            if (e instanceof Error) throw e
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    throw new Error('Stream ended without done event')
+  },
+
+  sealMirrorSession: (sessionId: string) =>
+    request<import('./types').MirrorSession>(`/mirror/sessions/${sessionId}/seal`, {
+      method: 'POST',
+    }),
+
+  // Shang (赏)
+  getShangToday: () =>
+    request<{ done: boolean; record: import('./types').ShangRecord | null }>('/mirror/shang/today'),
+
+  getShangRecords: (page = 1, pageSize = 20) =>
+    request<{ items: import('./types').ShangRecord[]; total: number }>(
+      `/mirror/shang/records?page=${page}&pageSize=${pageSize}`
+    ),
+
+  startShang: () =>
+    request<import('./types').ShangRecord>('/mirror/shang/start', { method: 'POST' }),
+
+  submitShangChoice: (recordId: string, choice: 'A' | 'B', attribution: string) =>
+    request<import('./types').ShangRecord>(`/mirror/shang/${recordId}/choose`, {
+      method: 'POST',
+      body: JSON.stringify({ choice, attribution }),
     }),
 }

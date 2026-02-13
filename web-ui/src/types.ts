@@ -20,6 +20,18 @@ export interface Session {
   status: string
 }
 
+export interface ToolStep {
+  name: string
+  arguments: Record<string, unknown> | string
+  result: string
+}
+
+export interface TokenUsage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+}
+
 export interface Message {
   id: string
   sessionId: string
@@ -27,6 +39,8 @@ export interface Message {
   content: string
   createdAt: string
   sequence: number
+  toolSteps?: ToolStep[]
+  tokenUsage?: TokenUsage
 }
 
 export interface SessionListResponse {
@@ -40,6 +54,13 @@ export interface ChatResponse {
   content: string
   assistantMessage: Message | null
 }
+
+export type StreamEvent =
+  | { type: 'thinking' }
+  | { type: 'tool_start'; name: string; arguments: Record<string, unknown> }
+  | { type: 'tool_end'; name: string; arguments: Record<string, unknown>; result: string }
+  | { type: 'done'; content: string; assistantMessage: Message | null }
+  | { type: 'error'; message: string }
 
 // Configuration Types
 
@@ -146,10 +167,102 @@ export interface InstalledSkill {
   tags?: string[]
 }
 
+export interface AgentConfig {
+  maxToolIterations: number
+  maxExecutionTime: number
+}
+
+// ==================== Mirror Room Types ====================
+
+export type MirrorSessionType = 'wu' | 'bian'
+export type MirrorSessionStatus = 'active' | 'sealed'
+export type AttackLevel = 'light' | 'medium' | 'heavy'
+
+export interface MirrorSession {
+  id: string
+  type: MirrorSessionType
+  title?: string
+  status: MirrorSessionStatus
+  createdAt: string
+  updatedAt: string
+  sealedAt?: string
+  messageCount: number
+  attackLevel?: AttackLevel // 辩专用
+  topic?: string
+  insight?: string // 核心洞察摘要（封存后填充）
+}
+
+export interface MirrorMessage {
+  id: string
+  sessionId: string
+  role: 'user' | 'assistant' | 'system'
+  content: string
+  createdAt: string
+  sequence: number
+  toolSteps?: ToolStep[]
+}
+
+export interface ShangRecord {
+  id: string
+  date: string
+  topic: string
+  imageA?: string // URL 或 base64
+  imageB?: string
+  descriptionA: string
+  descriptionB: string
+  choice: 'A' | 'B' | null
+  attribution: string // 归因
+  analysis?: ShangAnalysis
+  status: 'generating' | 'choosing' | 'attributing' | 'done'
+}
+
+export interface ShangAnalysis {
+  jungType?: { function: string; typeCode: string; description: string }
+  bigFive?: Record<string, string>
+  archetype?: { primary: string; secondary: string; fear: string; need: string }
+  crossValidation?: { consistentWithWu: boolean; consistentWithBian: boolean; note: string }
+}
+
+export interface BigFiveScore {
+  openness: number
+  conscientiousness: number
+  extraversion: number
+  agreeableness: number
+  neuroticism: number
+}
+
+export interface JungArchetype {
+  primary: string
+  secondary: string
+}
+
+export interface Driver {
+  need: string
+  evidence: string
+  suggestion: string
+}
+
+export interface Conflict {
+  explicit: string
+  implicit: string
+  type: string
+}
+
+export interface MirrorProfile {
+  version: string
+  updateTime: string
+  bigFive: BigFiveScore
+  jungArchetype: JungArchetype
+  drivers: Driver[]
+  conflicts: Conflict[]
+  suggestions: string[]
+}
+
 export interface ConfigData {
   channels: ChannelsConfig
   providers: Provider[]
   models: Model[]
+  agent?: AgentConfig
   mcps: McpServer[]
   skills: InstalledSkill[]
 }
@@ -172,5 +285,6 @@ export interface SystemStatus {
   stats: {
     sessions: number
     skills: number
+    tokens: TokenUsage
   }
 }

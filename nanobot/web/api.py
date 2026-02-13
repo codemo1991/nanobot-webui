@@ -7,7 +7,9 @@ import cgi
 import io
 import json
 import mimetypes
+import queue
 import re
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +25,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import convert_keys, ensure_initial_config, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.services.mirror_service import MirrorService
 from nanobot.services.system_status_service import SystemStatusService
 from nanobot.session.manager import SessionManager
 from nanobot.storage.status_repository import StatusRepository
@@ -72,6 +75,7 @@ class NanobotWebAPI:
             workspace=config.workspace_path,
             model=config.agents.defaults.model,
             max_iterations=config.agents.defaults.max_tool_iterations,
+            max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
             brave_api_key=config.tools.web.search.api_key or None,
             exec_config=config.tools.exec,
             filesystem_config=config.tools.filesystem,
@@ -87,6 +91,12 @@ class NanobotWebAPI:
             workspace=config.workspace_path
         )
         self.status_service.initialize()
+
+        # Mirror service
+        self.mirror = MirrorService(
+            workspace=config.workspace_path,
+            sessions_manager=self.sessions,
+        )
         
         # Initial gateway sync
         self._sync_gateway()
@@ -118,6 +128,7 @@ class NanobotWebAPI:
             workspace=workspace_path,
             model=config.agents.defaults.model,
             max_iterations=config.agents.defaults.max_tool_iterations,
+            max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
             brave_api_key=config.tools.web.search.api_key or None,
             exec_config=config.tools.exec,
             filesystem_config=config.tools.filesystem,
@@ -131,6 +142,10 @@ class NanobotWebAPI:
             workspace=workspace_path,
         )
         self.status_service.initialize()
+        self.mirror = MirrorService(
+            workspace=workspace_path,
+            sessions_manager=self.sessions,
+        )
         logger.info(f"Workspace hot-reloaded to: {workspace_path}")
 
     def switch_workspace(self, workspace_path: str) -> dict[str, Any]:
@@ -223,7 +238,7 @@ class NanobotWebAPI:
         return f"web:{session_id}"
 
     def list_sessions(self, page: int, page_size: int) -> dict[str, Any]:
-        all_sessions = [s for s in self.sessions.list_sessions() if s["key"].startswith("web:")]
+        all_sessions = self.sessions.list_sessions(key_prefix="web:")
         total = len(all_sessions)
         start = max(0, (page - 1) * page_size)
         end = start + page_size
@@ -281,9 +296,45 @@ class NanobotWebAPI:
                 "content": m["content"],
                 "createdAt": m["timestamp"],
                 "sequence": m["sequence"],
+                **({"toolSteps": m["tool_steps"]} if m.get("tool_steps") else {}),
+                **(
+                    {
+                        "tokenUsage": {
+                            "promptTokens": int(m["token_usage"].get("prompt_tokens", 0) or 0),
+                            "completionTokens": int(m["token_usage"].get("completion_tokens", 0) or 0),
+                            "totalTokens": int(m["token_usage"].get("total_tokens", 0) or 0),
+                        }
+                    }
+                    if m.get("token_usage")
+                    else {}
+                ),
             }
             for m in messages
         ]
+
+    def get_session_token_summary(self, session_id: str) -> dict[str, int]:
+        key = self.to_session_key(session_id)
+        session = self.sessions.get(key)
+        if session is None:
+            raise KeyError("session not found")
+        usage = self.sessions.get_session_token_usage(key)
+        return {
+            "promptTokens": int(usage.get("prompt_tokens", 0)),
+            "completionTokens": int(usage.get("completion_tokens", 0)),
+            "totalTokens": int(usage.get("total_tokens", 0)),
+        }
+
+    def reset_session_token_summary(self, session_id: str) -> dict[str, Any]:
+        key = self.to_session_key(session_id)
+        session = self.sessions.get(key)
+        if session is None:
+            raise KeyError("session not found")
+        self.sessions.reset_session_token_usage(key)
+        return {"reset": True, "scope": "session", "sessionId": session_id}
+
+    def reset_global_token_summary(self) -> dict[str, Any]:
+        self.sessions.reset_global_token_usage()
+        return {"reset": True, "scope": "global"}
 
     def rename_session(self, session_id: str, title: str) -> dict[str, Any]:
         key = self.to_session_key(session_id)
@@ -298,24 +349,59 @@ class NanobotWebAPI:
             "updatedAt": session.updated_at.isoformat(),
         }
 
-    async def chat(self, session_id: str, content: str) -> dict[str, Any]:
-        key = self.to_session_key(session_id)
+    # ==================== Mirror Room Methods ====================
+
+    def mirror_chat_stream(
+        self, session_type: str, session_id: str, content: str
+    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
+        """Run mirror chat with progress events."""
+        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+
+        def on_progress(evt: dict[str, Any]) -> None:
+            try:
+                evt_queue.put(evt)
+            except Exception:
+                pass
+
+        def run_agent() -> None:
+            try:
+                result = asyncio.run(
+                    self._mirror_chat_with_progress(session_type, session_id, content, on_progress)
+                )
+                evt_queue.put({"type": "done", **result})
+            except asyncio.CancelledError:
+                evt_queue.put({"type": "error", "message": "cancelled"})
+            except Exception as e:
+                logger.exception("Mirror chat stream failed")
+                evt_queue.put({"type": "error", "message": str(e)})
+
+        thread = threading.Thread(target=run_agent, daemon=False)
+        return evt_queue, thread
+
+    async def _mirror_chat_with_progress(
+        self,
+        session_type: str,
+        session_id: str,
+        content: str,
+        progress_callback: Any,
+    ) -> dict[str, Any]:
+        """Internal: run mirror chat with progress callback."""
+        key = MirrorService._session_key(session_type, session_id)
         self.sessions.get_or_create(key)
         try:
             response = await self.agent.process_direct(
                 content=content,
                 session_key=key,
-                channel="web",
+                channel="mirror",
                 chat_id=session_id,
+                progress_callback=progress_callback,
             )
         finally:
-            # Close MCP connections before loop ends - avoids "different task" errors
-            # when asyncio.run() tears down; connections are recreated next request
-            if self.agent.mcp_loader:
+            if getattr(self.agent, "mcp_loader", None):
                 try:
                     await self.agent.reload_mcp_config()
                 except BaseException:
-                    pass  # Suppress any close errors (BaseExceptionGroup, etc.)
+                    pass
         messages = self.sessions.get_messages(key=key, limit=2)
         assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
         return {
@@ -328,11 +414,143 @@ class NanobotWebAPI:
                     "content": assistant["content"],
                     "createdAt": assistant["timestamp"],
                     "sequence": assistant["sequence"],
+                    **({"toolSteps": assistant["tool_steps"]} if assistant.get("tool_steps") else {}),
                 }
                 if assistant
                 else None
             ),
         }
+
+    async def _run_mirror_analysis(
+        self, stype: str, key: str
+    ) -> dict[str, Any] | None:
+        """Run LLM analysis on mirror session for narrative/defense/insight."""
+        try:
+            messages_raw = self.sessions.get_messages(key=key, limit=100)
+            conv_text = "\n".join(
+                f"{'用户' if m['role'] == 'user' else 'AI'}: {m['content'][:500]}"
+                for m in messages_raw[-20:]
+            )
+            prompt = (
+                "你是一位擅长叙事与心理分析的助手。根据以下悟道/辩论对话，提取分析结果。"
+                "请以简洁中文回答，每条一行。\n\n"
+                "对话内容：\n" + conv_text + "\n\n"
+                "请按以下格式输出（每行一个）：\n"
+                "叙事结构: [第一人称/第三人称，过去/现在倾向等]\n"
+                "防御机制: [如合理化、投射、否认等]\n"
+                "潜意识关键词: [如应该、必须、没办法等]\n"
+                "核心洞察: [一句概括]\n"
+            )
+            if stype == "bian":
+                prompt += "辩题/立场: [用户主要立场]\n矛盾/谬误: [检测到的]\n"
+            msgs = [
+                {"role": "system", "content": "你输出简洁的分析，每行格式为「标签: 内容」。"},
+                {"role": "user", "content": prompt},
+            ]
+            resp = await self.agent.provider.chat(
+                messages=msgs,
+                model=self.agent.model,
+                max_tokens=800,
+                temperature=0.3,
+            )
+            if not resp.content:
+                return None
+            result = {}
+            for line in resp.content.strip().split("\n"):
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    result[k.strip()] = v.strip()
+            return result
+        except Exception as e:
+            logger.warning("Mirror LLM analysis failed: %s", e)
+            return None
+
+    def chat_stream(
+        self, session_id: str, content: str
+    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
+        """
+        Run chat with progress events. Returns (event_queue, thread).
+        Caller reads from queue until {"type": "done"} or {"type": "error"}.
+        """
+        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+
+        def on_progress(evt: dict[str, Any]) -> None:
+            try:
+                evt_queue.put(evt)
+            except Exception:
+                pass
+
+        def run_agent() -> None:
+            try:
+                result = asyncio.run(
+                    self._chat_with_progress(session_id, content, on_progress)
+                )
+                evt_queue.put({"type": "done", **result})
+            except asyncio.CancelledError:
+                evt_queue.put({"type": "error", "message": "cancelled"})
+            except Exception as e:
+                logger.exception("Chat stream failed")
+                evt_queue.put({"type": "error", "message": str(e)})
+
+        thread = threading.Thread(target=run_agent, daemon=False)
+        return evt_queue, thread
+
+    async def _chat_with_progress(
+        self,
+        session_id: str,
+        content: str,
+        progress_callback: Any,
+    ) -> dict[str, Any]:
+        """Internal: run chat with optional progress callback. Used by chat() and chat_stream."""
+        key = self.to_session_key(session_id)
+        self.sessions.get_or_create(key)
+        try:
+            response = await self.agent.process_direct(
+                content=content,
+                session_key=key,
+                channel="web",
+                chat_id=session_id,
+                progress_callback=progress_callback,
+            )
+        finally:
+            if getattr(self.agent, "mcp_loader", None):
+                try:
+                    await self.agent.reload_mcp_config()
+                except BaseException:
+                    pass
+        messages = self.sessions.get_messages(key=key, limit=2)
+        assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+        return {
+            "content": response,
+            "assistantMessage": (
+                {
+                    "id": f"msg_{assistant['sequence']}",
+                    "sessionId": session_id,
+                    "role": assistant["role"],
+                    "content": assistant["content"],
+                    "createdAt": assistant["timestamp"],
+                    "sequence": assistant["sequence"],
+                    **({"toolSteps": assistant["tool_steps"]} if assistant.get("tool_steps") else {}),
+                    **(
+                        {
+                            "tokenUsage": {
+                                "promptTokens": int(assistant["token_usage"].get("prompt_tokens", 0) or 0),
+                                "completionTokens": int(assistant["token_usage"].get("completion_tokens", 0) or 0),
+                                "totalTokens": int(assistant["token_usage"].get("total_tokens", 0) or 0),
+                            }
+                        }
+                        if assistant.get("token_usage")
+                        else {}
+                    ),
+                }
+                if assistant
+                else None
+            ),
+        }
+
+    async def chat(self, session_id: str, content: str) -> dict[str, Any]:
+        """Non-streaming chat. Reuses _chat_with_progress without callback."""
+        return await self._chat_with_progress(session_id, content, progress_callback=None)
 
     def get_config(self) -> dict[str, Any]:
         """Get all configuration data."""
@@ -439,10 +657,17 @@ class NanobotWebAPI:
                 "tags": [t.strip() for t in meta.get("tags", "").split(",")] if meta.get("tags") else []
             })
 
+        # Agent system config (max_tool_iterations, max_execution_time)
+        agent = {
+            "maxToolIterations": config.agents.defaults.max_tool_iterations,
+            "maxExecutionTime": getattr(config.agents.defaults, "max_execution_time", 600) or 0,
+        }
+
         return {
             "channels": channels,
             "providers": providers,
             "models": models,
+            "agent": agent,
             "mcps": [
                 {
                     "id": m.id,
@@ -632,6 +857,26 @@ class NanobotWebAPI:
             return {"connected": False, "message": str(e)}
         return {"connected": False, "message": "未知 transport 类型"}
 
+    def update_agent_config(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Update agent system config (max_tool_iterations, max_execution_time). Hot-updates running agent."""
+        config = load_config()
+        defaults = config.agents.defaults
+        if "maxToolIterations" in data and data["maxToolIterations"] is not None:
+            v = int(data["maxToolIterations"])
+            defaults.max_tool_iterations = max(1, min(v, 200))
+        if "maxExecutionTime" in data and data["maxExecutionTime"] is not None:
+            v = int(data["maxExecutionTime"])
+            defaults.max_execution_time = max(0, v)
+        save_config(config)
+        self.agent.update_agent_params(
+            max_iterations=defaults.max_tool_iterations,
+            max_execution_time=defaults.max_execution_time,
+        )
+        return {
+            "maxToolIterations": defaults.max_tool_iterations,
+            "maxExecutionTime": defaults.max_execution_time,
+        }
+
     def update_channels(self, data: dict[str, Any]) -> dict[str, Any]:
         """Update IM channels configuration."""
         config = load_config()
@@ -755,6 +1000,7 @@ class NanobotWebAPI:
 
             # Get status from SystemStatusService
             status = self.status_service.get_status()
+            token_usage = self.sessions.get_global_token_usage()
 
             # Merge with existing gateway, web, and environment info
             return {
@@ -774,7 +1020,12 @@ class NanobotWebAPI:
                 },
                 "stats": {
                     "sessions": status["sessions"],
-                    "skills": status["skills"]
+                    "skills": status["skills"],
+                    "tokens": {
+                        "promptTokens": int(token_usage.get("prompt_tokens", 0)),
+                        "completionTokens": int(token_usage.get("completion_tokens", 0)),
+                        "totalTokens": int(token_usage.get("total_tokens", 0)),
+                    },
                 }
             }
         except Exception as e:
@@ -800,7 +1051,12 @@ class NanobotWebAPI:
                 },
                 "stats": {
                     "sessions": 0,
-                    "skills": 0
+                    "skills": 0,
+                    "tokens": {
+                        "promptTokens": 0,
+                        "completionTokens": 0,
+                        "totalTokens": 0,
+                    },
                 }
             }
 
@@ -943,6 +1199,83 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _handle_chat_stream(
+        self, app: "NanobotWebAPI", session_id: str, content: str
+    ) -> None:
+        """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
+        evt_queue, thread = app.chat_stream(session_id, content)
+        thread.start()
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        try:
+            while thread.is_alive() or not evt_queue.empty():
+                try:
+                    evt = evt_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                try:
+                    payload = json.dumps(evt, ensure_ascii=False)
+                except (TypeError, ValueError) as e:
+                    logger.warning("SSE event not JSON-serializable: %s", e)
+                    continue
+                line = f"data: {payload}\n\n"
+                try:
+                    self.wfile.write(line.encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    logger.debug("Client disconnected during stream")
+                    break
+                if evt.get("type") in ("done", "error"):
+                    break
+            thread.join(timeout=1.0)
+        except Exception as e:
+            logger.warning("Chat stream write error: %s", e)
+        finally:
+            if thread.is_alive():
+                logger.debug("Chat stream thread still running after response end")
+
+    def _handle_mirror_chat_stream(
+        self, app: "NanobotWebAPI", session_type: str, session_id: str, content: str
+    ) -> None:
+        """Stream mirror chat progress via SSE."""
+        evt_queue, thread = app.mirror_chat_stream(session_type, session_id, content)
+        thread.start()
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        try:
+            while thread.is_alive() or not evt_queue.empty():
+                try:
+                    evt = evt_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                try:
+                    payload = json.dumps(evt, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    continue
+                line = f"data: {payload}\n\n"
+                try:
+                    self.wfile.write(line.encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+                if evt.get("type") in ("done", "error"):
+                    break
+            thread.join(timeout=1.0)
+        except Exception:
+            pass
+
     def _serve_static(self, file_path: Path) -> None:
         """Serve a static file."""
         try:
@@ -1010,6 +1343,15 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
                 return
 
+            # GET /api/v1/chat/sessions/{sessionId}/token-summary
+            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "token-summary":
+                session_id = parts[4]
+                try:
+                    self._write_json(HTTPStatus.OK, _ok(app.get_session_token_summary(session_id)))
+                except KeyError:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
+                return
+
             # Configuration endpoints
             if path == "/api/v1/config":
                 self._write_json(HTTPStatus.OK, _ok(app.get_config()))
@@ -1063,6 +1405,57 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(config_data["skills"]))
                 return
 
+            # ==================== Mirror Room GET ====================
+
+            # GET /api/v1/mirror/profile
+            if path == "/api/v1/mirror/profile":
+                profile = app.mirror.get_profile()
+                self._write_json(HTTPStatus.OK, _ok(profile))
+                return
+
+            # GET /api/v1/mirror/sessions?type=wu&page=1&pageSize=20
+            if path == "/api/v1/mirror/sessions":
+                stype = query.get("type", ["wu"])[0]
+                page = int(query.get("page", ["1"])[0])
+                page_size = int(query.get("pageSize", ["20"])[0])
+                data = app.mirror.list_sessions(stype, page, page_size)
+                self._write_json(HTTPStatus.OK, _ok(data))
+                return
+
+            # GET /api/v1/mirror/sessions/{sessionId}/messages
+            if (
+                len(parts) == 6
+                and parts[:3] == ["api", "v1", "mirror"]
+                and parts[3] == "sessions"
+                and parts[5] == "messages"
+            ):
+                session_id = parts[4]
+                limit = int(query.get("limit", ["50"])[0])
+                # Try both types
+                for stype in ("wu", "bian"):
+                    try:
+                        msgs = app.mirror.get_messages(session_id, stype, limit)
+                        self._write_json(HTTPStatus.OK, _ok(msgs))
+                        return
+                    except KeyError:
+                        continue
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "镜室会话不存在"))
+                return
+
+            # GET /api/v1/mirror/shang/today
+            if path == "/api/v1/mirror/shang/today":
+                data = app.mirror.get_shang_today()
+                self._write_json(HTTPStatus.OK, _ok(data))
+                return
+
+            # GET /api/v1/mirror/shang/records
+            if path == "/api/v1/mirror/shang/records":
+                page = int(query.get("page", ["1"])[0])
+                page_size = int(query.get("pageSize", ["20"])[0])
+                data = app.mirror.get_shang_records(page, page_size)
+                self._write_json(HTTPStatus.OK, _ok(data))
+                return
+
             self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", f"Unknown path: {path}"))
             return
 
@@ -1085,7 +1478,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        path, parts, _ = self._route()
+        path, parts, query = self._route()
         app = self.server.app
 
         if path == "/api/v1/system/workspace":
@@ -1126,7 +1519,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.CREATED, _ok(data))
             return
 
-        # POST /api/v1/chat/sessions/{sessionId}/messages
+        # POST /api/v1/chat/sessions/{sessionId}/messages (with optional ?stream=1 for SSE)
         if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "messages":
             body = self._read_json()
             content = (body.get("content") or "").strip()
@@ -1134,6 +1527,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 不能为空"))
                 return
             session_id = parts[4]
+            use_stream = query.get("stream", [None])[0] == "1"
+
+            if use_stream:
+                try:
+                    self._handle_chat_stream(app, session_id, content)
+                except Exception as exc:
+                    logger.exception("Chat stream failed")
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        _err("CHAT_STREAM_FAILED", "流式处理失败", str(exc)),
+                    )
+                return
+
             try:
                 data = asyncio.run(app.chat(session_id=session_id, content=content))
                 self._write_json(HTTPStatus.OK, _ok(data))
@@ -1157,6 +1563,18 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                 "content": assistant["content"],
                                 "createdAt": assistant["timestamp"],
                                 "sequence": assistant["sequence"],
+                                **({"toolSteps": assistant["tool_steps"]} if assistant.get("tool_steps") else {}),
+                                **(
+                                    {
+                                        "tokenUsage": {
+                                            "promptTokens": int(assistant["token_usage"].get("prompt_tokens", 0) or 0),
+                                            "completionTokens": int(assistant["token_usage"].get("completion_tokens", 0) or 0),
+                                            "totalTokens": int(assistant["token_usage"].get("total_tokens", 0) or 0),
+                                        }
+                                    }
+                                    if assistant.get("token_usage")
+                                    else {}
+                                ),
                             }
                             if assistant
                             else None
@@ -1171,6 +1589,22 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     _err("CHAT_FAILED", "处理消息失败", str(exc)),
                 )
+            return
+
+        # POST /api/v1/chat/sessions/{sessionId}/token-summary/reset
+        if len(parts) == 7 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "token-summary" and parts[6] == "reset":
+            session_id = parts[4]
+            try:
+                data = app.reset_session_token_summary(session_id)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
+            return
+
+        # POST /api/v1/system/token-summary/reset
+        if path == "/api/v1/system/token-summary/reset":
+            data = app.reset_global_token_summary()
+            self._write_json(HTTPStatus.OK, _ok(data))
             return
 
         # POST /api/v1/providers - Create provider
@@ -1219,6 +1653,129 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             model_id = parts[3]
             app.update_model(model_id, {"isDefault": True})
             self._write_json(HTTPStatus.OK, _ok({"success": True}))
+            return
+
+        # ==================== Mirror Room POST ====================
+
+        # POST /api/v1/mirror/sessions - Create mirror session
+        if path == "/api/v1/mirror/sessions":
+            body = self._read_json()
+            stype = body.get("type", "wu")
+            attack_level = body.get("attackLevel")
+            topic = body.get("topic")
+            try:
+                data = app.mirror.create_session(stype, attack_level=attack_level, topic=topic)
+                self._write_json(HTTPStatus.CREATED, _ok(data))
+            except Exception as e:
+                logger.exception("Mirror session create failed")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("MIRROR_CREATE_FAILED", str(e)))
+            return
+
+        # POST /api/v1/mirror/sessions/{sessionId}/messages (with optional ?stream=1)
+        if (
+            len(parts) == 6
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "sessions"
+            and parts[5] == "messages"
+        ):
+            body = self._read_json()
+            content = (body.get("content") or "").strip()
+            if not content:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 不能为空"))
+                return
+            session_id = parts[4]
+            use_stream = query.get("stream", [None])[0] == "1"
+
+            # Detect session type
+            stype = "wu"
+            for t in ("wu", "bian"):
+                key = MirrorService._session_key(t, session_id)
+                if app.sessions.get(key) is not None:
+                    stype = t
+                    break
+
+            if use_stream:
+                try:
+                    self._handle_mirror_chat_stream(app, stype, session_id, content)
+                except Exception as exc:
+                    logger.exception("Mirror chat stream failed")
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        _err("MIRROR_STREAM_FAILED", "镜室流式处理失败", str(exc)),
+                    )
+                return
+
+            try:
+                data = asyncio.run(
+                    app._mirror_chat_with_progress(stype, session_id, content, progress_callback=None)
+                )
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except Exception as exc:
+                logger.exception("Mirror chat failed")
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    _err("MIRROR_CHAT_FAILED", "镜室消息处理失败", str(exc)),
+                )
+            return
+
+        # POST /api/v1/mirror/sessions/{sessionId}/seal
+        if (
+            len(parts) == 6
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "sessions"
+            and parts[5] == "seal"
+        ):
+            session_id = parts[4]
+            try:
+                llm_analysis = None
+                for stype in ("wu", "bian"):
+                    key = MirrorService._session_key(stype, session_id)
+                    if app.sessions.get(key) is not None:
+                        try:
+                            llm_analysis = asyncio.run(
+                                app._run_mirror_analysis(stype, key)
+                            )
+                        except Exception as e:
+                            logger.warning("Mirror analysis LLM call failed: %s", e)
+                        break
+                data = app.mirror.seal_session(session_id, llm_analysis=llm_analysis)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "镜室会话不存在"))
+            return
+
+        # POST /api/v1/mirror/shang/start
+        if path == "/api/v1/mirror/shang/start":
+            try:
+                data = app.mirror.start_shang()
+                self._write_json(HTTPStatus.CREATED, _ok(data))
+            except Exception as e:
+                logger.exception("Shang start failed")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("SHANG_START_FAILED", str(e)))
+            return
+
+        # POST /api/v1/mirror/shang/{recordId}/choose
+        if (
+            len(parts) == 6
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "shang"
+            and parts[5] == "choose"
+        ):
+            record_id = parts[4]
+            body = self._read_json()
+            choice = body.get("choice")
+            attribution = (body.get("attribution") or "").strip()
+            if choice not in ("A", "B"):
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "choice 必须是 A 或 B"))
+                return
+            if not attribution:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "attribution 不能为空"))
+                return
+            try:
+                data = app.mirror.submit_shang_choice(record_id, choice, attribution)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("SHANG_RECORD_NOT_FOUND", "赏记录不存在"))
             return
 
         # POST /api/v1/skills/upload
@@ -1311,6 +1868,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         path, parts, _ = self._route()
         app = self.server.app
+
+        # PUT /api/v1/config/agent
+        if path == "/api/v1/config/agent":
+            body = self._read_json()
+            try:
+                data = app.update_agent_config(body)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except (ValueError, TypeError) as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
 
         # PUT /api/v1/channels
         if path == "/api/v1/channels":

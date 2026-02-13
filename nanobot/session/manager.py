@@ -122,6 +122,23 @@ class SessionManager:
 
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_sequence
                     ON chat_messages(session_key, sequence);
+
+                CREATE TABLE IF NOT EXISTS chat_token_totals (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_session_token_totals (
+                    session_key TEXT PRIMARY KEY,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(session_key) REFERENCES chat_sessions(key) ON DELETE CASCADE
+                );
                 """
             )
     
@@ -291,23 +308,39 @@ class SessionManager:
             cursor = conn.execute("DELETE FROM chat_sessions WHERE key = ?", (key,))
             return cursor.rowcount > 0
     
-    def list_sessions(self) -> list[dict[str, Any]]:
+    def list_sessions(self, key_prefix: str | None = None) -> list[dict[str, Any]]:
         """
-        List all sessions.
-        
+        List all sessions, optionally filtered by key prefix.
+
+        Args:
+            key_prefix: If set, only return sessions whose key starts with this prefix.
+
         Returns:
             List of session info dicts.
         """
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT s.key, s.created_at, s.updated_at, s.metadata_json, COUNT(m.id) AS message_count
-                FROM chat_sessions s
-                LEFT JOIN chat_messages m ON m.session_key = s.key
-                GROUP BY s.key, s.created_at, s.updated_at, s.metadata_json
-                ORDER BY s.updated_at DESC
-                """
-            ).fetchall()
+            if key_prefix:
+                rows = conn.execute(
+                    """
+                    SELECT s.key, s.created_at, s.updated_at, s.metadata_json, COUNT(m.id) AS message_count
+                    FROM chat_sessions s
+                    LEFT JOIN chat_messages m ON m.session_key = s.key
+                    WHERE s.key LIKE ? || '%%'
+                    GROUP BY s.key, s.created_at, s.updated_at, s.metadata_json
+                    ORDER BY s.updated_at DESC
+                    """,
+                    (key_prefix,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT s.key, s.created_at, s.updated_at, s.metadata_json, COUNT(m.id) AS message_count
+                    FROM chat_sessions s
+                    LEFT JOIN chat_messages m ON m.session_key = s.key
+                    GROUP BY s.key, s.created_at, s.updated_at, s.metadata_json
+                    ORDER BY s.updated_at DESC
+                    """
+                ).fetchall()
 
         sessions: list[dict[str, Any]] = []
         for row in rows:
@@ -376,3 +409,130 @@ class SessionManager:
                 }
             )
         return result
+
+    def increment_token_usage(
+        self,
+        session_key: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> None:
+        """Increment global and per-session token usage counters."""
+        safe_prompt = max(0, int(prompt_tokens))
+        safe_completion = max(0, int(completion_tokens))
+        safe_total = max(0, int(total_tokens))
+        if safe_prompt == 0 and safe_completion == 0 and safe_total == 0:
+            return
+
+        updated_at = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_token_totals (id, prompt_tokens, completion_tokens, total_tokens, updated_at)
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    total_tokens = total_tokens + excluded.total_tokens,
+                    updated_at = excluded.updated_at
+                """,
+                (safe_prompt, safe_completion, safe_total, updated_at),
+            )
+            conn.execute(
+                """
+                INSERT INTO chat_session_token_totals (
+                    session_key, prompt_tokens, completion_tokens, total_tokens, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    total_tokens = total_tokens + excluded.total_tokens,
+                    updated_at = excluded.updated_at
+                """,
+                (session_key, safe_prompt, safe_completion, safe_total, updated_at),
+            )
+
+    def get_session_token_usage(self, key: str) -> dict[str, int]:
+        """Get cumulative token usage for one session."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT prompt_tokens, completion_tokens, total_tokens
+                FROM chat_session_token_totals
+                WHERE session_key = ?
+                """,
+                (key,),
+            ).fetchone()
+        if row is None:
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {
+            "prompt_tokens": int(row["prompt_tokens"]),
+            "completion_tokens": int(row["completion_tokens"]),
+            "total_tokens": int(row["total_tokens"]),
+        }
+
+    def get_global_token_usage(self) -> dict[str, int]:
+        """Get cumulative token usage across all sessions."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT prompt_tokens, completion_tokens, total_tokens
+                FROM chat_token_totals
+                WHERE id = 1
+                """
+            ).fetchone()
+        if row is None:
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return {
+            "prompt_tokens": int(row["prompt_tokens"]),
+            "completion_tokens": int(row["completion_tokens"]),
+            "total_tokens": int(row["total_tokens"]),
+        }
+
+    def reset_session_token_usage(self, key: str) -> bool:
+        """Reset token usage for one session."""
+        updated_at = datetime.now().isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO chat_session_token_totals (
+                    session_key, prompt_tokens, completion_tokens, total_tokens, updated_at
+                )
+                VALUES (?, 0, 0, 0, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    prompt_tokens = 0,
+                    completion_tokens = 0,
+                    total_tokens = 0,
+                    updated_at = excluded.updated_at
+                """,
+                (key, updated_at),
+            )
+        return cursor.rowcount > 0
+
+    def reset_global_token_usage(self) -> None:
+        """Reset token usage for all sessions and global totals."""
+        updated_at = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chat_token_totals (id, prompt_tokens, completion_tokens, total_tokens, updated_at)
+                VALUES (1, 0, 0, 0, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    prompt_tokens = 0,
+                    completion_tokens = 0,
+                    total_tokens = 0,
+                    updated_at = excluded.updated_at
+                """,
+                (updated_at,),
+            )
+            conn.execute(
+                """
+                UPDATE chat_session_token_totals
+                SET prompt_tokens = 0,
+                    completion_tokens = 0,
+                    total_tokens = 0,
+                    updated_at = ?
+                """,
+                (updated_at,),
+            )

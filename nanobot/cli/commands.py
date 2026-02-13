@@ -167,7 +167,8 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
-    
+    from nanobot.services.memory_maintenance import MemoryMaintenanceService
+
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
@@ -207,6 +208,7 @@ def gateway(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
+        max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         filesystem_config=config.tools.filesystem,
@@ -243,7 +245,13 @@ def gateway(
         interval_s=30 * 60,  # 30 minutes
         enabled=True
     )
-    
+
+    memory_maintenance = MemoryMaintenanceService(
+        workspace=config.workspace_path,
+        provider=provider,
+        model=model,
+    )
+
     # Create channel manager
     channels = ChannelManager(config, bus)
     
@@ -257,17 +265,20 @@ def gateway(
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
-    
+    console.print(f"[green]✓[/green] Memory maintenance: every 60m summarize, daily 00:05 merge")
+
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
+            await memory_maintenance.start()
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+            memory_maintenance.stop()
             heartbeat.stop()
             cron.stop()
             agent.stop()
@@ -287,9 +298,20 @@ def gateway(
 def web_ui(
     host: str = typer.Option("127.0.0.1", "--host", help="Web API host"),
     port: int = typer.Option(6788, "--port", "-p", help="Web API port"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose (DEBUG) logging"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug (TRACE) logging, most verbose"),
 ):
     """Start nanobot Web UI API server."""
     from nanobot.web.api import run_server
+    from nanobot.logging_config import reconfigure_logging
+
+    # 根据参数调整日志级别
+    if debug:
+        reconfigure_logging("TRACE")
+        console.print("[dim]Debug mode enabled (TRACE level)[/dim]")
+    elif verbose:
+        reconfigure_logging("DEBUG")
+        console.print("[dim]Verbose mode enabled (DEBUG level)[/dim]")
 
     console.print(f"{__logo__} Starting Web UI API on http://{host}:{port}")
     run_server(host=host, port=port)
@@ -333,6 +355,8 @@ def agent(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         filesystem_config=config.tools.filesystem,

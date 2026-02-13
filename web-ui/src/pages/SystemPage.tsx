@@ -61,6 +61,22 @@ function SystemPage() {
     message.success(t('system.exportStarted'))
   }
 
+  const handleResetGlobalTokens = () => {
+    Modal.confirm({
+      title: t('system.resetGlobalTokensTitle'),
+      content: t('system.resetGlobalTokensConfirm'),
+      onOk: async () => {
+        try {
+          await api.resetGlobalTokenSummary()
+          message.success(t('system.resetGlobalTokensSuccess'))
+          loadStatus()
+        } catch (err) {
+          message.error(t('system.resetGlobalTokensFailed'))
+        }
+      },
+    })
+  }
+
   const handleOpenWorkspaceModal = () => {
     setWorkspaceInput(status?.web.workspace ?? '')
     setWorkspaceModalVisible(true)
@@ -165,6 +181,16 @@ function SystemPage() {
               </p>
             </div>
           </div>
+
+          <div className="card status-card">
+            <div className="status-icon">🧮</div>
+            <div>
+              <h3>{t('system.tokens')}</h3>
+              <p className="status-value">
+                {loading ? t('system.loading') : status ? new Intl.NumberFormat().format(status.stats.tokens.totalTokens) : '--'}
+              </p>
+            </div>
+          </div>
         </div>
 
         <div className="card">
@@ -256,6 +282,9 @@ function SystemPage() {
               loading={importing}
             >
               {t('system.importConfig')}
+            </Button>
+            <Button danger onClick={handleResetGlobalTokens}>
+              {t('system.resetGlobalTokens')}
             </Button>
           </div>
           <input
