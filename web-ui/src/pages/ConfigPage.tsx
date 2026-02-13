@@ -524,7 +524,8 @@ function ModelsConfig() {
         form.setFieldsValue({
           modelName: defaultModel.modelName,
           temperature: defaultModel.parameters?.temperature,
-          maxTokens: defaultModel.parameters?.maxTokens
+          maxTokens: defaultModel.parameters?.maxTokens,
+          qwenImageModel: defaultModel.qwenImageModel ?? ''
         })
       }
     } catch (error) {
@@ -545,7 +546,8 @@ function ModelsConfig() {
           maxTokens: values.maxTokens ? Number(values.maxTokens) : undefined
         },
         enabled: true,
-        name: values.modelName
+        name: values.modelName,
+        qwenImageModel: (values.qwenImageModel ?? '').trim()
       })
       message.success(t('config.model.updated'))
       loadModel()
@@ -571,6 +573,14 @@ function ModelsConfig() {
               <Input type="number" step="1" min="1" />
             </Form.Item>
           </Space>
+
+          <Form.Item
+            name="qwenImageModel"
+            label={t('config.model.qwenImageLabel')}
+            help={t('config.model.qwenImageHelp')}
+          >
+            <Input placeholder="qwen-image-plus" />
+          </Form.Item>
 
           <Form.Item>
             <Button type="primary" htmlType="submit">{t('config.save')}</Button>

@@ -145,6 +145,8 @@ export interface Model {
   enabled: boolean
   isDefault?: boolean
   parameters?: ModelParameters
+  /** 赏图生成模型，如 qwen-image-plus，留空则赏 Tab 用文字描述 */
+  qwenImageModel?: string
 }
 
 export interface McpServer {

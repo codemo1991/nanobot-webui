@@ -14,13 +14,17 @@ async function request<T>(path: string, options?: RequestInit & { skipJsonConten
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({ success: false, error: { code: 'NETWORK_ERROR', message: i18n.t('api.networkError') } }))
-    throw new Error(errorData.error?.message || i18n.t('api.requestFailed'))
+    const err = new Error(errorData.error?.message || i18n.t('api.requestFailed'))
+    ;(err as Error & { code?: string }).code = errorData.error?.code
+    throw err
   }
 
   const data: ApiResponse<T> = await response.json()
   
   if (!data.success) {
-    throw new Error(data.error?.message || i18n.t('api.requestFailed'))
+    const err = new Error(data.error?.message || i18n.t('api.requestFailed'))
+    ;(err as Error & { code?: string }).code = data.error?.code
+    throw err
   }
 
   return data.data!
@@ -121,7 +125,7 @@ export const api = {
               throw new Error('message' in evt ? evt.message : 'Stream error')
             }
           } catch (e) {
-            if (e instanceof Error) throw e
+            throw e  // 重抛任何异常，不吞掉非 Error 类型
           }
         }
       }
@@ -276,6 +280,9 @@ export const api = {
   getMirrorProfile: () =>
     request<import('./types').MirrorProfile | null>('/mirror/profile'),
 
+  generateMirrorProfile: () =>
+    request<import('./types').MirrorProfile>('/mirror/profile/generate', { method: 'POST' }),
+
   // Mirror sessions (悟 / 辩)
   getMirrorSessions: (type: import('./types').MirrorSessionType, page = 1, pageSize = 20) =>
     request<{ items: import('./types').MirrorSession[]; total: number }>(
@@ -291,8 +298,10 @@ export const api = {
       body: JSON.stringify({ type, ...options }),
     }),
 
-  getMirrorMessages: (sessionId: string, limit = 50) =>
-    request<import('./types').MirrorMessage[]>(`/mirror/sessions/${sessionId}/messages?limit=${limit}`),
+  getMirrorMessages: (sessionId: string, type?: import('./types').MirrorSessionType, limit = 50) =>
+    request<import('./types').MirrorMessage[]>(
+      `/mirror/sessions/${sessionId}/messages?limit=${limit}${type ? `&type=${type}` : ''}`
+    ),
 
   sendMirrorMessage: (sessionId: string, content: string, signal?: AbortSignal) =>
     request<ChatResponse>(`/mirror/sessions/${sessionId}/messages`, {
@@ -306,12 +315,15 @@ export const api = {
     sessionId: string,
     content: string,
     onEvent: (evt: StreamEvent) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    type?: import('./types').MirrorSessionType
   ): Promise<ChatResponse> {
+    const body: { content: string; type?: string } = { content }
+    if (type) body.type = type
     const res = await fetch(`${API_BASE}/mirror/sessions/${sessionId}/messages?stream=1`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
       signal,
     })
     if (!res.ok) {
@@ -348,7 +360,7 @@ export const api = {
               throw new Error('message' in evt ? evt.message : 'Stream error')
             }
           } catch (e) {
-            if (e instanceof Error) throw e
+            throw e  // 重抛任何异常，不吞掉非 Error 类型
           }
         }
       }
@@ -363,6 +375,79 @@ export const api = {
       method: 'POST',
     }),
 
+  renameMirrorSession: (sessionId: string, title: string) =>
+    request<import('./types').MirrorSession>(`/mirror/sessions/${sessionId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    }),
+
+  retryMirrorAnalysis: (sessionId: string) =>
+    request<import('./types').MirrorSession & { analysisStatus?: string }>(
+      `/mirror/sessions/${sessionId}/retry-analysis`,
+      { method: 'POST' }
+    ),
+
+  /** 悟/辩首次回复：新建会话后 AI 自动给出命题或辩题，流式返回 */
+  async getMirrorFirstReplyStream(
+    sessionId: string,
+    type: 'wu' | 'bian',
+    onEvent: (evt: import('./types').StreamEvent) => void,
+    signal?: AbortSignal
+  ): Promise<string> {
+    const path = type === 'wu' ? 'wu-first-reply' : 'bian-first-reply'
+    const res = await fetch(`${API_BASE}/mirror/sessions/${sessionId}/${path}?stream=1`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+      signal,
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err?.error?.message || i18n.t('api.requestFailed'))
+    }
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('Stream not supported')
+    const dec = new TextDecoder()
+    let buf = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n\n')
+        buf = lines.pop() ?? ''
+        for (const block of lines) {
+          const dataParts = block.split('\n')
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+          const dataStr = dataParts.join('\n')
+          if (!dataStr) continue
+          try {
+            const evt = JSON.parse(dataStr) as import('./types').StreamEvent
+            onEvent(evt)
+            if (evt.type === 'done' && 'content' in evt) {
+              return evt.content ?? ''
+            }
+            if (evt.type === 'error') {
+              throw new Error('message' in evt ? evt.message : 'Stream error')
+            }
+          } catch (e) {
+            throw e  // 重抛任何异常，不吞掉非 Error 类型
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    throw new Error('Stream ended without done event')
+  },
+
+  getWuFirstReplyStream: (sessionId: string, onEvent: (evt: import('./types').StreamEvent) => void, signal?: AbortSignal) =>
+    api.getMirrorFirstReplyStream(sessionId, 'wu', onEvent, signal),
+
+  getBianFirstReplyStream: (sessionId: string, onEvent: (evt: import('./types').StreamEvent) => void, signal?: AbortSignal) =>
+    api.getMirrorFirstReplyStream(sessionId, 'bian', onEvent, signal),
+
   // Shang (赏)
   getShangToday: () =>
     request<{ done: boolean; record: import('./types').ShangRecord | null }>('/mirror/shang/today'),
@@ -375,9 +460,14 @@ export const api = {
   startShang: () =>
     request<import('./types').ShangRecord>('/mirror/shang/start', { method: 'POST' }),
 
-  submitShangChoice: (recordId: string, choice: 'A' | 'B', attribution: string) =>
+  regenerateShangImages: (recordId: string) =>
+    request<import('./types').ShangRecord>(`/mirror/shang/${recordId}/regenerate-images`, {
+      method: 'POST',
+    }),
+
+  submitShangChoice: (recordId: string, choice: 'A' | 'B', attribution?: string) =>
     request<import('./types').ShangRecord>(`/mirror/shang/${recordId}/choose`, {
       method: 'POST',
-      body: JSON.stringify({ choice, attribution }),
+      body: JSON.stringify({ choice, attribution: attribution ?? '' }),
     }),
 }

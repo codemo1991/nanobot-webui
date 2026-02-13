@@ -133,6 +133,7 @@ MEMORY: When user says 记住/请记住/remember or asks you to remember somethi
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        mirror_attack_level: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -144,6 +145,7 @@ MEMORY: When user says 记住/请记住/remember or asks you to remember somethi
             media: Optional list of local file paths for images/media.
             channel: Current channel (telegram, feishu, etc.).
             chat_id: Current chat/user ID.
+            mirror_attack_level: For mirror bian sessions, the attack level (light/medium/heavy).
 
         Returns:
             List of messages including system prompt.
@@ -154,6 +156,22 @@ MEMORY: When user says 记住/请记住/remember or asks you to remember somethi
         system_prompt = self.build_system_prompt(skill_names)
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
+        # 攻击强度注入：辩模块按 attack_level 调整追问风格
+        CHANNEL_MIRROR = "mirror"
+        ATTACK_DESCRIPTIONS = {
+            "light": "友善追问，点到为止，不施加压力",
+            "medium": "举例反例，适度施压，温和挑战用户观点",
+            "heavy": "直指双标与矛盾，犀利追问，强压力测试",
+        }
+        if mirror_attack_level and channel == CHANNEL_MIRROR:
+            desc = ATTACK_DESCRIPTIONS.get(
+                mirror_attack_level.lower() if isinstance(mirror_attack_level, str) else "",
+                ATTACK_DESCRIPTIONS["medium"],
+            )
+            system_prompt += (
+                f"\n\n## 镜室-辩论模式\n本轮攻击强度: {mirror_attack_level}\n"
+                f"请严格按此风格追问: {desc}"
+            )
         messages.append({"role": "system", "content": system_prompt})
 
         # History

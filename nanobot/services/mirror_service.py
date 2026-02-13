@@ -100,6 +100,18 @@ class MirrorService:
         self.sessions.save(session)
         return self._format_session_obj(session, session_type, session_id)
 
+    def update_session_title(self, session_id: str, title: str) -> dict[str, Any] | None:
+        """更新悟/辩会话标题。返回更新后的 session 或 None。"""
+        for stype in ("wu", "bian"):
+            key = self._session_key(stype, session_id)
+            session = self.sessions.get(key)
+            if session is not None:
+                session.metadata["title"] = title
+                session.updated_at = datetime.now()
+                self.sessions.save(session)
+                return self._format_session_obj(session, stype, session_id)
+        return None
+
     def _format_session_obj(self, session: Any, stype: str, sid: str) -> dict[str, Any]:
         return {
             "id": sid,
@@ -236,12 +248,15 @@ class MirrorService:
         end = start + page_size
         return {"items": records[start:end], "total": total}
 
-    def start_shang(self) -> dict[str, Any]:
-        """Start a new shang session for today."""
+    def start_shang(
+        self,
+        dashscope_api_key: str | None = None,
+        qwen_image_model: str = "qwen-image-plus",
+    ) -> dict[str, Any]:
+        """Start a new shang session for today. If dashscope_api_key provided, generate A/B images via Qwen-Image."""
         today_str = date.today().strftime("%Y-%m-%d")
         record_id = f"shang_{uuid4().hex[:8]}"
 
-        # Generate topic and descriptions (placeholder - will be filled by LLM later)
         topics = [
             "内在力量", "孤独与连接", "秩序与混沌", "自由与束缚",
             "创造与毁灭", "光明与阴影", "旅程与归宿", "真实与面具"
@@ -249,14 +264,49 @@ class MirrorService:
         import random
         topic = random.choice(topics)
 
+        description_a = f"「{topic}」的第一种诠释 - 温暖而明亮的表达"
+        description_b = f"「{topic}」的第二种诠释 - 深沉而内敛的表达"
+
+        image_a_url: str | None = None
+        image_b_url: str | None = None
+        if dashscope_api_key and qwen_image_model:
+            try:
+                from nanobot.providers.dashscope_image import (
+                    generate_image,
+                    get_shang_prompts_for_topic,
+                    download_and_save_image,
+                )
+                prompt_a, prompt_b = get_shang_prompts_for_topic(topic)
+                model = qwen_image_model
+                url_a = generate_image(prompt_a, dashscope_api_key, model=model)
+                url_b = generate_image(prompt_b, dashscope_api_key, model=model)
+                images_dir = self._mirror_dir / "shang" / "images"
+                images_dir.mkdir(parents=True, exist_ok=True)
+                if url_a:
+                    if download_and_save_image(url_a, str(images_dir / f"{record_id}_A.png")):
+                        image_a_url = f"/api/v1/mirror/shang/image?recordId={record_id}&slot=A"
+                    else:
+                        image_a_url = url_a
+                else:
+                    image_a_url = None
+                if url_b:
+                    if download_and_save_image(url_b, str(images_dir / f"{record_id}_B.png")):
+                        image_b_url = f"/api/v1/mirror/shang/image?recordId={record_id}&slot=B"
+                    else:
+                        image_b_url = url_b
+                else:
+                    image_b_url = None
+            except Exception as e:
+                logger.warning("Qwen-Image generation failed: %s", e)
+
         record = {
             "id": record_id,
             "date": today_str,
             "topic": topic,
-            "imageA": None,
-            "imageB": None,
-            "descriptionA": f"「{topic}」的第一种诠释 - 温暖而明亮的表达",
-            "descriptionB": f"「{topic}」的第二种诠释 - 深沉而内敛的表达",
+            "imageA": image_a_url,
+            "imageB": image_b_url,
+            "descriptionA": description_a,
+            "descriptionB": description_b,
             "choice": None,
             "attribution": "",
             "analysis": None,
@@ -265,6 +315,53 @@ class MirrorService:
 
         self._save_shang_record(record)
         return record
+
+    def regenerate_shang_images(
+        self,
+        record_id: str,
+        dashscope_api_key: str | None = None,
+        qwen_image_model: str = "qwen-image-plus",
+    ) -> dict[str, Any] | None:
+        """重新生成指定 record 的 A/B 图片。仅 status=choosing 时可用。返回更新后的 record 或 None。"""
+        records = self._load_shang_records()
+        for i, r in enumerate(records):
+            if r["id"] == record_id and r.get("status") == "choosing":
+                topic = r.get("topic", "内在力量")
+                image_a_url: str | None = None
+                image_b_url: str | None = None
+                if dashscope_api_key and qwen_image_model:
+                    try:
+                        from nanobot.providers.dashscope_image import (
+                            generate_image,
+                            get_shang_prompts_for_topic,
+                            download_and_save_image,
+                        )
+                        prompt_a, prompt_b = get_shang_prompts_for_topic(topic)
+                        model = qwen_image_model
+                        url_a = generate_image(prompt_a, dashscope_api_key, model=model)
+                        url_b = generate_image(prompt_b, dashscope_api_key, model=model)
+                        images_dir = self._mirror_dir / "shang" / "images"
+                        images_dir.mkdir(parents=True, exist_ok=True)
+                        if url_a:
+                            if download_and_save_image(url_a, str(images_dir / f"{record_id}_A.png")):
+                                image_a_url = f"/api/v1/mirror/shang/image?recordId={record_id}&slot=A"
+                            else:
+                                image_a_url = url_a
+                        if url_b:
+                            if download_and_save_image(url_b, str(images_dir / f"{record_id}_B.png")):
+                                image_b_url = f"/api/v1/mirror/shang/image?recordId={record_id}&slot=B"
+                            else:
+                                image_b_url = url_b
+                    except Exception as e:
+                        logger.warning("Qwen-Image regenerate failed: %s", e)
+                if image_a_url is not None:
+                    r["imageA"] = image_a_url
+                if image_b_url is not None:
+                    r["imageB"] = image_b_url
+                records[i] = r
+                self._save_all_shang_records(records)
+                return r
+        return None
 
     def submit_shang_choice(
         self, record_id: str, choice: str, attribution: str
@@ -312,6 +409,77 @@ class MirrorService:
         )
 
     # ---------- Profile (吾) ----------
+
+    def get_fusion_data(self) -> dict[str, Any]:
+        """汇总悟/辩/赏数据供镜融合使用。"""
+        wu_summary = self._load_module_summary("wu")
+        bian_summary = self._load_module_summary("bian")
+        shang_summary = self._load_shang_summary()
+        return {
+            "wu_sessions_summary": wu_summary.get("sessions", "（暂无封存悟会话）"),
+            "wu_insights": wu_summary.get("insights", ""),
+            "wu_count": wu_summary.get("count", 0),
+            "bian_sessions_summary": bian_summary.get("sessions", "（暂无封存辩会话）"),
+            "bian_insights": bian_summary.get("insights", ""),
+            "bian_count": bian_summary.get("count", 0),
+            "shang_records_summary": shang_summary.get("records", "（暂无赏记录）"),
+            "shang_insights": shang_summary.get("insights", ""),
+            "shang_count": shang_summary.get("count", 0),
+        }
+
+    def _load_module_summary(self, stype: str) -> dict[str, Any]:
+        """加载悟或辩的汇总数据。"""
+        md_dir = self._mirror_dir / stype
+        sessions_text: list[str] = []
+        insights: list[str] = []
+        for path in sorted(md_dir.glob("*.md")):
+            if path.name == "MEMORY.md":
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+                sessions_text.append(f"### {path.stem}\n{content[:3000]}")
+                for line in content.split("\n"):
+                    if "核心洞察" in line or "core_insight" in line.lower():
+                        parts = line.split(":", 1)
+                        if len(parts) > 1 and parts[1].strip():
+                            insights.append(parts[1].strip())
+            except (IOError, UnicodeError):
+                continue
+        memory_file = md_dir / "MEMORY.md"
+        if memory_file.exists():
+            try:
+                mem = memory_file.read_text(encoding="utf-8")
+                sessions_text.append(f"### MEMORY\n{mem[:1500]}")
+            except (IOError, UnicodeError):
+                pass
+        text = "\n\n".join(sessions_text) if sessions_text else "（暂无数据）"
+        return {"sessions": text, "insights": "；".join(insights[:5]), "count": len(sessions_text)}
+
+    def _load_shang_summary(self) -> dict[str, Any]:
+        """加载赏记录汇总。"""
+        records = self._load_shang_records()
+        done = [r for r in records if r.get("status") == "done"]
+        lines = []
+        for r in done[-20:]:
+            topic = r.get("topic", "")
+            choice = r.get("choice", "")
+            attribution = (r.get("attribution") or "")[:200]
+            lines.append(f"- 主题:{topic} 选择:{choice} 归因:{attribution}")
+        text = "\n".join(lines) if lines else "（暂无赏记录）"
+        return {"records": text, "insights": "", "count": len(done)}
+
+    def save_profile(self, profile: dict[str, Any]) -> None:
+        """保存 profile 到 profile.json 并追加快照。"""
+        from datetime import datetime
+
+        profile["updateTime"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        profile_file = self._mirror_dir / "profile.json"
+        profile_file.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        snap_dir = self._mirror_dir / "snapshots"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        snap_file = snap_dir / f"{datetime.now().strftime('%Y-%m-%d')}.json"
+        snap_file.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("Mirror profile saved to %s", profile_file)
 
     def get_profile(self) -> dict[str, Any] | None:
         """Get the current mirror profile from profile.json or latest snapshot."""
