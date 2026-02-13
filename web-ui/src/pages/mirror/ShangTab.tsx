@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Button, Spin, Empty, Input, message as antMessage } from 'antd'
-import { EyeOutlined, CheckOutlined } from '@ant-design/icons'
+import { Button, Spin, Empty, Input, Modal, Select, message as antMessage } from 'antd'
+import { EyeOutlined, CheckOutlined, SyncOutlined, ZoomInOutlined } from '@ant-design/icons'
 import { api } from '../../api'
 import type { ShangRecord } from '../../types'
 
@@ -17,15 +17,25 @@ function ShangTab() {
   const [generating, setGenerating] = useState(false)
   const [attribution, setAttribution] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [regenerating, setRegenerating] = useState(false)
+  const [selectedChoice, setSelectedChoice] = useState<'A' | 'B' | null>(null)
+  const [zoomingImage, setZoomingImage] = useState<string | null>(null)
+  const [filterTopic, setFilterTopic] = useState('')
+  const [filterDateRange, setFilterDateRange] = useState<'all' | 'week' | 'month'>('all')
   const autoStartedRef = useRef(false)
+  const hasLoadedOnceRef = useRef(false)
 
   useEffect(() => {
     loadData()
   }, [])
 
-  // 当日未赏时自动开始生成（需求：系统自动开始生成）
   useEffect(() => {
-    if (loading || generating || autoStartedRef.current) return
+    if (todayRecord?.status === 'choosing') setSelectedChoice(null)
+  }, [todayRecord?.id])
+
+  // 当日未赏时自动开始生成（严格条件：历史加载完成后才触发，避免竞态）
+  useEffect(() => {
+    if (!hasLoadedOnceRef.current || loading || generating || autoStartedRef.current) return
     if (!todayDone && !todayRecord) {
       autoStartedRef.current = true
       setGenerating(true)
@@ -62,6 +72,7 @@ function ShangTab() {
       antMessage.error(t('mirror.loadFailed'))
     } finally {
       setLoading(false)
+      hasLoadedOnceRef.current = true
     }
   }
 
@@ -79,14 +90,31 @@ function ShangTab() {
     }
   }
 
-  const handleChoose = async (choice: 'A' | 'B') => {
-    if (!todayRecord || !attribution.trim()) return
+  const handleRegenerate = async () => {
+    if (!todayRecord || regenerating) return
+    setRegenerating(true)
+    try {
+      const updated = await api.regenerateShangImages(todayRecord.id)
+      setTodayRecord(updated)
+      setSelectedRecord(updated)
+      setSelectedChoice(null)
+      antMessage.success(t('mirror.shangRegenerateSuccess'))
+    } catch {
+      antMessage.error(t('mirror.loadFailed'))
+    } finally {
+      setRegenerating(false)
+    }
+  }
+
+  const handleChoose = async () => {
+    if (!todayRecord || !selectedChoice) return
     setSubmitting(true)
     try {
-      const updated = await api.submitShangChoice(todayRecord.id, choice, attribution.trim())
+      const updated = await api.submitShangChoice(todayRecord.id, selectedChoice, attribution.trim() || undefined)
       setTodayRecord(updated)
       setSelectedRecord(updated)
       setTodayDone(true)
+      setSelectedChoice(null)
       setRecords((prev) => {
         const exists = prev.find((r) => r.id === updated.id)
         if (exists) return prev.map((r) => (r.id === updated.id ? updated : r))
@@ -98,6 +126,29 @@ function ShangTab() {
       setSubmitting(false)
     }
   }
+
+  const filteredRecords = useMemo(() => {
+    return records.filter((r) => {
+      if (filterTopic.trim()) {
+        const kw = filterTopic.trim().toLowerCase()
+        if (!r.topic?.toLowerCase().includes(kw)) return false
+      }
+      if (filterDateRange !== 'all' && r.date) {
+        const d = new Date(r.date.replace(/\//g, '-'))
+        const now = new Date()
+        if (filterDateRange === 'week') {
+          const weekAgo = new Date(now)
+          weekAgo.setDate(weekAgo.getDate() - 7)
+          if (d < weekAgo) return false
+        } else if (filterDateRange === 'month') {
+          const monthAgo = new Date(now)
+          monthAgo.setMonth(monthAgo.getMonth() - 1)
+          if (d < monthAgo) return false
+        }
+      }
+      return true
+    })
+  }, [records, filterTopic, filterDateRange])
 
   if (loading) {
     return (
@@ -114,14 +165,35 @@ function ShangTab() {
         <div className="mirror-sidebar-header">
           <h3>{t('mirror.shangHistory')}</h3>
         </div>
+        <div style={{ padding: '0 12px 8px' }}>
+          <Input
+            placeholder={t('mirror.shangFilterTopic')}
+            value={filterTopic}
+            onChange={(e) => setFilterTopic(e.target.value)}
+            size="small"
+            allowClear
+            style={{ marginBottom: 6 }}
+          />
+          <Select
+            value={filterDateRange}
+            onChange={setFilterDateRange}
+            size="small"
+            style={{ width: '100%' }}
+            options={[
+              { value: 'all', label: t('mirror.shangFilterDateAll') },
+              { value: 'week', label: t('mirror.shangFilterDateWeek') },
+              { value: 'month', label: t('mirror.shangFilterDateMonth') },
+            ]}
+          />
+        </div>
         <div className="mirror-sidebar-list">
-          {records.length === 0 ? (
+          {filteredRecords.length === 0 ? (
             <Empty
-              description={t('mirror.shangNoRecords')}
+              description={records.length === 0 ? t('mirror.shangNoRecords') : t('mirror.shangFilterNoMatch')}
               image={Empty.PRESENTED_IMAGE_SIMPLE}
             />
           ) : (
-            records.map((r) => (
+            filteredRecords.map((r) => (
               <div
                 key={r.id}
                 className={`mirror-session-item ${selectedRecord?.id === r.id ? 'active' : ''}`}
@@ -169,27 +241,82 @@ function ShangTab() {
         {/* 选择阶段 */}
         {todayRecord && todayRecord.status === 'choosing' && (
           <div className="shang-content">
-            <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>{todayRecord.topic}</div>
+            <div style={{ fontSize: 16, fontWeight: 600, width: '100%', maxWidth: 680 }}>{todayRecord.topic}</div>
             <div className="shang-images">
-              <div className="shang-image-card">
-                {todayRecord.imageA ? (
-                  <img src={todayRecord.imageA} alt="A" />
-                ) : (
-                  <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f0f0', fontSize: 24, fontWeight: 700, color: '#999' }}>A</div>
-                )}
+              {/* A 图片 */}
+              <div
+                className={`shang-image-card shang-image-card-selectable ${selectedChoice === 'A' ? 'selected' : ''}`}
+                onClick={() => setSelectedChoice('A')}
+              >
+                <div className="shang-image-wrapper">
+                  {todayRecord.imageA ? (
+                    <>
+                      <img src={todayRecord.imageA} alt="A" loading="lazy" />
+                      <Button
+                        type="text"
+                        size="small"
+                        className="shang-zoom-btn"
+                        icon={<ZoomInOutlined />}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          const fullUrl = todayRecord.imageA!.startsWith('/') ? `${window.location.origin}${todayRecord.imageA}` : todayRecord.imageA!
+                          setZoomingImage(fullUrl)
+                        }}
+                        title={t('mirror.shangZoomHint')}
+                      />
+                    </>
+                  ) : (
+                    <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f0f0', fontSize: 24, fontWeight: 700, color: '#999' }}>A</div>
+                  )}
+                </div>
                 <div className="shang-image-desc">{todayRecord.descriptionA}</div>
               </div>
-              <div className="shang-image-card">
-                {todayRecord.imageB ? (
-                  <img src={todayRecord.imageB} alt="B" />
-                ) : (
-                  <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f0f0', fontSize: 24, fontWeight: 700, color: '#999' }}>B</div>
-                )}
-                <div className="shang-image-desc">{todayRecord.descriptionB}</div>
+              {/* B 图片 + 上方重新生成按钮 */}
+              <div className="shang-image-b-wrap">
+                <Button
+                  size="small"
+                  type={(!todayRecord.imageA || !todayRecord.imageB) ? 'primary' : 'default'}
+                  danger={!todayRecord.imageA && !todayRecord.imageB}
+                  icon={<SyncOutlined spin={regenerating} />}
+                  onClick={handleRegenerate}
+                  loading={regenerating}
+                  className="shang-regenerate-above-b"
+                >
+                  {(!todayRecord.imageA || !todayRecord.imageB)
+                    ? t('mirror.shangRetryGenerate')
+                    : t('mirror.shangRegenerateImages')}
+                </Button>
+                <div
+                  className={`shang-image-card shang-image-card-selectable ${selectedChoice === 'B' ? 'selected' : ''}`}
+                  onClick={() => setSelectedChoice('B')}
+                >
+                  <div className="shang-image-wrapper">
+                    {todayRecord.imageB ? (
+                      <>
+                        <img src={todayRecord.imageB} alt="B" loading="lazy" />
+                        <Button
+                          type="text"
+                          size="small"
+                          className="shang-zoom-btn"
+                          icon={<ZoomInOutlined />}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            const fullUrl = todayRecord.imageB!.startsWith('/') ? `${window.location.origin}${todayRecord.imageB}` : todayRecord.imageB!
+                            setZoomingImage(fullUrl)
+                          }}
+                          title={t('mirror.shangZoomHint')}
+                        />
+                      </>
+                    ) : (
+                      <div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f0f0', fontSize: 24, fontWeight: 700, color: '#999' }}>B</div>
+                    )}
+                  </div>
+                  <div className="shang-image-desc">{todayRecord.descriptionB}</div>
+                </div>
               </div>
             </div>
 
-            <div style={{ marginTop: 16, width: '100%', maxWidth: 600 }}>
+            <div style={{ marginTop: 8, width: '100%', maxWidth: 600 }}>
               <div style={{ marginBottom: 8, fontSize: 14, color: '#666' }}>
                 {t('mirror.shangWhyChoose')}
               </div>
@@ -201,26 +328,29 @@ function ShangTab() {
               />
             </div>
 
-            <div className="shang-choose-buttons">
+            <div className="shang-submit-row">
               <Button
                 type="primary"
+                shape="circle"
                 size="large"
-                onClick={() => handleChoose('A')}
+                className="shang-submit-round-btn"
+                onClick={handleChoose}
                 loading={submitting}
-                disabled={!attribution.trim()}
+                disabled={!selectedChoice}
               >
-                {t('mirror.shangChooseA')}
-              </Button>
-              <Button
-                type="primary"
-                size="large"
-                onClick={() => handleChoose('B')}
-                loading={submitting}
-                disabled={!attribution.trim()}
-              >
-                {t('mirror.shangChooseB')}
+                {t('mirror.shangSubmitBtn')}
               </Button>
             </div>
+            <Modal
+              open={!!zoomingImage}
+              footer={null}
+              onCancel={() => setZoomingImage(null)}
+              width="90vw"
+              keyboard
+              styles={{ body: { textAlign: 'center', padding: 24 } }}
+            >
+              {zoomingImage && <img src={zoomingImage} alt="放大" style={{ maxWidth: '100%', maxHeight: '80vh', objectFit: 'contain' }} />}
+            </Modal>
           </div>
         )}
 
@@ -231,7 +361,7 @@ function ShangTab() {
             <div className="shang-images" style={{ marginBottom: 24 }}>
               <div className={`shang-image-card ${selectedRecord.choice === 'A' ? 'selected' : ''}`}>
                 {selectedRecord.imageA ? (
-                  <img src={selectedRecord.imageA} alt="A" />
+                  <img src={selectedRecord.imageA} alt="A" loading="lazy" />
                 ) : (
                   <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f0f0', fontSize: 24, fontWeight: 700, color: '#999' }}>A</div>
                 )}
@@ -242,7 +372,7 @@ function ShangTab() {
               </div>
               <div className={`shang-image-card ${selectedRecord.choice === 'B' ? 'selected' : ''}`}>
                 {selectedRecord.imageB ? (
-                  <img src={selectedRecord.imageB} alt="B" />
+                  <img src={selectedRecord.imageB} alt="B" loading="lazy" />
                 ) : (
                   <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f0f0f0', fontSize: 24, fontWeight: 700, color: '#999' }}>B</div>
                 )}

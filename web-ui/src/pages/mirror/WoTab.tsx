@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Spin } from 'antd'
-import { UserOutlined, ThunderboltOutlined, WarningOutlined, CheckCircleOutlined, LineChartOutlined } from '@ant-design/icons'
+import { Spin, Button, Alert, message as antMessage } from 'antd'
+import { UserOutlined, ThunderboltOutlined, WarningOutlined, CheckCircleOutlined, LineChartOutlined, SyncOutlined, DownloadOutlined } from '@ant-design/icons'
 import { api } from '../../api'
 import type { MirrorProfile } from '../../types'
 
@@ -17,6 +17,8 @@ function WoTab() {
   const { t } = useTranslation()
   const [profile, setProfile] = useState<MirrorProfile | null>(null)
   const [loading, setLoading] = useState(true)
+  const [generating, setGenerating] = useState(false)
+  const [noDataError, setNoDataError] = useState(false)
 
   useEffect(() => {
     loadProfile()
@@ -43,12 +45,62 @@ function WoTab() {
     )
   }
 
+  const handleGenerateProfile = async () => {
+    setGenerating(true)
+    setNoDataError(false)
+    try {
+      const data = await api.generateMirrorProfile()
+      setProfile(data)
+      antMessage.success(t('mirror.profileGenerated'))
+    } catch (e: unknown) {
+      const err = e as Error & { code?: string }
+      const code = err?.code
+      const msg = err?.message || ''
+      const isNoData = code === 'NO_DATA' || /无数据|no data/i.test(msg)
+      setNoDataError(isNoData)
+      antMessage.error(msg || t('mirror.loadFailed'))
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  const handleExportProfile = () => {
+    if (!profile) return
+    const blob = new Blob([JSON.stringify(profile, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `profile-${profile.updateTime?.replace(/[^0-9]/g, '') || Date.now()}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    antMessage.success(t('mirror.exportProfileSuccess'))
+  }
+
   if (!profile || typeof profile !== 'object') {
     return (
       <div className="mirror-empty-state">
         <UserOutlined className="mirror-logo" />
         <div className="mirror-empty-title">{t('mirror.woEmpty')}</div>
         <div className="mirror-empty-hint">{t('mirror.woEmptyHint')}</div>
+        {noDataError && (
+          <Alert
+            type="info"
+            message={t('mirror.woNoDataHint')}
+            showIcon
+            style={{ marginTop: 16, maxWidth: 420, textAlign: 'left' }}
+          />
+        )}
+        <Button
+          type="primary"
+          size="large"
+          className="mirror-start-btn"
+          icon={<SyncOutlined spin={generating} />}
+          onClick={handleGenerateProfile}
+          loading={generating}
+          style={{ marginTop: 16 }}
+        >
+          {t('mirror.generateProfile')}
+        </Button>
       </div>
     )
   }
@@ -133,9 +185,26 @@ function WoTab() {
         </div>
       )}
 
-      {/* 更新时间 */}
+      {/* 更新时间与刷新 */}
       <div style={{ textAlign: 'center', color: '#999', fontSize: 12, padding: '12px 0' }}>
         {t('mirror.profileUpdatedAt')}: {profile.updateTime ?? '-'}
+      </div>
+      <div style={{ textAlign: 'center', padding: '8px 0', display: 'flex', gap: 8, justifyContent: 'center' }}>
+        <Button
+          size="small"
+          icon={<SyncOutlined spin={generating} />}
+          onClick={handleGenerateProfile}
+          loading={generating}
+        >
+          {t('mirror.refreshProfile')}
+        </Button>
+        <Button
+          size="small"
+          icon={<DownloadOutlined />}
+          onClick={handleExportProfile}
+        >
+          {t('mirror.exportProfile')}
+        </Button>
       </div>
     </div>
   )

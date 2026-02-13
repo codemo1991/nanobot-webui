@@ -277,12 +277,14 @@ class AgentLoop:
                 logger.exception("MCP tool loading failed")
         
         # Build initial messages (use get_history for LLM-formatted messages)
+        mirror_attack_level = msg.metadata.get("attack_level") if msg.metadata else None
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            mirror_attack_level=mirror_attack_level,
         )
         
         # Agent loop
@@ -651,6 +653,7 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
@@ -661,6 +664,7 @@ class AgentLoop:
             channel: Source channel (for context).
             chat_id: Source chat ID (for context).
             progress_callback: Optional callback for streaming progress (tool_start, tool_end, etc.).
+            extra_metadata: Optional extra metadata (e.g. attack_level for mirror bian sessions).
 
         Returns:
             The agent's response.
@@ -673,12 +677,18 @@ class AgentLoop:
             except ValueError:
                 logger.warning(f"Invalid session key '{session_key}', fallback to {channel}:{chat_id}")
 
+        metadata = {}
+        if progress_callback:
+            metadata["progress_callback"] = progress_callback
+        if extra_metadata:
+            metadata.update(extra_metadata)
+
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
             chat_id=chat_id,
             content=content,
-            metadata={"progress_callback": progress_callback} if progress_callback else {},
+            metadata=metadata,
         )
 
         response = await self._process_message(msg)

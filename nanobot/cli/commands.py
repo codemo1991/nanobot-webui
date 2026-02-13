@@ -290,6 +290,62 @@ def gateway(
 
 
 # ============================================================================
+# Mirror (镜室) Commands
+# ============================================================================
+
+
+mirror_app = typer.Typer(help="镜室相关命令")
+app.add_typer(mirror_app, name="mirror")
+
+
+@mirror_app.command("seal-stale")
+def mirror_seal_stale(
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="仅列出将被封存的会话，不实际执行"),
+):
+    """封存非当日、未封存的悟/辩会话。建议通过 crontab 每日 0 点执行。"""
+    from nanobot.config.loader import load_config
+    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.session.manager import SessionManager
+    from nanobot.services.mirror_seal_stale import seal_stale_sessions
+
+    config = load_config()
+    model = config.agents.defaults.model
+    api_key = config.get_api_key(model)
+    api_base = config.get_api_base(model)
+
+    if not api_key:
+        console.print("[red]Error: No API key configured. Set providers.*.apiKey in config.[/red]")
+        raise typer.Exit(1)
+
+    provider = LiteLLMProvider(
+        api_key=api_key,
+        api_base=api_base,
+        default_model=model,
+    )
+    sessions = SessionManager(config.workspace_path)
+
+    async def llm_chat(messages, model=None, max_tokens=800, temperature=0.3):
+        return await provider.chat(
+            messages,
+            model=model or config.agents.defaults.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    sealed = seal_stale_sessions(
+        workspace=config.workspace_path,
+        sessions=sessions,
+        llm_chat=llm_chat,
+        model=model,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        console.print(f"[dim]Would seal {sealed} stale mirror session(s) (dry-run)[/dim]")
+    else:
+        console.print(f"[green]Sealed {sealed} stale mirror session(s)[/green]")
+
+
+# ============================================================================
 # Web UI Commands
 # ============================================================================
 

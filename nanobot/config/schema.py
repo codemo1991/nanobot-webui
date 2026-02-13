@@ -99,6 +99,11 @@ class ProvidersConfig(BaseModel):
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
+class MirrorConfig(BaseModel):
+    """镜室（赏图生成）配置。"""
+    qwen_image_model: str = ""  # 如 qwen-image-plus，留空则赏 Tab 用文字描述
+
+
 class GatewayConfig(BaseModel):
     """Gateway/server configuration."""
     host: str = "0.0.0.0"
@@ -152,6 +157,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    mirror: MirrorConfig = Field(default_factory=MirrorConfig)
     mcps: list[McpServerConfig] = Field(default_factory=list)
     
     @property

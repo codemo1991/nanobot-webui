@@ -21,6 +21,7 @@ from uuid import uuid4
 from loguru import logger
 
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.bus.queue import MessageBus
 from nanobot.config.loader import convert_keys, ensure_initial_config, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
@@ -387,7 +388,12 @@ class NanobotWebAPI:
     ) -> dict[str, Any]:
         """Internal: run mirror chat with progress callback."""
         key = MirrorService._session_key(session_type, session_id)
-        self.sessions.get_or_create(key)
+        session = self.sessions.get_or_create(key)
+        # 攻击强度注入：将 attack_level 传给 LLM，供辩模块调整追问风格
+        attack_level = None
+        if session_type == "bian" and session.metadata.get("attack_level"):
+            attack_level = session.metadata["attack_level"]
+        extra_metadata = {"attack_level": attack_level} if attack_level else None
         try:
             response = await self.agent.process_direct(
                 content=content,
@@ -395,6 +401,7 @@ class NanobotWebAPI:
                 channel="mirror",
                 chat_id=session_id,
                 progress_callback=progress_callback,
+                extra_metadata=extra_metadata,
             )
         finally:
             if getattr(self.agent, "mcp_loader", None):
@@ -421,6 +428,142 @@ class NanobotWebAPI:
             ),
         }
 
+    def _load_mirror_prompt(self, prompt_file: str, fallback: str) -> str:
+        """从 mirror-system skill 加载 prompt，失败则用 fallback。"""
+        try:
+            mirror_skill_path = BUILTIN_SKILLS_DIR / "mirror-system" / "references" / prompt_file
+            if mirror_skill_path.exists():
+                content = mirror_skill_path.read_text(encoding="utf-8")
+                # 提取 System Prompt 部分（在 ```之间）
+                import re
+                match = re.search(r'```\n(.*?)\n```', content, re.DOTALL)
+                if match:
+                    return match.group(1).strip()
+            logger.debug(f"Mirror prompt file {prompt_file} not found, using fallback")
+        except Exception as e:
+            logger.warning(f"Failed to load mirror prompt {prompt_file}: {e}")
+        return fallback
+
+    async def _wu_first_reply(self, session_id: str) -> str:
+        """悟首次回复：新建悟会话后，AI 自动给出三个悟命题或引导问题。"""
+        key = MirrorService._session_key("wu", session_id)
+        session = self.sessions.get(key)
+        if session is None:
+            raise KeyError("mirror wu session not found")
+        # 已有消息则不再生成首次回复
+        if session.messages:
+            return ""
+        trigger = "请开始悟道，给出三个悟命题或开放式引导问题，供用户选择；也可提示可直接说出此刻想聊的。"
+        # 从 mirror-system/references/wu-prompts.md 加载 prompt
+        fallback_system = (
+            "你是一名悟道助手，擅长通过提问帮助用户探索内心叙事与潜意识。"
+            "用户刚开启悟道会话，请直接给出三个悟命题或开放式引导问题，供用户选择。"
+            "格式示例：1. 工作驱动力 2. 情绪表达 3. 人际关系。"
+            "最后可加一句「也可直接说你此刻想聊的」。用简洁自然的中文，无需称呼寒暄。"
+        )
+        system_content = self._load_mirror_prompt("wu-prompts.md", fallback_system)
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": trigger},
+        ]
+        resp = await self.agent.provider.chat(
+            messages=messages,
+            model=self.agent.model,
+            max_tokens=600,
+            temperature=0.7,
+        )
+        content = (resp.content or "").strip()
+        if not content:
+            content = "你可以从以下方向开始：工作驱动力、情绪表达、人际关系。或者直接说你此刻想聊的。"
+        session.add_message("user", trigger)
+        session.add_message("assistant", content)
+        self.sessions.save(session)
+        return content
+
+    def wu_first_reply_stream(
+        self, session_id: str
+    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
+        """流式返回悟首次回复。"""
+        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+
+        def run() -> None:
+            try:
+                evt_queue.put({"type": "thinking"})
+                result = asyncio.run(self._wu_first_reply(session_id))
+                evt_queue.put({"type": "done", "content": result})
+            except KeyError:
+                evt_queue.put({"type": "error", "message": "mirror wu session not found"})
+            except Exception as e:
+                logger.exception("Wu first reply failed")
+                evt_queue.put({"type": "error", "message": str(e)})
+
+        thread = threading.Thread(target=run, daemon=False)
+        return evt_queue, thread
+
+    async def _bian_first_reply(self, session_id: str) -> str:
+        """辩首次回复：有 topic 时开场该辩题，无 topic 时随机给出三个辩题供选。"""
+        key = MirrorService._session_key("bian", session_id)
+        session = self.sessions.get(key)
+        if session is None:
+            raise KeyError("mirror bian session not found")
+        if session.messages:
+            return ""
+        topic = session.metadata.get("topic") or ""
+        attack_level = session.metadata.get("attack_level") or "medium"
+        if topic.strip():
+            trigger = f"用户指定辩题：{topic.strip()}。请以辩论者身份开场，简要陈述该辩题的正反两面，并邀请用户选择立场开始辩论。用简洁自然的中文，无需寒暄。"
+        else:
+            trigger = (
+                "用户未指定辩题。请随机给出三个适合认知压力测试的辩题，供用户选择。"
+                "格式示例：1. 加班是奋斗还是剥削 2. 内卷有没有意义 3. 自由与责任的边界。"
+                "用简洁自然的中文，最后可加「选一个开始，或直接提出你的辩题」。"
+            )
+        fallback_system = (
+            "你是一名辩论助手，擅长通过追问暴露用户的认知偏误与双标。"
+            "根据用户是否指定辩题，给出辩题或开场白。用简洁自然的中文。"
+        )
+        system_content = self._load_mirror_prompt("bian-prompts.md", fallback_system)
+        if attack_level:
+            desc_map = {"light": "友善追问", "medium": "适度施压", "heavy": "犀利戳穿"}
+            system_content += f"\n\n本轮攻击强度：{attack_level}。请按{desc_map.get(attack_level, '适度施压')}的风格追问。"
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": trigger},
+        ]
+        resp = await self.agent.provider.chat(
+            messages=messages,
+            model=self.agent.model,
+            max_tokens=600,
+            temperature=0.7,
+        )
+        content = (resp.content or "").strip()
+        if not content:
+            content = "1. 加班是奋斗还是剥削 2. 内卷有没有意义 3. 自由与责任的边界。选一个开始，或直接提出你的辩题。"
+        session.add_message("user", trigger)
+        session.add_message("assistant", content)
+        self.sessions.save(session)
+        return content
+
+    def bian_first_reply_stream(
+        self, session_id: str
+    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
+        """流式返回辩首次回复。"""
+        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+
+        def run() -> None:
+            try:
+                evt_queue.put({"type": "thinking"})
+                result = asyncio.run(self._bian_first_reply(session_id))
+                evt_queue.put({"type": "done", "content": result})
+            except KeyError:
+                evt_queue.put({"type": "error", "message": "mirror bian session not found"})
+            except Exception as e:
+                logger.exception("Bian first reply failed")
+                evt_queue.put({"type": "error", "message": str(e)})
+
+        thread = threading.Thread(target=run, daemon=False)
+        return evt_queue, thread
+
     async def _run_mirror_analysis(
         self, stype: str, key: str
     ) -> dict[str, Any] | None:
@@ -431,20 +574,32 @@ class NanobotWebAPI:
                 f"{'用户' if m['role'] == 'user' else 'AI'}: {m['content'][:500]}"
                 for m in messages_raw[-20:]
             )
-            prompt = (
-                "你是一位擅长叙事与心理分析的助手。根据以下悟道/辩论对话，提取分析结果。"
-                "请以简洁中文回答，每条一行。\n\n"
-                "对话内容：\n" + conv_text + "\n\n"
-                "请按以下格式输出（每行一个）：\n"
-                "叙事结构: [第一人称/第三人称，过去/现在倾向等]\n"
-                "防御机制: [如合理化、投射、否认等]\n"
-                "潜意识关键词: [如应该、必须、没办法等]\n"
-                "核心洞察: [一句概括]\n"
-            )
-            if stype == "bian":
-                prompt += "辩题/立场: [用户主要立场]\n矛盾/谬误: [检测到的]\n"
+            # 从 mirror-system 加载封存分析 prompt（悟 或 辩）
+            prompt_file = "wu-prompts.md" if stype == "wu" else "bian-prompts.md"
+            fallback_system = "你输出简洁的分析，每行格式为「标签: 内容」。"
+            system_content = self._load_mirror_prompt(prompt_file, fallback_system)
+            if not system_content or system_content == fallback_system:
+                system_content = "你是一位擅长叙事与心理分析的助手。根据以下悟道/辩论对话，提取分析结果。请以简洁中文回答，每条一行。"
+            
+            prompt = f"对话内容：\n{conv_text}\n\n请按以下格式输出（每行一个）：\n"
+            if stype == "wu":
+                prompt += (
+                    "叙事结构: [第一人称/第三人称，过去/现在倾向等]\n"
+                    "防御机制: [如合理化、投射、否认等]\n"
+                    "潜意识关键词: [如应该、必须、没办法等]\n"
+                    "核心洞察: [一句概括]\n"
+                )
+            else:  # bian
+                prompt += (
+                    "辩题/立场: [用户主要立场]\n"
+                    "矛盾/谬误: [检测到的认知失调或逻辑谬误]\n"
+                    "叙事结构: [第一人称/第三人称，过去/现在倾向等]\n"
+                    "防御机制: [如合理化、投射、否认等]\n"
+                    "潜意识关键词: [如应该、必须、没办法等]\n"
+                    "核心洞察: [一句概括]\n"
+                )
             msgs = [
-                {"role": "system", "content": "你输出简洁的分析，每行格式为「标签: 内容」。"},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ]
             resp = await self.agent.provider.chat(
@@ -464,6 +619,86 @@ class NanobotWebAPI:
         except Exception as e:
             logger.warning("Mirror LLM analysis failed: %s", e)
             return None
+
+    async def generate_mirror_profile(self) -> dict[str, Any] | None:
+        """融合悟/辩/赏数据生成镜画像，保存到 profile.json。"""
+        import re
+        fusion = self.mirror.get_fusion_data()
+        if fusion["wu_count"] == 0 and fusion["bian_count"] == 0 and fusion["shang_count"] == 0:
+            logger.warning("No mirror data to fuse")
+            return None
+        system_content = (
+            "你是一位资深心理分析师，擅长综合多维数据进行人格画像。"
+            "根据悟（叙事）、辩（认知压力）、赏（审美偏好）数据，归纳核心模式，生成综合画像。"
+            "描述性、非诊断性；行动导向、非标签化。"
+        )
+        user_content = f"""# 数据来源
+
+## 悟模块数据（语言层）
+{fusion["wu_sessions_summary"][:6000]}
+核心洞察：{fusion["wu_insights"]}
+
+## 辩模块数据（行为层）
+{fusion["bian_sessions_summary"][:6000]}
+核心洞察：{fusion["bian_insights"]}
+
+## 赏模块数据（直觉层）
+{fusion["shang_records_summary"][:2000]}
+核心洞察：{fusion["shang_insights"]}
+
+---
+
+# 请生成综合画像
+
+请完成分析后，在回复末尾输出一个 JSON 代码块（用 ```json 包裹），格式如下：
+```json
+{{
+  "bigFive": {{"openness": 80, "conscientiousness": 65, "extraversion": 30, "agreeableness": 50, "neuroticism": 60}},
+  "jungArchetype": {{"primary": "隐士", "secondary": "智者"}},
+  "drivers": [{{"need": "掌控感", "evidence": "来自数据的证据", "suggestion": "行动建议"}}],
+  "conflicts": [{{"explicit": "显性表现", "implicit": "隐性表现", "type": "认知失调"}}],
+  "suggestions": ["建议1", "建议2"]
+}}
+```
+大五分数为 0-100 整数。drivers、conflicts、suggestions 可为空数组。"""
+        try:
+            resp = await self.agent.provider.chat(
+                messages=[
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": user_content},
+                ],
+                model=self.agent.model,
+                max_tokens=2000,
+                temperature=0.4,
+            )
+            if not resp.content:
+                return None
+            match = re.search(r"```json\s*([\s\S]*?)\s*```", resp.content)
+            if match:
+                profile = json.loads(match.group(1).strip())
+            else:
+                profile = self._parse_profile_from_text(resp.content)
+            if not profile:
+                return None
+            self.mirror.save_profile(profile)
+            return profile
+        except Exception as e:
+            logger.warning("Mirror profile generation failed: %s", e)
+            return None
+
+    def _parse_profile_from_text(self, text: str) -> dict[str, Any] | None:
+        """从文本尝试解析 profile 结构（降级）。"""
+        profile: dict[str, Any] = {
+            "bigFive": {},
+            "jungArchetype": {"primary": "-", "secondary": "-"},
+            "drivers": [],
+            "conflicts": [],
+            "suggestions": [],
+        }
+        b5_keys = ["openness", "conscientiousness", "extraversion", "agreeableness", "neuroticism"]
+        for k in b5_keys:
+            profile["bigFive"][k] = 50
+        return profile
 
     def chat_stream(
         self, session_id: str, content: str
@@ -635,7 +870,8 @@ class NanobotWebAPI:
             "parameters": {
                 "temperature": config.agents.defaults.temperature,
                 "maxTokens": config.agents.defaults.max_tokens,
-            }
+            },
+            "qwenImageModel": (config.mirror.qwen_image_model or "").strip(),
         }]
         
         # Load skills
@@ -960,7 +1196,9 @@ class NanobotWebAPI:
                 config.agents.defaults.temperature = params["temperature"]
             if "maxTokens" in params:
                 config.agents.defaults.max_tokens = params["maxTokens"]
-        
+        if "qwenImageModel" in data:
+            config.mirror.qwen_image_model = (data["qwenImageModel"] or "").strip()
+
         from nanobot.config.loader import save_config
         save_config(config)
 
@@ -981,7 +1219,8 @@ class NanobotWebAPI:
             "parameters": {
                 "temperature": config.agents.defaults.temperature,
                 "maxTokens": config.agents.defaults.max_tokens,
-            }
+            },
+            "qwenImageModel": config.mirror.qwen_image_model,
         }
 
     def update_model(self, model_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -1431,8 +1670,9 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             ):
                 session_id = parts[4]
                 limit = int(query.get("limit", ["50"])[0])
-                # Try both types
-                for stype in ("wu", "bian"):
+                type_param = query.get("type", [None])[0]
+                types_to_try = [type_param] if type_param in ("wu", "bian") else ("wu", "bian")
+                for stype in types_to_try:
                     try:
                         msgs = app.mirror.get_messages(session_id, stype, limit)
                         self._write_json(HTTPStatus.OK, _ok(msgs))
@@ -1454,6 +1694,34 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 page_size = int(query.get("pageSize", ["20"])[0])
                 data = app.mirror.get_shang_records(page, page_size)
                 self._write_json(HTTPStatus.OK, _ok(data))
+                return
+
+            # GET /api/v1/mirror/shang/image?recordId=xxx&slot=A
+            if path == "/api/v1/mirror/shang/image":
+                record_id = query.get("recordId", [None])[0]
+                slot = query.get("slot", [None])[0]
+                # 校验 recordId 格式，防止 path traversal（仅接受 shang_xxxxxxxx）
+                valid_record = record_id and re.match(r"^shang_[0-9a-f]{8}$", str(record_id).lower())
+                if valid_record and slot in ("A", "B"):
+                    from nanobot.config.loader import load_config
+                    cfg = load_config()
+                    img_path = cfg.workspace_path / "mirror" / "shang" / "images" / f"{record_id}_{slot}.png"
+                    try:
+                        rp = img_path.resolve()
+                        images_dir = (cfg.workspace_path / "mirror" / "shang" / "images").resolve()
+                        rp.relative_to(images_dir)  # 确保在 images 目录内
+                        if rp.is_file():
+                            size = rp.stat().st_size
+                            if size <= 10 * 1024 * 1024:  # 限制 10MB
+                                self.send_response(HTTPStatus.OK)
+                                self.send_header("Content-Type", "image/png")
+                                self.send_header("Cache-Control", "max-age=86400")
+                                self.end_headers()
+                                self.wfile.write(rp.read_bytes())
+                                return
+                    except (OSError, ValueError):
+                        pass
+                self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", "图片不存在"))
                 return
 
             self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", f"Unknown path: {path}"))
@@ -1671,6 +1939,120 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("MIRROR_CREATE_FAILED", str(e)))
             return
 
+        # POST /api/v1/mirror/sessions/{sessionId}/wu-first-reply (stream=1)
+        if (
+            len(parts) == 6
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "sessions"
+            and parts[5] == "wu-first-reply"
+        ):
+            session_id = parts[4]
+            use_stream = query.get("stream", [None])[0] == "1"
+            key_wu = MirrorService._session_key("wu", session_id)
+            if app.sessions.get(key_wu) is None:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "悟会话不存在"))
+                return
+            if use_stream:
+                try:
+                    evt_queue, thread = app.wu_first_reply_stream(session_id)
+                    thread.start()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    try:
+                        while thread.is_alive() or not evt_queue.empty():
+                            try:
+                                evt = evt_queue.get(timeout=0.5)
+                            except queue.Empty:
+                                continue
+                            payload = json.dumps(evt, ensure_ascii=False)
+                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                            if evt.get("type") in ("done", "error"):
+                                break
+                        thread.join(timeout=1.0)
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    logger.exception("Wu first reply stream failed")
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        _err("WU_FIRST_REPLY_FAILED", "悟首次回复失败", str(exc)),
+                    )
+            else:
+                try:
+                    content = asyncio.run(app._wu_first_reply(session_id))
+                    self._write_json(HTTPStatus.OK, _ok({"content": content}))
+                except KeyError:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "悟会话不存在"))
+                except Exception as exc:
+                    logger.exception("Wu first reply failed")
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        _err("WU_FIRST_REPLY_FAILED", "悟首次回复失败", str(exc)),
+                    )
+            return
+
+        # POST /api/v1/mirror/sessions/{sessionId}/bian-first-reply (stream=1)
+        if (
+            len(parts) == 6
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "sessions"
+            and parts[5] == "bian-first-reply"
+        ):
+            session_id = parts[4]
+            use_stream = query.get("stream", [None])[0] == "1"
+            key_bian = MirrorService._session_key("bian", session_id)
+            if app.sessions.get(key_bian) is None:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "辩会话不存在"))
+                return
+            if use_stream:
+                try:
+                    evt_queue, thread = app.bian_first_reply_stream(session_id)
+                    thread.start()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    try:
+                        while thread.is_alive() or not evt_queue.empty():
+                            try:
+                                evt = evt_queue.get(timeout=0.5)
+                            except queue.Empty:
+                                continue
+                            payload = json.dumps(evt, ensure_ascii=False)
+                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                            if evt.get("type") in ("done", "error"):
+                                break
+                        thread.join(timeout=1.0)
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    logger.exception("Bian first reply stream failed")
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        _err("BIAN_FIRST_REPLY_FAILED", "辩首次回复失败", str(exc)),
+                    )
+            else:
+                try:
+                    content = asyncio.run(app._bian_first_reply(session_id))
+                    self._write_json(HTTPStatus.OK, _ok({"content": content}))
+                except KeyError:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "辩会话不存在"))
+                except Exception as exc:
+                    logger.exception("Bian first reply failed")
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        _err("BIAN_FIRST_REPLY_FAILED", "辩首次回复失败", str(exc)),
+                    )
+            return
+
         # POST /api/v1/mirror/sessions/{sessionId}/messages (with optional ?stream=1)
         if (
             len(parts) == 6
@@ -1686,13 +2068,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             session_id = parts[4]
             use_stream = query.get("stream", [None])[0] == "1"
 
-            # Detect session type
-            stype = "wu"
-            for t in ("wu", "bian"):
-                key = MirrorService._session_key(t, session_id)
-                if app.sessions.get(key) is not None:
-                    stype = t
-                    break
+            # Session type: prefer from body, else detect by iterating
+            stype = body.get("type") if body.get("type") in ("wu", "bian") else None
+            if not stype:
+                for t in ("wu", "bian"):
+                    key = MirrorService._session_key(t, session_id)
+                    if app.sessions.get(key) is not None:
+                        stype = t
+                        break
+                if not stype:
+                    stype = "wu"
 
             if use_stream:
                 try:
@@ -1728,6 +2113,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             session_id = parts[4]
             try:
                 llm_analysis = None
+                analysis_ok = False
                 for stype in ("wu", "bian"):
                     key = MirrorService._session_key(stype, session_id)
                     if app.sessions.get(key) is not None:
@@ -1735,23 +2121,121 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                             llm_analysis = asyncio.run(
                                 app._run_mirror_analysis(stype, key)
                             )
+                            analysis_ok = llm_analysis is not None and bool(llm_analysis)
                         except Exception as e:
                             logger.warning("Mirror analysis LLM call failed: %s", e)
                         break
                 data = app.mirror.seal_session(session_id, llm_analysis=llm_analysis)
+                data["analysisStatus"] = "success" if analysis_ok else "failed"
                 self._write_json(HTTPStatus.OK, _ok(data))
             except KeyError:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "镜室会话不存在"))
             return
 
+        # POST /api/v1/mirror/sessions/{sessionId}/retry-analysis
+        if (
+            len(parts) == 6
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "sessions"
+            and parts[5] == "retry-analysis"
+        ):
+            session_id = parts[4]
+            try:
+                analysis_ok = False
+                for stype in ("wu", "bian"):
+                    key = MirrorService._session_key(stype, session_id)
+                    session = app.sessions.get(key)
+                    if session is not None and session.metadata.get("status") == "sealed":
+                        try:
+                            llm_analysis = asyncio.run(app._run_mirror_analysis(stype, key))
+                            if llm_analysis:
+                                insight = llm_analysis.get("核心洞察") or llm_analysis.get("core_insight")
+                                if insight:
+                                    session.metadata["insight"] = str(insight)[:100]
+                                    app.sessions.save(session)
+                                    analysis_ok = True
+                        except Exception as e:
+                            logger.warning("Mirror retry analysis failed: %s", e)
+                        formatted = app.mirror._format_session_obj(session, stype, session_id)
+                        formatted["analysisStatus"] = "success" if analysis_ok else "failed"
+                        self._write_json(HTTPStatus.OK, _ok(formatted))
+                        return
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "会话不存在或未封存"))
+            except Exception as e:
+                logger.exception("Retry analysis failed")
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    _err("RETRY_ANALYSIS_FAILED", str(e)),
+                )
+            return
+
+        # POST /api/v1/mirror/profile/generate
+        if path == "/api/v1/mirror/profile/generate":
+            try:
+                profile = asyncio.run(app.generate_mirror_profile())
+                if profile is None:
+                    self._write_json(
+                        HTTPStatus.BAD_REQUEST,
+                        _err("NO_DATA", "悟/辩/赏均无数据，无法生成画像"),
+                    )
+                else:
+                    self._write_json(HTTPStatus.OK, _ok(profile))
+            except Exception as e:
+                logger.exception("Mirror profile generate failed")
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    _err("PROFILE_GENERATE_FAILED", str(e)),
+                )
+            return
+
         # POST /api/v1/mirror/shang/start
         if path == "/api/v1/mirror/shang/start":
             try:
-                data = app.mirror.start_shang()
+                cfg = load_config()
+                qwen_img = (cfg.mirror.qwen_image_model or "").strip()
+                dashscope_key = (cfg.providers.dashscope.api_key or "").strip() or None
+                api_key = dashscope_key if qwen_img else None
+                data = app.mirror.start_shang(
+                    dashscope_api_key=api_key,
+                    qwen_image_model=qwen_img or "",
+                )
                 self._write_json(HTTPStatus.CREATED, _ok(data))
             except Exception as e:
                 logger.exception("Shang start failed")
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("SHANG_START_FAILED", str(e)))
+            return
+
+        # POST /api/v1/mirror/shang/{recordId}/regenerate-images
+        if (
+            len(parts) == 6
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "shang"
+            and parts[5] == "regenerate-images"
+        ):
+            record_id = parts[4]
+            try:
+                cfg = load_config()
+                qwen_img = (cfg.mirror.qwen_image_model or "").strip()
+                dashscope_key = (cfg.providers.dashscope.api_key or "").strip() or None
+                api_key = dashscope_key if qwen_img else None
+                data = app.mirror.regenerate_shang_images(
+                    record_id,
+                    dashscope_api_key=api_key,
+                    qwen_image_model=qwen_img or "",
+                )
+                if data is None:
+                    self._write_json(
+                        HTTPStatus.BAD_REQUEST,
+                        _err("SHANG_REGENERATE_FAILED", "记录不存在或已提交，无法重新生成"),
+                    )
+                else:
+                    self._write_json(HTTPStatus.OK, _ok(data))
+            except Exception as e:
+                logger.exception("Shang regenerate images failed")
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    _err("SHANG_REGENERATE_FAILED", str(e)),
+                )
             return
 
         # POST /api/v1/mirror/shang/{recordId}/choose
@@ -1768,9 +2252,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if choice not in ("A", "B"):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "choice 必须是 A 或 B"))
                 return
-            if not attribution:
-                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "attribution 不能为空"))
-                return
+            # attribution 可为空，用户可直接点「已赏」提交
             try:
                 data = app.mirror.submit_shang_choice(record_id, choice, attribution)
                 self._write_json(HTTPStatus.OK, _ok(data))
@@ -1824,6 +2306,21 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(data))
             except KeyError:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
+            return
+
+        # PATCH /api/v1/mirror/sessions/{sessionId}
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "mirror"] and parts[3] == "sessions":
+            body = self._read_json()
+            title = (body.get("title") or "").strip()
+            if not title:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "title 不能为空"))
+                return
+            session_id = parts[4]
+            data = app.mirror.update_session_title(session_id, title)
+            if data is None:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "镜室会话不存在"))
+            else:
+                self._write_json(HTTPStatus.OK, _ok(data))
             return
 
         self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", f"Unknown path: {path}"))
