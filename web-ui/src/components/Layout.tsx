@@ -25,6 +25,9 @@ function Layout() {
           <NavLink to="/chat" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
             💬 {t('nav.chat')}
           </NavLink>
+          <NavLink to="/mirror" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
+            🪞 {t('nav.mirror')}
+          </NavLink>
           <NavLink to="/config" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
             ⚙️ {t('nav.config')}
           </NavLink>

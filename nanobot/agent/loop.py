@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -14,11 +14,13 @@ from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
+from nanobot.agent.tools.memory import RememberTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.memory import RememberTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import parse_session_key
@@ -42,7 +44,8 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
-        max_iterations: int = 20,
+        max_iterations: int = 40,
+        max_execution_time: int = 600,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         filesystem_config: "FilesystemToolConfig | None" = None,
@@ -56,6 +59,7 @@ class AgentLoop:
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
+        self.max_execution_time = max_execution_time  # 秒, 0=不限
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.filesystem_config = filesystem_config or FilesystemToolConfig()
@@ -80,6 +84,13 @@ class AgentLoop:
         self._mcp_fail_time: float = 0.0  # Cooldown after MCP load failure
         self._register_default_tools()
         self._init_mcp_loader()
+
+    def update_agent_params(self, max_iterations: int | None = None, max_execution_time: int | None = None) -> None:
+        """Hot-update agent params without restart."""
+        if max_iterations is not None:
+            self.max_iterations = max(1, min(max_iterations, 200))
+        if max_execution_time is not None:
+            self.max_execution_time = max(0, max_execution_time)
 
     def _init_mcp_loader(self) -> None:
         """Initialize MCP tool loader from config."""
@@ -131,6 +142,9 @@ class AgentLoop:
         self.tools.register(WriteFileTool(workspace=ws, restrict_to_workspace=fs_cfg.restrict_to_workspace))
         self.tools.register(EditFileTool(workspace=ws, restrict_to_workspace=fs_cfg.restrict_to_workspace))
         self.tools.register(ListDirTool(workspace=ws, restrict_to_workspace=fs_cfg.restrict_to_workspace))
+        
+        # Memory tool (用户说「记住」时必须调用，否则不会真正写入)
+        self.tools.register(RememberTool(workspace=ws))
         
         # Shell tool
         self.tools.register(ExecTool(
@@ -274,17 +288,56 @@ class AgentLoop:
         # Agent loop
         iteration = 0
         final_content = None
-        
+        tool_steps: list[dict[str, Any]] = []
+        usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        loop_start = time.monotonic()
+
+        def _truncate(val: str, max_len: int = 2000) -> str:
+            if not isinstance(val, str):
+                val = str(val)
+            return val[:max_len] + "…" if len(val) > max_len else val
+
+        def _make_fallback_from_tools(steps: list[dict[str, Any]]) -> str:
+            if steps:
+                names = [s["name"] for s in steps]
+                return (
+                    f"I've completed {len(steps)} tool call(s): {', '.join(names)}. "
+                    "Please review the results above. If you need a specific summary, try asking again."
+                )
+            return "I've completed processing but have no response to give."
+
+        def _accumulate_usage(usage: dict[str, Any] | None) -> None:
+            if not usage:
+                return
+            usage_acc["prompt_tokens"] += max(0, int(usage.get("prompt_tokens", 0) or 0))
+            usage_acc["completion_tokens"] += max(0, int(usage.get("completion_tokens", 0) or 0))
+            usage_acc["total_tokens"] += max(0, int(usage.get("total_tokens", 0) or 0))
+
         while iteration < self.max_iterations:
             iteration += 1
-            
+
+            # 时间限制: 防止 runaway，与 max_iterations 互补
+            if self.max_execution_time > 0:
+                elapsed = time.monotonic() - loop_start
+                if elapsed >= self.max_execution_time:
+                    logger.info("Max execution time %ds reached (elapsed %.0fs)", self.max_execution_time, elapsed)
+                    break
+
+            # Notify progress: thinking / about to call LLM
+            progress = msg.metadata.get("progress_callback")
+            if progress:
+                try:
+                    progress({"type": "thinking"})
+                except Exception:
+                    pass
             # Call LLM
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
                 model=self.model
             )
-            
+            _accumulate_usage(response.usage)
+
             # Handle tool calls
             if response.has_tool_calls:
                 # Add assistant message with tool calls
@@ -302,27 +355,93 @@ class AgentLoop:
                 messages = self.context.add_assistant_message(
                     messages, response.content, tool_call_dicts
                 )
-                
-                # Execute tools
+
+                # Execute tools and collect steps for UI display
+                loop_detected = False
                 for tool_call in response.tool_calls:
+                    # 循环检测: 连续两次完全相同的调用视为 loop，提前终止
+                    call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
+                    if len(tool_steps) >= 1:
+                        last_key = (tool_steps[-1]["name"], json.dumps(tool_steps[-1]["arguments"], sort_keys=True))
+                        if call_key == last_key:
+                            logger.info("Loop detected: identical tool call %s, forcing synthesis", tool_call.name)
+                            loop_detected = True
+                            break
+                    progress = msg.metadata.get("progress_callback")
+                    if progress:
+                        try:
+                            progress({"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments})
+                        except Exception:
+                            pass  # Non-blocking; don't fail agent on callback error
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    truncated = _truncate(result)
+                    tool_steps.append({
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments,
+                        "result": truncated,
+                    })
+                    if progress:
+                        try:
+                            progress({"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated})
+                        except Exception:
+                            pass
+                if loop_detected:
+                    break
             else:
                 # No tool calls, we're done
                 final_content = response.content
                 break
-        
+
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-        
-        # Save to session
-        session.add_message("user", msg.content)
-        session.add_message("assistant", final_content)
+            # Hit max_iterations with only tool calls - force one final LLM call without tools
+            # to get a proper summary/response instead of generic fallback
+            logger.info("Max iterations reached with no text response; requesting final synthesis (no tools)")
+            progress = msg.metadata.get("progress_callback")
+            if progress:
+                try:
+                    progress({"type": "thinking"})
+                except Exception:
+                    pass
+            try:
+                synth = await self.provider.chat(
+                    messages=messages,
+                    tools=None,
+                    model=self.model,
+                )
+                _accumulate_usage(synth.usage)
+                if synth.content and synth.content.strip():
+                    final_content = synth.content.strip()
+                else:
+                    final_content = _make_fallback_from_tools(tool_steps)
+            except Exception as e:
+                logger.warning("Final synthesis call failed: %s", e)
+                final_content = _make_fallback_from_tools(tool_steps)
+
+        # Save to session (include tool_steps for UI display)
+        user_token_usage = {
+            "prompt_tokens": usage_acc["prompt_tokens"],
+            "completion_tokens": 0,
+            "total_tokens": usage_acc["prompt_tokens"],
+        }
+        session.add_message("user", msg.content, token_usage=user_token_usage)
+        session.add_message(
+            "assistant",
+            final_content,
+            tool_steps=tool_steps,
+            token_usage=usage_acc.copy(),
+        )
         self.sessions.save(session)
+        self.sessions.increment_token_usage(
+            session.key,
+            prompt_tokens=usage_acc["prompt_tokens"],
+            completion_tokens=usage_acc["completion_tokens"],
+            total_tokens=usage_acc["total_tokens"],
+        )
         
         return OutboundMessage(
             channel=msg.channel,
@@ -399,17 +518,48 @@ class AgentLoop:
         # Agent loop (limited for announce handling)
         iteration = 0
         final_content = None
-        
+        tool_steps: list[dict[str, Any]] = []
+        usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        loop_start = time.monotonic()
+
+        def _truncate(val: str, max_len: int = 2000) -> str:
+            if not isinstance(val, str):
+                val = str(val)
+            return val[:max_len] + "…" if len(val) > max_len else val
+
+        def _make_fallback_from_tools(steps: list[dict[str, Any]]) -> str:
+            if steps:
+                names = [s["name"] for s in steps]
+                return (
+                    f"I've completed {len(steps)} tool call(s): {', '.join(names)}. "
+                    "Please review the results above."
+                )
+            return "Background task completed."
+
+        def _accumulate_usage(usage: dict[str, Any] | None) -> None:
+            if not usage:
+                return
+            usage_acc["prompt_tokens"] += max(0, int(usage.get("prompt_tokens", 0) or 0))
+            usage_acc["completion_tokens"] += max(0, int(usage.get("completion_tokens", 0) or 0))
+            usage_acc["total_tokens"] += max(0, int(usage.get("total_tokens", 0) or 0))
+
         while iteration < self.max_iterations:
             iteration += 1
-            
+            if self.max_execution_time > 0:
+                elapsed = time.monotonic() - loop_start
+                if elapsed >= self.max_execution_time:
+                    logger.info("System msg: max execution time %ds reached", self.max_execution_time)
+                    break
+
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
                 model=self.model
             )
-            
+            _accumulate_usage(response.usage)
+
             if response.has_tool_calls:
+                loop_detected = False
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -424,25 +574,69 @@ class AgentLoop:
                 messages = self.context.add_assistant_message(
                     messages, response.content, tool_call_dicts
                 )
-                
+
                 for tool_call in response.tool_calls:
+                    call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
+                    if len(tool_steps) >= 1:
+                        last_key = (tool_steps[-1]["name"], json.dumps(tool_steps[-1]["arguments"], sort_keys=True))
+                        if call_key == last_key:
+                            logger.info("System msg: loop detected %s", tool_call.name)
+                            loop_detected = True
+                            break
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    tool_steps.append({
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments,
+                        "result": _truncate(result),
+                    })
+                if loop_detected:
+                    break
             else:
                 final_content = response.content
                 break
-        
+
         if final_content is None:
-            final_content = "Background task completed."
-        
+            try:
+                logger.info("System msg: max iterations, requesting final synthesis (no tools)")
+                synth = await self.provider.chat(
+                    messages=messages,
+                    tools=None,
+                    model=self.model,
+                )
+                _accumulate_usage(synth.usage)
+                if synth.content and synth.content.strip():
+                    final_content = synth.content.strip()
+                else:
+                    final_content = _make_fallback_from_tools(tool_steps)
+            except Exception as e:
+                logger.warning("Final synthesis failed: %s", e)
+                final_content = _make_fallback_from_tools(tool_steps)
+
         # Save to session (mark as system message in history)
-        session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
-        session.add_message("assistant", final_content)
+        user_token_usage = {
+            "prompt_tokens": usage_acc["prompt_tokens"],
+            "completion_tokens": 0,
+            "total_tokens": usage_acc["prompt_tokens"],
+        }
+        session.add_message("user", f"[System: {msg.sender_id}] {msg.content}", token_usage=user_token_usage)
+        session.add_message(
+            "assistant",
+            final_content,
+            tool_steps=tool_steps,
+            token_usage=usage_acc.copy(),
+        )
         self.sessions.save(session)
+        self.sessions.increment_token_usage(
+            session.key,
+            prompt_tokens=usage_acc["prompt_tokens"],
+            completion_tokens=usage_acc["completion_tokens"],
+            total_tokens=usage_acc["total_tokens"],
+        )
         
         return OutboundMessage(
             channel=origin_channel,
@@ -456,16 +650,18 @@ class AgentLoop:
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
-        
+
         Args:
             content: The message content.
             session_key: Session identifier.
             channel: Source channel (for context).
             chat_id: Source chat ID (for context).
-        
+            progress_callback: Optional callback for streaming progress (tool_start, tool_end, etc.).
+
         Returns:
             The agent's response.
         """
@@ -481,8 +677,9 @@ class AgentLoop:
             channel=channel,
             sender_id="user",
             chat_id=chat_id,
-            content=content
+            content=content,
+            metadata={"progress_callback": progress_callback} if progress_callback else {},
         )
-        
+
         response = await self._process_message(msg)
         return response.content if response else ""

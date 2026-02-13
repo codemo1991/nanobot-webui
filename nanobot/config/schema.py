@@ -71,7 +71,8 @@ class AgentDefaults(BaseModel):
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
     temperature: float = 0.7
-    max_tool_iterations: int = 20
+    max_tool_iterations: int = 40  # 典型: 简单 0-5, 中等 5-15, 复杂 15-35. 40 覆盖多数场景
+    max_execution_time: int = 600  # 秒, 0=不限. 防止 runaway, 与 max_iterations 互补
 
 
 class AgentsConfig(BaseModel):

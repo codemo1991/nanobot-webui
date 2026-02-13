@@ -1,5 +1,6 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import json
 import os
 from typing import Any
 
@@ -8,6 +9,31 @@ from loguru import logger
 from litellm import acompletion
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+
+# 单条消息内容在日志中的最大长度，超出则截断
+_LLM_LOG_CONTENT_MAX = 1500
+
+
+def _format_msg_for_log(msg: dict[str, Any], max_len: int = _LLM_LOG_CONTENT_MAX) -> str:
+    """格式化单条消息用于日志输出"""
+    role = msg.get("role", "?")
+    content = msg.get("content")
+    if isinstance(content, list):
+        # 可能是多模态 content，简单拼接
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                if "text" in part:
+                    parts.append(part["text"])
+                elif "type" in part:
+                    parts.append(f"[{part['type']}]")
+            else:
+                parts.append(str(part))
+        content = "".join(parts)
+    content = str(content) if content is not None else ""
+    if len(content) > max_len:
+        content = content[:max_len] + f"... (截断, 共 {len(content)} 字)"
+    return f"[{role}] {content}"
 
 
 class LiteLLMProvider(LLMProvider):
@@ -177,9 +203,34 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
         
+        # DEBUG 级别输出 LLM 对话日志（使用 nanobot web-ui -v 启用）
+        logger.debug("LLM 请求: model={}, messages={}", model, len(messages))
+        for i, m in enumerate(messages):
+            logger.debug("  [{}] {}", i + 1, _format_msg_for_log(m))
+        if tools:
+            logger.debug("  工具数量: {}", len(tools))
+        
         try:
             response = await acompletion(**kwargs)
-            return self._parse_response(response)
+            result = self._parse_response(response)
+            
+            # DEBUG 级别输出 LLM 响应日志
+            usage = result.usage or {}
+            if result.tool_calls:
+                tc_names = [tc.name for tc in result.tool_calls]
+                logger.debug("LLM 响应: tool_calls={}, usage={}", tc_names, usage)
+                for tc in result.tool_calls:
+                    args_preview = json.dumps(tc.arguments, ensure_ascii=False)
+                    if len(args_preview) > 300:
+                        args_preview = args_preview[:300] + "..."
+                    logger.debug("  -> {}({})", tc.name, args_preview)
+            else:
+                content_preview = (result.content or "")[:800]
+                if len(result.content or "") > 800:
+                    content_preview += f"... (共 {len(result.content)} 字)"
+                logger.debug("LLM 响应: content={}, usage={}", content_preview, usage)
+            
+            return result
         except Exception as e:
             logger.exception("LLM API call failed")
             # Return error as content for graceful handling

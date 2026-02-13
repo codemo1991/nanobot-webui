@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Form, Input, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography } from 'antd'
+import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography } from 'antd'
 import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined } from '@ant-design/icons'
 import { api } from '../api'
-import type { ChannelsConfig, Provider, InstalledSkill, McpServer } from '../types'
+import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig } from '../types'
 import './ConfigPage.css'
 
 const { Title, Text } = Typography
@@ -19,6 +19,7 @@ export default function ConfigPage() {
     { key: 'models', label: t('config.models'), children: <ModelsConfig /> },
     { key: 'mcps', label: t('config.mcps'), children: <McpConfig /> },
     { key: 'skills', label: t('config.skills'), children: <SkillsConfig /> },
+    { key: 'system', label: t('config.system'), children: <SystemConfig /> },
   ]
 
   return (
@@ -428,6 +429,79 @@ function ProvidersConfig() {
           </Form.Item>
         </Form>
       </Modal>
+    </div>
+  )
+}
+
+function SystemConfig() {
+  const { t } = useTranslation()
+  const [loading, setLoading] = useState(false)
+  const [form] = Form.useForm()
+
+  useEffect(() => {
+    loadAgent()
+  }, [])
+
+  const loadAgent = async () => {
+    try {
+      setLoading(true)
+      const data = await api.getConfig()
+      const agent = data?.agent ?? { maxToolIterations: 40, maxExecutionTime: 600 }
+      form.setFieldsValue({
+        maxToolIterations: agent.maxToolIterations,
+        maxExecutionTime: agent.maxExecutionTime,
+      })
+    } catch (error) {
+      console.error(error)
+      message.error(t('config.agent.saveFailed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleSave = async (values: Partial<AgentConfig>) => {
+    try {
+      await api.updateAgentConfig({
+        maxToolIterations: values.maxToolIterations != null ? Number(values.maxToolIterations) : undefined,
+        maxExecutionTime: values.maxExecutionTime != null ? Number(values.maxExecutionTime) : undefined,
+      })
+      message.success(t('config.agent.saveSuccess'))
+      loadAgent()
+    } catch (error) {
+      console.error(error)
+      message.error(t('config.agent.saveFailed'))
+    }
+  }
+
+  return (
+    <div className="config-panel">
+      <Card
+        title={t('config.system')}
+        loading={loading}
+        extra={<Text type="secondary" style={{ fontSize: 12 }}>{t('config.systemSubtitle')}</Text>}
+      >
+        <Form form={form} layout="vertical" initialValues={{ maxToolIterations: 40, maxExecutionTime: 600 }} onFinish={handleSave}>
+          <Form.Item
+            name="maxToolIterations"
+            label={t('config.agent.maxToolIterations')}
+            rules={[{ required: true }, { type: 'number', min: 1, max: 200 }]}
+            help={t('config.agent.maxToolIterationsHelp')}
+          >
+            <InputNumber min={1} max={200} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="maxExecutionTime"
+            label={t('config.agent.maxExecutionTime')}
+            rules={[{ required: true }, { type: 'number', min: 0 }]}
+            help={t('config.agent.maxExecutionTimeHelp')}
+          >
+            <InputNumber min={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item>
+            <Button type="primary" htmlType="submit">{t('config.save')}</Button>
+          </Form.Item>
+        </Form>
+      </Card>
     </div>
   )
 }
