@@ -620,6 +620,75 @@ class NanobotWebAPI:
             logger.warning("Mirror LLM analysis failed: %s", e)
             return None
 
+    async def _run_shang_analysis(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        """根据赏记录的选择与归因，运行 LLM 分析（荣格类型、原型等）。"""
+        try:
+            topic = record.get("topic", "")
+            choice = record.get("choice", "")
+            desc_a = record.get("descriptionA", "")
+            desc_b = record.get("descriptionB", "")
+            attribution = record.get("attribution", "")
+            system_content = self._load_mirror_prompt(
+                "shang-prompts.md",
+                "你是一位心理分析师，擅长通过审美偏好进行人格推断。",
+            )
+            if not system_content or len(system_content) < 50:
+                system_content = (
+                    "你是一位心理分析师，擅长通过审美偏好进行人格推断。"
+                    "请根据用户的图像选择与归因，分析其荣格类型、大五倾向、原型特征。以简洁中文回答，每行格式为「标签: 内容」。"
+                )
+            prompt = f"""命题主题：{topic}
+用户选择：{choice}（图A 或 图B）
+图A特征：{desc_a}
+图B特征：{desc_b}
+用户归因：{attribution}
+
+请按以下格式输出（每行一个）：
+认知功能: [如 Intuition(N) + Thinking(T)]
+类型代码: [如 NT型]
+荣格解释: [一句话说明为什么]
+主原型: [如 隐士 The Hermit]
+次原型: [如 智者 The Sage]
+大五线索: [开放性/外向性等简要描述]
+"""
+            msgs = [
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": prompt},
+            ]
+            resp = await self.agent.provider.chat(
+                messages=msgs,
+                model=self.agent.model,
+                max_tokens=600,
+                temperature=0.3,
+            )
+            if not resp.content:
+                return None
+            result = {}
+            for line in resp.content.strip().split("\n"):
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    result[k.strip()] = v.strip()
+            analysis: dict[str, Any] = {}
+            if result.get("类型代码") or result.get("认知功能") or result.get("荣格解释"):
+                analysis["jungType"] = {
+                    "function": result.get("认知功能", ""),
+                    "typeCode": result.get("类型代码", ""),
+                    "description": result.get("荣格解释", ""),
+                }
+            if result.get("主原型") or result.get("次原型"):
+                analysis["archetype"] = {
+                    "primary": result.get("主原型", ""),
+                    "secondary": result.get("次原型", ""),
+                    "fear": "",
+                    "need": "",
+                }
+            if result.get("大五线索"):
+                analysis["bigFive"] = {"线索": result.get("大五线索", "")}
+            return analysis if analysis else None
+        except Exception as e:
+            logger.warning("Shang LLM analysis failed: %s", e)
+            return None
+
     async def generate_mirror_profile(self) -> dict[str, Any] | None:
         """融合悟/辩/赏数据生成镜画像，保存到 profile.json。"""
         import re
@@ -2255,6 +2324,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             # attribution 可为空，用户可直接点「已赏」提交
             try:
                 data = app.mirror.submit_shang_choice(record_id, choice, attribution)
+                # 异步运行 LLM 分析并更新记录
+                try:
+                    analysis = asyncio.run(app._run_shang_analysis(data))
+                    if analysis:
+                        updated = app.mirror.update_shang_analysis(record_id, analysis)
+                        if updated:
+                            data = updated
+                except Exception as e:
+                    logger.warning("Shang analysis failed (non-blocking): %s", e)
+                try:
+                    app.mirror.write_shang_record_to_memory(data)
+                except Exception as e:
+                    logger.warning("Shang write to memory failed: %s", e)
                 self._write_json(HTTPStatus.OK, _ok(data))
             except KeyError:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("SHANG_RECORD_NOT_FOUND", "赏记录不存在"))
@@ -2326,7 +2408,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", f"Unknown path: {path}"))
 
     def do_DELETE(self) -> None:
-        path, parts, _ = self._route()
+        path, parts, query = self._route()
         app = self.server.app
 
         # DELETE /api/v1/chat/sessions/{sessionId}
@@ -2358,6 +2440,48 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("PROVIDER_NOT_FOUND", "Provider 不存在"))
+            return
+
+        # DELETE /api/v1/mirror/sessions/{sessionId}?type=wu|bian
+        if (
+            len(parts) == 5
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "sessions"
+        ):
+            session_id = parts[4]
+            stype = (query.get("type") or [None])[0]
+            if stype not in ("wu", "bian"):
+                self._write_json(
+                    HTTPStatus.BAD_REQUEST,
+                    _err("VALIDATION_ERROR", "type 必须为 wu 或 bian"),
+                )
+                return
+            deleted = app.mirror.delete_session(stype, session_id)
+            if deleted:
+                self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
+            else:
+                self._write_json(
+                    HTTPStatus.NOT_FOUND,
+                    _err("MIRROR_SESSION_NOT_FOUND", "镜室会话不存在"),
+                )
+            return
+
+        # DELETE /api/v1/mirror/shang/records/{recordId}
+        if (
+            len(parts) == 6
+            and parts[:3] == ["api", "v1", "mirror"]
+            and parts[3] == "shang"
+            and parts[4] == "records"
+        ):
+            record_id = parts[5]
+            deleted = app.mirror.delete_shang_record(record_id)
+            if deleted:
+                self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
+            else:
+                self._write_json(
+                    HTTPStatus.NOT_FOUND,
+                    _err("SHANG_RECORD_NOT_FOUND", "赏记录不存在"),
+                )
             return
 
         self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", f"Unknown path: {path}"))

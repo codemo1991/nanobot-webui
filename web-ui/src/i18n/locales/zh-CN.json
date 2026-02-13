@@ -278,6 +278,7 @@
     "shangChooseA": "选 A",
     "shangChooseB": "选 B",
     "shangRegenerateImages": "重新生成图片",
+    "shangRegenerateBtn": "换",
     "shangRetryGenerate": "重试生成",
     "shangRegenerating": "正在重新生成...",
     "shangRegenerateSuccess": "图片已重新生成",
@@ -316,7 +317,11 @@
     "guideWu": "通过命题对话探索内心，AI 会给出命题并追问你的感受与立场。",
     "guideBian": "与 AI 进行价值观辩论，检验观点的自洽性，暴露认知偏误。",
     "guideShang": "审美直觉投射：AI 生成两张图，凭直觉选择并归因。",
-    "guideWo": "基于悟、辩、赏的综合数据，生成你的心理画像（大五、原型、驱动力等）。"
+    "guideWo": "基于悟、辩、赏的综合数据，生成你的心理画像（大五、原型、驱动力等）。",
+    "deleteConfirm": "确定删除此记录？",
+    "deleteOk": "确定",
+    "deleteCancel": "取消",
+    "deleteFailed": "删除记录失败"
   },
   "skillBuilder": {
     "title": "Skill 创建工具",

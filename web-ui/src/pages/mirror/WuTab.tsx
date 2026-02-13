@@ -1,6 +1,6 @@
 import { useTranslation } from 'react-i18next'
-import { Button, Input, Spin, Empty, Avatar, Typography } from 'antd'
-import { BulbOutlined, PlusOutlined, SendOutlined, UserOutlined, RobotOutlined, LockOutlined, SyncOutlined, EditOutlined } from '@ant-design/icons'
+import { Button, Input, Spin, Empty, Avatar, Typography, Popconfirm } from 'antd'
+import { BulbOutlined, PlusOutlined, SendOutlined, UserOutlined, RobotOutlined, LockOutlined, SyncOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { formatMessageTime } from '../../utils/format'
@@ -83,6 +83,22 @@ function WuTab() {
                         chat.setEditTitle(s.title || s.topic || '')
                       }}
                     />
+                    <Popconfirm
+                      title={t('mirror.deleteConfirm')}
+                      onConfirm={(e) => { e?.stopPropagation(); chat.handleDeleteSession(s.id) }}
+                      onCancel={(e) => e?.stopPropagation()}
+                      okText={t('mirror.deleteOk')}
+                      cancelText={t('mirror.deleteCancel')}
+                    >
+                      <Button
+                        type="text"
+                        size="small"
+                        danger
+                        icon={<DeleteOutlined />}
+                        className="mirror-session-edit-btn"
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    </Popconfirm>
                   </>
                 )}
               </div>

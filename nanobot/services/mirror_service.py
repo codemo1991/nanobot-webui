@@ -112,6 +112,11 @@ class MirrorService:
                 return self._format_session_obj(session, stype, session_id)
         return None
 
+    def delete_session(self, session_type: str, session_id: str) -> bool:
+        """删除悟/辩会话。"""
+        key = self._session_key(session_type, session_id)
+        return self.sessions.delete(key)
+
     def _format_session_obj(self, session: Any, stype: str, sid: str) -> dict[str, Any]:
         return {
             "id": sid,
@@ -383,6 +388,97 @@ class MirrorService:
                 self._save_all_shang_records(records)
                 return r
         raise KeyError("shang record not found")
+
+    def update_shang_analysis(self, record_id: str, analysis: dict[str, Any]) -> dict[str, Any] | None:
+        """更新赏记录的 analysis 字段。"""
+        records = self._load_shang_records()
+        for i, r in enumerate(records):
+            if r["id"] == record_id:
+                r["analysis"] = analysis
+                records[i] = r
+                self._save_all_shang_records(records)
+                return r
+        return None
+
+    def delete_shang_record(self, record_id: str) -> bool:
+        """删除赏记录。"""
+        records = self._load_shang_records()
+        new_records = [r for r in records if r["id"] != record_id]
+        if len(new_records) == len(records):
+            return False
+        self._save_all_shang_records(new_records)
+        return True
+
+    def write_shang_record_to_memory(self, record: dict[str, Any]) -> None:
+        """将赏记录的主要多维评价维度写入日期 MD 和 MEMORY.md，与悟/辩保持一致。"""
+        self._write_shang_record_to_files(record)
+
+    def _write_shang_record_to_files(self, record: dict[str, Any]) -> None:
+        """写入 mirror/shang/{date}.md 和 MEMORY.md。"""
+        try:
+            record_date = record.get("date") or date.today().strftime("%Y-%m-%d")
+            now_str = datetime.now().strftime("%H:%M")
+            record_id = record.get("id", "")
+            topic = record.get("topic", "")
+            choice = record.get("choice", "")
+            desc_a = record.get("descriptionA", "")
+            desc_b = record.get("descriptionB", "")
+            attribution = record.get("attribution", "")
+
+            analysis_lines = []
+            analysis = record.get("analysis") or {}
+            if isinstance(analysis, dict):
+                jung = analysis.get("jungType")
+                if jung and isinstance(jung, dict):
+                    tc = jung.get("typeCode", "")
+                    desc = jung.get("description", "")
+                    if tc or desc:
+                        analysis_lines.append(f"**荣格类型**: {tc} - {desc}")
+                archetype = analysis.get("archetype")
+                if archetype and isinstance(archetype, dict):
+                    prim = archetype.get("primary", "")
+                    sec = archetype.get("secondary", "")
+                    if prim or sec:
+                        analysis_lines.append(f"**主/次原型**: {prim} / {sec}")
+                b5 = analysis.get("bigFive")
+                if b5 and isinstance(b5, dict):
+                    for k, v in b5.items():
+                        if v:
+                            analysis_lines.append(f"**{k}**: {v}")
+            extra = "\n".join(analysis_lines) if analysis_lines else ""
+
+            analysis_block = f"""
+### SHANG分析 #{record_id[-8:] if record_id else '?'} ({now_str})
+**记录ID**: {record_id}
+**命题主题**: {topic}
+**选择**: {choice}（图A 或 图B）
+**图A特征**: {desc_a[:150]}{"..." if len(desc_a) > 150 else ""}
+**图B特征**: {desc_b[:150]}{"..." if len(desc_b) > 150 else ""}
+**归因**: {attribution[:300]}{"..." if len(attribution) > 300 else ""}
+{f"{chr(10)}{extra}{chr(10)}" if extra else ""}
+---
+"""
+            shang_dir = self._mirror_dir / "shang"
+            shang_dir.mkdir(parents=True, exist_ok=True)
+
+            daily_file = shang_dir / f"{record_date}.md"
+            if daily_file.exists():
+                existing = daily_file.read_text(encoding="utf-8")
+            else:
+                existing = f"## {record_date}\n\n"
+            daily_file.write_text(existing + analysis_block, encoding="utf-8")
+
+            memory_file = shang_dir / "MEMORY.md"
+            if memory_file.exists():
+                mem_content = memory_file.read_text(encoding="utf-8")
+            else:
+                mem_content = "# SHANG 总档案\n\n"
+            summary_line = f"- [{record_date} {now_str}] 赏 #{record_id[-8:] if record_id else '?'} 主题:{topic} 选择:{choice}\n"
+            memory_file.write_text(mem_content + summary_line, encoding="utf-8")
+
+            logger.info(f"Shang record written to memory for {record_id}")
+        except Exception as e:
+            logger.error(f"Failed to write shang record to memory: {e}")
 
     def _load_shang_records(self) -> list[dict[str, Any]]:
         """Load all shang records from JSON files."""

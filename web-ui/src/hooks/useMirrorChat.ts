@@ -263,6 +263,23 @@ export function useMirrorChat(
     [editTitle, t]
   )
 
+  const handleDeleteSession = useCallback(
+    async (sessionId: string) => {
+      try {
+        await api.deleteMirrorSession(sessionId, sessionType)
+        setSessions((prev) => prev.filter((s) => s.id !== sessionId))
+        if (currentSession?.id === sessionId) {
+          setCurrentSession(null)
+          setMessages([])
+        }
+        antMessage.success(t('chat.sessionDeleted'))
+      } catch {
+        antMessage.error(t('mirror.loadFailed'))
+      }
+    },
+    [sessionType, currentSession, t]
+  )
+
   const handleRetryAnalysis = useCallback(async () => {
     if (!currentSession) return
     setRetrying(true)
@@ -337,6 +354,7 @@ export function useMirrorChat(
     handleRenameSession,
     handleRetryAnalysis,
     handleSeal,
+    handleDeleteSession,
     isSealed,
   }
 }
