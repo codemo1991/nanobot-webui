@@ -41,7 +41,14 @@ class ExecTool(Tool):
     
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        return """Execute a shell command on the local machine and return its output.
+
+IMPORTANT: Commands run on the same machine where nanobot is running, regardless of the 
+request source (Feishu, Telegram, web UI, or CLI). When asked to run a command 
+(e.g., open an app, start a browser, execute a script), use this tool directly.
+Do NOT create batch files or scripts for the user to run manually.
+
+Use with caution. Dangerous commands are blocked by safety guard."""
     
     @property
     def parameters(self) -> dict[str, Any]:

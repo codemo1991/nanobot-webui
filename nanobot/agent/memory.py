@@ -68,15 +68,39 @@ def parse_memory_entries_with_dates(text: str) -> list[tuple[str, str]]:
 class MemoryStore:
     """
     Memory system for the agent.
-    
+
     Supports daily notes (memory/YYYY-MM-DD.md) and long-term memory (MEMORY.md).
+    Supports agent-specific memory isolation via agent_id parameter.
     """
-    
-    def __init__(self, workspace: Path):
+
+    DEFAULT_MEMORY_DIR = "memory"
+    AGENT_MEMORY_DIR = "agents"
+
+    def __init__(self, workspace: Path, agent_id: str | None = None):
         self.workspace = workspace
-        self.memory_dir = ensure_dir(workspace / "memory")
-        self.memory_file = self.memory_dir / "MEMORY.md"
-    
+        self.agent_id = agent_id
+
+        if agent_id:
+            self.memory_dir = ensure_dir(workspace / self.AGENT_MEMORY_DIR / agent_id / self.DEFAULT_MEMORY_DIR)
+            self.memory_file = self.memory_dir / "MEMORY.md"
+        else:
+            self.memory_dir = ensure_dir(workspace / self.DEFAULT_MEMORY_DIR)
+            self.memory_file = self.memory_dir / "MEMORY.md"
+
+    @classmethod
+    def for_agent(cls, workspace: Path, agent_id: str) -> "MemoryStore":
+        """Create a MemoryStore for a specific agent."""
+        return cls(workspace=workspace, agent_id=agent_id)
+
+    @classmethod
+    def global_memory(cls, workspace: Path) -> "MemoryStore":
+        """Create a MemoryStore for global memory (no agent isolation)."""
+        return cls(workspace=workspace, agent_id=None)
+
+    def is_agent_memory(self) -> bool:
+        """Check if this is agent-specific memory."""
+        return self.agent_id is not None
+
     def get_today_file(self) -> Path:
         """Get path to today's memory file."""
         return self.memory_dir / f"{today_date()}.md"

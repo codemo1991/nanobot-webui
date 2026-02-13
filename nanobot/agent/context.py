@@ -2,7 +2,6 @@
 
 import base64
 import mimetypes
-import platform
 from pathlib import Path
 from typing import Any
 
@@ -13,16 +12,19 @@ from nanobot.agent.skills import SkillsLoader
 class ContextBuilder:
     """
     Builds the context (system prompt + messages) for the agent.
-    
+
     Assembles bootstrap files, memory, skills, and conversation history
     into a coherent prompt for the LLM.
+
+    Supports agent-specific memory isolation when agent_id is provided.
     """
-    
+
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
-    
-    def __init__(self, workspace: Path):
+
+    def __init__(self, workspace: Path, agent_id: str | None = None):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.agent_id = agent_id
+        self.memory = MemoryStore(workspace, agent_id=agent_id)
         self.skills = SkillsLoader(workspace)
     
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
@@ -63,8 +65,8 @@ class ContextBuilder:
         if skills_summary:
             parts.append(f"""# Skills
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
+Skills extend your capabilities. To use a skill, read its SKILL.md file with read_file tool.
+(✓ = available, ✗ = missing dependencies)
 
 {skills_summary}""")
         
@@ -75,43 +77,25 @@ Skills with available="false" need dependencies installed first - you can try in
         from datetime import datetime
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         workspace_path = str(self.workspace.expanduser().resolve())
-        system = platform.system()
-        runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
         
         return f"""# nanobot 🐈
 
-You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
-- Read, write, and edit files
-- Execute shell commands
-- Search the web and fetch web pages
-- Send messages to users on chat channels
-- Spawn subagents for complex background tasks
-- MCP tools (mcp_*): Extended capabilities from configured MCP servers - use these alongside skills when relevant
+You are nanobot, a helpful AI assistant.
 
 ## Current Time
 {now}
 
-## Runtime
-{runtime}
-
 ## Workspace
-Your workspace is at: {workspace_path}
-- Memory files: {workspace_path}/memory/MEMORY.md
+{workspace_path}
+- Memory: {workspace_path}/memory/MEMORY.md
 - Daily notes: {workspace_path}/memory/YYYY-MM-DD.md
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+- Skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
-IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
-Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
-For normal conversation, just respond with text - do not call the message tool.
-
-EXEC BEHAVIOR: Nanobot always runs on the user's local machine. Whether the request comes from Feishu,
-Telegram, web UI, or CLI, the exec tool runs commands on that same machine. When the user asks to run
-a command (e.g. open an app, start a browser, execute a script), use exec directly. Do NOT create
-batch files or scripts for the user to run manually - exec the command yourself.
-
-Always be helpful, accurate, and concise. When using tools, explain what you're doing.
-
-MEMORY: When user says 记住/请记住/remember or asks you to remember something, you MUST call the remember tool to save it. Do NOT just reply "我记住了" in text — that does not persist. Only the remember tool writes to memory/MEMORY.md."""
+## Behavior Guidelines
+- Be helpful, accurate, and concise
+- Use tools when needed, explain what you're doing
+- When user says "记住/remember", call the remember tool to persist the information
+- For normal conversation, respond with text directly. Only use the 'message' tool for cross-channel messaging."""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
