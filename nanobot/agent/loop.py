@@ -20,7 +20,6 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.memory import RememberTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import parse_session_key
@@ -51,6 +50,8 @@ class AgentLoop:
         filesystem_config: "FilesystemToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         message_timeout: float = 300.0,  # 5 min max per message
+        max_history_messages: int = 30,
+        tool_result_max_length: int = 2000,
     ):
         from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig
         from nanobot.cron.service import CronService
@@ -65,6 +66,8 @@ class AgentLoop:
         self.filesystem_config = filesystem_config or FilesystemToolConfig()
         self.cron_service = cron_service
         self.message_timeout = message_timeout
+        self.max_history_messages = max_history_messages
+        self.tool_result_max_length = tool_result_max_length
         
         self.context = ContextBuilder(workspace)
         self.sessions = SessionManager(workspace)
@@ -76,6 +79,7 @@ class AgentLoop:
             model=self.model,
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
+            sessions=self.sessions,
         )
         
         self._running = False
@@ -85,12 +89,22 @@ class AgentLoop:
         self._register_default_tools()
         self._init_mcp_loader()
 
-    def update_agent_params(self, max_iterations: int | None = None, max_execution_time: int | None = None) -> None:
+    def update_agent_params(
+        self,
+        max_iterations: int | None = None,
+        max_execution_time: int | None = None,
+        max_history_messages: int | None = None,
+        tool_result_max_length: int | None = None,
+    ) -> None:
         """Hot-update agent params without restart."""
         if max_iterations is not None:
             self.max_iterations = max(1, min(max_iterations, 200))
         if max_execution_time is not None:
             self.max_execution_time = max(0, max_execution_time)
+        if max_history_messages is not None:
+            self.max_history_messages = max(1, min(max_history_messages, 200))
+        if tool_result_max_length is not None:
+            self.tool_result_max_length = max(100, tool_result_max_length)
 
     def _init_mcp_loader(self) -> None:
         """Initialize MCP tool loader from config."""
@@ -279,7 +293,7 @@ class AgentLoop:
         # Build initial messages (use get_history for LLM-formatted messages)
         mirror_attack_level = msg.metadata.get("attack_level") if msg.metadata else None
         messages = self.context.build_messages(
-            history=session.get_history(),
+            history=session.get_history(max_messages=self.max_history_messages),
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
@@ -293,11 +307,13 @@ class AgentLoop:
         tool_steps: list[dict[str, Any]] = []
         usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         loop_start = time.monotonic()
+        tool_result_max_len = self.tool_result_max_length
 
-        def _truncate(val: str, max_len: int = 2000) -> str:
+        def _truncate(val: str, max_len: int | None = None) -> str:
             if not isinstance(val, str):
                 val = str(val)
-            return val[:max_len] + "…" if len(val) > max_len else val
+            limit = max_len or tool_result_max_len
+            return val[:limit] + "…" if len(val) > limit else val
 
         def _make_fallback_from_tools(steps: list[dict[str, Any]]) -> str:
             if steps:
@@ -511,7 +527,7 @@ class AgentLoop:
         
         # Build messages with the announce content
         messages = self.context.build_messages(
-            history=session.get_history(),
+            history=session.get_history(max_messages=self.max_history_messages),
             current_message=msg.content,
             channel=origin_channel,
             chat_id=origin_chat_id,
@@ -523,11 +539,13 @@ class AgentLoop:
         tool_steps: list[dict[str, Any]] = []
         usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         loop_start = time.monotonic()
+        tool_result_max_len = self.tool_result_max_length
 
-        def _truncate(val: str, max_len: int = 2000) -> str:
+        def _truncate(val: str, max_len: int | None = None) -> str:
             if not isinstance(val, str):
                 val = str(val)
-            return val[:max_len] + "…" if len(val) > max_len else val
+            limit = max_len or tool_result_max_len
+            return val[:limit] + "…" if len(val) > limit else val
 
         def _make_fallback_from_tools(steps: list[dict[str, Any]]) -> str:
             if steps:

@@ -67,12 +67,15 @@ class ChannelsConfig(BaseModel):
 
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
-    workspace: str = "~/.nanobot/workspace"
+    workspace: str = "~/.nanobot/web-ui"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 40  # 典型: 简单 0-5, 中等 5-15, 复杂 15-35. 40 覆盖多数场景
     max_execution_time: int = 600  # 秒, 0=不限. 防止 runaway, 与 max_iterations 互补
+    max_history_messages: int = 30  # 历史消息条数上限，控制token使用
+    max_message_length: int = 8000  # 单条消息最大字符数，超出时截断
+    tool_result_max_length: int = 2000  # tool result截断长度
 
 
 class AgentsConfig(BaseModel):
@@ -165,58 +168,70 @@ class Config(BaseSettings):
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
     
+    _MODEL_PROVIDER_MAP: dict[tuple[str, ...], str] = {
+        ("openrouter/", "openrouter"): "openrouter",
+        ("zhipu/", "zai/", "glm", "zhipu"): "zhipu",
+        ("dashscope/", "qwen", "dashscope"): "dashscope",
+        ("deepseek/", "deepseek"): "deepseek",
+        ("anthropic/", "claude"): "anthropic",
+        ("openai/", "gpt"): "openai",
+        ("gemini/", "gemini"): "gemini",
+        ("groq/", "groq"): "groq",
+        ("vllm/", "vllm"): "vllm",
+    }
+    
+    _FALLBACK_PROVIDER_ORDER: list[str] = [
+        "openrouter", "deepseek", "anthropic", "openai",
+        "gemini", "zhipu", "dashscope", "groq", "vllm"
+    ]
+    
+    _MODEL_API_BASE_MAP: dict[str, str | None] = {
+        "openrouter": "https://openrouter.ai/api/v1",
+        "zhipu": None,
+        "dashscope": None,
+        "deepseek": None,
+        "anthropic": None,
+        "openai": None,
+        "gemini": None,
+        "groq": None,
+        "vllm": None,
+    }
+
+    def _get_provider_for_model(self, model: str | None) -> str | None:
+        """Get provider name for the given model."""
+        model_lower = (model or self.agents.defaults.model).lower()
+        for prefixes, provider in self._MODEL_PROVIDER_MAP.items():
+            for prefix in prefixes:
+                if model_lower.startswith(prefix) or prefix in model_lower:
+                    return provider
+        return None
+    
     def get_api_key(self, model: str | None = None) -> str | None:
         """
         Get API key for the given model, or first available in priority order.
         When model is specified, returns the key for the matching provider.
         """
-        model_lower = (model or self.agents.defaults.model).lower()
-        if model_lower.startswith("openrouter/") or "openrouter" in model_lower:
-            return self.providers.openrouter.api_key or None
-        if model_lower.startswith(("zhipu/", "zai/")) or "glm" in model_lower or "zhipu" in model_lower:
-            return self.providers.zhipu.api_key or None
-        if model_lower.startswith("dashscope/") or "qwen" in model_lower or "dashscope" in model_lower:
-            return self.providers.dashscope.api_key or None
-        if model_lower.startswith("deepseek/") or "deepseek" in model_lower:
-            return self.providers.deepseek.api_key or None
-        if model_lower.startswith("anthropic/") or "claude" in model_lower:
-            return self.providers.anthropic.api_key or None
-        if model_lower.startswith("openai/") or "gpt" in model_lower:
-            return self.providers.openai.api_key or None
-        if model_lower.startswith("gemini/") or "gemini" in model_lower:
-            return self.providers.gemini.api_key or None
-        if model_lower.startswith("groq/") or "groq" in model_lower:
-            return self.providers.groq.api_key or None
-        if model_lower.startswith("vllm/") or "vllm" in model_lower:
-            return self.providers.vllm.api_key or None
-        # Fallback: first available key in priority order
-        return (
-            self.providers.openrouter.api_key or
-            self.providers.deepseek.api_key or
-            self.providers.anthropic.api_key or
-            self.providers.openai.api_key or
-            self.providers.gemini.api_key or
-            self.providers.zhipu.api_key or
-            self.providers.dashscope.api_key or
-            self.providers.groq.api_key or
-            self.providers.vllm.api_key or
-            None
-        )
+        provider = self._get_provider_for_model(model)
+        if provider:
+            key = getattr(self.providers, provider).api_key
+            if key:
+                return key
+        
+        for fallback_provider in self._FALLBACK_PROVIDER_ORDER:
+            key = getattr(self.providers, fallback_provider).api_key
+            if key:
+                return key
+        return None
 
     def get_api_base(self, model: str | None = None) -> str | None:
         """
         Get API base URL for the given model.
         When model is specified, returns the base for the matching provider.
         """
-        model_lower = (model or self.agents.defaults.model).lower()
-        if model_lower.startswith("openrouter/") or "openrouter" in model_lower:
-            return self.providers.openrouter.api_base or "https://openrouter.ai/api/v1"
-        if model_lower.startswith(("zhipu/", "zai/")) or "glm" in model_lower or "zhipu" in model_lower:
-            return self.providers.zhipu.api_base  # Zhipu uses default endpoint when None
-        if model_lower.startswith("dashscope/") or "qwen" in model_lower or "dashscope" in model_lower:
-            return self.providers.dashscope.api_base  # DashScope uses default when None
-        if model_lower.startswith("vllm/") or "vllm" in model_lower:
-            return self.providers.vllm.api_base
+        provider = self._get_provider_for_model(model)
+        if provider:
+            provider_base = getattr(self.providers, provider).api_base
+            return provider_base or self._MODEL_API_BASE_MAP.get(provider)
         return None
     
     class Config:

@@ -23,7 +23,7 @@ from loguru import logger
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.bus.queue import MessageBus
-from nanobot.config.loader import convert_keys, ensure_initial_config, load_config, save_config
+from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.services.mirror_service import MirrorService
@@ -1384,15 +1384,18 @@ class NanobotWebAPI:
             return [f"Error reading logs: {e}"]
 
     def export_config(self) -> dict[str, Any]:
-        """Export system configuration."""
-        config_path = Path.home() / ".nanobot" / "config.json"
-        if not config_path.exists():
-            return {}
+        """Export system configuration from SQLite."""
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            repo = get_config_repository()
+            if repo.has_config():
+                return repo.load_full_config()
+            config_path = Path.home() / ".nanobot" / "config.json"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            return {}
         except Exception as e:
-            logger.exception(f"Failed to export config from {config_path}")
+            logger.exception(f"Failed to export config")
             return {}
 
     def upload_skill(self, form: cgi.FieldStorage) -> dict[str, Any]:

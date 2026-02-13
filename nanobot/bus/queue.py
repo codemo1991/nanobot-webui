@@ -72,10 +72,10 @@ class MessageBus:
     
     @property
     def inbound_size(self) -> int:
-        """Number of pending inbound messages."""
+        """Number of pending inbound messages. Note: qsize() may be approximate."""
         return self.inbound.qsize()
     
     @property
     def outbound_size(self) -> int:
-        """Number of pending outbound messages."""
+        """Number of pending outbound messages. Note: qsize() may be approximate."""
         return self.outbound.qsize()

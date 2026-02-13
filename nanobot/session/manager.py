@@ -28,8 +28,21 @@ class Session:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
     
-    def add_message(self, role: str, content: str, **kwargs: Any) -> None:
-        """Add a message to the session."""
+    DEFAULT_MAX_MESSAGE_LENGTH = 8000
+
+    def add_message(self, role: str, content: str, max_length: int | None = None, **kwargs: Any) -> None:
+        """Add a message to the session.
+        
+        Args:
+            role: Message role (user/assistant/system).
+            content: Message content.
+            max_length: Maximum content length. Defaults to DEFAULT_MAX_MESSAGE_LENGTH.
+            **kwargs: Additional metadata.
+        """
+        max_len = max_length or self.DEFAULT_MAX_MESSAGE_LENGTH
+        if len(content) > max_len:
+            content = content[:max_len] + f"\n... [截断，原长度 {len(content)} 字符]"
+        
         msg = {
             "role": role,
             "content": content,
@@ -68,16 +81,16 @@ class SessionManager:
     Sessions are stored in a SQLite database.
     """
     
-    # Max cached sessions; evict oldest when exceeded (LRU-like via OrderedDict)
-    _CACHE_MAX = 500
+    DEFAULT_CACHE_MAX = 500
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, max_cache_size: int | None = None):
         self.workspace = workspace
         data_dir = ensure_dir(Path.home() / ".nanobot")
         self.db_path = data_dir / "chat.db"
         self._cache: OrderedDict[str, Session] = OrderedDict()
         self._locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        self._max_cache_size = max_cache_size or self.DEFAULT_CACHE_MAX
         self._init_db()
 
     def _lock_for(self, key: str) -> threading.Lock:
@@ -169,7 +182,7 @@ class SessionManager:
 
     def _evict_if_needed(self) -> None:
         """Evict oldest cache entries when over limit."""
-        while len(self._cache) > self._CACHE_MAX:
+        while len(self._cache) > self._max_cache_size:
             evicted_key, _ = self._cache.popitem(last=False)
             self._locks_lock.acquire()
             try:
@@ -177,6 +190,21 @@ class SessionManager:
                     del self._locks[evicted_key]
             finally:
                 self._locks_lock.release()
+    
+    def set_max_cache_size(self, size: int) -> None:
+        """Set max cache size at runtime. Triggers eviction if needed."""
+        self._max_cache_size = max(1, size)
+        self._evict_if_needed()
+    
+    @property
+    def cache_size(self) -> int:
+        """Current number of cached sessions."""
+        return len(self._cache)
+    
+    @property
+    def max_cache_size(self) -> int:
+        """Current max cache size setting."""
+        return self._max_cache_size
 
     def get(self, key: str) -> Session | None:
         """Get an existing session without creating a new one."""
