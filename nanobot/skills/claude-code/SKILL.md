@@ -1,6 +1,9 @@
 ---
 name: claude-code
 description: Delegate coding tasks to Claude Code CLI for implementation
+short_description: "Claude Code CLI coding agent"
+keywords: "code, coding, implement, refactor, debug, claude, write code, programming"
+category: "coding"
 metadata: {"nanobot":{"emoji":"🤖","requires":{"bins":["claude"]}}}
 ---
 

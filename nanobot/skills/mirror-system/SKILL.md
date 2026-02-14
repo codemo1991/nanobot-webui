@@ -1,6 +1,9 @@
 ---
 name: mirror-system
 description: "个人镜像系统 - 悟/辩/赏/镜四模块，用于深度自我认知探索。基于叙事心理学、防御机制理论、认知失调、荣格原型。"
+short_description: "自我认知探索系统"
+keywords: "镜室, 悟, 辩, 赏, 镜, 心理, 认知, 自我探索, 人格分析"
+category: "psychology"
 metadata: {"nanobot":{"emoji":"🪞"}}
 ---
 

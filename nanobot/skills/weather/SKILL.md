@@ -1,6 +1,9 @@
 ---
 name: weather
 description: Get current weather and forecasts (no API key required).
+short_description: "Weather forecasts and info"
+keywords: "weather, forecast, temperature, rain, sunny, climate, wttr, 天气"
+category: "utility"
 homepage: https://wttr.in/:help
 metadata: {"nanobot":{"emoji":"🌤️","requires":{"bins":["curl"]}}}
 ---
