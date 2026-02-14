@@ -20,11 +20,16 @@ class ClaudeCodeTool(Tool):
         self._manager = manager
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
+        self._progress_callback: Any = None
     
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the origin context for result notifications."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
+    
+    def set_progress_callback(self, callback: Any) -> None:
+        """Set callback for progress updates."""
+        self._progress_callback = callback
     
     @property
     def name(self) -> str:
@@ -111,6 +116,7 @@ use read_file/write_file/edit_file tools instead."""
                 origin_channel=self._origin_channel,
                 origin_chat_id=self._origin_chat_id,
                 timeout=timeout,
+                progress_callback=self._progress_callback,
             )
             
             running_count = self._manager.get_running_count()

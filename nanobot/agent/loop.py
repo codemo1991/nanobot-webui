@@ -512,9 +512,22 @@ class AgentLoop:
                             progress({"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments})
                         except Exception:
                             pass  # Non-blocking; don't fail agent on callback error
+                    
+                    # Set progress callback for claude_code tool
+                    if tool_call.name == "claude_code":
+                        claude_code_tool = self.tools.get("claude_code")
+                        if claude_code_tool and hasattr(claude_code_tool, "set_progress_callback"):
+                            claude_code_tool.set_progress_callback(progress)
+                    
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    
+                    # Clear progress callback after execution
+                    if tool_call.name == "claude_code":
+                        claude_code_tool = self.tools.get("claude_code")
+                        if claude_code_tool and hasattr(claude_code_tool, "set_progress_callback"):
+                            claude_code_tool.set_progress_callback(None)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
