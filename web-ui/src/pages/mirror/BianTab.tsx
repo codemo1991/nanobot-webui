@@ -148,28 +148,32 @@ function BianTab() {
               ))}
             </div>
 
-            <div style={{ width: '100%', maxWidth: 480 }}>
-              <div style={{ fontSize: 14, fontWeight: 600, color: '#333', marginBottom: 8 }}>
+            <div className="bian-topic-section">
+              <div className="bian-topic-label">
                 {t('mirror.bianTopicLabel')}
               </div>
-              <Input
-                value={customTopic}
-                onChange={(e) => setCustomTopic(e.target.value)}
-                placeholder={t('mirror.bianTopicPlaceholder')}
-                style={{ width: '100%', marginBottom: 8 }}
-              />
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              <div className="bian-topic-input-wrapper">
+                <input
+                  type="text"
+                  value={customTopic}
+                  onChange={(e) => setCustomTopic(e.target.value)}
+                  placeholder={t('mirror.bianTopicPlaceholder')}
+                  className="bian-topic-input"
+                />
+              </div>
+              <div className="bian-topic-presets">
                 {BIAN_TOPIC_PRESET_KEYS.map((key) => {
                   const presetText = t(`mirror.${key}`)
+                  const isSelected = presetText === customTopic
                   return (
-                    <Button
+                    <button
                       key={key}
-                      size="small"
-                      type={presetText === customTopic ? 'primary' : 'default'}
-                      onClick={() => setCustomTopic(presetText === customTopic ? '' : presetText)}
+                      type="button"
+                      className={`bian-topic-preset-btn ${isSelected ? 'selected' : ''}`}
+                      onClick={() => setCustomTopic(isSelected ? '' : presetText)}
                     >
                       {presetText}
-                    </Button>
+                    </button>
                   )
                 })}
               </div>

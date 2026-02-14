@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from loguru import logger
 
+from nanobot.storage.memory_repository import get_memory_repository
+
 
 class MirrorService:
     """Handles all mirror-room data operations."""
@@ -18,10 +20,12 @@ class MirrorService:
         self.workspace = Path(workspace)
         self.sessions = sessions_manager
         self._mirror_dir = self.workspace / "mirror"
+        self._repo = get_memory_repository()
         self._ensure_dirs()
 
     def _ensure_dirs(self) -> None:
         """Create mirror directory structure if not exists."""
+        # Keep directory structure for images and profile files
         for sub in ["wu", "bian", "shang", "snapshots"]:
             (self._mirror_dir / sub).mkdir(parents=True, exist_ok=True)
 
@@ -174,7 +178,7 @@ class MirrorService:
         key: str,
         llm_analysis: dict[str, Any] | None = None,
     ) -> None:
-        """Write session analysis to daily MD file and MEMORY.md."""
+        """Write session analysis to SQLite (daily notes and memory)."""
         try:
             messages = self.sessions.get_messages(key=key, limit=200)
             today_str = date.today().strftime("%Y-%m-%d")
@@ -202,13 +206,12 @@ class MirrorService:
 {extra}
 ---
 """
-            # Write to daily file
-            daily_file = self._mirror_dir / stype / f"{today_str}.md"
-            if daily_file.exists():
-                existing = daily_file.read_text(encoding="utf-8")
-            else:
-                existing = f"## {today_str}\n\n"
-            daily_file.write_text(existing + analysis_block, encoding="utf-8")
+            # Write to daily notes in SQLite
+            self._repo.append_daily_note(
+                content=analysis_block,
+                note_date=today_str,
+                scope=f"mirror-{stype}",
+            )
 
             # 若有 LLM 分析，写入核心洞察供侧栏展示
             if llm_analysis:
@@ -219,14 +222,14 @@ class MirrorService:
                         session.metadata["insight"] = str(insight)[:100]
                         self.sessions.save(session)
 
-            # Append to MEMORY.md
-            memory_file = self._mirror_dir / stype / "MEMORY.md"
-            if memory_file.exists():
-                mem_content = memory_file.read_text(encoding="utf-8")
-            else:
-                mem_content = f"# {stype.upper()} 总档案\n\n"
-            summary_line = f"- [{today_str} {now_str}] 会话 {session_id[-6:]} - {len(messages)} 条消息\n"
-            memory_file.write_text(mem_content + summary_line, encoding="utf-8")
+            # Append to memory in SQLite
+            summary_line = f"会话 {session_id[-6:]} - {len(messages)} 条消息"
+            self._repo.append_memory(
+                content=summary_line,
+                scope=f"mirror-{stype}",
+                source_type="session_analysis",
+                source_id=session_id,
+            )
 
             logger.info(f"Mirror analysis written for {stype} session {session_id}")
         except Exception as e:
@@ -237,8 +240,9 @@ class MirrorService:
     def get_shang_today(self) -> dict[str, Any]:
         """Check if today's shang has been completed."""
         today_str = date.today().strftime("%Y-%m-%d")
-        records = self._load_shang_records()
-        today_records = [r for r in records if r.get("date") == today_str]
+        records = self._repo.list_shang_records(page=1, page_size=1000)
+        items = records.get("items", [])
+        today_records = [r for r in items if r.get("date") == today_str]
         if today_records:
             latest = today_records[-1]
             return {"done": latest.get("status") == "done", "record": latest}
@@ -246,12 +250,7 @@ class MirrorService:
 
     def get_shang_records(self, page: int = 1, page_size: int = 20) -> dict[str, Any]:
         """Get paginated shang records."""
-        records = self._load_shang_records()
-        records.sort(key=lambda r: r.get("date", ""), reverse=True)
-        total = len(records)
-        start = max(0, (page - 1) * page_size)
-        end = start + page_size
-        return {"items": records[start:end], "total": total}
+        return self._repo.list_shang_records(page=page, page_size=page_size)
 
     def start_shang(
         self,
@@ -318,7 +317,7 @@ class MirrorService:
             "status": "choosing",
         }
 
-        self._save_shang_record(record)
+        self._repo.save_shang_record(record)
         return record
 
     def regenerate_shang_images(
@@ -328,93 +327,95 @@ class MirrorService:
         qwen_image_model: str = "qwen-image-plus",
     ) -> dict[str, Any] | None:
         """重新生成指定 record 的 A/B 图片。仅 status=choosing 时可用。返回更新后的 record 或 None。"""
-        records = self._load_shang_records()
-        for i, r in enumerate(records):
-            if r["id"] == record_id and r.get("status") == "choosing":
-                topic = r.get("topic", "内在力量")
-                image_a_url: str | None = None
-                image_b_url: str | None = None
-                if dashscope_api_key and qwen_image_model:
-                    try:
-                        from nanobot.providers.dashscope_image import (
-                            generate_image,
-                            get_shang_prompts_for_topic,
-                            download_and_save_image,
-                        )
-                        prompt_a, prompt_b = get_shang_prompts_for_topic(topic)
-                        model = qwen_image_model
-                        url_a = generate_image(prompt_a, dashscope_api_key, model=model)
-                        url_b = generate_image(prompt_b, dashscope_api_key, model=model)
-                        images_dir = self._mirror_dir / "shang" / "images"
-                        images_dir.mkdir(parents=True, exist_ok=True)
-                        if url_a:
-                            if download_and_save_image(url_a, str(images_dir / f"{record_id}_A.png")):
-                                image_a_url = f"/api/v1/mirror/shang/image?recordId={record_id}&slot=A"
-                            else:
-                                image_a_url = url_a
-                        if url_b:
-                            if download_and_save_image(url_b, str(images_dir / f"{record_id}_B.png")):
-                                image_b_url = f"/api/v1/mirror/shang/image?recordId={record_id}&slot=B"
-                            else:
-                                image_b_url = url_b
-                    except Exception as e:
-                        logger.warning("Qwen-Image regenerate failed: %s", e)
-                if image_a_url is not None:
-                    r["imageA"] = image_a_url
-                if image_b_url is not None:
-                    r["imageB"] = image_b_url
-                records[i] = r
-                self._save_all_shang_records(records)
-                return r
-        return None
+        record = self._repo.get_shang_record(record_id)
+        if record is None or record.get("status") != "choosing":
+            return None
+
+        topic = record.get("topic", "内在力量")
+        image_a_url: str | None = None
+        image_b_url: str | None = None
+
+        if dashscope_api_key and qwen_image_model:
+            try:
+                from nanobot.providers.dashscope_image import (
+                    generate_image,
+                    get_shang_prompts_for_topic,
+                    download_and_save_image,
+                )
+                prompt_a, prompt_b = get_shang_prompts_for_topic(topic)
+                model = qwen_image_model
+                url_a = generate_image(prompt_a, dashscope_api_key, model=model)
+                url_b = generate_image(prompt_b, dashscope_api_key, model=model)
+                images_dir = self._mirror_dir / "shang" / "images"
+                images_dir.mkdir(parents=True, exist_ok=True)
+                if url_a:
+                    if download_and_save_image(url_a, str(images_dir / f"{record_id}_A.png")):
+                        image_a_url = f"/api/v1/mirror/shang/image?recordId={record_id}&slot=A"
+                    else:
+                        image_a_url = url_a
+                if url_b:
+                    if download_and_save_image(url_b, str(images_dir / f"{record_id}_B.png")):
+                        image_b_url = f"/api/v1/mirror/shang/image?recordId={record_id}&slot=B"
+                    else:
+                        image_b_url = url_b
+            except Exception as e:
+                logger.warning("Qwen-Image regenerate failed: %s", e)
+
+        updates = {}
+        if image_a_url is not None:
+            updates["imageA"] = image_a_url
+        if image_b_url is not None:
+            updates["imageB"] = image_b_url
+
+        if updates:
+            self._repo.update_shang_record(record_id, updates)
+            # Return updated record
+            return self._repo.get_shang_record(record_id)
+
+        return record
 
     def submit_shang_choice(
         self, record_id: str, choice: str, attribution: str
     ) -> dict[str, Any]:
         """Submit A/B choice and attribution for a shang record."""
-        records = self._load_shang_records()
-        for i, r in enumerate(records):
-            if r["id"] == record_id:
-                r["choice"] = choice
-                r["attribution"] = attribution
-                r["status"] = "done"
-                r["analysis"] = {
-                    "jungType": None,
-                    "bigFive": None,
-                    "archetype": None,
-                    "crossValidation": None,
-                }
-                records[i] = r
-                self._save_all_shang_records(records)
-                return r
-        raise KeyError("shang record not found")
+        record = self._repo.get_shang_record(record_id)
+        if record is None:
+            raise KeyError("shang record not found")
+
+        updates = {
+            "choice": choice,
+            "attribution": attribution,
+            "status": "done",
+            "analysis": {
+                "jungType": None,
+                "bigFive": None,
+                "archetype": None,
+                "crossValidation": None,
+            },
+        }
+
+        self._repo.update_shang_record(record_id, updates)
+        return self._repo.get_shang_record(record_id)
 
     def update_shang_analysis(self, record_id: str, analysis: dict[str, Any]) -> dict[str, Any] | None:
         """更新赏记录的 analysis 字段。"""
-        records = self._load_shang_records()
-        for i, r in enumerate(records):
-            if r["id"] == record_id:
-                r["analysis"] = analysis
-                records[i] = r
-                self._save_all_shang_records(records)
-                return r
-        return None
+        record = self._repo.get_shang_record(record_id)
+        if record is None:
+            return None
+
+        self._repo.update_shang_record(record_id, {"analysis": analysis})
+        return self._repo.get_shang_record(record_id)
 
     def delete_shang_record(self, record_id: str) -> bool:
         """删除赏记录。"""
-        records = self._load_shang_records()
-        new_records = [r for r in records if r["id"] != record_id]
-        if len(new_records) == len(records):
-            return False
-        self._save_all_shang_records(new_records)
-        return True
+        return self._repo.delete_shang_record(record_id)
 
     def write_shang_record_to_memory(self, record: dict[str, Any]) -> None:
         """将赏记录的主要多维评价维度写入日期 MD 和 MEMORY.md，与悟/辩保持一致。"""
-        self._write_shang_record_to_files(record)
+        self._write_shang_record_to_sqlite(record)
 
-    def _write_shang_record_to_files(self, record: dict[str, Any]) -> None:
-        """写入 mirror/shang/{date}.md 和 MEMORY.md。"""
+    def _write_shang_record_to_sqlite(self, record: dict[str, Any]) -> None:
+        """写入 mirror-shang daily notes 和 memory."""
         try:
             record_date = record.get("date") or date.today().strftime("%Y-%m-%d")
             now_str = datetime.now().strftime("%H:%M")
@@ -458,51 +459,25 @@ class MirrorService:
 {f"{chr(10)}{extra}{chr(10)}" if extra else ""}
 ---
 """
-            shang_dir = self._mirror_dir / "shang"
-            shang_dir.mkdir(parents=True, exist_ok=True)
+            # Write to daily notes in SQLite
+            self._repo.append_daily_note(
+                content=analysis_block,
+                note_date=record_date,
+                scope="mirror-shang",
+            )
 
-            daily_file = shang_dir / f"{record_date}.md"
-            if daily_file.exists():
-                existing = daily_file.read_text(encoding="utf-8")
-            else:
-                existing = f"## {record_date}\n\n"
-            daily_file.write_text(existing + analysis_block, encoding="utf-8")
-
-            memory_file = shang_dir / "MEMORY.md"
-            if memory_file.exists():
-                mem_content = memory_file.read_text(encoding="utf-8")
-            else:
-                mem_content = "# SHANG 总档案\n\n"
-            summary_line = f"- [{record_date} {now_str}] 赏 #{record_id[-8:] if record_id else '?'} 主题:{topic} 选择:{choice}\n"
-            memory_file.write_text(mem_content + summary_line, encoding="utf-8")
+            # Append to memory in SQLite
+            summary_line = f"赏 #{record_id[-8:] if record_id else '?'} 主题:{topic} 选择:{choice}"
+            self._repo.append_memory(
+                content=summary_line,
+                scope="mirror-shang",
+                source_type="shang_analysis",
+                source_id=record_id,
+            )
 
             logger.info(f"Shang record written to memory for {record_id}")
         except Exception as e:
             logger.error(f"Failed to write shang record to memory: {e}")
-
-    def _load_shang_records(self) -> list[dict[str, Any]]:
-        """Load all shang records from JSON files."""
-        shang_dir = self._mirror_dir / "shang"
-        records = []
-        index_file = shang_dir / "records.json"
-        if index_file.exists():
-            try:
-                records = json.loads(index_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, IOError):
-                records = []
-        return records
-
-    def _save_shang_record(self, record: dict[str, Any]) -> None:
-        """Add a single shang record."""
-        records = self._load_shang_records()
-        records.append(record)
-        self._save_all_shang_records(records)
-
-    def _save_all_shang_records(self, records: list[dict[str, Any]]) -> None:
-        index_file = self._mirror_dir / "shang" / "records.json"
-        index_file.write_text(
-            json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
 
     # ---------- Profile (吾) ----------
 
@@ -525,73 +500,62 @@ class MirrorService:
 
     def _load_module_summary(self, stype: str) -> dict[str, Any]:
         """加载悟或辩的汇总数据。"""
-        md_dir = self._mirror_dir / stype
+        scope = f"mirror-{stype}"
+
+        # Get daily notes
+        from datetime import timedelta
         sessions_text: list[str] = []
         insights: list[str] = []
-        for path in sorted(md_dir.glob("*.md")):
-            if path.name == "MEMORY.md":
-                continue
-            try:
-                content = path.read_text(encoding="utf-8")
-                sessions_text.append(f"### {path.stem}\n{content[:3000]}")
-                for line in content.split("\n"):
+
+        today = date.today()
+        for i in range(30):  # Last 30 days
+            check_date = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+            note = self._repo.get_daily_note(note_date=check_date, scope=scope)
+            if note:
+                sessions_text.append(f"### {check_date}\n{note[:3000]}")
+                # Extract insights
+                for line in note.split("\n"):
                     if "核心洞察" in line or "core_insight" in line.lower():
                         parts = line.split(":", 1)
                         if len(parts) > 1 and parts[1].strip():
                             insights.append(parts[1].strip())
-            except (IOError, UnicodeError):
-                continue
-        memory_file = md_dir / "MEMORY.md"
-        if memory_file.exists():
-            try:
-                mem = memory_file.read_text(encoding="utf-8")
-                sessions_text.append(f"### MEMORY\n{mem[:1500]}")
-            except (IOError, UnicodeError):
-                pass
+
+        # Get memory entries
+        memories = self._repo.get_memories(scope=scope, limit=50)
+        if memories:
+            mem_content = "\n".join([f"- [{m['entry_date']}] {m['content']}" for m in memories[:20]])
+            sessions_text.append(f"### MEMORY\n{mem_content[:1500]}")
+
         text = "\n\n".join(sessions_text) if sessions_text else "（暂无数据）"
         return {"sessions": text, "insights": "；".join(insights[:5]), "count": len(sessions_text)}
 
     def _load_shang_summary(self) -> dict[str, Any]:
         """加载赏记录汇总。"""
-        records = self._load_shang_records()
-        done = [r for r in records if r.get("status") == "done"]
+        records_data = self._repo.list_shang_records(page=1, page_size=100)
+        items = records_data.get("items", [])
+        done = [r for r in items if r.get("status") == "done"]
+
         lines = []
         for r in done[-20:]:
             topic = r.get("topic", "")
             choice = r.get("choice", "")
             attribution = (r.get("attribution") or "")[:200]
             lines.append(f"- 主题:{topic} 选择:{choice} 归因:{attribution}")
+
         text = "\n".join(lines) if lines else "（暂无赏记录）"
         return {"records": text, "insights": "", "count": len(done)}
 
     def save_profile(self, profile: dict[str, Any]) -> None:
-        """保存 profile 到 profile.json 并追加快照。"""
-        from datetime import datetime
-
+        """保存 profile 到 SQLite 并追加快照。"""
         profile["updateTime"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        profile_file = self._mirror_dir / "profile.json"
-        profile_file.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
-        snap_dir = self._mirror_dir / "snapshots"
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        snap_file = snap_dir / f"{datetime.now().strftime('%Y-%m-%d')}.json"
-        snap_file.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("Mirror profile saved to %s", profile_file)
+        self._repo.save_mirror_profile(profile)
+        logger.info("Mirror profile saved to SQLite")
 
     def get_profile(self) -> dict[str, Any] | None:
-        """Get the current mirror profile from profile.json or latest snapshot."""
-        profile_file = self._mirror_dir / "profile.json"
-        if profile_file.exists():
-            try:
-                return json.loads(profile_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, IOError):
-                pass
-        # 降级：从 snapshots/ 取最新快照
-        snap_dir = self._mirror_dir / "snapshots"
-        if snap_dir.exists():
-            snaps = sorted(snap_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for snap in snaps:
-                try:
-                    return json.loads(snap.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, IOError):
-                    continue
-        return None
+        """Get the current mirror profile from SQLite."""
+        # 优先从主表获取
+        profile = self._repo.get_mirror_profile()
+        if profile:
+            return profile
+        # 降级：从快照表获取最新
+        return self._repo.get_latest_mirror_profile_snapshot()

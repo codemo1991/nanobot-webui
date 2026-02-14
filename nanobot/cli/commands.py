@@ -212,6 +212,7 @@ def gateway(
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         filesystem_config=config.tools.filesystem,
+        claude_code_config=config.tools.claude_code,
         cron_service=cron,
     )
     
@@ -416,6 +417,7 @@ def agent(
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         filesystem_config=config.tools.filesystem,
+        claude_code_config=config.tools.claude_code,
     )
     
     if message:

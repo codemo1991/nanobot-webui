@@ -94,6 +94,7 @@ function MirrorPage() {
         className="mirror-tabs"
         size="large"
         centered
+        destroyInactiveTabPane={false}
       />
     </div>
   )

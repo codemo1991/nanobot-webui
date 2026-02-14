@@ -227,12 +227,17 @@ function ChatPage() {
     }
   }
 
-  const handleStop = () => {
+  const handleStop = async () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
       abortControllerRef.current = null
       setLoading(false)
       antMessage.info(t('chat.generationStopped'))
+    }
+    try {
+      await api.stopAgent()
+    } catch (e) {
+      console.warn('Stop agent request failed:', e)
     }
   }
 
@@ -498,15 +503,6 @@ function ChatPage() {
         </Content>
 
         <div className="chat-input-container">
-          <div className="chat-token-summary">
-            <Text type="secondary">
-              {t('chat.tokenUsageSummary', {
-                input: formatTokenNumber(sessionTokenUsage.promptTokens),
-                output: formatTokenNumber(sessionTokenUsage.completionTokens),
-                total: formatTokenNumber(sessionTokenUsage.totalTokens),
-              })}
-            </Text>
-          </div>
           <TextArea
             value={input}
             onChange={e => setInput(e.target.value)}
@@ -516,16 +512,27 @@ function ChatPage() {
             disabled={!currentSession || loading}
             className="chat-input"
           />
-          <Button
-            type="primary"
-            icon={loading ? <StopOutlined /> : <SendOutlined />}
-            onClick={loading ? handleStop : handleSend}
-            danger={loading}
-            disabled={(!currentSession || !input.trim()) && !loading}
-            className="send-button"
-          >
-            {loading ? t('chat.stop') : t('chat.send')}
-          </Button>
+          <div className="chat-input-actions">
+            <div className="chat-token-summary">
+              <Text type="secondary">
+                {t('chat.tokenUsageSummary', {
+                  input: formatTokenNumber(sessionTokenUsage.promptTokens),
+                  output: formatTokenNumber(sessionTokenUsage.completionTokens),
+                  total: formatTokenNumber(sessionTokenUsage.totalTokens),
+                })}
+              </Text>
+            </div>
+            <Button
+              type="primary"
+              icon={loading ? <StopOutlined /> : <SendOutlined />}
+              onClick={loading ? handleStop : handleSend}
+              danger={loading}
+              disabled={(!currentSession || !input.trim()) && !loading}
+              className="send-button"
+            >
+              {loading ? t('chat.stop') : t('chat.send')}
+            </Button>
+          </div>
         </div>
       </Layout>
     </Layout>

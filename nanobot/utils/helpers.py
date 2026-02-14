@@ -89,3 +89,70 @@ def parse_session_key(key: str) -> tuple[str, str]:
     if len(parts) != 2:
         raise ValueError(f"Invalid session key: {key}")
     return parts[0], parts[1]
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    估算文本的token数量。
+    
+    使用简化的估算方法：
+    - 中文字符：约 1.5 字符/token
+    - 英文字符：约 4 字符/token
+    - 混合文本取加权平均
+    
+    Args:
+        text: 要估算的文本
+    
+    Returns:
+        估算的token数量
+    """
+    if not text:
+        return 0
+    
+    CHARS_PER_TOKEN_CHINESE = 1.5
+    CHARS_PER_TOKEN_ENGLISH = 4.0
+    
+    chinese_chars = 0
+    total_chars = len(text)
+    
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff':
+            chinese_chars += 1
+    
+    non_chinese = total_chars - chinese_chars
+    
+    chinese_tokens = chinese_chars / CHARS_PER_TOKEN_CHINESE
+    english_tokens = non_chinese / CHARS_PER_TOKEN_ENGLISH
+    
+    return int(chinese_tokens + english_tokens)
+
+
+def truncate_to_token_limit(text: str, max_tokens: int, suffix: str = "...") -> str:
+    """
+    将文本截断到指定的token限制内。
+    
+    Args:
+        text: 要截断的文本
+        max_tokens: 最大token数
+        suffix: 截断后添加的后缀
+    
+    Returns:
+        截断后的文本
+    """
+    if not text or max_tokens <= 0:
+        return ""
+    
+    if estimate_tokens(text) <= max_tokens:
+        return text
+    
+    min_chars = len(suffix) + 1
+    target_chars = max(min_chars, int(max_tokens * 2.5))
+    truncated = text[:target_chars]
+    
+    while len(truncated) > min_chars and estimate_tokens(truncated + suffix) > max_tokens:
+        truncated = truncated[:-100]
+    
+    if len(truncated) <= min_chars:
+        return text[:max(1, int(max_tokens * 2))]
+    
+    return truncated + suffix

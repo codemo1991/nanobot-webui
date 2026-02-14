@@ -20,9 +20,31 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
+from nanobot.agent.tools.claude_code import ClaudeCodeTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
-from nanobot.utils.helpers import parse_session_key
+from nanobot.utils.helpers import parse_session_key, estimate_tokens
+
+
+TOOL_KEYWORDS = {
+    "read_file": [],
+    "write_file": [],
+    "edit_file": ["编辑", "修改", "edit", "replace"],
+    "list_dir": ["列表", "目录", "list", "dir", "文件夹"],
+    "exec": [],
+    "web_search": ["搜索", "search", "查找", "百度", "google", "bing"],
+    "web_fetch": ["网页", "url", "http", "fetch", "获取网页"],
+    "message": ["发送消息", "通知", "message", "send"],
+    "remember": ["记住", "remember", "记忆"],
+    "spawn": ["子代理", "subagent", "spawn", "并行"],
+    "cron": ["定时", "计划", "cron", "schedule"],
+    "claude_code": ["claude code", "claude-code", "代码实现", "实现功能", "写代码"],
+}
+
+for tool, keywords in TOOL_KEYWORDS.items():
+    TOOL_KEYWORDS[tool] = [kw.lower() for kw in keywords]
+
+ESSENTIAL_TOOLS = ["read_file", "write_file", "exec", "remember"]
 
 
 class AgentLoop:
@@ -48,28 +70,40 @@ class AgentLoop:
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         filesystem_config: "FilesystemToolConfig | None" = None,
+        claude_code_config: "ClaudeCodeConfig | None" = None,
         cron_service: "CronService | None" = None,
-        message_timeout: float = 300.0,  # 5 min max per message
+        message_timeout: float = 300.0,
         max_history_messages: int = 30,
         tool_result_max_length: int = 2000,
+        smart_tool_selection: bool = True,
+        system_prompt_max_tokens: int = 5000,
+        memory_max_tokens: int = 2000,
     ):
-        from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig
+        from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig, ClaudeCodeConfig
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
-        self.max_execution_time = max_execution_time  # 秒, 0=不限
+        self.max_execution_time = max_execution_time
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.filesystem_config = filesystem_config or FilesystemToolConfig()
+        self.claude_code_config = claude_code_config or ClaudeCodeConfig()
         self.cron_service = cron_service
         self.message_timeout = message_timeout
         self.max_history_messages = max_history_messages
         self.tool_result_max_length = tool_result_max_length
+        self._smart_tool_selection = smart_tool_selection
+        self._system_prompt_max_tokens = system_prompt_max_tokens
+        self._memory_max_tokens = memory_max_tokens
         
-        self.context = ContextBuilder(workspace)
+        token_budget = {
+            "total": system_prompt_max_tokens,
+            "memory": memory_max_tokens,
+        }
+        self.context = ContextBuilder(workspace, token_budget=token_budget)
         self.sessions = SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -82,12 +116,61 @@ class AgentLoop:
             sessions=self.sessions,
         )
         
+        from nanobot.claude_code.manager import ClaudeCodeManager
+        self.claude_code_manager = ClaudeCodeManager(
+            workspace=workspace,
+            bus=bus,
+            default_timeout=self.claude_code_config.default_timeout,
+            max_concurrent_tasks=self.claude_code_config.max_concurrent_tasks,
+        )
+        
         self._running = False
         self._mcp_loaded = False
         self._mcp_loop_id: int | None = None
-        self._mcp_fail_time: float = 0.0  # Cooldown after MCP load failure
+        self._mcp_fail_time: float = 0.0
+        self._cancel_event = asyncio.Event()
         self._register_default_tools()
         self._init_mcp_loader()
+
+    def _select_tools_for_message(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
+        """
+        根据消息内容选择相关工具定义。
+        
+        Args:
+            message: 用户消息内容
+            max_tools: 最大返回工具数量
+        
+        Returns:
+            选中的工具定义列表
+        """
+        if not self._smart_tool_selection:
+            return self.tools.get_definitions()
+        
+        message_lower = message.lower()
+        selected_names = set(ESSENTIAL_TOOLS)
+        
+        for tool_name, keywords in TOOL_KEYWORDS.items():
+            if tool_name in selected_names:
+                continue
+            if any(kw in message_lower for kw in keywords):
+                selected_names.add(tool_name)
+                if len(selected_names) >= max_tools:
+                    break
+        
+        if len(selected_names) < max_tools:
+            for tool_name in self.tools.tool_names:
+                if tool_name.startswith("mcp_"):
+                    selected_names.add(tool_name)
+                    if len(selected_names) >= max_tools:
+                        break
+        
+        definitions = []
+        for name in selected_names:
+            tool = self.tools.get(name)
+            if tool:
+                definitions.append(tool.to_schema())
+        
+        return definitions
 
     def update_agent_params(
         self,
@@ -95,6 +178,9 @@ class AgentLoop:
         max_execution_time: int | None = None,
         max_history_messages: int | None = None,
         tool_result_max_length: int | None = None,
+        smart_tool_selection: bool | None = None,
+        system_prompt_max_tokens: int | None = None,
+        memory_max_tokens: int | None = None,
     ) -> None:
         """Hot-update agent params without restart."""
         if max_iterations is not None:
@@ -105,6 +191,14 @@ class AgentLoop:
             self.max_history_messages = max(1, min(max_history_messages, 200))
         if tool_result_max_length is not None:
             self.tool_result_max_length = max(100, tool_result_max_length)
+        if smart_tool_selection is not None:
+            self._smart_tool_selection = smart_tool_selection
+        if system_prompt_max_tokens is not None:
+            self._system_prompt_max_tokens = max(1000, system_prompt_max_tokens)
+            self.context.update_token_budget(total=self._system_prompt_max_tokens)
+        if memory_max_tokens is not None:
+            self._memory_max_tokens = max(200, memory_max_tokens)
+            self.context.update_token_budget(memory=self._memory_max_tokens)
 
     def _init_mcp_loader(self) -> None:
         """Initialize MCP tool loader from config."""
@@ -182,6 +276,10 @@ class AgentLoop:
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        
+        # Claude Code tool (for complex coding tasks)
+        claude_code_tool = ClaudeCodeTool(manager=self.claude_code_manager)
+        self.tools.register(claude_code_tool)
     
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -228,6 +326,22 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    def cancel_current_request(self) -> None:
+        """Cancel the current running request by setting the cancel event."""
+        if not self._cancel_event.is_set():
+            self._cancel_event.set()
+            logger.info("Agent request cancellation requested")
+
+    async def _check_cancelled(self) -> None:
+        """Check if cancellation was requested and raise if so."""
+        if self._cancel_event.is_set():
+            self._cancel_event.clear()
+            raise asyncio.CancelledError("Request cancelled by user")
+
+    def _reset_cancel_event(self) -> None:
+        """Reset the cancel event for a new request."""
+        self._cancel_event.clear()
     
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
@@ -261,6 +375,10 @@ class AgentLoop:
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
+        
+        claude_code_tool = self.tools.get("claude_code")
+        if isinstance(claude_code_tool, ClaudeCodeTool):
+            claude_code_tool.set_context(msg.channel, msg.chat_id)
         
         # MCP tools are tied to the event loop that created them. Web uses asyncio.run() per request,
         # so each request gets a new loop; prior MCP sessions become stale (ClosedResourceError).
@@ -333,6 +451,8 @@ class AgentLoop:
 
         while iteration < self.max_iterations:
             iteration += 1
+            
+            await self._check_cancelled()
 
             # 时间限制: 防止 runaway，与 max_iterations 互补
             if self.max_execution_time > 0:
@@ -349,9 +469,10 @@ class AgentLoop:
                 except Exception:
                     pass
             # Call LLM
+            selected_tools = self._select_tools_for_message(msg.content)
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=selected_tools,
                 model=self.model
             )
             _accumulate_usage(response.usage)
@@ -503,6 +624,10 @@ class AgentLoop:
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(origin_channel, origin_chat_id)
         
+        claude_code_tool = self.tools.get("claude_code")
+        if isinstance(claude_code_tool, ClaudeCodeTool):
+            claude_code_tool.set_context(origin_channel, origin_chat_id)
+        
         # Same loop check as _process_message (MCP sessions tied to event loop)
         try:
             _loop_id = id(asyncio.get_running_loop())
@@ -565,15 +690,19 @@ class AgentLoop:
 
         while iteration < self.max_iterations:
             iteration += 1
+            
+            await self._check_cancelled()
+            
             if self.max_execution_time > 0:
                 elapsed = time.monotonic() - loop_start
                 if elapsed >= self.max_execution_time:
                     logger.info("System msg: max execution time %ds reached", self.max_execution_time)
                     break
 
+            selected_tools = self._select_tools_for_message(msg.content)
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=selected_tools,
                 model=self.model
             )
             _accumulate_usage(response.usage)
@@ -687,6 +816,8 @@ class AgentLoop:
         Returns:
             The agent's response.
         """
+        self._reset_cancel_event()
+        
         if ":" in session_key:
             try:
                 parsed_channel, parsed_chat_id = parse_session_key(session_key)
@@ -709,5 +840,10 @@ class AgentLoop:
             metadata=metadata,
         )
 
-        response = await self._process_message(msg)
-        return response.content if response else ""
+        try:
+            await self._check_cancelled()
+            response = await self._process_message(msg)
+            return response.content if response else ""
+        except asyncio.CancelledError:
+            logger.info("Agent request was cancelled")
+            return ""

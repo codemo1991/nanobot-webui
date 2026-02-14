@@ -6,6 +6,14 @@ from typing import Any
 from nanobot.agent.tools.base import Tool
 
 
+def _resolve_path(path: str | Path, workspace: Path | None) -> Path:
+    """Resolve a path, treating relative paths as relative to workspace."""
+    file_path = Path(path).expanduser()
+    if not file_path.is_absolute() and workspace:
+        file_path = workspace / file_path
+    return file_path
+
+
 def _check_path_in_workspace(path: Path, workspace_path: Path) -> bool:
     """Check if resolved path is under workspace."""
     try:
@@ -45,7 +53,7 @@ class ReadFileTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            file_path = Path(path).expanduser()
+            file_path = _resolve_path(path, self.workspace)
             if self.restrict_to_workspace and self.workspace:
                 if not _check_path_in_workspace(file_path, self.workspace):
                     return f"Error: Path must be within workspace: {path}"
@@ -96,7 +104,7 @@ class WriteFileTool(Tool):
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
-            file_path = Path(path).expanduser()
+            file_path = _resolve_path(path, self.workspace)
             if self.restrict_to_workspace and self.workspace:
                 if not _check_path_in_workspace(file_path, self.workspace):
                     return f"Error: Path must be within workspace: {path}"
@@ -147,7 +155,7 @@ class EditFileTool(Tool):
 
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
-            file_path = Path(path).expanduser()
+            file_path = _resolve_path(path, self.workspace)
             if self.restrict_to_workspace and self.workspace:
                 if not _check_path_in_workspace(file_path, self.workspace):
                     return f"Error: Path must be within workspace: {path}"
@@ -204,7 +212,7 @@ class ListDirTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            dir_path = Path(path).expanduser()
+            dir_path = _resolve_path(path, self.workspace)
             if self.restrict_to_workspace and self.workspace:
                 if not _check_path_in_workspace(dir_path, self.workspace):
                     return f"Error: Path must be within workspace: {path}"

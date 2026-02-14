@@ -77,7 +77,7 @@ def load_config(config_path: Path | None = None) -> Config:
             data = convert_keys(config_data)
             return Config.model_validate(data)
         except Exception as e:
-            logger.warning(f"Failed to load config from SQLite: {e}")
+            logger.warning(f"Failed to load config from SQLite: {e}, will try JSON fallback")
     
     path = config_path or get_config_path()
     
@@ -88,9 +88,14 @@ def load_config(config_path: Path | None = None) -> Config:
             config = Config.model_validate(convert_keys(data))
             _migrate_json_to_sqlite(path, repo)
             return config
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f"Failed to load config from {path}: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Config file {path} is not valid JSON: {e}. Please check the file format.")
+        except ValueError as e:
+            logger.error(f"Config validation failed: {e}. Please check the config schema.")
+        except Exception as e:
+            logger.error(f"Failed to load config from {path}: {e}")
     
+    logger.info("Using default configuration. You can configure API keys in the web UI.")
     return Config()
 
 

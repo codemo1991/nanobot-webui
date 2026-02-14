@@ -7,6 +7,16 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.utils.helpers import estimate_tokens, truncate_to_token_limit
+
+
+TOKEN_BUDGET_DEFAULTS = {
+    "identity": 500,
+    "bootstrap": 1500,
+    "memory": 2000,
+    "skills": 500,
+    "total": 5000,
+}
 
 
 class ContextBuilder:
@@ -21,49 +31,88 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
 
-    def __init__(self, workspace: Path, agent_id: str | None = None):
+    def __init__(self, workspace: Path, agent_id: str | None = None, token_budget: dict[str, int] | None = None):
         self.workspace = workspace
         self.agent_id = agent_id
         self.memory = MemoryStore(workspace, agent_id=agent_id)
         self.skills = SkillsLoader(workspace)
+        self.token_budget = {**TOKEN_BUDGET_DEFAULTS, **(token_budget or {})}
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def update_token_budget(self, **kwargs: int) -> None:
+        """Update token budget settings at runtime."""
+        self.token_budget.update(kwargs)
+    
+    def build_system_prompt(self, skill_names: list[str] | None = None, max_tokens: int | None = None) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
         Args:
             skill_names: Optional list of skills to include.
+            max_tokens: Maximum tokens for the system prompt. Uses token_budget["total"] if not specified.
         
         Returns:
             Complete system prompt.
         """
+        budget = max_tokens or self.token_budget["total"]
         parts = []
+        current_tokens = 0
         
-        # Core identity
-        parts.append(self._get_identity())
+        identity = self._get_identity()
+        identity_tokens = estimate_tokens(identity)
+        if identity_tokens > self.token_budget["identity"]:
+            identity = truncate_to_token_limit(identity, self.token_budget["identity"])
+            identity_tokens = estimate_tokens(identity)
+        parts.append(identity)
+        current_tokens += identity_tokens
         
-        # Bootstrap files
-        bootstrap = self._load_bootstrap_files()
-        if bootstrap:
-            parts.append(bootstrap)
+        remaining = max(0, budget - current_tokens)
+        bootstrap_budget = min(
+            self.token_budget["bootstrap"],
+            remaining - self.token_budget["memory"] - self.token_budget["skills"]
+        )
+        if bootstrap_budget > 200:
+            bootstrap = self._load_bootstrap_files()
+            if bootstrap:
+                bootstrap_tokens = estimate_tokens(bootstrap)
+                if bootstrap_tokens > bootstrap_budget:
+                    bootstrap = truncate_to_token_limit(bootstrap, bootstrap_budget)
+                parts.append(bootstrap)
+                current_tokens += estimate_tokens(bootstrap)
         
-        # Memory context
-        memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        remaining = max(0, budget - current_tokens)
+        memory_budget = min(
+            self.token_budget["memory"],
+            remaining - self.token_budget["skills"]
+        )
+        if memory_budget > 200:
+            memory = self.memory.get_memory_context(max_tokens=memory_budget)
+            if memory:
+                parts.append(f"# Memory\n\n{memory}")
+                current_tokens += estimate_tokens(memory)
         
-        # Skills - progressive loading
-        # 1. Always-loaded skills: include full content
+        always_skills_budget = budget - current_tokens - self.token_budget["skills"]
         always_skills = self.skills.get_always_skills()
-        if always_skills:
+        if always_skills and always_skills_budget > 0:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
+                always_tokens = estimate_tokens(always_content)
+                if always_tokens > always_skills_budget:
+                    always_content = truncate_to_token_limit(always_content, always_skills_budget)
+                    always_tokens = estimate_tokens(always_content)
                 parts.append(f"# Active Skills\n\n{always_content}")
+                current_tokens += always_tokens
         
-        # 2. Available skills: only show summary (agent uses read_file to load)
-        skills_summary = self.skills.build_skills_summary()
-        if skills_summary:
-            parts.append(f"""# Skills
+        skills_budget = min(
+            self.token_budget["skills"],
+            budget - current_tokens
+        )
+        if skills_budget > 50:
+            skills_summary = self.skills.build_skills_summary()
+            if skills_summary:
+                skills_tokens = estimate_tokens(skills_summary)
+                if skills_tokens > skills_budget:
+                    skills_summary = truncate_to_token_limit(skills_summary, skills_budget)
+                parts.append(f"""# Skills
 
 Skills extend your capabilities. To use a skill, read its SKILL.md file with read_file tool.
 (✓ = available, ✗ = missing dependencies)

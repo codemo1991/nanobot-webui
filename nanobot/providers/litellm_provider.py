@@ -13,6 +13,48 @@ from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 # 单条消息内容在日志中的最大长度，超出则截断
 _LLM_LOG_CONTENT_MAX = 1500
 
+# Provider 前缀映射表：用于自动添加正确的 LiteLLM 前缀
+PROVIDER_PREFIX_MAP = {
+    "openrouter": "openrouter",
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "openai": "openai",
+    "gpt": "openai",
+    "gemini": "gemini",
+    "zhipu": "zhipu",
+    "glm": "zai",
+    "zai": "zai",
+    "dashscope": "dashscope",
+    "qwen": "dashscope",
+    "groq": "groq",
+    "deepseek": "deepseek",
+    "minimax": "minimax",
+    "01ai": "01ai",
+    "moonshot": "moonshot",
+    "kimi": "moonshot",
+}
+
+# Provider 环境变量映射表
+PROVIDER_ENV_KEYS = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gpt": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "zhipu": "ZHIPUAI_API_KEY",
+    "glm": "ZHIPUAI_API_KEY",
+    "zai": "ZHIPUAI_API_KEY",
+    "dashscope": "DASHSCOPE_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    "01ai": "01AI_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "kimi": "MOONSHOT_API_KEY",
+}
+
 
 def _format_msg_for_log(msg: dict[str, Any], max_len: int = _LLM_LOG_CONTENT_MAX) -> str:
     """格式化单条消息用于日志输出"""
@@ -36,6 +78,64 @@ def _format_msg_for_log(msg: dict[str, Any], max_len: int = _LLM_LOG_CONTENT_MAX
     return f"[{role}] {content}"
 
 
+def _detect_provider_from_model(model: str) -> str | None:
+    """从模型名称中检测 provider 类型"""
+    model_lower = model.lower()
+    for key, provider in PROVIDER_PREFIX_MAP.items():
+        if key in model_lower:
+            return provider
+    return None
+
+
+def _ensure_model_prefix(model: str, is_openrouter: bool = False, is_vllm: bool = False) -> str:
+    """
+    确保模型名称带有正确的 provider 前缀。
+    
+    Args:
+        model: 原始模型名称
+        is_openrouter: 是否使用 OpenRouter
+        is_vllm: 是否使用 vLLM 自定义端点
+    
+    Returns:
+        带正确前缀的模型名称
+    """
+    # 已经被正确前缀的不需要处理
+    if "/" in model:
+        return model
+    
+    # OpenRouter 特殊处理
+    if is_openrouter:
+        return f"openrouter/{model}"
+    
+    # vLLM 特殊处理
+    if is_vllm:
+        return f"hosted_vllm/{model}"
+    
+    # 从模型名检测 provider
+    provider = _detect_provider_from_model(model)
+    if provider:
+        prefix = PROVIDER_PREFIX_MAP.get(provider, provider)
+        return f"{prefix}/{model}"
+    
+    return model
+
+
+def _set_provider_env_key(api_key: str, model: str) -> None:
+    """根据模型名称设置正确的环境变量"""
+    provider = _detect_provider_from_model(model)
+    if provider:
+        env_key = PROVIDER_ENV_KEYS.get(provider)
+        if env_key:
+            os.environ[env_key] = api_key
+
+
+def _set_provider_env_key_by_provider(api_key: str, provider: str) -> None:
+    """根据 provider 类型设置正确的环境变量"""
+    env_key = PROVIDER_ENV_KEYS.get(provider)
+    if env_key:
+        os.environ[env_key] = api_key
+
+
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
@@ -43,6 +143,15 @@ class LiteLLMProvider(LLMProvider):
     Supports OpenRouter, Anthropic, OpenAI, Gemini, and many other providers through
     a unified interface.
     """
+    
+    # 用于检测自定义 API 端点的域名关键字
+    PROVIDER_DOMAIN_KEYS = {
+        "openrouter": "openrouter",
+        "minimax": "minimax",
+        "deepseek": "deepseek",
+        "zhipu": "zhipuai",
+        "zhipuai": "zhipuai",
+    }
     
     def __init__(
         self, 
@@ -53,43 +162,53 @@ class LiteLLMProvider(LLMProvider):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         
+        # 检测自定义 API 端点类型
+        self._detected_provider = self._detect_provider_from_api_base(api_base)
+        
         # Detect OpenRouter by api_key prefix or explicit api_base
         self.is_openrouter = (
             (api_key and api_key.startswith("sk-or-")) or
-            (api_base and "openrouter" in api_base)
+            (api_base and "openrouter" in api_base) or
+            self._detected_provider == "openrouter"
         )
         
         # Track if using custom endpoint (vLLM, etc.)
-        self.is_vllm = bool(api_base) and not self.is_openrouter
+        # 排除已识别的 provider
+        self.is_vllm = (
+            bool(api_base) and 
+            not self.is_openrouter and 
+            self._detected_provider is None
+        )
         
-        # Configure LiteLLM based on provider
+        # Configure LiteLLM environment based on provider
         if api_key:
             if self.is_openrouter:
-                # OpenRouter mode - set key
                 os.environ["OPENROUTER_API_KEY"] = api_key
             elif self.is_vllm:
-                # vLLM/custom endpoint - uses OpenAI-compatible API
                 os.environ["OPENAI_API_KEY"] = api_key
-            elif "deepseek" in default_model:
-                os.environ.setdefault("DEEPSEEK_API_KEY", api_key)
-            elif "anthropic" in default_model:
-                os.environ.setdefault("ANTHROPIC_API_KEY", api_key)
-            elif "openai" in default_model or "gpt" in default_model:
-                os.environ.setdefault("OPENAI_API_KEY", api_key)
-            elif "gemini" in default_model.lower():
-                os.environ.setdefault("GEMINI_API_KEY", api_key)
-            elif "zhipu" in default_model or "glm" in default_model or "zai" in default_model:
-                os.environ.setdefault("ZHIPUAI_API_KEY", api_key)
-            elif "dashscope" in default_model or "qwen" in default_model.lower():
-                os.environ.setdefault("DASHSCOPE_API_KEY", api_key)
-            elif "groq" in default_model:
-                os.environ.setdefault("GROQ_API_KEY", api_key)
+            else:
+                # 使用检测到的 provider 或从模型名推断
+                provider = self._detected_provider or _detect_provider_from_model(default_model)
+                if provider:
+                    _set_provider_env_key_by_provider(api_key, provider)
+                else:
+                    _set_provider_env_key(api_key, default_model)
         
         if api_base:
             litellm.api_base = api_base
         
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
+    
+    def _detect_provider_from_api_base(self, api_base: str | None) -> str | None:
+        """从 API base URL 检测 provider 类型"""
+        if not api_base:
+            return None
+        api_base_lower = api_base.lower()
+        for key, provider in self.PROVIDER_DOMAIN_KEYS.items():
+            if key in api_base_lower:
+                return provider
+        return None
 
     def update_config(
         self,
@@ -106,32 +225,33 @@ class LiteLLMProvider(LLMProvider):
         if api_base is not None:
             self.api_base = api_base
 
+        # 重新检测 provider
+        self._detected_provider = self._detect_provider_from_api_base(self.api_base)
+        
         self.is_openrouter = (
             (self.api_key and self.api_key.startswith("sk-or-")) or
-            (self.api_base and "openrouter" in (self.api_base or ""))
+            (self.api_base and "openrouter" in (self.api_base or "")) or
+            self._detected_provider == "openrouter"
         )
-        self.is_vllm = bool(self.api_base) and not self.is_openrouter
+        
+        # 排除已识别的 provider
+        self.is_vllm = (
+            bool(self.api_base) and 
+            not self.is_openrouter and 
+            self._detected_provider is None
+        )
 
-        model_lower = model.lower()
         if self.api_key:
             if self.is_openrouter:
                 os.environ["OPENROUTER_API_KEY"] = self.api_key
             elif self.is_vllm:
                 os.environ["OPENAI_API_KEY"] = self.api_key
-            elif "deepseek" in model_lower:
-                os.environ["DEEPSEEK_API_KEY"] = self.api_key
-            elif "anthropic" in model_lower or "claude" in model_lower:
-                os.environ["ANTHROPIC_API_KEY"] = self.api_key
-            elif "openai" in model_lower or "gpt" in model_lower:
-                os.environ["OPENAI_API_KEY"] = self.api_key
-            elif "gemini" in model_lower:
-                os.environ["GEMINI_API_KEY"] = self.api_key
-            elif "zhipu" in model_lower or "glm" in model_lower or "zai" in model_lower:
-                os.environ["ZHIPUAI_API_KEY"] = self.api_key
-            elif "dashscope" in model_lower or "qwen" in model_lower:
-                os.environ["DASHSCOPE_API_KEY"] = self.api_key
-            elif "groq" in model_lower:
-                os.environ["GROQ_API_KEY"] = self.api_key
+            else:
+                provider = self._detected_provider or _detect_provider_from_model(model)
+                if provider:
+                    _set_provider_env_key_by_provider(self.api_key, provider)
+                else:
+                    _set_provider_env_key(self.api_key, model)
 
         if self.api_base:
             litellm.api_base = self.api_base
@@ -159,34 +279,12 @@ class LiteLLMProvider(LLMProvider):
         """
         model = model or self.default_model
         
-        # For OpenRouter, prefix model name if not already prefixed
-        if self.is_openrouter and not model.startswith("openrouter/"):
-            model = f"openrouter/{model}"
-        
-        # For Zhipu/Z.ai, ensure prefix is present
-        # Handle cases like "glm-4.7-flash" -> "zai/glm-4.7-flash"
-        if ("glm" in model.lower() or "zhipu" in model.lower()) and not (
-            model.startswith("zhipu/") or 
-            model.startswith("zai/") or 
-            model.startswith("openrouter/")
-        ):
-            model = f"zai/{model}"
-
-        # For Qwen/DashScope, ensure dashscope/ prefix
-        if "qwen" in model.lower() and not (
-            model.startswith("dashscope/") or 
-            model.startswith("openrouter/")
-        ):
-            model = f"dashscope/{model}"
-        
-        # For vLLM, use hosted_vllm/ prefix per LiteLLM docs
-        # Convert openai/ prefix to hosted_vllm/ if user specified it
-        if self.is_vllm:
-            model = f"hosted_vllm/{model}"
-        
-        # For Gemini, ensure gemini/ prefix if not already present
-        if "gemini" in model.lower() and not model.startswith("gemini/"):
-            model = f"gemini/{model}"
+        # 使用统一的函数确保模型前缀正确
+        model = _ensure_model_prefix(
+            model, 
+            is_openrouter=self.is_openrouter, 
+            is_vllm=self.is_vllm
+        )
         
         kwargs: dict[str, Any] = {
             "model": model,

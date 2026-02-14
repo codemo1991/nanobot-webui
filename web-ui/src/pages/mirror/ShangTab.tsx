@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Button, Spin, Empty, Input, Modal, Select, Popconfirm, message as antMessage } from 'antd'
+import { Button, Spin, Empty, Input, Modal, Popconfirm, message as antMessage } from 'antd'
 import { EyeOutlined, CheckOutlined, ZoomInOutlined, DeleteOutlined, PlusOutlined } from '@ant-design/icons'
 import { api } from '../../api'
 import type { ShangRecord } from '../../types'
@@ -21,7 +21,6 @@ function ShangTab() {
   const [selectedChoice, setSelectedChoice] = useState<'A' | 'B' | null>(null)
   const [zoomingImage, setZoomingImage] = useState<string | null>(null)
   const [filterTopic, setFilterTopic] = useState('')
-  const [filterDateRange, setFilterDateRange] = useState<'all' | 'week' | 'month'>('all')
   const autoStartedRef = useRef(false)
   const hasLoadedOnceRef = useRef(false)
 
@@ -153,22 +152,9 @@ function ShangTab() {
         const kw = filterTopic.trim().toLowerCase()
         if (!r.topic?.toLowerCase().includes(kw)) return false
       }
-      if (filterDateRange !== 'all' && r.date) {
-        const d = new Date(r.date.replace(/\//g, '-'))
-        const now = new Date()
-        if (filterDateRange === 'week') {
-          const weekAgo = new Date(now)
-          weekAgo.setDate(weekAgo.getDate() - 7)
-          if (d < weekAgo) return false
-        } else if (filterDateRange === 'month') {
-          const monthAgo = new Date(now)
-          monthAgo.setMonth(monthAgo.getMonth() - 1)
-          if (d < monthAgo) return false
-        }
-      }
       return true
     })
-  }, [records, filterTopic, filterDateRange])
+  }, [records, filterTopic])
 
   if (loading) {
     return (
@@ -201,18 +187,6 @@ function ShangTab() {
             onChange={(e) => setFilterTopic(e.target.value)}
             size="small"
             allowClear
-            style={{ marginBottom: 6 }}
-          />
-          <Select
-            value={filterDateRange}
-            onChange={setFilterDateRange}
-            size="small"
-            style={{ width: '100%' }}
-            options={[
-              { value: 'all', label: t('mirror.shangFilterDateAll') },
-              { value: 'week', label: t('mirror.shangFilterDateWeek') },
-              { value: 'month', label: t('mirror.shangFilterDateMonth') },
-            ]}
           />
         </div>
         <div className="mirror-sidebar-list">

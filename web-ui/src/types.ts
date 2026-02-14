@@ -250,6 +250,51 @@ export interface Conflict {
   type: string
 }
 
+export interface MbtiDimension {
+  倾向: string
+  得分: string
+  置信度: number
+  关键证据: string[]
+}
+
+export interface CognitiveFunction {
+  功能: string
+  强度: number
+  表现: string
+}
+
+export interface ContextMask {
+  情境: string
+  显现类型: string
+  面具厚度: number
+}
+
+export interface GrowthSuggestion {
+  挑战: string
+  练习: string
+  预期: string
+}
+
+export interface MbtiAnalysis {
+  当前类型: string
+  历史类型分布: string
+  类型漂移: string
+  维度: {
+    EI: MbtiDimension
+    SN: MbtiDimension
+    TF: MbtiDimension
+    JP: MbtiDimension
+  }
+  认知功能栈: {
+    主导: CognitiveFunction
+    辅助: CognitiveFunction
+    第三: CognitiveFunction
+    劣势: CognitiveFunction
+  }
+  情境面具: ContextMask[]
+  成长建议: GrowthSuggestion[]
+}
+
 export interface MirrorProfile {
   version: string
   updateTime: string
@@ -258,6 +303,7 @@ export interface MirrorProfile {
   drivers: Driver[]
   conflicts: Conflict[]
   suggestions: string[]
+  mbti?: MbtiAnalysis
 }
 
 export interface ConfigData {
