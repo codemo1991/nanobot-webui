@@ -80,6 +80,7 @@ class NanobotWebAPI:
             brave_api_key=config.tools.web.search.api_key or None,
             exec_config=config.tools.exec,
             filesystem_config=config.tools.filesystem,
+            claude_code_config=config.tools.claude_code,
         )
         self.sessions = self.agent.sessions
         
@@ -133,6 +134,7 @@ class NanobotWebAPI:
             brave_api_key=config.tools.web.search.api_key or None,
             exec_config=config.tools.exec,
             filesystem_config=config.tools.filesystem,
+            claude_code_config=config.tools.claude_code,
         )
         self.sessions = self.agent.sessions
         data_dir = Path.home() / ".nanobot"
@@ -715,7 +717,7 @@ class NanobotWebAPI:
 {fusion["shang_records_summary"][:2000]}
 核心洞察：{fusion["shang_insights"]}
 
----
+----
 
 # 请生成综合画像
 
@@ -726,10 +728,37 @@ class NanobotWebAPI:
   "jungArchetype": {{"primary": "隐士", "secondary": "智者"}},
   "drivers": [{{"need": "掌控感", "evidence": "来自数据的证据", "suggestion": "行动建议"}}],
   "conflicts": [{{"explicit": "显性表现", "implicit": "隐性表现", "type": "认知失调"}}],
-  "suggestions": ["建议1", "建议2"]
+  "suggestions": ["建议1", "建议2"],
+  "mbti": {{
+    "当前类型": "INFP",
+    "历史类型分布": "INFP(65%), INTP(20%), ENFP(10%), 其他(5%)",
+    "类型漂移": "过去3个月内在INFP-INTP边界波动",
+    "维度": {{
+      "EI": {{"倾向": "I", "得分": "72/28", "置信度": 75, "关键证据": ["对话中75%的话题关于内部思考", "选择独处活动的次数是社交的3倍"]}},
+      "SN": {{"倾向": "N", "得分": "65/35", "置信度": 65, "关键证据": ["频繁使用比喻和抽象概念", "对未来可能性的讨论多于具体细节"]}},
+      "TF": {{"倾向": "F", "得分": "58/42", "置信度": 58, "关键证据": ["决策时优先考虑人际关系", "使用感觉一词的频率是逻辑的2倍"]}},
+      "JP": {{"倾向": "P", "得分": "55/45", "置信度": 55, "关键证据": ["对计划的执行有灵活调整", "对话中表现出对新选项的开放性"]}}
+    }},
+    "认知功能栈": {{
+      "主导": {{"功能": "内倾情感 (Fi)", "强度": 85, "表现": "对话中频繁回归个人价值观和信念"}},
+      "辅助": {{"功能": "外倾直觉 (Ne)", "强度": 72, "表现": "擅长发现事物之间的潜在联系"}},
+      "第三": {{"功能": "内倾感觉 (Si)", "强度": 45, "表现": "偶尔依赖过去的经验做判断"}},
+      "劣势": {{"功能": "外倾思维 (Te)", "强度": 25, "表现": "不擅长组织外部系统"}}
+    }},
+    "情境面具": [
+      {{"情境": "工作场合", "显现类型": "ISTJ", "面具厚度": 70}},
+      {{"情境": "亲密关系", "显现类型": "INFP", "面具厚度": 30}},
+      {{"情境": "社交聚会", "显现类型": "ENFP", "面具厚度": 60}},
+      {{"情境": "压力状态", "显现类型": "ISFP", "面具厚度": 75}}
+    ],
+    "成长建议": [
+      {{"挑战": "每周制定并执行一个具体的计划", "练习": "将一个大目标分解为可执行的步骤", "预期": "6个月后Te强度从25提升至40"}},
+      {{"挑战": "在决策中加入客观数据分析", "练习": "每次重大决定前写下3个客观理由", "预期": "减少情感决策导致的后悔率"}}
+    ]
+  }}
 }}
 ```
-大五分数为 0-100 整数。drivers、conflicts、suggestions 可为空数组。"""
+大五分数为 0-100 整数。drivers、conflicts、suggestions 可为空数组。如果没有足够数据进行 MBTI 分析，mbti 字段可以省略或为 null。"""
         try:
             resp = await self.agent.provider.chat(
                 messages=[
@@ -1929,6 +1958,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     _err("CHAT_FAILED", "处理消息失败", str(exc)),
                 )
+            return
+
+        # POST /api/v1/chat/stop - Stop the current running agent
+        if path == "/api/v1/chat/stop":
+            try:
+                app.agent.cancel_current_request()
+                self._write_json(HTTPStatus.OK, _ok({"stopped": True}))
+            except Exception as e:
+                logger.exception("Stop request failed")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("STOP_FAILED", str(e)))
             return
 
         # POST /api/v1/chat/sessions/{sessionId}/token-summary/reset

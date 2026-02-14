@@ -77,6 +77,11 @@ export const api = {
       signal,
     }),
 
+  stopAgent: () =>
+    request<{ stopped: boolean }>('/chat/stop', {
+      method: 'POST',
+    }),
+
   /** Stream chat with SSE; calls onEvent for each progress event. Rejects on error. */
   async sendMessageStream(
     sessionId: string,

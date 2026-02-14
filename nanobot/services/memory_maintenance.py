@@ -16,11 +16,11 @@ from loguru import logger
 from nanobot.agent.memory import (
     MEMORY_READ_MAX_CHARS,
     MEMORY_READ_MAX_ENTRIES,
-    MemoryStore,
     entries_to_text_preserve_dates,
     parse_memory_entries_with_dates,
     truncate_entries_to_limit,
 )
+from nanobot.storage.memory_repository import get_memory_repository
 
 
 async def _call_llm_summarize(provider: Any, model: str, text: str, prompt: str) -> str:
@@ -57,15 +57,19 @@ class MemoryMaintenanceService:
         model: str | None = None,
         tick_interval_min: int = 5,
         summarize_interval_min: int = 60,
+        scope: str = "global",
+        agent_id: str | None = None,
     ):
         self.workspace = Path(workspace).resolve()
-        self.memory = MemoryStore(self.workspace)
+        self._repo = get_memory_repository()
         self.provider = provider
         self.model = model or (
             provider.get_default_model() if hasattr(provider, "get_default_model") else "anthropic/claude-sonnet-4-5"
         )
         self.tick_interval_min = tick_interval_min
         self.summarize_interval_min = summarize_interval_min
+        self.scope = scope
+        self.agent_id = agent_id
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_daily_run_date: datetime.date | None = None
@@ -80,7 +84,8 @@ class MemoryMaintenanceService:
         except Exception as e:
             logger.warning("Memory maintenance initial tick failed: {}", e)
         logger.info(
-            "Memory maintenance started (tick {} min, summarize {} min)",
+            "Memory maintenance started (scope={}, tick {} min, summarize {} min)",
+            self.scope,
             self.tick_interval_min,
             self.summarize_interval_min,
         )
@@ -122,52 +127,121 @@ class MemoryMaintenanceService:
 
     async def _run_summarize_if_needed(self) -> None:
         """若 MEMORY 超过阈值，执行 LLM 总结。"""
-        raw = self.memory.read_long_term()
-        if not raw or not raw.strip():
+        # Get stats from SQLite
+        entry_count = self._repo.get_memory_entries_count(
+            agent_id=self.agent_id, scope=self.scope
+        )
+        char_count = self._repo.get_memories_char_count(
+            agent_id=self.agent_id, scope=self.scope
+        )
+
+        if entry_count <= MEMORY_READ_MAX_ENTRIES and char_count <= MEMORY_READ_MAX_CHARS:
             return
-        entries = parse_memory_entries_with_dates(raw)
-        n = len(entries)
-        total_chars = sum(len(d) + len(c) + 20 for d, c in entries)
-        if n <= MEMORY_READ_MAX_ENTRIES and total_chars <= MEMORY_READ_MAX_CHARS:
-            return
-        logger.info("Memory over limit ({} entries, {} chars), summarizing...", n, total_chars)
+
+        logger.info(
+            "Memory over limit (scope={}, {} entries, {} chars), summarizing...",
+            self.scope, entry_count, char_count
+        )
+
         try:
-            summarized = await _call_llm_summarize(self.provider, self.model, raw, MEMORY_SUMMARIZE_PROMPT)
+            # Get memories for summarization
+            entries = self._repo.get_memories_for_summarize(
+                agent_id=self.agent_id, scope=self.scope
+            )
+            raw = entries_to_text_preserve_dates(entries)
+
+            if not raw.strip():
+                return
+
+            summarized = await _call_llm_summarize(
+                self.provider, self.model, raw, MEMORY_SUMMARIZE_PROMPT
+            )
             if not summarized:
                 return
+
             new_entries = parse_memory_entries_with_dates(summarized)
             if not new_entries and "# Long-term Memory" in summarized:
-                new_entries = parse_memory_entries_with_dates(summarized.replace("# Long-term Memory", "").strip())
+                new_entries = parse_memory_entries_with_dates(
+                    summarized.replace("# Long-term Memory", "").strip()
+                )
+
             new_entries = truncate_entries_to_limit(new_entries)
-            self.memory.write_long_term(entries_to_text_preserve_dates(new_entries))
-            logger.info("Memory summarized: {} -> {} entries", n, len(new_entries))
+
+            # Replace memories in SQLite
+            self._repo.replace_memories(
+                entries=new_entries,
+                agent_id=self.agent_id,
+                scope=self.scope,
+            )
+
+            logger.info(
+                "Memory summarized (scope={}): {} -> {} entries",
+                self.scope, entry_count, len(new_entries)
+            )
         except Exception as e:
             logger.exception("Memory summarization failed: {}", e)
 
     async def _run_daily_merge(self) -> None:
         """处理昨日 date.md，提取重要信息追加到 MEMORY。"""
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        daily_file = self.memory.memory_dir / f"{yesterday}.md"
-        if not daily_file.exists():
+
+        # Get yesterday's note from SQLite
+        content = self._repo.get_daily_note(
+            note_date=yesterday,
+            agent_id=self.agent_id,
+            scope=self.scope,
+        )
+
+        if not content or not content.strip():
             return
-        content = daily_file.read_text(encoding="utf-8")
-        if not content.strip():
-            return
-        logger.info("Daily merge: extracting from {}", daily_file.name)
+
+        logger.info("Daily merge: extracting from {} (scope={})", yesterday, self.scope)
+
         try:
-            extracted = await _call_llm_summarize(self.provider, self.model, content, DAILY_EXTRACT_PROMPT)
+            extracted = await _call_llm_summarize(
+                self.provider, self.model, content, DAILY_EXTRACT_PROMPT
+            )
             if not extracted or not extracted.strip():
                 return
+
             new_entries = parse_memory_entries_with_dates(extracted)
             if not new_entries:
+                # Fallback parsing
                 for line in extracted.split("\n"):
                     line = line.strip()
                     if line.startswith("- [") and "]" in line:
                         end = line.index("]", 3)
                         date_part = line[3:end].strip()
                         new_entries.append((date_part, line[end + 1 :].strip()))
+
             if new_entries:
-                self.memory.append_entries_with_limit(new_entries)
-            logger.info("Daily merge: added {} entries from {}", len(new_entries), daily_file.name)
+                # Get existing entries
+                existing_entries = self._repo.get_memories_for_summarize(
+                    agent_id=self.agent_id, scope=self.scope
+                )
+
+                # Merge and truncate
+                all_entries = list(existing_entries)
+                all_entries.extend(new_entries)
+                all_entries = truncate_entries_to_limit(all_entries)
+
+                # Replace memories
+                self._repo.replace_memories(
+                    entries=all_entries,
+                    agent_id=self.agent_id,
+                    scope=self.scope,
+                )
+
+            # Mark daily note as processed
+            self._repo.mark_daily_note_processed(
+                note_date=yesterday,
+                agent_id=self.agent_id,
+                scope=self.scope,
+            )
+
+            logger.info(
+                "Daily merge: added {} entries from {} (scope={})",
+                len(new_entries), yesterday, self.scope
+            )
         except Exception as e:
             logger.exception("Daily merge failed: {}", e)

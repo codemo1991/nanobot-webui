@@ -71,11 +71,14 @@ class AgentDefaults(BaseModel):
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
     temperature: float = 0.7
-    max_tool_iterations: int = 40  # 典型: 简单 0-5, 中等 5-15, 复杂 15-35. 40 覆盖多数场景
-    max_execution_time: int = 600  # 秒, 0=不限. 防止 runaway, 与 max_iterations 互补
-    max_history_messages: int = 30  # 历史消息条数上限，控制token使用
-    max_message_length: int = 8000  # 单条消息最大字符数，超出时截断
-    tool_result_max_length: int = 2000  # tool result截断长度
+    max_tool_iterations: int = 40
+    max_execution_time: int = 600
+    max_history_messages: int = 30
+    max_message_length: int = 8000
+    tool_result_max_length: int = 2000
+    smart_tool_selection: bool = True
+    system_prompt_max_tokens: int = 5000
+    memory_max_tokens: int = 2000
 
 
 class AgentsConfig(BaseModel):
@@ -135,6 +138,13 @@ class FilesystemToolConfig(BaseModel):
     restrict_to_workspace: bool = False  # If true, only allow paths inside workspace
 
 
+class ClaudeCodeConfig(BaseModel):
+    """Claude Code CLI integration configuration."""
+    enabled: bool = True
+    default_timeout: int = 600  # Default task timeout in seconds
+    max_concurrent_tasks: int = 3  # Maximum concurrent Claude Code tasks
+
+
 class McpServerConfig(BaseModel):
     """MCP (Model Context Protocol) server configuration."""
     id: str = ""
@@ -151,6 +161,7 @@ class ToolsConfig(BaseModel):
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     filesystem: FilesystemToolConfig = Field(default_factory=FilesystemToolConfig)
+    claude_code: ClaudeCodeConfig = Field(default_factory=ClaudeCodeConfig)
 
 
 class Config(BaseSettings):

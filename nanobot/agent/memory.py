@@ -3,8 +3,14 @@
 import re
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 
-from nanobot.utils.helpers import ensure_dir, today_date
+from nanobot.utils.helpers import ensure_dir, today_date, estimate_tokens, truncate_to_token_limit
+from nanobot.storage.memory_repository import (
+    get_memory_repository,
+    parse_memory_entries_with_dates as _parse_entries,
+    entries_to_text_preserve_dates as _entries_to_text,
+)
 
 # 写入限制：文件最多条目数与字符数
 MEMORY_MAX_ENTRIES = 100
@@ -39,30 +45,12 @@ def truncate_entries_to_limit(
 
 def entries_to_text_preserve_dates(entries_with_dates: list[tuple[str, str]]) -> str:
     """将 (date, content) 列表格式化为 MEMORY.md 内容，保留原日期"""
-    if not entries_with_dates:
-        return "# Long-term Memory\n\n"
-    lines = ["# Long-term Memory"]
-    for date_part, content in entries_with_dates:
-        lines.append(f"\n- [{date_part}] {content}")
-    return "\n".join(lines) + "\n"
+    return _entries_to_text(entries_with_dates)
 
 
 def parse_memory_entries_with_dates(text: str) -> list[tuple[str, str]]:
     """解析为 (date_str, content) 元组列表"""
-    if not text or not text.strip():
-        return []
-    result = []
-    for m in re.finditer(r"^\s*-\s*\[([\d\-:\s]+)\]\s*(.+?)(?=\n\s*-\s*\[|\n#|\Z)", text, re.DOTALL | re.MULTILINE):
-        result.append((m.group(1).strip(), m.group(2).strip()))
-    if not result:
-        for line in text.split("\n"):
-            line = line.strip()
-            if line.startswith("- [") and "]" in line:
-                end = line.index("]", 3)
-                date_part = line[3:end].strip()
-                content = line[end + 1 :].strip()
-                result.append((date_part, content))
-    return result
+    return _parse_entries(text)
 
 
 class MemoryStore:
@@ -71,6 +59,9 @@ class MemoryStore:
 
     Supports daily notes (memory/YYYY-MM-DD.md) and long-term memory (MEMORY.md).
     Supports agent-specific memory isolation via agent_id parameter.
+    
+    Note: This class now uses SQLite as the underlying storage while maintaining
+    backward compatibility with the original file-based API.
     """
 
     DEFAULT_MEMORY_DIR = "memory"
@@ -79,7 +70,9 @@ class MemoryStore:
     def __init__(self, workspace: Path, agent_id: str | None = None):
         self.workspace = workspace
         self.agent_id = agent_id
+        self._repo = get_memory_repository()
 
+        # Keep directory paths for backward compatibility (some code may check these)
         if agent_id:
             self.memory_dir = ensure_dir(workspace / self.AGENT_MEMORY_DIR / agent_id / self.DEFAULT_MEMORY_DIR)
             self.memory_file = self.memory_dir / "MEMORY.md"
@@ -102,39 +95,48 @@ class MemoryStore:
         return self.agent_id is not None
 
     def get_today_file(self) -> Path:
-        """Get path to today's memory file."""
+        """Get path to today's memory file (for backward compatibility)."""
         return self.memory_dir / f"{today_date()}.md"
-    
+
     def read_today(self) -> str:
         """Read today's memory notes."""
-        today_file = self.get_today_file()
-        if today_file.exists():
-            return today_file.read_text(encoding="utf-8")
+        note = self._repo.get_daily_note(
+            note_date=today_date(),
+            agent_id=self.agent_id,
+            scope="global"
+        )
+        if note:
+            return f"# {today_date()}\n\n{note}"
         return ""
-    
+
     def append_today(self, content: str) -> None:
         """Append content to today's memory notes."""
-        today_file = self.get_today_file()
-        
-        if today_file.exists():
-            existing = today_file.read_text(encoding="utf-8")
-            content = existing + "\n" + content
-        else:
-            # Add header for new day
-            header = f"# {today_date()}\n\n"
-            content = header + content
-        
-        today_file.write_text(content, encoding="utf-8")
-    
+        # Strip header if present
+        if content.startswith(f"# {today_date()}"):
+            content = content.split("\n", 2)[-1]
+        self._repo.append_daily_note(
+            content=content,
+            note_date=today_date(),
+            agent_id=self.agent_id,
+            scope="global"
+        )
+
     def read_long_term(self) -> str:
-        """Read long-term memory (MEMORY.md)."""
-        if self.memory_file.exists():
-            return self.memory_file.read_text(encoding="utf-8")
-        return ""
-    
+        """Read long-term memory (MEMORY.md format)."""
+        entries = self._repo.get_memories_for_summarize(
+            agent_id=self.agent_id,
+            scope="global"
+        )
+        return entries_to_text_preserve_dates(entries)
+
     def write_long_term(self, content: str) -> None:
-        """Write to long-term memory (MEMORY.md)."""
-        self.memory_file.write_text(content, encoding="utf-8")
+        """Write to long-term memory (replaces all entries)."""
+        entries = parse_memory_entries_with_dates(content)
+        self._repo.replace_memories(
+            entries=entries,
+            agent_id=self.agent_id,
+            scope="global"
+        )
 
     def append_long_term_with_limit(self, content: str) -> None:
         """
@@ -148,67 +150,117 @@ class MemoryStore:
         """批量追加 (date_str, content) 条目，超出限制时丢弃最旧。一次读写，用于每日合并。"""
         if not new_entries:
             return
-        existing = self.read_long_term()
-        entries = parse_memory_entries_with_dates(existing)
-        entries.extend((d, c.strip()) for d, c in new_entries if c and c.strip())
-        entries = truncate_entries_to_limit(entries)
-        self.write_long_term(entries_to_text_preserve_dates(entries))
-    
+
+        # Get existing entries
+        existing_entries = self._repo.get_memories_for_summarize(
+            agent_id=self.agent_id,
+            scope="global"
+        )
+
+        # Merge and truncate
+        all_entries = list(existing_entries)
+        all_entries.extend((d, c.strip()) for d, c in new_entries if c and c.strip())
+        all_entries = truncate_entries_to_limit(all_entries)
+
+        # Replace all entries
+        self._repo.replace_memories(
+            entries=all_entries,
+            agent_id=self.agent_id,
+            scope="global"
+        )
+
     def get_recent_memories(self, days: int = 7) -> str:
         """
         Get memories from the last N days.
-        
+
         Args:
             days: Number of days to look back.
-        
+
         Returns:
             Combined memory content.
         """
         from datetime import timedelta
-        
+
         memories = []
         today = datetime.now().date()
-        
+
         for i in range(days):
             date = today - timedelta(days=i)
             date_str = date.strftime("%Y-%m-%d")
-            file_path = self.memory_dir / f"{date_str}.md"
-            
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                memories.append(content)
-        
+            note = self._repo.get_daily_note(
+                note_date=date_str,
+                agent_id=self.agent_id,
+                scope="global"
+            )
+            if note:
+                memories.append(f"# {date_str}\n\n{note}")
+
         return "\n\n---\n\n".join(memories)
-    
+
     def list_memory_files(self) -> list[Path]:
-        """List all memory files sorted by date (newest first)."""
-        if not self.memory_dir.exists():
-            return []
-        
-        files = list(self.memory_dir.glob("????-??-??.md"))
-        return sorted(files, reverse=True)
-    
-    def get_memory_context(self) -> str:
+        """List all memory files sorted by date (newest first) - for backward compatibility."""
+        # This method is kept for backward compatibility but returns empty list
+        # since we no longer use files
+        return []
+
+    def get_memory_context(self, max_tokens: int | None = None) -> str:
         """
         Get memory context for the agent.
+        
+        Args:
+            max_tokens: Optional maximum tokens for the context. If specified, will truncate to fit.
+        
+        Returns:
+            Memory context string.
         - 若 MEMORY 条数≤80 且≤25KB：全量读取
         - 否则：取前30条（最旧）+ 后50条（最新），兼顾首尾
         """
         parts = []
-        long_term_raw = self.read_long_term()
-        if long_term_raw:
-            entries = parse_memory_entries_with_dates(long_term_raw)
+
+        entries = self._repo.get_memories_for_summarize(
+            agent_id=self.agent_id,
+            scope="global"
+        )
+
+        if entries:
             n = len(entries)
             total_chars = sum(len(d) + len(c) + 20 for d, c in entries)
+
             if n <= MEMORY_READ_MAX_ENTRIES and total_chars <= MEMORY_READ_MAX_CHARS:
-                long_term = long_term_raw
+                long_term = entries_to_text_preserve_dates(entries)
             else:
                 head = entries[:MEMORY_READ_KEEP_HEAD]
                 tail_start = max(MEMORY_READ_KEEP_HEAD, n - MEMORY_READ_KEEP_TAIL)
                 merged = head + entries[tail_start:]
                 long_term = entries_to_text_preserve_dates(merged)
+
             parts.append("## Long-term Memory\n" + long_term)
-        today = self.read_today()
-        if today:
-            parts.append("## Today's Notes\n" + today)
-        return "\n\n".join(parts) if parts else ""
+
+        today_note = self._repo.get_daily_note(
+            note_date=today_date(),
+            agent_id=self.agent_id,
+            scope="global"
+        )
+        if today_note:
+            parts.append("## Today's Notes\n# " + today_date() + "\n\n" + today_note)
+
+        result = "\n\n".join(parts) if parts else ""
+        
+        if max_tokens and estimate_tokens(result) > max_tokens:
+            result = truncate_to_token_limit(result, max_tokens)
+        
+        return result
+
+    # ========== New methods for direct repository access ==========
+
+    def get_repository(self) -> Any:
+        """Get the underlying memory repository for advanced operations."""
+        return self._repo
+
+    def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Search memories using full-text search."""
+        return self._repo.search_memories(
+            query=query,
+            scope="global",
+            limit=limit
+        )
