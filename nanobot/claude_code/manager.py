@@ -79,6 +79,7 @@ class ClaudeCodeManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         timeout: int | None = None,
+        progress_callback: Any = None,
     ) -> str:
         """
         Start a Claude Code task and return task ID.
@@ -93,6 +94,7 @@ class ClaudeCodeManager:
             origin_channel: Origin channel for result notification.
             origin_chat_id: Origin chat ID for result notification.
             timeout: Task timeout in seconds.
+            progress_callback: Optional callback for progress updates (receives dict with type, task_id, line).
         
         Returns:
             Task ID for tracking.
@@ -157,6 +159,7 @@ class ClaudeCodeManager:
                 teammate_mode=teammate_mode,
                 timeout=timeout or self.default_timeout,
                 task_meta_path=task_meta_path,
+                progress_callback=progress_callback,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -175,8 +178,9 @@ class ClaudeCodeManager:
         teammate_mode: str,
         timeout: int,
         task_meta_path: Path,
+        progress_callback: Any = None,
     ) -> None:
-        """Execute Claude Code process."""
+        """Execute Claude Code process with optional progress streaming."""
         try:
             hook_script = self._get_hook_script_path()
             hook_script = hook_script.resolve()
@@ -218,9 +222,37 @@ class ClaudeCodeManager:
                     env=env,
                 )
             
+            # Stream stdout for progress updates
+            stdout_lines: list[str] = []
+            stderr_lines: list[str] = []
+            
+            async def read_stream(stream: asyncio.StreamReader | None, lines: list[str], stream_name: str) -> None:
+                if not stream:
+                    return
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    line_text = line.decode("utf-8", errors="replace").rstrip()
+                    lines.append(line_text)
+                    if stream_name == "stdout" and progress_callback:
+                        try:
+                            progress_callback({
+                                "type": "claude_code_progress",
+                                "task_id": task_id,
+                                "line": line_text,
+                                "timestamp": datetime.now().isoformat(),
+                            })
+                        except Exception as e:
+                            logger.warning(f"Progress callback error: {e}")
+            
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        read_stream(process.stdout, stdout_lines, "stdout"),
+                        read_stream(process.stderr, stderr_lines, "stderr"),
+                        process.wait(),
+                    ),
                     timeout=timeout
                 )
             except asyncio.TimeoutError:
@@ -231,7 +263,7 @@ class ClaudeCodeManager:
                 return
             
             if process.returncode != 0:
-                stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+                stderr_text = "\n".join(stderr_lines)
                 logger.error(f"Claude Code [{task_id}] failed with code {process.returncode}: {stderr_text}")
                 await self._write_error_result(task_id, process.returncode, stderr_text)
             else:
@@ -257,9 +289,7 @@ class ClaudeCodeManager:
         
         if permission_mode == "bypassPermissions":
             cmd.append("--dangerously-skip-permissions")
-        elif permission_mode == "plan":
-            cmd.extend(["--permission-mode", "plan"])
-        elif permission_mode in ("acceptEdits", "default", "delegate", "dontAsk"):
+        elif permission_mode in ("auto", "plan", "acceptEdits", "default", "delegate", "dontAsk"):
             cmd.extend(["--permission-mode", permission_mode])
         
         if agent_teams:
