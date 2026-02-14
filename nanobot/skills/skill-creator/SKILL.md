@@ -1,6 +1,9 @@
 ---
 name: skill-creator
 description: Create or update AgentSkills. Use when designing, structuring, or packaging skills with scripts, references, and assets.
+short_description: "Create new skills"
+keywords: "skill, create, new skill, agent skill, skill template"
+category: "system"
 ---
 
 # Skill Creator

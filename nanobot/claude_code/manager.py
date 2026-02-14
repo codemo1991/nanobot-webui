@@ -86,7 +86,8 @@ class ClaudeCodeManager:
         Args:
             prompt: The task prompt for Claude Code.
             workdir: Working directory (defaults to workspace). Must be within workspace.
-            permission_mode: Permission mode (default/plan/auto/bypassPermissions).
+            permission_mode: Permission mode (auto/plan/acceptEdits/default/delegate/dontAsk/bypassPermissions).
+                "auto" means no --permission-mode flag (use CLI default).
             agent_teams: Enable Agent Teams mode.
             teammate_mode: Teammate mode (auto/in-process/tmux).
             origin_channel: Origin channel for result notification.
@@ -256,10 +257,10 @@ class ClaudeCodeManager:
         
         if permission_mode == "bypassPermissions":
             cmd.append("--dangerously-skip-permissions")
-        elif permission_mode == "auto":
-            cmd.extend(["--permission-mode", "auto"])
         elif permission_mode == "plan":
             cmd.extend(["--permission-mode", "plan"])
+        elif permission_mode in ("acceptEdits", "default", "delegate", "dontAsk"):
+            cmd.extend(["--permission-mode", permission_mode])
         
         if agent_teams:
             cmd.append("--agent-teams")

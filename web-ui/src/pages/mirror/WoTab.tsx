@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Spin, Button, Alert, message as antMessage, Progress } from 'antd'
-import { UserOutlined, ThunderboltOutlined, WarningOutlined, CheckCircleOutlined, LineChartOutlined, SyncOutlined, DownloadOutlined, ExperimentOutlined } from '@ant-design/icons'
+import { Spin, Button, Alert, message as antMessage, Progress, Popover } from 'antd'
+import { UserOutlined, ThunderboltOutlined, WarningOutlined, CheckCircleOutlined, LineChartOutlined, SyncOutlined, DownloadOutlined, ExperimentOutlined, InfoCircleOutlined } from '@ant-design/icons'
 import { api } from '../../api'
 import type { MirrorProfile, MbtiAnalysis } from '../../types'
 
@@ -18,6 +18,52 @@ const MBTI_COLORS: Record<string, string> = {
   SN: '#13c2c2',
   TF: '#fa8c16',
   JP: '#eb2f96',
+}
+
+const MBTI_DESCRIPTIONS: Record<string, { name: string; desc: string }> = {
+  INTJ: { name: '建筑师', desc: '富有想象力和战略性的思想家，一切皆在计划之中。具有独特的视角和强烈的内在驱动力，善于规划长期目标并坚定执行。' },
+  INTP: { name: '逻辑学家', desc: '富有创造力的发明家，对知识有着永不满足的渴望。喜欢分析复杂系统，追求逻辑一致性，常常沉浸在抽象思考中。' },
+  ENTJ: { name: '指挥官', desc: '大胆、富有想象力的领导者，总能找到解决方法。天生的组织者，善于制定战略并激励他人实现目标。' },
+  ENTP: { name: '辩论家', desc: '聪明好奇的思想家，无法抗拒智力挑战。喜欢探索新想法，善于发现问题的不同角度，享受思想碰撞。' },
+  INFJ: { name: '提倡者', desc: '安静而神秘，但能深刻启发他人。具有强烈的直觉和同理心，追求有意义的人际关系和崇高理想。' },
+  INFP: { name: '调停者', desc: '诗意、善良的利他主义者，总是渴望帮助良善之事。内心世界丰富，追求真实自我和内在和谐。' },
+  ENFJ: { name: '主人公', desc: '富有魅力的领导者，能够吸引听众。天生善于理解他人，乐于帮助他人成长和实现潜能。' },
+  ENFP: { name: '竞选者', desc: '热情、有创造力的社交达人，总能找到微笑的理由。充满想象力和感染力，善于发现生活中的美好可能。' },
+  ISTJ: { name: '物流师', desc: '务实、注重事实的人，其可靠性不容置疑。重视传统和责任，以有条理的方式完成任务。' },
+  ISFJ: { name: '守卫者', desc: '非常敬业和温暖的守护者，随时准备保护所爱之人。忠诚可靠，善于关注他人的需求。' },
+  ESTJ: { name: '总经理', desc: '出色的管理者，在管理事务和人员方面无与伦比。重视秩序和效率，善于组织资源达成目标。' },
+  ESFJ: { name: '执政官', desc: '极具同情心、爱交际的人，总是渴望帮助他人。重视和谐的人际关系，善于营造温馨的氛围。' },
+  ISTP: { name: '鉴赏家', desc: '大胆而实际的实验家，善于使用各种工具。喜欢动手解决问题，保持冷静理性的态度。' },
+  ISFP: { name: '探险家', desc: '灵活而有魅力的艺术家，随时准备探索和体验新事物。追求自由和美感，活在当下。' },
+  ESTP: { name: '企业家', desc: '聪明、精力充沛、善于感知的人，真正享受生活边缘。喜欢冒险和行动，善于把握机会。' },
+  ESFP: { name: '表演者', desc: '自发、精力充沛的艺人，生活永远不会无聊。热爱生活，善于带动气氛，享受与人互动。' },
+}
+
+const JUNG_ARCHETYPES: Record<string, { name: string; desc: string }> = {
+  '天真者': { name: '天真者', desc: '纯真、乐观、追求幸福。相信美好，渴望简单纯粹的生活，以善良和信任面对世界。' },
+  '智者': { name: '智者', desc: '追求真理、知识与理解。以洞察力和智慧为指引，不断探索生命的深层意义。' },
+  '探险家': { name: '探险家', desc: '追求自由、发现自我。渴望突破边界，在未知中寻找真实的自己。' },
+  '统治者': { name: '统治者', desc: '追求控制、秩序与权力。具有领导才能，善于建立结构和管理资源。' },
+  '创造者': { name: '创造者', desc: '追求创新与想象力。渴望将愿景变为现实，以独特方式表达自我。' },
+  '照顾者': { name: '照顾者', desc: '保护、关怀他人。以无私的爱服务他人，在给予中找到意义。' },
+  '英雄': { name: '英雄', desc: '证明价值、勇敢行动。面对挑战不屈不挠，为正义和理想而战。' },
+  '反叛者': { name: '反叛者', desc: '打破常规、革命。挑战现状，推动变革，追求真正的自由。' },
+  '情人': { name: '情人', desc: '追求亲密与激情。珍视感官体验和情感连接，热爱生活中的美好。' },
+  '小丑': { name: '小丑', desc: '快乐、活在当下。以幽默和轻松的态度面对生活，带来欢笑。' },
+  '普通人': { name: '普通人', desc: '追求归属感、平易近人。脚踏实地，与他人建立真诚的连接。' },
+  '魔法师': { name: '魔法师', desc: '改变世界、愿景。相信转变的力量，将梦想转化为现实。' },
+  'Sage': { name: '智者', desc: '追求真理、知识与理解。以洞察力和智慧为指引，不断探索生命的深层意义。' },
+  'Innocent': { name: '天真者', desc: '纯真、乐观、追求幸福。相信美好，渴望简单纯粹的生活，以善良和信任面对世界。' },
+  'Explorer': { name: '探险家', desc: '追求自由、发现自我。渴望突破边界，在未知中寻找真实的自己。' },
+  'Ruler': { name: '统治者', desc: '追求控制、秩序与权力。具有领导才能，善于建立结构和管理资源。' },
+  'Creator': { name: '创造者', desc: '追求创新与想象力。渴望将愿景变为现实，以独特方式表达自我。' },
+  'Caregiver': { name: '照顾者', desc: '保护、关怀他人。以无私的爱服务他人，在给予中找到意义。' },
+  'Hero': { name: '英雄', desc: '证明价值、勇敢行动。面对挑战不屈不挠，为正义和理想而战。' },
+  'Outlaw': { name: '反叛者', desc: '打破常规、革命。挑战现状，推动变革，追求真正的自由。' },
+  'Lover': { name: '情人', desc: '追求亲密与激情。珍视感官体验和情感连接，热爱生活中的美好。' },
+  'Jester': { name: '小丑', desc: '快乐、活在当下。以幽默和轻松的态度面对生活，带来欢笑。' },
+  'Everyman': { name: '普通人', desc: '追求归属感、平易近人。脚踏实地，与他人建立真诚的连接。' },
+  'Magician': { name: '魔法师', desc: '改变世界、愿景。相信转变的力量，将梦想转化为现实。' },
 }
 
 function WoTab() {
@@ -165,8 +211,48 @@ function WoTab() {
       {/* 荣格原型 */}
       <div className="wo-profile-section">
         <h3><UserOutlined /> {t('mirror.jungArchetype')}</h3>
-        <p><strong>{t('mirror.primaryArchetype')}:</strong> {String(jungArchetype.primary || '-')}</p>
-        <p><strong>{t('mirror.secondaryArchetype')}:</strong> {String(jungArchetype.secondary || '-')}</p>
+        <p>
+          <strong>{t('mirror.primaryArchetype')}:</strong> {String(jungArchetype.primary || '-')}
+          {jungArchetype.primary && JUNG_ARCHETYPES[String(jungArchetype.primary)] && (
+            <Popover
+              trigger="click"
+              placement="right"
+              content={
+                <div style={{ maxWidth: 300 }}>
+                  <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 6 }}>
+                    {JUNG_ARCHETYPES[String(jungArchetype.primary)].name}
+                  </div>
+                  <div style={{ fontSize: 13, lineHeight: 1.6, color: '#666' }}>
+                    {JUNG_ARCHETYPES[String(jungArchetype.primary)].desc}
+                  </div>
+                </div>
+              }
+            >
+              <InfoCircleOutlined style={{ color: '#722ed1', cursor: 'pointer', fontSize: 14, marginLeft: 6 }} />
+            </Popover>
+          )}
+        </p>
+        <p>
+          <strong>{t('mirror.secondaryArchetype')}:</strong> {String(jungArchetype.secondary || '-')}
+          {jungArchetype.secondary && JUNG_ARCHETYPES[String(jungArchetype.secondary)] && (
+            <Popover
+              trigger="click"
+              placement="right"
+              content={
+                <div style={{ maxWidth: 300 }}>
+                  <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 6 }}>
+                    {JUNG_ARCHETYPES[String(jungArchetype.secondary)].name}
+                  </div>
+                  <div style={{ fontSize: 13, lineHeight: 1.6, color: '#666' }}>
+                    {JUNG_ARCHETYPES[String(jungArchetype.secondary)].desc}
+                  </div>
+                </div>
+              }
+            >
+              <InfoCircleOutlined style={{ color: '#722ed1', cursor: 'pointer', fontSize: 14, marginLeft: 6 }} />
+            </Popover>
+          )}
+        </p>
       </div>
 
       {/* 深层驱动力 */}
@@ -218,6 +304,24 @@ function WoTab() {
           <div style={{ marginBottom: 16, padding: '12px 16px', background: '#f0f5ff', borderRadius: 8, border: '1px solid #d6e4ff' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
               <span style={{ fontSize: 28, fontWeight: 'bold', color: '#1890ff' }}>{mbti.当前类型 || '-'}</span>
+              {mbti.当前类型 && MBTI_DESCRIPTIONS[mbti.当前类型] && (
+                <Popover
+                  trigger="click"
+                  placement="right"
+                  content={
+                    <div style={{ maxWidth: 320 }}>
+                      <div style={{ fontWeight: 600, fontSize: 16, marginBottom: 8 }}>
+                        {mbti.当前类型} - {MBTI_DESCRIPTIONS[mbti.当前类型].name}
+                      </div>
+                      <div style={{ fontSize: 13, lineHeight: 1.6, color: '#666' }}>
+                        {MBTI_DESCRIPTIONS[mbti.当前类型].desc}
+                      </div>
+                    </div>
+                  }
+                >
+                  <InfoCircleOutlined style={{ color: '#1890ff', cursor: 'pointer', fontSize: 16 }} />
+                </Popover>
+              )}
               <span style={{ color: '#666', fontSize: 13 }}>{mbti.历史类型分布 || ''}</span>
             </div>
             {mbti.类型漂移 && <div style={{ fontSize: 12, color: '#999' }}>{mbti.类型漂移}</div>}

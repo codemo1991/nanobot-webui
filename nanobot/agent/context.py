@@ -42,13 +42,21 @@ class ContextBuilder:
         """Update token budget settings at runtime."""
         self.token_budget.update(kwargs)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None, max_tokens: int | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        max_tokens: int | None = None,
+        user_message: str | None = None,
+        dynamic_skills: bool = True,
+    ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
         Args:
             skill_names: Optional list of skills to include.
             max_tokens: Maximum tokens for the system prompt. Uses token_budget["total"] if not specified.
+            user_message: Optional user message for dynamic skill matching.
+            dynamic_skills: If True, use dynamic skill loading based on user message.
         
         Returns:
             Complete system prompt.
@@ -107,7 +115,11 @@ class ContextBuilder:
             budget - current_tokens
         )
         if skills_budget > 50:
-            skills_summary = self.skills.build_skills_summary()
+            if dynamic_skills and user_message:
+                skills_summary = self.skills.build_dynamic_summary(user_message)
+            else:
+                skills_summary = self.skills.build_skills_summary(level=0)
+            
             if skills_summary:
                 skills_tokens = estimate_tokens(skills_summary)
                 if skills_tokens > skills_budget:
@@ -167,6 +179,7 @@ You are nanobot, a helpful AI assistant.
         channel: str | None = None,
         chat_id: str | None = None,
         mirror_attack_level: str | None = None,
+        dynamic_skills: bool = True,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -179,17 +192,20 @@ You are nanobot, a helpful AI assistant.
             channel: Current channel (telegram, feishu, etc.).
             chat_id: Current chat/user ID.
             mirror_attack_level: For mirror bian sessions, the attack level (light/medium/heavy).
+            dynamic_skills: If True, use dynamic skill loading based on user message.
 
         Returns:
             List of messages including system prompt.
         """
         messages = []
 
-        # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        system_prompt = self.build_system_prompt(
+            skill_names=skill_names,
+            user_message=current_message,
+            dynamic_skills=dynamic_skills,
+        )
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
-        # 攻击强度注入：辩模块按 attack_level 调整追问风格
         CHANNEL_MIRROR = "mirror"
         ATTACK_DESCRIPTIONS = {
             "light": "友善追问，点到为止，不施加压力",
@@ -207,10 +223,8 @@ You are nanobot, a helpful AI assistant.
             )
         messages.append({"role": "system", "content": system_prompt})
 
-        # History
         messages.extend(history)
 
-        # Current message (with optional image attachments)
         user_content = self._build_user_content(current_message, media)
         messages.append({"role": "user", "content": user_content})
 

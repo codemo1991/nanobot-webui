@@ -3,17 +3,35 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  background: #f5f7fa;
+}
+
+.system-page .page-header {
+  padding: 20px 24px;
+  background: linear-gradient(135deg, #52c41a 0%, #389e0d 100%);
+  color: #fff;
+}
+
+.system-page .page-header h1 {
+  font-size: 22px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #fff;
+}
+
+.system-page .page-description {
+  color: rgba(255, 255, 255, 0.85);
 }
 
 .system-content {
   flex: 1;
   overflow-y: auto;
-  padding: 24px 32px;
+  padding: 24px;
 }
 
 .status-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 16px;
   margin-bottom: 24px;
 }
@@ -22,62 +40,95 @@
   display: flex;
   align-items: center;
   gap: 16px;
+  padding: 20px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: all 0.3s ease;
+}
+
+.status-card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  transform: translateY(-2px);
 }
 
 .status-icon {
-  font-size: 32px;
+  font-size: 36px;
   line-height: 1;
 }
 
 .status-card h3 {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
-  color: var(--color-text-secondary);
+  color: #999;
   margin-bottom: 4px;
 }
 
 .status-value {
-  font-size: 20px;
+  font-size: 22px;
   font-weight: 600;
-  color: var(--color-text);
+  color: #333;
 }
 
 .system-content .card {
-  margin-bottom: 24px;
+  margin-bottom: 20px;
+  padding: 20px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  border: none;
 }
 
 .system-content .card h2 {
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 600;
   margin-bottom: 16px;
+  color: #333;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.system-content .card.error-card {
+  background: linear-gradient(135deg, #fff2f0 0%, #ffccc7 100%);
+  border: 1px solid #ffa39e;
+}
+
+.system-content .card.error-card p {
+  color: #cf1322;
+  margin: 0;
 }
 
 .info-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
 
 .info-item {
   display: flex;
   justify-content: space-between;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--color-border);
+  align-items: center;
+  padding: 12px 16px;
+  background: #fafafa;
+  border-radius: 8px;
+  transition: background 0.2s;
 }
 
-.info-item:last-child {
-  border-bottom: none;
+.info-item:hover {
+  background: #f0f0f0;
 }
 
 .info-label {
   font-weight: 500;
-  color: var(--color-text-secondary);
+  color: #666;
+  font-size: 14px;
 }
 
 .info-value {
-  color: var(--color-text);
+  color: #333;
   font-family: 'Monaco', 'Courier New', monospace;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .action-buttons {
@@ -86,16 +137,50 @@
   flex-wrap: wrap;
 }
 
+.action-buttons .ant-btn {
+  border-radius: 8px;
+  font-weight: 500;
+  transition: all 0.2s;
+  height: 38px;
+  padding: 0 16px;
+}
+
+.action-buttons .ant-btn-primary {
+  background: linear-gradient(135deg, #52c41a 0%, #389e0d 100%);
+  border: none;
+  box-shadow: 0 2px 4px rgba(82, 196, 26, 0.3);
+}
+
+.action-buttons .ant-btn-primary:hover {
+  background: linear-gradient(135deg, #73d13d 0%, #52c41a 100%);
+  box-shadow: 0 4px 8px rgba(82, 196, 26, 0.4);
+  transform: translateY(-1px);
+}
+
+.action-buttons .ant-btn-default:hover {
+  border-color: #52c41a;
+  color: #52c41a;
+}
+
 .workspace-actions {
   margin-top: 12px;
 }
 
+.workspace-actions .ant-btn {
+  border-radius: 8px;
+}
+
 .workspace-tip {
   margin-top: 12px;
-  padding: 8px 12px;
-  background: var(--color-bg-secondary, #f5f5f5);
-  border-radius: 6px;
-  color: var(--color-text-secondary, #666);
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #f6ffed 0%, #d9f7be 100%);
+  border-radius: 8px;
+  color: #389e0d;
+  border: 1px solid #b7eb8f;
+}
+
+.workspace-tip small {
+  font-size: 13px;
 }
 
 .workspace-code {
@@ -103,4 +188,10 @@
   background: rgba(0, 0, 0, 0.05);
   padding: 2px 6px;
   border-radius: 4px;
+}
+
+.workspace-path {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }

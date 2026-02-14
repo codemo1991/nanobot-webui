@@ -1,6 +1,9 @@
 ---
 name: code-review-expert
 description: "Expert code review of current git changes. SOLID, security, performance, error handling, boundary conditions. Senior engineer lens."
+short_description: "Git diff code review"
+keywords: "code review, git diff, solid, security, performance, refactor, lint, quality"
+category: "coding"
 metadata: {"nanobot":{"emoji":"🔍","requires":{"bins":["git"]}}}
 ---
 

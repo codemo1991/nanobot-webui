@@ -1,6 +1,9 @@
 ---
 name: tmux
 description: Remote-control tmux sessions for interactive CLIs by sending keystrokes and scraping pane output.
+short_description: "Interactive tmux control"
+keywords: "tmux, terminal, session, interactive, cli, shell"
+category: "devops"
 metadata: {"nanobot":{"emoji":"🧵","os":["darwin","linux"],"requires":{"bins":["tmux"]}}}
 ---
 

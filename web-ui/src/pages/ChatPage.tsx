@@ -503,25 +503,16 @@ function ChatPage() {
         </Content>
 
         <div className="chat-input-container">
-          <TextArea
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder={t('chat.inputPlaceholder')}
-            autoSize={{ minRows: 1, maxRows: 4 }}
-            disabled={!currentSession || loading}
-            className="chat-input"
-          />
-          <div className="chat-input-actions">
-            <div className="chat-token-summary">
-              <Text type="secondary">
-                {t('chat.tokenUsageSummary', {
-                  input: formatTokenNumber(sessionTokenUsage.promptTokens),
-                  output: formatTokenNumber(sessionTokenUsage.completionTokens),
-                  total: formatTokenNumber(sessionTokenUsage.totalTokens),
-                })}
-              </Text>
-            </div>
+          <div className="chat-input-row">
+            <TextArea
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={t('chat.inputPlaceholder')}
+              autoSize={{ minRows: 1, maxRows: 4 }}
+              disabled={!currentSession || loading}
+              className="chat-input"
+            />
             <Button
               type="primary"
               icon={loading ? <StopOutlined /> : <SendOutlined />}
@@ -532,6 +523,15 @@ function ChatPage() {
             >
               {loading ? t('chat.stop') : t('chat.send')}
             </Button>
+          </div>
+          <div className="chat-token-summary">
+            <Text type="secondary">
+              {t('chat.tokenUsageSummary', {
+                input: formatTokenNumber(sessionTokenUsage.promptTokens),
+                output: formatTokenNumber(sessionTokenUsage.completionTokens),
+                total: formatTokenNumber(sessionTokenUsage.totalTokens),
+              })}
+            </Text>
           </div>
         </div>
       </Layout>

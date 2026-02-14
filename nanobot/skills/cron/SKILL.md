@@ -1,6 +1,9 @@
 ---
 name: cron
 description: Schedule reminders and recurring tasks.
+short_description: "Schedule reminders/tasks"
+keywords: "cron, schedule, reminder, timer, recurring, task, 定时, 提醒"
+category: "utility"
 ---
 
 # Cron
