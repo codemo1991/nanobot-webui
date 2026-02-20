@@ -87,12 +87,15 @@ export const api = {
     sessionId: string,
     content: string,
     onEvent: (evt: StreamEvent) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    images?: string[]
   ): Promise<ChatResponse> {
+    const body: Record<string, unknown> = { content }
+    if (images && images.length > 0) body.images = images
     const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/messages?stream=1`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
       signal,
     })
     if (!res.ok) {

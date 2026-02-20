@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse } from 'antd'
-import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined } from '@ant-design/icons'
+import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image } from 'antd'
+import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -121,6 +121,8 @@ function ChatPage() {
   const [editTitle, setEditTitle] = useState('')
   const [streamingToolSteps, setStreamingToolSteps] = useState<ToolStep[]>([])
   const [streamingThinking, setStreamingThinking] = useState(false)
+  const [claudeCodeProgress, setClaudeCodeProgress] = useState('')
+  const [pendingImages, setPendingImages] = useState<string[]>([])
   const [sessionTokenUsage, setSessionTokenUsage] = useState<TokenUsage>({
     promptTokens: 0,
     completionTokens: 0,
@@ -128,6 +130,7 @@ function ChatPage() {
   })
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
+  const imageInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     loadSessions()
@@ -249,10 +252,13 @@ function ChatPage() {
     }
 
     const userMessage = input.trim()
+    const imagesToSend = [...pendingImages]
     setInput('')
+    setPendingImages([])
     setLoading(true)
     setStreamingToolSteps([])
     setStreamingThinking(false)
+    setClaudeCodeProgress('')
 
     const controller = new AbortController()
     abortControllerRef.current = controller
@@ -263,15 +269,19 @@ function ChatPage() {
       role: 'user',
       content: userMessage,
       createdAt: new Date().toISOString(),
-      sequence: messages.length + 1
+      sequence: messages.length + 1,
+      images: imagesToSend.length > 0 ? imagesToSend : undefined,
     }
     setMessages(prev => [...prev, tempUserMsg])
 
-    const handleStreamEvent = (evt: { type: string; name?: string; arguments?: Record<string, unknown>; result?: string }) => {
+    const handleStreamEvent = (evt: { type: string; name?: string; arguments?: Record<string, unknown>; result?: string; subtype?: string; content?: string; tool_name?: string }) => {
       if (evt.type === 'thinking') {
         setStreamingThinking(true)
       } else if (evt.type === 'tool_start' && evt.name) {
         setStreamingThinking(false)
+        if (evt.name === 'claude_code') {
+          setClaudeCodeProgress('')
+        }
         setStreamingToolSteps(prev => [...prev, { name: evt.name!, arguments: evt.arguments ?? {}, result: '' }])
       } else if (evt.type === 'tool_end' && evt.name) {
         setStreamingToolSteps(prev => {
@@ -284,6 +294,27 @@ function ChatPage() {
           }
           return next
         })
+        if (evt.name === 'claude_code') {
+          setClaudeCodeProgress('')
+        }
+      } else if (evt.type === 'claude_code_progress') {
+        const subtype = evt.subtype || 'text'
+        const content = evt.content || ''
+        let line = ''
+        if (subtype === 'tool_use') {
+          line = `[${evt.tool_name || 'Tool'}] ${content}`
+        } else if (subtype === 'tool_result') {
+          line = `  -> ${content}`
+        } else if (subtype === 'assistant_text') {
+          line = content.length > 120 ? content.slice(0, 120) + '...' : content
+        } else {
+          line = content
+        }
+        setClaudeCodeProgress(prev => {
+          const newText = prev ? prev + '\n' + line : line
+          const lines = newText.split('\n')
+          return lines.length > 30 ? lines.slice(-30).join('\n') : newText
+        })
       }
     }
 
@@ -292,7 +323,8 @@ function ChatPage() {
         currentSession.id,
         userMessage,
         handleStreamEvent,
-        controller.signal
+        controller.signal,
+        imagesToSend.length > 0 ? imagesToSend : undefined,
       )
       await loadMessages(currentSession.id)
       await loadSessionTokenUsage(currentSession.id)
@@ -305,12 +337,30 @@ function ChatPage() {
     } finally {
       setStreamingToolSteps([])
       setStreamingThinking(false)
+      setClaudeCodeProgress('')
       if (abortControllerRef.current === controller) {
         setLoading(false)
         abortControllerRef.current = null
       }
     }
   }, [input, loading, messages, currentSession, t])
+
+  const handleImageSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    if (!files.length) return
+    const remaining = 4 - pendingImages.length
+    const toProcess = files.slice(0, remaining)
+    toProcess.forEach(file => {
+      if (!file.type.startsWith('image/')) return
+      const reader = new FileReader()
+      reader.onload = (ev) => {
+        const dataUrl = ev.target?.result as string
+        if (dataUrl) setPendingImages(prev => [...prev, dataUrl])
+      }
+      reader.readAsDataURL(file)
+    })
+    e.target.value = ''
+  }, [pendingImages.length])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -456,7 +506,18 @@ function ChatPage() {
                             </ReactMarkdown>
                           </>
                         ) : (
-                          <Text>{message.content}</Text>
+                          <>
+                            {message.images && message.images.length > 0 && (
+                              <div className="message-images">
+                                <Image.PreviewGroup>
+                                  {message.images.map((src, i) => (
+                                    <Image key={i} src={src} className="message-image-thumb" />
+                                  ))}
+                                </Image.PreviewGroup>
+                              </div>
+                            )}
+                            <Text>{message.content}</Text>
+                          </>
                         )}
                       </div>
                       {message.tokenUsage && (
@@ -492,6 +553,11 @@ function ChatPage() {
                         {streamingToolSteps.length > 0 && (
                           <ToolStepsPanel steps={streamingToolSteps} showRunningOnLast />
                         )}
+                        {claudeCodeProgress && (
+                          <div className="claude-code-progress">
+                            <pre>{claudeCodeProgress}</pre>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -503,7 +569,39 @@ function ChatPage() {
         </Content>
 
         <div className="chat-input-container">
+          {pendingImages.length > 0 && (
+            <div className="pending-images-row">
+              {pendingImages.map((src, i) => (
+                <div key={i} className="pending-image-wrapper">
+                  <img src={src} className="pending-image-thumb" alt="" />
+                  <button
+                    className="pending-image-remove"
+                    onClick={() => setPendingImages(prev => prev.filter((_, idx) => idx !== i))}
+                  >
+                    <CloseCircleOutlined />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="chat-input-row">
+            <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              style={{ display: 'none' }}
+              onChange={handleImageSelect}
+            />
+            <Tooltip title="上传图片 (最多4张)">
+              <Button
+                type="text"
+                icon={<PictureOutlined />}
+                onClick={() => imageInputRef.current?.click()}
+                disabled={!currentSession || loading || pendingImages.length >= 4}
+                className="image-upload-button"
+              />
+            </Tooltip>
             <TextArea
               value={input}
               onChange={e => setInput(e.target.value)}
@@ -518,7 +616,7 @@ function ChatPage() {
               icon={loading ? <StopOutlined /> : <SendOutlined />}
               onClick={loading ? handleStop : handleSend}
               danger={loading}
-              disabled={(!currentSession || !input.trim()) && !loading}
+              disabled={(!currentSession || (!input.trim() && pendingImages.length === 0)) && !loading}
               className="send-button"
             >
               {loading ? t('chat.stop') : t('chat.send')}

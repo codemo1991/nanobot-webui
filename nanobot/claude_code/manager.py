@@ -69,6 +69,227 @@ class ClaudeCodeManager:
             self._watcher = None
         self._started = False
     
+    async def run_task(
+        self,
+        prompt: str,
+        workdir: str | None = None,
+        permission_mode: str = "auto",
+        agent_teams: bool = False,
+        teammate_mode: str = "auto",
+        timeout: int | None = None,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """
+        Run Claude Code task synchronously (await completion) with real-time progress streaming.
+
+        Uses --output-format stream-json for structured progress updates.
+        Returns dict with task_id, output, status.
+        """
+        task_id = str(uuid.uuid4())[:8]
+
+        workspace_resolved = self.workspace.resolve()
+        if workdir:
+            workdir_path = Path(workdir)
+            if workdir_path.is_absolute():
+                cwd = workdir_path.resolve()
+            else:
+                cwd = (workspace_resolved / workdir).resolve()
+                try:
+                    cwd.relative_to(workspace_resolved)
+                except ValueError:
+                    raise ValueError(
+                        f"Relative path '{workdir}' resolves outside the workspace '{self.workspace}'. "
+                        f"Use an absolute path if you need to access directories outside the workspace."
+                    )
+        else:
+            cwd = workspace_resolved
+
+        cmd = self._build_sync_command(
+            prompt=prompt,
+            permission_mode=permission_mode,
+        )
+
+        logger.debug(f"Claude Code [{task_id}] sync command: {' '.join(cmd)}")
+        logger.info(f"Claude Code task [{task_id}] started (sync): {prompt[:200]}")
+
+        env = os.environ.copy()
+
+        if platform.system() == "Windows":
+            process = await asyncio.create_subprocess_shell(
+                " ".join(self._quote_args(cmd)),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(cwd),
+                env=env,
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(cwd),
+                env=env,
+            )
+
+        final_result = ""
+        output_lines: list[str] = []
+        stderr_lines: list[str] = []
+
+        async def _read_stdout(stream: asyncio.StreamReader | None) -> None:
+            nonlocal final_result
+            if not stream:
+                return
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if not text:
+                    continue
+                output_lines.append(text)
+
+                try:
+                    data = json.loads(text)
+                    evt_type = data.get("type", "")
+
+                    if evt_type == "assistant":
+                        msg = data.get("message", {})
+                        for block in msg.get("content", []):
+                            if block.get("type") == "text":
+                                final_result = block.get("text", "")
+                                if progress_callback:
+                                    try:
+                                        progress_callback({
+                                            "type": "claude_code_progress",
+                                            "task_id": task_id,
+                                            "subtype": "assistant_text",
+                                            "content": final_result[:500],
+                                            "timestamp": datetime.now().isoformat(),
+                                        })
+                                    except Exception:
+                                        pass
+                            elif block.get("type") == "tool_use":
+                                if progress_callback:
+                                    tool_name = block.get("name", "")
+                                    tool_input = block.get("input", {})
+                                    desc = ""
+                                    if tool_name == "Bash":
+                                        desc = tool_input.get("command", "")[:200]
+                                    elif tool_name in ("Write", "Edit", "Read"):
+                                        desc = tool_input.get("file_path", "")
+                                    else:
+                                        desc = str(tool_input)[:200]
+                                    try:
+                                        progress_callback({
+                                            "type": "claude_code_progress",
+                                            "task_id": task_id,
+                                            "subtype": "tool_use",
+                                            "tool_name": tool_name,
+                                            "content": desc,
+                                            "timestamp": datetime.now().isoformat(),
+                                        })
+                                    except Exception:
+                                        pass
+
+                    elif evt_type == "tool":
+                        if progress_callback:
+                            try:
+                                progress_callback({
+                                    "type": "claude_code_progress",
+                                    "task_id": task_id,
+                                    "subtype": "tool_result",
+                                    "tool_name": data.get("name", ""),
+                                    "content": str(data.get("content", ""))[:300],
+                                    "timestamp": datetime.now().isoformat(),
+                                })
+                            except Exception:
+                                pass
+
+                    elif evt_type == "result":
+                        result_text = data.get("result", "")
+                        if result_text:
+                            final_result = result_text
+
+                except json.JSONDecodeError:
+                    if progress_callback:
+                        try:
+                            progress_callback({
+                                "type": "claude_code_progress",
+                                "task_id": task_id,
+                                "subtype": "text",
+                                "content": text[:500],
+                                "timestamp": datetime.now().isoformat(),
+                            })
+                        except Exception:
+                            pass
+
+        async def _read_stderr(stream: asyncio.StreamReader | None) -> None:
+            if not stream:
+                return
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                stderr_lines.append(line.decode("utf-8", errors="replace").rstrip())
+
+        effective_timeout = timeout or self.default_timeout
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _read_stdout(process.stdout),
+                    _read_stderr(process.stderr),
+                    process.wait(),
+                ),
+                timeout=effective_timeout,
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            logger.warning(f"Claude Code [{task_id}] timed out after {effective_timeout}s")
+            return {
+                "task_id": task_id,
+                "output": f"Task timed out after {effective_timeout} seconds",
+                "status": "timeout",
+            }
+
+        if process.returncode != 0:
+            stderr_text = "\n".join(stderr_lines)
+            logger.error(f"Claude Code [{task_id}] failed (code {process.returncode}): {stderr_text}")
+            return {
+                "task_id": task_id,
+                "output": f"Error (code {process.returncode}): {stderr_text}",
+                "status": "error",
+            }
+
+        logger.info(f"Claude Code [{task_id}] completed successfully")
+        return {
+            "task_id": task_id,
+            "output": final_result or "\n".join(output_lines),
+            "status": "done",
+        }
+
+    def _build_sync_command(
+        self,
+        prompt: str,
+        permission_mode: str,
+    ) -> list[str]:
+        """Build Claude Code CLI command for synchronous execution (no hooks, stream-json output)."""
+        cmd = ["claude"]
+
+        cmd.extend(["--output-format", "stream-json"])
+        cmd.append("--verbose")
+
+        if permission_mode == "bypassPermissions":
+            cmd.append("--dangerously-skip-permissions")
+        elif permission_mode in ("plan", "acceptEdits", "default", "delegate", "dontAsk"):
+            cmd.extend(["--permission-mode", permission_mode])
+
+        cmd.append("-p")
+        cmd.append(prompt)
+
+        return cmd
+
     async def start_task(
         self,
         prompt: str,
@@ -267,7 +488,9 @@ class ClaudeCodeManager:
                 logger.error(f"Claude Code [{task_id}] failed with code {process.returncode}: {stderr_text}")
                 await self._write_error_result(task_id, process.returncode, stderr_text)
             else:
+                stdout_text = "\n".join(stdout_lines)
                 logger.info(f"Claude Code [{task_id}] process completed successfully")
+                await self._write_success_result(task_id, stdout_text)
                 
         except Exception as e:
             logger.exception(f"Claude Code [{task_id}] error: {e}")
@@ -289,7 +512,7 @@ class ClaudeCodeManager:
         
         if permission_mode == "bypassPermissions":
             cmd.append("--dangerously-skip-permissions")
-        elif permission_mode in ("auto", "plan", "acceptEdits", "default", "delegate", "dontAsk"):
+        elif permission_mode in ("plan", "acceptEdits", "default", "delegate", "dontAsk"):
             cmd.extend(["--permission-mode", permission_mode])
         
         if agent_teams:
@@ -435,7 +658,20 @@ if __name__ == "__main__":
         }
         result_path = self.result_dir / f"{task_id}.json"
         result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-    
+
+    async def _write_success_result(self, task_id: str, output: str) -> None:
+        """Write a success result file."""
+        origin = self._task_origins.pop(task_id, {})
+        result = {
+            "task_id": task_id,
+            "timestamp": datetime.now().isoformat(),
+            "output": output,
+            "status": "done",
+            "origin": origin,
+        }
+        result_path = self.result_dir / f"{task_id}.json"
+        result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+
     def _handle_result(self, result: dict[str, Any]) -> None:
         """Handle a result from the watcher."""
         task_id = result.get("task_id", "")

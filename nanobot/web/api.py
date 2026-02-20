@@ -75,6 +75,7 @@ class NanobotWebAPI:
             provider=provider,
             workspace=config.workspace_path,
             model=config.agents.defaults.model,
+            subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
             max_iterations=config.agents.defaults.max_tool_iterations,
             max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
             brave_api_key=config.tools.web.search.api_key or None,
@@ -86,6 +87,7 @@ class NanobotWebAPI:
         
         # Initialize system status service
         data_dir = Path.home() / ".nanobot"
+        (data_dir / "media").mkdir(parents=True, exist_ok=True)
         status_repo = StatusRepository(data_dir / "chat.db")
         self.status_service = SystemStatusService(
             status_repo=status_repo,
@@ -129,6 +131,7 @@ class NanobotWebAPI:
             provider=provider,
             workspace=workspace_path,
             model=config.agents.defaults.model,
+            subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
             max_iterations=config.agents.defaults.max_tool_iterations,
             max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
             brave_api_key=config.tools.web.search.api_key or None,
@@ -798,14 +801,45 @@ class NanobotWebAPI:
             profile["bigFive"][k] = 50
         return profile
 
+    def _save_images_to_temp(self, images: list[str]) -> list[str]:
+        """
+        将 base64 data URL 图片保存为临时文件，返回文件路径列表。
+        调用方负责在处理完成后清理这些文件。
+        """
+        import base64
+        import mimetypes
+        import tempfile
+
+        paths = []
+        for data_url in images:
+            try:
+                if not data_url.startswith("data:"):
+                    continue
+                header, b64data = data_url.split(",", 1)
+                mime = header.split(";")[0].split(":")[1]
+                ext = mimetypes.guess_extension(mime) or ".jpg"
+                if ext == ".jpe":
+                    ext = ".jpg"
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=ext, delete=False,
+                    dir=Path.home() / ".nanobot" / "media"
+                )
+                tmp.write(base64.b64decode(b64data))
+                tmp.close()
+                paths.append(tmp.name)
+            except Exception as e:
+                logger.warning(f"Failed to save image: {e}")
+        return paths
+
     def chat_stream(
-        self, session_id: str, content: str
+        self, session_id: str, content: str, images: list[str] | None = None
     ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
         """
         Run chat with progress events. Returns (event_queue, thread).
         Caller reads from queue until {"type": "done"} or {"type": "error"}.
         """
         evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        media_paths = self._save_images_to_temp(images or [])
 
         def on_progress(evt: dict[str, Any]) -> None:
             try:
@@ -816,7 +850,7 @@ class NanobotWebAPI:
         def run_agent() -> None:
             try:
                 result = asyncio.run(
-                    self._chat_with_progress(session_id, content, on_progress)
+                    self._chat_with_progress(session_id, content, on_progress, media_paths)
                 )
                 evt_queue.put({"type": "done", **result})
             except asyncio.CancelledError:
@@ -824,6 +858,12 @@ class NanobotWebAPI:
             except Exception as e:
                 logger.exception("Chat stream failed")
                 evt_queue.put({"type": "error", "message": str(e)})
+            finally:
+                for p in media_paths:
+                    try:
+                        Path(p).unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
         thread = threading.Thread(target=run_agent, daemon=False)
         return evt_queue, thread
@@ -833,6 +873,7 @@ class NanobotWebAPI:
         session_id: str,
         content: str,
         progress_callback: Any,
+        media: list[str] | None = None,
     ) -> dict[str, Any]:
         """Internal: run chat with optional progress callback. Used by chat() and chat_stream."""
         key = self.to_session_key(session_id)
@@ -844,6 +885,7 @@ class NanobotWebAPI:
                 channel="web",
                 chat_id=session_id,
                 progress_callback=progress_callback,
+                media=media or [],
             )
         finally:
             if getattr(self.agent, "mcp_loader", None):
@@ -881,9 +923,17 @@ class NanobotWebAPI:
             ),
         }
 
-    async def chat(self, session_id: str, content: str) -> dict[str, Any]:
+    async def chat(self, session_id: str, content: str, images: list[str] | None = None) -> dict[str, Any]:
         """Non-streaming chat. Reuses _chat_with_progress without callback."""
-        return await self._chat_with_progress(session_id, content, progress_callback=None)
+        media_paths = self._save_images_to_temp(images or [])
+        try:
+            return await self._chat_with_progress(session_id, content, progress_callback=None, media=media_paths)
+        finally:
+            for p in media_paths:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def get_config(self) -> dict[str, Any]:
         """Get all configuration data."""
@@ -970,6 +1020,7 @@ class NanobotWebAPI:
                 "maxTokens": config.agents.defaults.max_tokens,
             },
             "qwenImageModel": (config.mirror.qwen_image_model or "").strip(),
+            "subagentModel": (getattr(config.agents.defaults, "subagent_model", "") or "").strip(),
         }]
         
         # Load skills
@@ -1296,6 +1347,9 @@ class NanobotWebAPI:
                 config.agents.defaults.max_tokens = params["maxTokens"]
         if "qwenImageModel" in data:
             config.mirror.qwen_image_model = (data["qwenImageModel"] or "").strip()
+        
+        subagent_model = (data.get("subagentModel") or "").strip()
+        config.agents.defaults.subagent_model = subagent_model
 
         from nanobot.config.loader import save_config
         save_config(config)
@@ -1305,7 +1359,13 @@ class NanobotWebAPI:
             api_key = config.get_api_key(model_name)
             api_base = config.get_api_base(model_name)
             self.agent.provider.update_config(model_name, api_key, api_base)
+            if subagent_model:
+                sa_key = config.get_api_key(subagent_model)
+                sa_base = config.get_api_base(subagent_model)
+                self.agent.provider.update_config(subagent_model, sa_key, sa_base)
         self.agent.update_model(model_name)
+        if hasattr(self.agent, "update_subagent_model"):
+            self.agent.update_subagent_model(subagent_model)
         
         return {
             "id": "default",
@@ -1319,6 +1379,7 @@ class NanobotWebAPI:
                 "maxTokens": config.agents.defaults.max_tokens,
             },
             "qwenImageModel": config.mirror.qwen_image_model,
+            "subagentModel": subagent_model,
         }
 
     def update_model(self, model_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -1540,10 +1601,10 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _handle_chat_stream(
-        self, app: "NanobotWebAPI", session_id: str, content: str
+        self, app: "NanobotWebAPI", session_id: str, content: str, images: list[str] | None = None
     ) -> None:
         """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
-        evt_queue, thread = app.chat_stream(session_id, content)
+        evt_queue, thread = app.chat_stream(session_id, content, images)
         thread.start()
 
         self.send_response(HTTPStatus.OK)
@@ -1895,12 +1956,13 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if not content:
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 不能为空"))
                 return
+            images: list[str] = body.get("images") or []
             session_id = parts[4]
             use_stream = query.get("stream", [None])[0] == "1"
 
             if use_stream:
                 try:
-                    self._handle_chat_stream(app, session_id, content)
+                    self._handle_chat_stream(app, session_id, content, images)
                 except Exception as exc:
                     logger.exception("Chat stream failed")
                     self._write_json(
@@ -1910,7 +1972,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                data = asyncio.run(app.chat(session_id=session_id, content=content))
+                data = asyncio.run(app.chat(session_id=session_id, content=content, images=images))
                 self._write_json(HTTPStatus.OK, _ok(data))
             except RuntimeError as exc:
                 # MCP streamable_http + anyio: "cancel scope in different task" can occur

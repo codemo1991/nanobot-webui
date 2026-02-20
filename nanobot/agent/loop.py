@@ -65,6 +65,7 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
+        subagent_model: str | None = None,
         max_iterations: int = 40,
         max_execution_time: int = 600,
         brave_api_key: str | None = None,
@@ -85,6 +86,7 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.subagent_model = subagent_model or ""
         self.max_iterations = max_iterations
         self.max_execution_time = max_execution_time
         self.brave_api_key = brave_api_key
@@ -123,6 +125,10 @@ class AgentLoop:
             default_timeout=self.claude_code_config.default_timeout,
             max_concurrent_tasks=self.claude_code_config.max_concurrent_tasks,
         )
+        
+        # 如果传入了独立的 subagent_model，更新 SubagentManager 使用它
+        if subagent_model:
+            self.subagents.model = subagent_model
         
         self._running = False
         self._mcp_loaded = False
@@ -239,7 +245,13 @@ class AgentLoop:
     def update_model(self, model: str) -> None:
         """Update default model at runtime (hot config)."""
         self.model = model
-        self.subagents.model = model
+        if not self.subagent_model:
+            self.subagents.model = model
+
+    def update_subagent_model(self, subagent_model: str) -> None:
+        """Update subagent model at runtime (hot config). Empty string means use main model."""
+        self.subagent_model = subagent_model
+        self.subagents.model = subagent_model if subagent_model else self.model
     
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -814,6 +826,7 @@ class AgentLoop:
         chat_id: str = "direct",
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         extra_metadata: dict[str, Any] | None = None,
+        media: list[str] | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
@@ -825,6 +838,7 @@ class AgentLoop:
             chat_id: Source chat ID (for context).
             progress_callback: Optional callback for streaming progress (tool_start, tool_end, etc.).
             extra_metadata: Optional extra metadata (e.g. attack_level for mirror bian sessions).
+            media: Optional list of local file paths for images to include in the message.
 
         Returns:
             The agent's response.
@@ -851,6 +865,7 @@ class AgentLoop:
             chat_id=chat_id,
             content=content,
             metadata=metadata,
+            media=media or [],
         )
 
         try:
