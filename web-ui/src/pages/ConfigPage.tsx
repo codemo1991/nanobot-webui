@@ -525,7 +525,8 @@ function ModelsConfig() {
           modelName: defaultModel.modelName,
           temperature: defaultModel.parameters?.temperature,
           maxTokens: defaultModel.parameters?.maxTokens,
-          qwenImageModel: defaultModel.qwenImageModel ?? ''
+          qwenImageModel: defaultModel.qwenImageModel ?? '',
+          subagentModel: defaultModel.subagentModel ?? '',
         })
       }
     } catch (error) {
@@ -547,7 +548,8 @@ function ModelsConfig() {
         },
         enabled: true,
         name: values.modelName,
-        qwenImageModel: (values.qwenImageModel ?? '').trim()
+        qwenImageModel: (values.qwenImageModel ?? '').trim(),
+        subagentModel: (values.subagentModel ?? '').trim(),
       })
       message.success(t('config.model.updated'))
       loadModel()
@@ -563,6 +565,14 @@ function ModelsConfig() {
         <Form form={form} layout="vertical" onFinish={handleSave}>
           <Form.Item name="modelName" label={t('config.model.nameLabel')} rules={[{ required: true }]} help={t('config.model.nameHelp')}>
             <Input />
+          </Form.Item>
+
+          <Form.Item
+            name="subagentModel"
+            label="子 Agent 模型"
+            help="子 Agent (spawn tool) 使用的模型，留空则与主 Agent 相同。支持视觉模型，如 dashscope/qwen-vl-plus"
+          >
+            <Input placeholder="留空则与主 Agent 相同，例如：dashscope/qwen-vl-plus" />
           </Form.Item>
           
           <Space>

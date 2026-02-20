@@ -46,12 +46,15 @@ Claude Code is a specialized coding agent that excels at:
 - Debugging complex issues
 - Code review and improvements
 
-The task runs independently with its own token budget.
-You will be notified when it completes via system message.
+The task runs with its own token budget and you will receive the result directly.
+Progress is streamed in real-time during execution.
 
 IMPORTANT: Only use this for substantial coding tasks that benefit from
 Claude Code's specialized capabilities. For simple file operations,
-use read_file/write_file/edit_file tools instead."""
+use read_file/write_file/edit_file tools instead.
+
+NOTE: For best results, set permission_mode to 'bypassPermissions' to avoid
+interactive permission prompts in non-interactive mode."""
     
     @property
     def parameters(self) -> dict[str, Any]:
@@ -75,13 +78,13 @@ use read_file/write_file/edit_file tools instead."""
                 "agent_teams": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Enable Agent Teams mode for parallel work. Useful for large tasks that can be split."
+                    "description": "Enable Agent Teams mode for parallel work. Only supported on newer Claude Code versions."
                 },
                 "teammate_mode": {
                     "type": "string",
                     "enum": ["auto", "in-process", "tmux"],
-                    "default": "auto",
-                    "description": "Teammate mode for Agent Teams: 'auto' (let Claude decide), 'in-process' (same process), 'tmux' (separate tmux sessions)"
+                    "default": "in-process",
+                    "description": "Teammate mode for Agent Teams: 'in-process' (same process, recommended), 'auto' (let Claude decide), 'tmux' (separate tmux sessions)"
                 },
                 "timeout": {
                     "type": "integer",
@@ -98,37 +101,38 @@ use read_file/write_file/edit_file tools instead."""
         workdir: str | None = None,
         permission_mode: str = "auto",
         agent_teams: bool = False,
-        teammate_mode: str = "auto",
+        teammate_mode: str = "in-process",
         timeout: int = 600,
         **kwargs: Any,
     ) -> str:
-        """Start Claude Code and return task ID for tracking."""
+        """Run Claude Code synchronously and return the result."""
         if not self._manager.check_claude_available():
             return "Error: Claude Code CLI is not available. Please install it first: npm install -g @anthropic-ai/claude-code"
         
         try:
-            task_id = await self._manager.start_task(
+            result = await self._manager.run_task(
                 prompt=prompt,
                 workdir=workdir,
                 permission_mode=permission_mode,
                 agent_teams=agent_teams,
                 teammate_mode=teammate_mode,
-                origin_channel=self._origin_channel,
-                origin_chat_id=self._origin_chat_id,
                 timeout=timeout,
                 progress_callback=self._progress_callback,
             )
             
-            running_count = self._manager.get_running_count()
+            status = result.get("status", "unknown")
+            output = result.get("output", "")
+            task_id = result.get("task_id", "")
             
-            return (
-                f"Claude Code task [{task_id}] started successfully.\n"
-                f"I'll notify you when it completes.\n"
-                f"Currently running {running_count} Claude Code task(s)."
-            )
+            if status == "done":
+                return f"Claude Code task [{task_id}] completed.\n\nResult:\n{output}"
+            elif status == "timeout":
+                return f"Claude Code task [{task_id}] timed out.\n\n{output}"
+            else:
+                return f"Claude Code task [{task_id}] failed.\n\n{output}"
         except ValueError as e:
             return f"Error: {str(e)}"
         except RuntimeError as e:
             return f"Error: {str(e)}"
         except Exception as e:
-            return f"Error starting Claude Code: {str(e)}"
+            return f"Error running Claude Code: {str(e)}"

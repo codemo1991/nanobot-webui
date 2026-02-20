@@ -41,6 +41,7 @@ export interface Message {
   sequence: number
   toolSteps?: ToolStep[]
   tokenUsage?: TokenUsage
+  images?: string[]  // base64 data URLs for user-uploaded images
 }
 
 export interface SessionListResponse {
@@ -59,6 +60,7 @@ export type StreamEvent =
   | { type: 'thinking' }
   | { type: 'tool_start'; name: string; arguments: Record<string, unknown> }
   | { type: 'tool_end'; name: string; arguments: Record<string, unknown>; result: string }
+  | { type: 'claude_code_progress'; task_id: string; subtype: string; content: string; tool_name?: string; timestamp?: string }
   | { type: 'done'; content: string; assistantMessage: Message | null }
   | { type: 'error'; message: string }
 
@@ -147,6 +149,8 @@ export interface Model {
   parameters?: ModelParameters
   /** 赏图生成模型，如 qwen-image-plus，留空则赏 Tab 用文字描述 */
   qwenImageModel?: string
+  /** 子 Agent 使用的模型，留空则与主 Agent 相同 */
+  subagentModel?: string
 }
 
 export interface McpServer {

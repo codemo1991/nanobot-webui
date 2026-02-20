@@ -69,6 +69,7 @@ class AgentDefaults(BaseModel):
     """Default agent configuration."""
     workspace: str = "~/.nanobot/web-ui"
     model: str = "anthropic/claude-opus-4-5"
+    subagent_model: str = ""  # 子 Agent 使用的模型，留空则与主 Agent 相同
     max_tokens: int = 8192
     temperature: float = 0.7
     max_tool_iterations: int = 40

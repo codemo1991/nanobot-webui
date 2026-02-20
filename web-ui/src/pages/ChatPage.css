@@ -507,6 +507,86 @@
   font-size: 12px;
 }
 
+/* Image upload & preview */
+.pending-images-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px 0;
+}
+
+.pending-image-wrapper {
+  position: relative;
+  display: inline-block;
+}
+
+.pending-image-thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid #e8e8e8;
+}
+
+.pending-image-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  color: #ff4d4f;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.pending-image-remove:hover {
+  color: #cf1322;
+}
+
+.image-upload-button {
+  flex-shrink: 0;
+  color: #8c8c8c;
+}
+
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.message-image-thumb {
+  width: 120px !important;
+  height: 120px !important;
+  object-fit: cover !important;
+  border-radius: 6px;
+  border: 1px solid #e8e8e8;
+  cursor: pointer;
+}
+
+/* Claude Code Progress */
+.claude-code-progress {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: #1a1a2e;
+  border-radius: 6px;
+  border-left: 3px solid #6c5ce7;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.claude-code-progress pre {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #b2bec3;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+}
+
 /* Scrollbar Styles */
 .sessions-list::-webkit-scrollbar,
 .chat-content::-webkit-scrollbar,
