@@ -60,8 +60,8 @@ class NanobotWebAPI:
         is_bedrock = model.startswith("bedrock/")
         if not api_key and not is_bedrock:
             logger.warning(
-                "No API key configured. Web UI will start; configure providers.*.apiKey in ~/.nanobot/config.json "
-                "or via the Config page to use chat."
+                "No API key configured. Web UI will start; configure providers.*.apiKey "
+                "via the Config page to use chat."
             )
 
         provider = LiteLLMProvider(
@@ -69,6 +69,14 @@ class NanobotWebAPI:
             api_base=api_base,
             default_model=config.agents.defaults.model,
         )
+
+        subagent_model_cfg = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
+        if subagent_model_cfg:
+            sa_key = config.get_api_key(subagent_model_cfg)
+            if sa_key:
+                provider.ensure_api_key_for_model(
+                    subagent_model_cfg, sa_key, config.get_api_base(subagent_model_cfg)
+                )
 
         self.agent = AgentLoop(
             bus=MessageBus(),
@@ -126,6 +134,13 @@ class NanobotWebAPI:
             api_base=api_base,
             default_model=config.agents.defaults.model,
         )
+        subagent_model_cfg = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
+        if subagent_model_cfg:
+            sa_key = config.get_api_key(subagent_model_cfg)
+            if sa_key:
+                provider.ensure_api_key_for_model(
+                    subagent_model_cfg, sa_key, config.get_api_base(subagent_model_cfg)
+                )
         self.agent = AgentLoop(
             bus=self.agent.bus,
             provider=provider,
@@ -312,6 +327,11 @@ class NanobotWebAPI:
                         }
                     }
                     if m.get("token_usage")
+                    else {}
+                ),
+                **(
+                    {"images": m["images"]}
+                    if m.get("images")
                     else {}
                 ),
             }
@@ -810,25 +830,39 @@ class NanobotWebAPI:
         import mimetypes
         import tempfile
 
+        media_dir = Path.home() / ".nanobot" / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+
         paths = []
         for data_url in images:
             try:
                 if not data_url.startswith("data:"):
+                    logger.warning(f"Invalid image data URL format: {data_url[:50]}...")
                     continue
                 header, b64data = data_url.split(",", 1)
                 mime = header.split(";")[0].split(":")[1]
                 ext = mimetypes.guess_extension(mime) or ".jpg"
                 if ext == ".jpe":
                     ext = ".jpg"
-                tmp = tempfile.NamedTemporaryFile(
-                    suffix=ext, delete=False,
-                    dir=Path.home() / ".nanobot" / "media"
-                )
-                tmp.write(base64.b64decode(b64data))
-                tmp.close()
-                paths.append(tmp.name)
+                
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        tmp = tempfile.NamedTemporaryFile(
+                            suffix=ext, delete=False,
+                            dir=media_dir
+                        )
+                        tmp.write(base64.b64decode(b64data))
+                        tmp.close()
+                        paths.append(tmp.name)
+                        break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"Retry saving image (attempt {attempt + 1}/{max_retries}): {e}")
+                            continue
+                        raise
             except Exception as e:
-                logger.warning(f"Failed to save image: {e}")
+                logger.warning(f"Failed to save image after {max_retries} attempts: {e}")
         return paths
 
     def chat_stream(
@@ -1359,10 +1393,10 @@ class NanobotWebAPI:
             api_key = config.get_api_key(model_name)
             api_base = config.get_api_base(model_name)
             self.agent.provider.update_config(model_name, api_key, api_base)
-            if subagent_model:
+            if subagent_model and hasattr(self.agent.provider, "ensure_api_key_for_model"):
                 sa_key = config.get_api_key(subagent_model)
                 sa_base = config.get_api_base(subagent_model)
-                self.agent.provider.update_config(subagent_model, sa_key, sa_base)
+                self.agent.provider.ensure_api_key_for_model(subagent_model, sa_key, sa_base)
         self.agent.update_model(model_name)
         if hasattr(self.agent, "update_subagent_model"):
             self.agent.update_subagent_model(subagent_model)
@@ -1477,13 +1511,7 @@ class NanobotWebAPI:
         """Export system configuration from SQLite."""
         try:
             repo = get_config_repository()
-            if repo.has_config():
-                return repo.load_full_config()
-            config_path = Path.home() / ".nanobot" / "config.json"
-            if config_path.exists():
-                with open(config_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            return {}
+            return repo.load_full_config()
         except Exception as e:
             logger.exception(f"Failed to export config")
             return {}
@@ -1925,6 +1953,14 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("WORKSPACE_SWITCH_FAILED", str(e)))
             return
 
+        if path == "/api/v1/system/restart":
+            from nanobot.agent.tools.self_update import RESTART_EXIT_CODE
+            logger.info("Restart requested via API")
+            self._write_json(HTTPStatus.OK, _ok({"message": "Restarting..."}))
+            import os
+            threading.Timer(1.5, lambda: os._exit(RESTART_EXIT_CODE)).start()
+            return
+
         if path == "/api/v1/system/config/import":
             body = self._read_json()
             config_data = body.get("config") or body
@@ -1953,10 +1989,10 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "messages":
             body = self._read_json()
             content = (body.get("content") or "").strip()
-            if not content:
-                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 不能为空"))
-                return
             images: list[str] = body.get("images") or []
+            if not content and not images:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 或 images 不能为空"))
+                return
             session_id = parts[4]
             use_stream = query.get("stream", [None])[0] == "1"
 

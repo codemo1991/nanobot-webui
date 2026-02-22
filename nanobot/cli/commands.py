@@ -43,32 +43,33 @@ def main(
 @app.command()
 def onboard():
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_path, save_config
+    from nanobot.config.loader import get_config_repository, get_db_path, save_config
     from nanobot.config.schema import Config
     from nanobot.utils.helpers import get_workspace_path
-    
-    config_path = get_config_path()
-    
-    if config_path.exists():
-        console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
+
+    db_path = get_db_path()
+    repo = get_config_repository()
+
+    if repo.has_config():
+        console.print(f"[yellow]Config already exists in {db_path}[/yellow]")
         if not typer.confirm("Overwrite?"):
             raise typer.Exit()
-    
+
     # Create default config
     config = Config()
     save_config(config)
-    console.print(f"[green]✓[/green] Created config at {config_path}")
-    
+    console.print(f"[green]✓[/green] Created config in SQLite: {db_path}")
+
     # Create workspace
     workspace = get_workspace_path()
     console.print(f"[green]✓[/green] Created workspace at {workspace}")
-    
+
     # Create default bootstrap files
     _create_workspace_templates(workspace)
-    
+
     console.print(f"\n{__logo__} nanobot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
+    console.print("  1. Add your API key via the [cyan]web UI Config page[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]nanobot agent -m \"Hello!\"[/cyan]")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]")
@@ -188,7 +189,7 @@ def gateway(
 
     if not api_key and not is_bedrock:
         console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers.openrouter.apiKey")
+        console.print("Set one via the web UI Config page, or use: nanobot web-ui")
         raise typer.Exit(1)
     
     provider = LiteLLMProvider(
@@ -196,6 +197,14 @@ def gateway(
         api_base=api_base,
         default_model=config.agents.defaults.model
     )
+
+    subagent_model = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
+    if subagent_model:
+        sa_key = config.get_api_key(subagent_model)
+        if sa_key and hasattr(provider, "ensure_api_key_for_model"):
+            provider.ensure_api_key_for_model(
+                subagent_model, sa_key, config.get_api_base(subagent_model)
+            )
     
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -207,6 +216,7 @@ def gateway(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        subagent_model=subagent_model or None,
         max_iterations=config.agents.defaults.max_tool_iterations,
         max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -362,7 +372,6 @@ def web_ui(
     from nanobot.web.api import run_server
     from nanobot.logging_config import reconfigure_logging
 
-    # 根据参数调整日志级别
     if debug:
         reconfigure_logging("TRACE")
         console.print("[dim]Debug mode enabled (TRACE level)[/dim]")
@@ -372,6 +381,77 @@ def web_ui(
 
     console.print(f"{__logo__} Starting Web UI API on http://{host}:{port}")
     run_server(host=host, port=port)
+
+
+@app.command("launcher")
+def launcher(
+    host: str = typer.Option("127.0.0.1", "--host", help="Web API host"),
+    port: int = typer.Option(6788, "--port", "-p", help="Web API port"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose (DEBUG) logging"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug (TRACE) logging, most verbose"),
+):
+    """Start nanobot with auto-restart guardian (supports self-update)."""
+    import subprocess
+    import sys
+    import time
+
+    from nanobot.agent.tools.self_update import RESTART_EXIT_CODE
+
+    MAX_RAPID_RESTARTS = 5
+    RAPID_RESTART_WINDOW = 60
+    restart_timestamps: list[float] = []
+
+    console.print(f"\n  [cyan]{'=' * 36}[/cyan]")
+    console.print(f"   [cyan]nanobot launcher (guardian mode)[/cyan]")
+    console.print(f"  [cyan]{'=' * 36}[/cyan]\n")
+
+    while True:
+        cmd = [sys.executable, "-m", "nanobot", "web-ui", "--host", host, "--port", str(port)]
+        if verbose:
+            cmd.append("--verbose")
+        if debug:
+            cmd.append("--debug")
+
+        console.print(f"[green][launcher] Starting:[/green] {' '.join(cmd)}")
+        console.print(f"[dim][launcher] Restart exit code: {RESTART_EXIT_CODE} | Ctrl+C to stop[/dim]\n")
+
+        try:
+            result = subprocess.run(cmd)
+            exit_code = result.returncode
+        except KeyboardInterrupt:
+            console.print("\n[green][launcher] Stopped by user. Goodbye.[/green]")
+            raise typer.Exit(0)
+
+        console.print(f"\n[yellow][launcher] nanobot exited with code: {exit_code}[/yellow]")
+
+        if exit_code == RESTART_EXIT_CODE:
+            now = time.time()
+            restart_timestamps[:] = [t for t in restart_timestamps if now - t < RAPID_RESTART_WINDOW]
+            restart_timestamps.append(now)
+
+            if len(restart_timestamps) >= MAX_RAPID_RESTARTS:
+                console.print(
+                    f"[red][launcher] Too many rapid restarts "
+                    f"({MAX_RAPID_RESTARTS} in {RAPID_RESTART_WINDOW}s). Exiting.[/red]"
+                )
+                raise typer.Exit(1)
+
+            console.print("[cyan][launcher] Self-update restart requested. Reinstalling...[/cyan]")
+
+            repo_dir = Path(__file__).resolve().parent.parent.parent
+            if (repo_dir / "pyproject.toml").exists():
+                console.print(f"[dim][launcher] Running: pip install -e . (in {repo_dir})[/dim]")
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-e", ".", "--quiet"],
+                    cwd=str(repo_dir),
+                )
+
+            console.print("[cyan][launcher] Restarting in 2 seconds...[/cyan]")
+            time.sleep(2)
+            continue
+        else:
+            console.print("[green][launcher] Normal exit. Goodbye.[/green]")
+            raise typer.Exit(exit_code or 0)
 
 
 # ============================================================================
@@ -810,27 +890,28 @@ def cron_run(
 @app.command()
 def status():
     """Show nanobot status."""
-    from nanobot.config.loader import load_config, get_config_path
+    from nanobot.config.loader import load_config, get_db_path, get_config_repository
 
-    config_path = get_config_path()
+    db_path = get_db_path()
+    repo = get_config_repository()
     config = load_config()
     workspace = config.workspace_path
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
+    console.print(f"Database: {db_path} {'[green]✓[/green]' if db_path.exists() else '[red]✗[/red]'}")
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
-    if config_path.exists():
+    if repo.has_config():
         console.print(f"Model: {config.agents.defaults.model}")
-        
+
         # Check API keys
         has_openrouter = bool(config.providers.openrouter.api_key)
         has_anthropic = bool(config.providers.anthropic.api_key)
         has_openai = bool(config.providers.openai.api_key)
         has_gemini = bool(config.providers.gemini.api_key)
         has_vllm = bool(config.providers.vllm.api_base)
-        
+
         console.print(f"OpenRouter API: {'[green]✓[/green]' if has_openrouter else '[dim]not set[/dim]'}")
         console.print(f"Anthropic API: {'[green]✓[/green]' if has_anthropic else '[dim]not set[/dim]'}")
         console.print(f"OpenAI API: {'[green]✓[/green]' if has_openai else '[dim]not set[/dim]'}")

@@ -1,9 +1,13 @@
 """Feishu/Lark channel implementation using lark-oapi SDK with WebSocket long connection."""
 
 import asyncio
+import functools
 import json
+import re
 import threading
+import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -22,7 +26,10 @@ try:
         CreateMessageReactionRequest,
         CreateMessageReactionRequestBody,
         Emoji,
+        GetMessageResourceRequest,
         P2ImMessageReceiveV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
     )
     FEISHU_AVAILABLE = True
 except ImportError:
@@ -31,115 +38,275 @@ except ImportError:
     Emoji = None
     CustomizedEvent = None  # type: ignore
 
-# Message type display mapping
-MSG_TYPE_MAP = {
-    "image": "[image]",
-    "audio": "[audio]",
-    "file": "[file]",
-    "sticker": "[sticker]",
-}
+MEDIA_DIR = Path.home() / ".nanobot" / "media"
+
+
+def _markdown_to_feishu_post(text: str) -> dict[str, Any]:
+    """
+    将 Markdown 文本转换为飞书 post（富文本）格式。
+
+    飞书 post 结构：
+    {
+        "zh_cn": {
+            "content": [
+                [  // 每个内层 list 是一个段落
+                    {"tag": "text", "text": "...", "style": [...]},
+                    {"tag": "a", "text": "...", "href": "..."},
+                    {"tag": "code_block", "language": "...", "text": "..."},
+                ]
+            ]
+        }
+    }
+    """
+    if not text:
+        return {"zh_cn": {"content": [[{"tag": "text", "text": ""}]]}}
+
+    paragraphs: list[list[dict[str, Any]]] = []
+
+    # 先提取代码块，防止内部内容被解析
+    code_blocks: list[tuple[str, str]] = []
+
+    def _save_code_block(m: re.Match) -> str:
+        lang = m.group(1) or ""
+        code = m.group(2)
+        idx = len(code_blocks)
+        code_blocks.append((lang, code))
+        return f"\x00CODEBLOCK{idx}\x00"
+
+    text = re.sub(r"```(\w*)\n?([\s\S]*?)```", _save_code_block, text)
+
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # 代码块占位符
+        cb_match = re.match(r"^\x00CODEBLOCK(\d+)\x00$", line.strip())
+        if cb_match:
+            idx = int(cb_match.group(1))
+            lang, code = code_blocks[idx]
+            paragraphs.append([{
+                "tag": "code_block",
+                "language": lang or "plain_text",
+                "text": code,
+            }])
+            i += 1
+            continue
+
+        # 空行
+        if not line.strip():
+            i += 1
+            continue
+
+        # 标题行 -> 加粗段落
+        header_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if header_match:
+            header_text = header_match.group(2)
+            paragraphs.append([{"tag": "text", "text": header_text, "style": ["bold"]}])
+            i += 1
+            continue
+
+        # 引用行 > text
+        quote_match = re.match(r"^>\s*(.*)", line)
+        if quote_match:
+            quote_text = quote_match.group(1)
+            paragraphs.append([{"tag": "text", "text": f"│ {quote_text}", "style": ["italic"]}])
+            i += 1
+            continue
+
+        # 普通段落：解析 inline 格式
+        elements = _parse_inline_elements(line)
+        if elements:
+            paragraphs.append(elements)
+        i += 1
+
+    if not paragraphs:
+        paragraphs = [[{"tag": "text", "text": text}]]
+
+    return {"zh_cn": {"content": paragraphs}}
+
+
+def _parse_inline_elements(line: str) -> list[dict[str, Any]]:
+    """解析一行文本中的 inline 格式元素（加粗、斜体、链接、行内代码、列表）。"""
+    # 列表项
+    list_match = re.match(r"^[-*]\s+(.+)$", line)
+    if list_match:
+        line = f"• {list_match.group(1)}"
+
+    # 有序列表
+    ol_match = re.match(r"^(\d+)\.\s+(.+)$", line)
+    if ol_match:
+        line = f"{ol_match.group(1)}. {ol_match.group(2)}"
+
+    elements: list[dict[str, Any]] = []
+
+    # 使用正则分段匹配各种 inline 格式
+    pattern = re.compile(
+        r"(`[^`]+`)"            # inline code
+        r"|(\[([^\]]+)\]\(([^)]+)\))"  # link [text](url)
+        r"|(\*\*(.+?)\*\*)"    # bold **text**
+        r"|(\*(.+?)\*)"        # italic *text*
+        r"|(~~(.+?)~~)"        # strikethrough ~~text~~
+    )
+
+    last_end = 0
+    for m in pattern.finditer(line):
+        # 前面的纯文本
+        if m.start() > last_end:
+            elements.append({"tag": "text", "text": line[last_end:m.start()]})
+
+        if m.group(1):  # inline code
+            code_text = m.group(1)[1:-1]
+            elements.append({"tag": "text", "text": code_text, "style": ["bold"]})
+        elif m.group(2):  # link
+            elements.append({"tag": "a", "text": m.group(3), "href": m.group(4)})
+        elif m.group(5):  # bold
+            elements.append({"tag": "text", "text": m.group(6), "style": ["bold"]})
+        elif m.group(7):  # italic
+            elements.append({"tag": "text", "text": m.group(8), "style": ["italic"]})
+        elif m.group(9):  # strikethrough
+            elements.append({"tag": "text", "text": m.group(10), "style": ["lineThrough"]})
+
+        last_end = m.end()
+
+    # 剩余纯文本
+    if last_end < len(line):
+        elements.append({"tag": "text", "text": line[last_end:]})
+
+    return elements if elements else [{"tag": "text", "text": line}]
+
+
+# 卡片内容最大长度（字符），超出时截断
+_CARD_CONTENT_MAX = 8000
+
+
+def _build_card_json(
+    body_md: str,
+    header_text: str = "AI 助手",
+    template: str = "blue",
+) -> str:
+    """
+    构建飞书交互卡片（Card 1.0）JSON 字符串。
+
+    body_md: 卡片正文，支持飞书 lark_md 格式（Markdown 子集）。
+    template: 卡片标题颜色，可选 blue / green / red / yellow / grey 等。
+    """
+    if len(body_md) > _CARD_CONTENT_MAX:
+        body_md = body_md[:_CARD_CONTENT_MAX] + "\n\n...(内容已截断)"
+
+    card: dict[str, Any] = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": header_text},
+            "template": template,
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": body_md},
+            }
+        ],
+    }
+    return json.dumps(card, ensure_ascii=False)
 
 
 class FeishuChannel(BaseChannel):
     """
     Feishu/Lark channel using WebSocket long connection.
-    
+
     Uses WebSocket to receive events - no public IP or webhook required.
-    
+
+    Supports:
+    - Text messages
+    - Image messages (download + image recognition)
+    - Rich text (post) messages (parse text + images)
+    - Rich text (post) reply format
+
     Requires:
     - App ID and App Secret from Feishu Open Platform
     - Bot capability enabled
     - Event subscription enabled (im.message.receive_v1)
+    - im:message、im:resource 权限
     """
-    
+
     name = "feishu"
-    
+
     def __init__(self, config: FeishuConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: FeishuConfig = config
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
-        self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
-    
+        # chat_id -> 进度卡片 message_id（处理中的会话）
+        self._active_progress_cards: dict[str, str] = {}
+        # chat_id -> 上次 patch 时间戳（用于节流控制）
+        self._last_card_update: dict[str, float] = {}
+
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
         if not FEISHU_AVAILABLE:
             logger.error("Feishu SDK not installed. Run: pip install lark-oapi")
             return
-        
+
         if not self.config.app_id or not self.config.app_secret:
             logger.error("Feishu app_id and app_secret not configured")
             return
-        
+
         self._running = True
         self._loop = asyncio.get_running_loop()
-        
-        # Create Lark client for sending messages
+
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
         self._client = lark.Client.builder() \
             .app_id(self.config.app_id) \
             .app_secret(self.config.app_secret) \
             .log_level(lark.LogLevel.INFO) \
             .build()
-        
-        # Create event handler - builder with message receive handler
+
         builder = lark.EventDispatcherHandler.builder(
             self.config.encrypt_key or "",
             self.config.verification_token or "",
         ).register_p2_im_message_receive_v1(self._on_message_sync)
 
-        # Register no-op handler for message read receipts to avoid "processor not found" errors
-        # (lark-oapi 1.2+ has register_p2_customized_event; older versions may not)
         def _noop_message_read(data: Any) -> None:
-            """Ignore message read receipts - no processing needed."""
             pass
 
         if CustomizedEvent is not None:
-            register_customized = getattr(
-                builder, "register_p2_customized_event", None
-            )
+            register_customized = getattr(builder, "register_p2_customized_event", None)
             if register_customized is not None:
                 for evt in ("im.message.message_read_v1", "im.message.message_read"):
                     try:
                         builder = register_customized(evt, _noop_message_read)
-                        logger.info(f"Registered no-op handler for {evt} (avoids read receipt errors)")
+                        logger.info(f"Registered no-op handler for {evt}")
                         break
                     except Exception as e:
                         logger.debug(f"Could not register {evt}: {e}")
-            else:
-                logger.warning(
-                    "lark-oapi has no register_p2_customized_event; "
-                    "upgrade with: pip install -U lark-oapi  (message read errors may persist)"
-                )
 
         event_handler = builder.build()
-        
-        # Create WebSocket client for long connection
+
         self._ws_client = lark.ws.Client(
             self.config.app_id,
             self.config.app_secret,
             event_handler=event_handler,
-            log_level=lark.LogLevel.INFO
+            log_level=lark.LogLevel.INFO,
         )
-        
-        # Start WebSocket client in a separate thread
+
         def run_ws():
             try:
                 self._ws_client.start()
-            except Exception as e:
+            except Exception:
                 logger.exception("Feishu WebSocket error")
-        
+
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
         self._ws_thread.start()
-        
+
         logger.info("Feishu bot started with WebSocket long connection")
-        logger.info("No public IP required - using WebSocket to receive events")
-        
-        # Keep running until stopped
+
         while self._running:
             await asyncio.sleep(1)
-    
+
     async def stop(self) -> None:
         """Stop the Feishu bot."""
         self._running = False
@@ -149,56 +316,82 @@ class FeishuChannel(BaseChannel):
             except Exception as e:
                 logger.warning(f"Error stopping WebSocket client: {e}")
         logger.info("Feishu bot stopped")
-    
-    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
-        """Sync helper for adding reaction (runs in thread pool)."""
-        try:
-            request = CreateMessageReactionRequest.builder() \
-                .message_id(message_id) \
-                .request_body(
-                    CreateMessageReactionRequestBody.builder()
-                    .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
-                    .build()
-                ).build()
-            
-            response = self._client.im.v1.message_reaction.create(request)
-            
-            if not response.success():
-                logger.warning(f"Failed to add reaction: code={response.code}, msg={response.msg}")
-            else:
-                logger.debug(f"Added {emoji_type} reaction to message {message_id}")
-        except Exception as e:
-            logger.warning(f"Error adding reaction: {e}")
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
-        """
-        Add a reaction emoji to a message (non-blocking).
-        
-        Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
-        """
-        if not self._client or not Emoji:
-            return
-        
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
-    
+    # ── 发送消息 ───────────────────────────────────────────────
+
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Feishu."""
+        """发送消息。若存在进度卡片则直接更新为最终结果（绿色），否则新建 post 消息。"""
         if not self._client:
             logger.warning("Feishu client not initialized")
             return
-        
+
+        # 尝试将进度卡片更新为最终回复
+        card_message_id = self._active_progress_cards.pop(msg.chat_id, None)
+        self._last_card_update.pop(msg.chat_id, None)
+
+        if card_message_id:
+            loop = asyncio.get_running_loop()
+            fn = functools.partial(
+                self._patch_card_sync,
+                card_message_id,
+                msg.content,
+                "AI 助手",
+                "green",
+            )
+            success = await loop.run_in_executor(None, fn)
+            if success:
+                logger.debug(f"Progress card updated with final result: {card_message_id}")
+                return
+            logger.warning("Final card patch failed, falling back to new post message")
+
+        # 无进度卡片（或 patch 失败）时，发送新的 post 消息
         try:
-            # Determine receive_id_type based on chat_id format
-            # open_id starts with "ou_", chat_id starts with "oc_"
             if msg.chat_id.startswith("oc_"):
                 receive_id_type = "chat_id"
             else:
                 receive_id_type = "open_id"
-            
-            # Build text message content
+
+            # 将 markdown 转为飞书 post 格式
+            post_body = _markdown_to_feishu_post(msg.content)
+            content = json.dumps(post_body, ensure_ascii=False)
+
+            request = CreateMessageRequest.builder() \
+                .receive_id_type(receive_id_type) \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(msg.chat_id)
+                    .msg_type("post")
+                    .content(content)
+                    .build()
+                ).build()
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None, self._client.im.v1.message.create, request
+            )
+
+            if not response.success():
+                logger.warning(
+                    "Feishu post message failed (code=%s msg=%s), falling back to text",
+                    response.code, response.msg,
+                )
+                await self._send_text_fallback(msg)
+            else:
+                logger.debug(f"Feishu post message sent to {msg.chat_id}")
+
+        except Exception as e:
+            logger.warning(f"Feishu post send error: {e}, falling back to text")
+            await self._send_text_fallback(msg)
+
+    async def _send_text_fallback(self, msg: OutboundMessage) -> None:
+        """纯文本发送回退。"""
+        try:
+            if msg.chat_id.startswith("oc_"):
+                receive_id_type = "chat_id"
+            else:
+                receive_id_type = "open_id"
+
             content = json.dumps({"text": msg.content})
-            
             request = CreateMessageRequest.builder() \
                 .receive_id_type(receive_id_type) \
                 .request_body(
@@ -208,82 +401,507 @@ class FeishuChannel(BaseChannel):
                     .content(content)
                     .build()
                 ).build()
-            
-            response = self._client.im.v1.message.create(request)
-            
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None, self._client.im.v1.message.create, request
+            )
             if not response.success():
-                logger.error(
-                    f"Failed to send Feishu message: code={response.code}, "
-                    f"msg={response.msg}, log_id={response.get_log_id()}"
-                )
-            else:
-                logger.debug(f"Feishu message sent to {msg.chat_id}")
-                
+                logger.error(f"Feishu text fallback failed: code={response.code}, msg={response.msg}")
         except Exception as e:
-            logger.exception("Error sending Feishu message")
-    
+            logger.exception(f"Feishu text fallback error: {e}")
+
+    # ── 进度卡片 ───────────────────────────────────────────────
+
+    def _patch_card_sync(
+        self,
+        message_id: str,
+        body_md: str,
+        header_text: str,
+        template: str,
+    ) -> bool:
+        """同步更新已发送的交互卡片内容（供 progress_callback 调用）。"""
+        try:
+            content = _build_card_json(body_md, header_text, template)
+            request = PatchMessageRequest.builder() \
+                .message_id(message_id) \
+                .request_body(
+                    PatchMessageRequestBody.builder()
+                    .content(content)
+                    .build()
+                ).build()
+            response = self._client.im.v1.message.patch(request)
+            if not response.success():
+                logger.debug(
+                    "Card patch failed: code=%s msg=%s",
+                    response.code, response.msg,
+                )
+                return False
+            return True
+        except Exception as e:
+            logger.debug(f"Card patch error: {e}")
+            return False
+
+    async def _send_initial_progress_card(
+        self, chat_id: str, receive_id_type: str
+    ) -> str | None:
+        """发送初始'思考中'进度卡片，返回消息 ID（失败返回 None）。"""
+        try:
+            content = _build_card_json("⚙️ 正在思考...", "AI 助手", "blue")
+            request = CreateMessageRequest.builder() \
+                .receive_id_type(receive_id_type) \
+                .request_body(
+                    CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("interactive")
+                    .content(content)
+                    .build()
+                ).build()
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None, self._client.im.v1.message.create, request
+            )
+
+            if response.success() and response.data and response.data.message_id:
+                logger.debug(f"Progress card sent: {response.data.message_id}")
+                return response.data.message_id
+            else:
+                logger.warning(
+                    "Failed to send progress card: code=%s msg=%s",
+                    response.code, response.msg,
+                )
+                return None
+        except Exception as e:
+            logger.warning(f"Error sending progress card: {e}")
+            return None
+
+    # ── 接收消息 ───────────────────────────────────────────────
+
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
-        """
-        Sync handler for incoming messages (called from WebSocket thread).
-        Schedules async handling in the main event loop.
-        """
+        """Sync handler (WebSocket thread) → schedule async handler."""
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
-    
+
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
         """Handle incoming message from Feishu."""
         try:
             event = data.event
             message = event.message
             sender = event.sender
-            
-            # Deduplication check
+
             message_id = message.message_id
             if message_id in self._processed_message_ids:
                 return
             self._processed_message_ids[message_id] = None
-            
-            # Trim cache: keep most recent 500 when exceeds 1000
             while len(self._processed_message_ids) > 1000:
                 self._processed_message_ids.popitem(last=False)
-            
-            # Skip bot messages
-            sender_type = sender.sender_type
-            if sender_type == "bot":
+
+            if sender.sender_type == "bot":
                 return
-            
+
             sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
             chat_id = message.chat_id
-            chat_type = message.chat_type  # "p2p" or "group"
+            chat_type = message.chat_type
             msg_type = message.message_type
-            
-            # Add reaction to indicate "seen"
-            await self._add_reaction(message_id, "THUMBSUP")
-            
-            # Parse message content
+
+            await self._add_reaction(message_id, "OnIt")
+
+            content_parts: list[str] = []
+            media_paths: list[str] = []
+
             if msg_type == "text":
-                try:
-                    content = json.loads(message.content).get("text", "")
-                except json.JSONDecodeError:
-                    content = message.content or ""
+                content_parts.append(self._parse_text_content(message.content))
+
+            elif msg_type == "image":
+                image_path = await self._download_image_from_message(message_id, message.content)
+                if image_path:
+                    media_paths.append(image_path)
+                    content_parts.append("[图片]")
+                else:
+                    content_parts.append("[图片: 下载失败]")
+
+            elif msg_type == "post":
+                text, images = await self._parse_post_content(message_id, message.content)
+                if text:
+                    content_parts.append(text)
+                media_paths.extend(images)
+                if images and not text:
+                    content_parts.append("[富文本图片]")
+
+            elif msg_type == "file":
+                content_parts.append("[文件]")
+
+            elif msg_type == "audio":
+                content_parts.append("[语音]")
+
+            elif msg_type == "sticker":
+                content_parts.append("[表情]")
+
             else:
-                content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
-            
-            if not content:
+                content_parts.append(f"[{msg_type}]")
+
+            content = "\n".join(content_parts) if content_parts else "[空消息]"
+            if not content.strip() and not media_paths:
                 return
-            
-            # Forward to message bus
+
             reply_to = chat_id if chat_type == "group" else sender_id
+            receive_id_type = "chat_id" if reply_to.startswith("oc_") else "open_id"
+
+            # 发送初始进度卡片
+            card_message_id = await self._send_initial_progress_card(reply_to, receive_id_type)
+            if card_message_id:
+                self._active_progress_cards[reply_to] = card_message_id
+                self._last_card_update[reply_to] = 0.0
+
+            # 构建进度回调闭包，负责实时更新进度卡片
+            progress_callback = None
+            if card_message_id:
+                # 每个 step: {"name": str, "desc": str, "result": str}
+                steps_done: list[dict[str, str]] = []
+                step_current: list[dict[str, str]] = [{}]
+                # Claude Code 滚动输出缓冲（最近 25 行）
+                claude_lines: list[str] = []
+                in_claude_code: list[bool] = [False]
+                last_update_ts: list[float] = [0.0]
+                _self = self
+
+                def _fmt_args(tool_name: str, arguments: dict) -> str:
+                    """从工具参数中提取人类可读的一行描述。"""
+                    if not arguments:
+                        return ""
+                    # 常见字段优先级：路径 > 查询 > 命令 > prompt > url > 首个值
+                    for key in ("path", "file_path", "relative_path"):
+                        if key in arguments:
+                            return str(arguments[key])
+                    for key in ("query", "search_query"):
+                        if key in arguments:
+                            v = str(arguments[key])
+                            return f'"{v[:80]}"'
+                    if "command" in arguments:
+                        return f'`{str(arguments["command"])[:80]}`'
+                    if "prompt" in arguments:
+                        v = str(arguments["prompt"])
+                        return v[:80] + ("..." if len(v) > 80 else "")
+                    if "url" in arguments:
+                        return str(arguments["url"])[:80]
+                    # 兜底：取第一个键值对
+                    first_key = next(iter(arguments))
+                    first_val = str(arguments[first_key])
+                    return f"{first_key}={first_val[:60]}"
+
+                _TOOL_ICON: dict[str, str] = {
+                    "read_file": "📄",
+                    "write_file": "✏️",
+                    "edit_file": "✏️",
+                    "search_web": "🌐",
+                    "execute_command": "💻",
+                    "claude_code": "🤖",
+                    "mcp": "🔌",
+                    "list_directory": "📁",
+                    "image_recognition": "🖼️",
+                }
+
+                def _tool_icon(name: str) -> str:
+                    for prefix, icon in _TOOL_ICON.items():
+                        if name.startswith(prefix):
+                            return icon
+                    return "🔧"
+
+                def _build_normal_card() -> None:
+                    """构建普通 agent 工具调用进度卡片并 patch。"""
+                    prog_lines: list[str] = []
+                    total = len(steps_done) + (1 if step_current[0] else 0)
+                    if total:
+                        prog_lines.append(f"**已调用 {len(steps_done)}/{total} 个工具**\n")
+                    for s in steps_done:
+                        icon = _tool_icon(s["name"])
+                        desc = f" — {s['desc']}" if s.get("desc") else ""
+                        result_hint = f"\n> {s['result'][:80]}" if s.get("result") else ""
+                        prog_lines.append(f"{icon} ~~`{s['name']}`~~{desc}{result_hint}")
+                    if step_current[0]:
+                        cur = step_current[0]
+                        icon = _tool_icon(cur["name"])
+                        desc = f" {cur['desc']}" if cur.get("desc") else ""
+                        label = "Claude Code" if in_claude_code[0] else cur["name"]
+                        prog_lines.append(f"{icon} **`{label}`**{desc} _执行中..._")
+
+                    body_md = "\n".join(prog_lines) if prog_lines else "⚙️ 正在思考..."
+                    _self._patch_card_sync(card_message_id, body_md, "AI 助手", "blue")
+
+                def _on_progress(evt: dict[str, Any]) -> None:  # noqa: C901
+                    evt_type = evt.get("type", "")
+
+                    # ── Claude Code 实时输出 ──────────────────────
+                    if evt_type == "claude_code_progress":
+                        subtype = evt.get("subtype", "")
+                        raw_line = evt.get("line", "")
+
+                        if raw_line:
+                            claude_lines.append(raw_line)
+                        elif subtype == "subagent_start":
+                            subagent_type = evt.get("subagent_type", "subagent")
+                            content = evt.get("content", "")
+                            label = {
+                                "code-explorer": "🔍 探索",
+                                "code-implementer": "⚒️ 实现",
+                                "command-runner": "▶️ 执行",
+                            }.get(subagent_type, f"🤖 {subagent_type}")
+                            claude_lines.append(f"[并行 {label}] {content[:100]}")
+                        elif subtype == "tool_use":
+                            tool_name = evt.get("tool_name", "Tool")
+                            content = evt.get("content", "")
+                            claude_lines.append(f"[{tool_name}] {content[:120]}")
+                        elif subtype == "assistant_text":
+                            content = evt.get("content", "")
+                            if content:
+                                claude_lines.append(content[:150] + ("..." if len(content) > 150 else ""))
+                        elif subtype == "waiting_user_decision":
+                            claude_lines.append("⏳ 等待用户决策...")
+                        else:
+                            return
+
+                        if len(claude_lines) > 25:
+                            del claude_lines[:-25]
+
+                        now = time.time()
+                        if now - last_update_ts[0] < 2.0:
+                            return
+                        last_update_ts[0] = now
+
+                        # Claude Code 卡片：上方显示 agent 进度，下方显示 CC 实时输出
+                        prog_summary = ""
+                        if steps_done:
+                            prog_summary = f"**已完成 {len(steps_done)} 个工具** | "
+                        code_block = "\n".join(claude_lines)
+                        body_md = (
+                            f"{prog_summary}**⚙️ Claude Code 执行中...**\n\n"
+                            f"```\n{code_block}\n```"
+                        )
+                        _self._patch_card_sync(card_message_id, body_md, "Claude Code", "orange")
+                        return
+
+                    # ── 普通工具调用进度 ──────────────────────────
+                    if evt_type == "tool_start":
+                        name = evt.get("name", "unknown")
+                        arguments = evt.get("arguments") or {}
+                        desc = _fmt_args(name, arguments)
+                        step_current[0] = {"name": name, "desc": desc}
+                        if name == "claude_code":
+                            in_claude_code[0] = True
+                            claude_lines.clear()
+                    elif evt_type == "tool_end":
+                        name = evt.get("name", "") or (step_current[0].get("name", "") if step_current[0] else "")
+                        result = evt.get("result", "") or ""
+                        # 取结果首行作为摘要
+                        result_summary = result.split("\n")[0][:80] if result else ""
+                        cur = step_current[0] if step_current[0].get("name") == name else {"name": name, "desc": ""}
+                        steps_done.append({"name": name, "desc": cur.get("desc", ""), "result": result_summary})
+                        step_current[0] = {}
+                        if name == "claude_code":
+                            in_claude_code[0] = False
+                    else:
+                        # thinking 等事件：卡片已显示"思考中"，无需更新
+                        return
+
+                    # 节流：两次 patch 间隔不低于 1 秒
+                    now = time.time()
+                    if now - last_update_ts[0] < 1.0:
+                        return
+                    last_update_ts[0] = now
+
+                    _build_normal_card()
+
+                progress_callback = _on_progress
+
+            metadata: dict[str, Any] = {
+                "message_id": message_id,
+                "chat_type": chat_type,
+                "msg_type": msg_type,
+            }
+            if progress_callback is not None:
+                metadata["progress_callback"] = progress_callback
+
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
                 content=content,
-                metadata={
-                    "message_id": message_id,
-                    "chat_type": chat_type,
-                    "msg_type": msg_type,
-                }
+                media=media_paths,
+                metadata=metadata,
             )
-            
-        except Exception as e:
+
+        except Exception:
             logger.exception("Error processing Feishu message")
+
+    # ── 消息解析 ───────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_text_content(raw: str | None) -> str:
+        """解析飞书 text 消息的 JSON content。"""
+        if not raw:
+            return ""
+        try:
+            return json.loads(raw).get("text", "")
+        except (json.JSONDecodeError, TypeError):
+            return raw
+
+    async def _parse_post_content(
+        self, message_id: str, raw: str | None
+    ) -> tuple[str, list[str]]:
+        """
+        解析飞书 post（富文本）消息，返回 (纯文本, [图片路径列表])。
+
+        Post 格式:
+        {"zh_cn": {"title": "...", "content": [[{tag, text/image_key, ...}]]}}
+        """
+        if not raw:
+            return "", []
+
+        try:
+            body = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return raw or "", []
+
+        # 支持 zh_cn / en_us / 任意第一个 locale
+        locale_data = body.get("zh_cn") or body.get("en_us")
+        if not locale_data:
+            first = next(iter(body.values()), None) if isinstance(body, dict) else None
+            if isinstance(first, dict):
+                locale_data = first
+            else:
+                return str(body), []
+
+        title = locale_data.get("title", "")
+        content_blocks: list[list[dict]] = locale_data.get("content", [])
+
+        text_parts: list[str] = []
+        image_paths: list[str] = []
+
+        if title:
+            text_parts.append(title)
+
+        for paragraph in content_blocks:
+            line_parts: list[str] = []
+            for elem in paragraph:
+                tag = elem.get("tag", "")
+                if tag == "text":
+                    line_parts.append(elem.get("text", ""))
+                elif tag == "a":
+                    href = elem.get("href", "")
+                    link_text = elem.get("text", href)
+                    line_parts.append(f"{link_text}({href})")
+                elif tag == "at":
+                    line_parts.append(f"@{elem.get('user_name', elem.get('user_id', ''))}")
+                elif tag == "img":
+                    image_key = elem.get("image_key", "")
+                    if image_key:
+                        path = await self._download_image_by_key(message_id, image_key)
+                        if path:
+                            image_paths.append(path)
+                elif tag == "media":
+                    line_parts.append("[视频]")
+                elif tag == "code_block":
+                    code_text = elem.get("text", "")
+                    lang = elem.get("language", "")
+                    line_parts.append(f"```{lang}\n{code_text}\n```")
+            if line_parts:
+                text_parts.append("".join(line_parts))
+
+        return "\n".join(text_parts), image_paths
+
+    # ── 图片下载 ───────────────────────────────────────────────
+
+    async def _download_image_from_message(
+        self, message_id: str, raw_content: str | None
+    ) -> str | None:
+        """从 image 消息中提取 image_key 并下载。"""
+        if not raw_content:
+            return None
+        try:
+            image_key = json.loads(raw_content).get("image_key", "")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not image_key:
+            return None
+        return await self._download_image_by_key(message_id, image_key)
+
+    async def _download_image_by_key(
+        self, message_id: str, image_key: str
+    ) -> str | None:
+        """
+        通过飞书 API 下载图片资源。
+
+        使用 im.v1.message_resource.get 接口：
+        GET /open-apis/im/v1/messages/:message_id/resources/:file_key?type=image
+        """
+        if not self._client or not image_key:
+            return None
+
+        try:
+            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+            save_path = MEDIA_DIR / f"feishu_{image_key[:20]}.png"
+
+            if save_path.exists() and save_path.stat().st_size > 0:
+                logger.debug(f"Feishu image cache hit: {save_path}")
+                return str(save_path)
+
+            request = GetMessageResourceRequest.builder() \
+                .message_id(message_id) \
+                .file_key(image_key) \
+                .type("image") \
+                .build()
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None, self._client.im.v1.message_resource.get, request
+            )
+
+            if not response.success():
+                logger.warning(
+                    "Feishu image download failed: code=%s msg=%s (key=%s)",
+                    response.code, response.msg, image_key,
+                )
+                return None
+
+            # lark-oapi 返回 response.file (file-like) 或 response.data
+            file_obj = getattr(response, "file", None)
+            if file_obj is not None:
+                if hasattr(file_obj, "read"):
+                    data = file_obj.read()
+                else:
+                    data = file_obj
+                with open(save_path, "wb") as f:
+                    f.write(data)
+                logger.info(f"Feishu image downloaded: {save_path} ({len(data)} bytes)")
+                return str(save_path)
+
+            logger.warning("Feishu image response has no file data (key=%s)", image_key)
+            return None
+
+        except Exception as e:
+            logger.warning(f"Feishu image download error (key={image_key}): {e}")
+            return None
+
+    # ── Reaction ──────────────────────────────────────────────
+
+    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
+        try:
+            request = CreateMessageReactionRequest.builder() \
+                .message_id(message_id) \
+                .request_body(
+                    CreateMessageReactionRequestBody.builder()
+                    .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
+                    .build()
+                ).build()
+
+            response = self._client.im.v1.message_reaction.create(request)
+            if not response.success():
+                logger.warning(f"Failed to add reaction: code={response.code}, msg={response.msg}")
+        except Exception as e:
+            logger.warning(f"Error adding reaction: {e}")
+
+    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
+        if not self._client or not Emoji:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)

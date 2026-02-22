@@ -20,11 +20,16 @@ class SpawnTool(Tool):
         self._manager = manager
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
+        self._current_media: list[str] = []
     
     def set_context(self, channel: str, chat_id: str) -> None:
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
+
+    def set_media(self, media: list[str]) -> None:
+        """Set the current message's media paths for optional forwarding."""
+        self._current_media = list(media) if media else []
     
     @property
     def name(self) -> str:
@@ -35,7 +40,8 @@ class SpawnTool(Tool):
         return (
             "Spawn a subagent to handle a task in the background. "
             "Use this for complex or time-consuming tasks that can run independently. "
-            "The subagent will complete the task and report back when done."
+            "The subagent will complete the task and report back when done. "
+            "Set attach_media=true to forward the current message's images to the subagent."
         )
     
     @property
@@ -66,6 +72,11 @@ class SpawnTool(Tool):
                     "description": "Enable agent-specific memory for this subagent (stores memory in agents/{session_id}/memory/)",
                     "default": False,
                 },
+                "attach_media": {
+                    "type": "boolean",
+                    "description": "Whether to forward the current message's images to the subagent for visual analysis",
+                    "default": False,
+                },
             },
             "required": ["task"],
         }
@@ -77,9 +88,11 @@ class SpawnTool(Tool):
         template: str = "minimal",
         session_id: str | None = None,
         enable_memory: bool = False,
+        attach_media: bool = False,
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
+        media = self._current_media if attach_media and self._current_media else None
         return await self._manager.spawn(
             task=task,
             label=label,
@@ -88,4 +101,5 @@ class SpawnTool(Tool):
             enable_memory=enable_memory,
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
+            media=media,
         )

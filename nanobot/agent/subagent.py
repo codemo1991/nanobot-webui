@@ -1,7 +1,9 @@
 """Subagent manager for background task execution."""
 
 import asyncio
+import base64
 import json
+import mimetypes
 import uuid
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,25 @@ class SubagentManager:
         self.sessions = sessions
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
 
+    def _build_user_message_with_media(self, text: str, media: list[str] | None = None) -> dict[str, Any]:
+        """Build user message with optional base64-encoded images."""
+        if not media:
+            return {"role": "user", "content": text}
+        
+        images = []
+        for path in media:
+            p = Path(path)
+            mime, _ = mimetypes.guess_type(path)
+            if not p.is_file() or not mime or not mime.startswith("image/"):
+                continue
+            b64 = base64.b64encode(p.read_bytes()).decode()
+            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        
+        if not images:
+            return {"role": "user", "content": text}
+        
+        return {"role": "user", "content": images + [{"type": "text", "text": text}]}
+
     async def spawn(
         self,
         task: str,
@@ -59,6 +80,7 @@ class SubagentManager:
         enable_memory: bool = False,
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
+        media: list[str] | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -71,6 +93,7 @@ class SubagentManager:
             enable_memory: Whether to enable agent-specific memory for this subagent.
             origin_channel: The channel to announce results to.
             origin_chat_id: The chat ID to announce results to.
+            media: Optional list of local file paths for images to include.
 
         Returns:
             Status message indicating the subagent was started.
@@ -97,7 +120,7 @@ class SubagentManager:
         }
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, template, session_id, enable_memory)
+            self._run_subagent(task_id, task, display_label, origin, template, session_id, enable_memory, media)
         )
         self._running_tasks[task_id] = bg_task
 
@@ -118,6 +141,7 @@ class SubagentManager:
         template: str = "minimal",
         session_id: str | None = None,
         enable_memory: bool = False,
+        media: list[str] | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, memory: {enable_memory})")
@@ -147,20 +171,34 @@ class SubagentManager:
                     history = existing.get_history(max_messages=50)
                     messages.extend(history)
                 else:
-                    messages.append({"role": "user", "content": task})
+                    messages.append(self._build_user_message_with_media(task, media))
             else:
-                messages.append({"role": "user", "content": task})
+                messages.append(self._build_user_message_with_media(task, media))
 
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
+            # 视觉模型通常不支持 function calling，有图片时不传 tools
+            use_tools = None if media else tools.get_definitions()
+
+            # DashScope 模型有图片时绕过 LiteLLM (Bug #16007: LiteLLM 会丢弃 image_url)
+            if media and use_tools is None:
+                model_lower = self.model.lower()
+                if any(k in model_lower for k in ("dashscope", "qwen")):
+                    direct_result = await self._dashscope_direct_call(messages, self.model)
+                    if direct_result:
+                        final_result = direct_result
+                    else:
+                        final_result = "DashScope 图片识别失败，请检查 API key 和模型配置。"
+                    # 跳过正常 loop
+                    max_iterations = 0
 
             while iteration < max_iterations:
                 iteration += 1
 
                 response = await self.provider.chat(
                     messages=messages,
-                    tools=tools.get_definitions(),
+                    tools=use_tools,
                     model=self.model,
                 )
 
@@ -280,6 +318,52 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             tools.register(WebFetchTool())
 
         return tools
+
+    async def _dashscope_direct_call(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+    ) -> str | None:
+        """
+        直接调用 DashScope OpenAI 兼容 API，绕过 LiteLLM。
+        LiteLLM Bug #16007: DashScope 适配层会丢弃 image_url 内容。
+        """
+        import os
+        import httpx
+
+        api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        if not api_key:
+            try:
+                from nanobot.config.loader import load_config
+                cfg = load_config()
+                api_key = (cfg.providers.dashscope.api_key or "").strip()
+            except Exception:
+                pass
+        if not api_key:
+            logger.warning("DashScope API key not found for subagent image recognition")
+            return None
+
+        model_name = model.split("/", 1)[1] if "/" in model else model
+        url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, Any] = {"model": model_name, "messages": messages}
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if content and content.strip():
+                logger.info("DashScope subagent image call completed (model: %s)", model_name)
+                return content.strip()
+            return None
+        except Exception as e:
+            logger.warning("DashScope subagent image call failed (model: %s): %s", model_name, e)
+            return None
 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""

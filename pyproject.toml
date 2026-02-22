@@ -32,6 +32,7 @@ dependencies = [
     "croniter>=2.0.0",
     "python-telegram-bot>=21.0",
     "watchdog>=3.0.0",
+    "claude-agent-sdk>=0.1.39",
 ]
 
 [project.optional-dependencies]
