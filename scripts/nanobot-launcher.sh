@@ -73,7 +73,10 @@ while true; do
 
         if [ -f "$REPO_DIR/pyproject.toml" ]; then
             echo "[launcher] Running: pip install -e . (in $REPO_DIR)"
+            # 使用 --no-deps 加速，主要目的是让 Python 识别代码变更
+            (cd "$REPO_DIR" && pip install -e . --no-deps --quiet 2>&1 | sed 's/^/  /') || \
             (cd "$REPO_DIR" && pip install -e . --quiet 2>&1 | sed 's/^/  /')
+            echo "[launcher] pip install done (exit: $?)"
         fi
 
         echo "[launcher] Restarting in 2 seconds..."

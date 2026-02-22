@@ -54,8 +54,9 @@ while ($true) {
     Write-Host "[launcher] Restart exit code: $RESTART_EXIT_CODE | Ctrl+C to stop" -ForegroundColor DarkGray
     Write-Host ""
 
-    $process = Start-Process -FilePath "nanobot" -ArgumentList $nanobotArgs -NoNewWindow -PassThru -Wait
-    $exitCode = $process.ExitCode
+    # 直接调用而非 Start-Process，$LASTEXITCODE 可可靠捕获 os._exit() 的退出码
+    & nanobot @nanobotArgs
+    $exitCode = $LASTEXITCODE
 
     Write-Host ""
     Write-Host "[launcher] nanobot exited with code: $exitCode" -ForegroundColor Yellow
