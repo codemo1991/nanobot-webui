@@ -31,6 +31,12 @@ $RAPID_RESTART_WINDOW = 60  # seconds
 
 $restartTimestamps = @()
 
+# 设置 UTF-8 编码，避免 emoji/中文导致 UnicodeEncodeError
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+
 function Write-Banner {
     Write-Host ""
     Write-Host "  ================================" -ForegroundColor Cyan
@@ -72,14 +78,25 @@ while ($true) {
             exit 1
         }
 
-        Write-Host "[launcher] Self-update restart requested. Reinstalling..." -ForegroundColor Cyan
+        Write-Host "[launcher] Self-update restart requested. Pulling & reinstalling..." -ForegroundColor Cyan
 
         # Find repo directory (same directory as this script's parent)
         $repoDir = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
         if (Test-Path (Join-Path $repoDir "pyproject.toml")) {
-            Write-Host "[launcher] Running: pip install -e . (in $repoDir)" -ForegroundColor DarkGray
             Push-Location $repoDir
+
+            # 拉取远端最新代码（如已在 nanobot 内部 pull 则为 no-op，无害）
+            Write-Host "[launcher] Running: git pull (in $repoDir)" -ForegroundColor DarkGray
+            $gitOut = & git pull 2>&1
+            $gitOut | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "[launcher] Warning: git pull failed (exit $LASTEXITCODE), continuing anyway..." -ForegroundColor Yellow
+            }
+
+            # 重新安装依赖（处理新增包）
+            Write-Host "[launcher] Running: pip install -e . (in $repoDir)" -ForegroundColor DarkGray
             & pip install -e . --quiet 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+
             Pop-Location
         }
 
