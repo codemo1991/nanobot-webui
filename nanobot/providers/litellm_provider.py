@@ -255,6 +255,23 @@ class LiteLLMProvider(LLMProvider):
 
         if self.api_base:
             litellm.api_base = self.api_base
+
+    def ensure_api_key_for_model(self, model: str, api_key: str, api_base: str | None = None) -> None:
+        """
+        仅为指定模型设置对应 provider 的环境变量，不修改 provider 实例属性。
+        用于子agent等场景，避免覆盖主模型配置。
+        """
+        if not api_key:
+            return
+        provider = _detect_provider_from_model(model)
+        if provider:
+            _set_provider_env_key_by_provider(api_key, provider)
+        else:
+            _set_provider_env_key(api_key, model)
+        if api_base:
+            base_provider = self._detect_provider_from_api_base(api_base)
+            if base_provider:
+                _set_provider_env_key_by_provider(api_key, base_provider)
     
     async def chat(
         self,

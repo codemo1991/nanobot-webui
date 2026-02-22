@@ -123,6 +123,7 @@ function ChatPage() {
   const [streamingThinking, setStreamingThinking] = useState(false)
   const [claudeCodeProgress, setClaudeCodeProgress] = useState('')
   const [pendingImages, setPendingImages] = useState<string[]>([])
+  const [imageSendStatus, setImageSendStatus] = useState<Record<number, 'sending' | 'sent' | 'error'>>({})
   const [sessionTokenUsage, setSessionTokenUsage] = useState<TokenUsage>({
     promptTokens: 0,
     completionTokens: 0,
@@ -245,7 +246,8 @@ function ChatPage() {
   }
 
   const handleSend = useCallback(async () => {
-    if (!input.trim() || !currentSession) return
+    if (!currentSession) return
+    if (!input.trim() && !pendingImages.length) return
     if (loading) {
       handleStop()
       return
@@ -255,6 +257,7 @@ function ChatPage() {
     const imagesToSend = [...pendingImages]
     setInput('')
     setPendingImages([])
+    setImageSendStatus({})
     setLoading(true)
     setStreamingToolSteps([])
     setStreamingThinking(false)
@@ -273,6 +276,12 @@ function ChatPage() {
       images: imagesToSend.length > 0 ? imagesToSend : undefined,
     }
     setMessages(prev => [...prev, tempUserMsg])
+
+    if (imagesToSend.length > 0) {
+      const status: Record<number, 'sending' | 'sent' | 'error'> = {}
+      imagesToSend.forEach((_, i) => { status[i] = 'sending' })
+      setImageSendStatus(status)
+    }
 
     const handleStreamEvent = (evt: { type: string; name?: string; arguments?: Record<string, unknown>; result?: string; subtype?: string; content?: string; tool_name?: string }) => {
       if (evt.type === 'thinking') {
@@ -326,11 +335,25 @@ function ChatPage() {
         controller.signal,
         imagesToSend.length > 0 ? imagesToSend : undefined,
       )
+      if (imagesToSend.length > 0) {
+        setImageSendStatus(prev => {
+          const newStatus = { ...prev }
+          Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'sent' })
+          return newStatus
+        })
+      }
       await loadMessages(currentSession.id)
       await loadSessionTokenUsage(currentSession.id)
       void loadSessions()
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') return
+      if (imagesToSend.length > 0) {
+        setImageSendStatus(prev => {
+          const newStatus = { ...prev }
+          Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'error' })
+          return newStatus
+        })
+      }
       antMessage.error(t('chat.sendFailed'))
       if (err instanceof Error) console.error(err)
       setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
@@ -343,7 +366,7 @@ function ChatPage() {
         abortControllerRef.current = null
       }
     }
-  }, [input, loading, messages, currentSession, t])
+  }, [input, loading, messages, currentSession, pendingImages.length, t])
 
   const handleImageSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
@@ -572,8 +595,28 @@ function ChatPage() {
           {pendingImages.length > 0 && (
             <div className="pending-images-row">
               {pendingImages.map((src, i) => (
-                <div key={i} className="pending-image-wrapper">
+                <div key={i} className={`pending-image-wrapper ${imageSendStatus[i] || ''}`}>
                   <img src={src} className="pending-image-thumb" alt="" />
+                  {imageSendStatus[i] && (
+                    <span className="pending-image-status">
+                      {imageSendStatus[i] === 'sending' ? t('chat.sending') : imageSendStatus[i] === 'sent' ? t('chat.sent') : t('chat.failed')}
+                    </span>
+                  )}
+                  {imageSendStatus[i] === 'error' && (
+                    <button
+                      className="pending-image-retry"
+                      onClick={() => {
+                        setImageSendStatus(prev => {
+                          const newStatus = { ...prev }
+                          delete newStatus[i]
+                          return newStatus
+                        })
+                      }}
+                      title={t('chat.retry')}
+                    >
+                      ↻
+                    </button>
+                  )}
                   <button
                     className="pending-image-remove"
                     onClick={() => setPendingImages(prev => prev.filter((_, idx) => idx !== i))}

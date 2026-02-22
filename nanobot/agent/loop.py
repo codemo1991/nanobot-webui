@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +22,7 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.claude_code import ClaudeCodeTool
+from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import parse_session_key, estimate_tokens
@@ -39,6 +41,7 @@ TOOL_KEYWORDS = {
     "spawn": ["子代理", "subagent", "spawn", "并行"],
     "cron": ["定时", "计划", "cron", "schedule"],
     "claude_code": ["claude code", "claude-code", "代码实现", "实现功能", "写代码"],
+    "self_update": ["自更新", "自我更新", "self-update", "self_update", "evolve", "自我进化", "重启", "restart", "推送", "push", "更新自己"],
 }
 
 for tool, keywords in TOOL_KEYWORDS.items():
@@ -292,6 +295,9 @@ class AgentLoop:
         # Claude Code tool (for complex coding tasks)
         claude_code_tool = ClaudeCodeTool(manager=self.claude_code_manager)
         self.tools.register(claude_code_tool)
+
+        # Self-update tool (for self-evolution: git push + restart)
+        self.tools.register(SelfUpdateTool(workspace=ws))
     
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -318,10 +324,25 @@ class AgentLoop:
                     raise  # Propagate for clean shutdown
                 except asyncio.TimeoutError:
                     logger.warning(f"Message processing timed out after {self.message_timeout}s")
+                    timeout_text = (
+                        "⏳ 当前任务处理时间较长。"
+                        "如有 Claude Code 任务正在执行，它将继续在后台运行，"
+                        "完成后会自动通知您结果。\n\n"
+                        "您也可以继续提问，我会记住本次对话上下文。"
+                    )
+                    # 保存会话历史，确保超时后上下文不丢失
+                    try:
+                        session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
+                        session = self.sessions.get_or_create(session_key)
+                        session.add_message("user", msg.content)
+                        session.add_message("assistant", timeout_text)
+                        self.sessions.save(session)
+                    except Exception as _e:
+                        logger.warning(f"Failed to save session on timeout: {_e}")
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        content="Sorry, processing timed out. Please try again with a shorter request."
+                        content=timeout_text,
                     ))
                 except Exception as e:
                     logger.exception("Error processing message")
@@ -369,7 +390,13 @@ class AgentLoop:
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
             return await self._process_system_message(msg)
-        
+
+        # 优先检查是否是对 Claude Code 决策请求的回复
+        # 当 manager 有挂起的决策时，该消息直接路由给对应的 Future，不走 LLM
+        if self.claude_code_manager.resolve_decision(msg.session_key, msg.content):
+            logger.info(f"Message routed as Claude Code decision reply for {msg.session_key}")
+            return None
+
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
         
         # Get or create session
@@ -383,6 +410,7 @@ class AgentLoop:
         spawn_tool = self.tools.get("spawn")
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(msg.channel, msg.chat_id)
+            spawn_tool.set_media(msg.media if msg.media else [])
         
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
@@ -430,6 +458,39 @@ class AgentLoop:
             chat_id=msg.chat_id,
             mirror_attack_level=mirror_attack_level,
         )
+
+        # Inline image recognition: 用视觉模型识别图片，将最后一条用户消息替换为纯文本
+        # 避免主模型（可能不支持视觉）收到图片时回复“无法查看图片”
+        if msg.media:
+            img_desc = None
+            if self.subagent_model and self.subagent_model != self.model:
+                progress_cb = msg.metadata.get("progress_callback")
+                if progress_cb:
+                    try:
+                        progress_cb({"type": "tool_start", "name": "image_recognition", "arguments": {"images": len(msg.media)}})
+                    except Exception:
+                        pass
+                img_desc = await self._inline_image_recognition(msg.media, user_text=msg.content)
+                if progress_cb:
+                    try:
+                        progress_cb({"type": "tool_end", "name": "image_recognition", "arguments": {}, "result": (img_desc or "")[:200]})
+                    except Exception:
+                        pass
+
+            last_user = messages[-1] if messages and messages[-1].get("role") == "user" else None
+            if last_user:
+                if img_desc:
+                    text_content = msg.content.strip() or "请描述这张图片。"
+                    last_user["content"] = f"{text_content}\n\n[图片识别结果]\n{img_desc}"
+                else:
+                    has_vision_config = bool(self.subagent_model and self.subagent_model != self.model)
+                    fallback = (
+                        "用户发送了图片。图片识别失败（请检查 DashScope API key 及子 Agent 模型配置），"
+                        "请用户用文字描述图片内容。"
+                        if has_vision_config
+                        else "用户发送了图片。系统未配置视觉模型，请用户用文字描述图片内容，或前往设置配置子 Agent 模型（如 dashscope/qwen-vl-plus）。"
+                    )
+                    last_user["content"] = f"{msg.content}\n\n[{fallback}]" if msg.content.strip() else fallback
         
         # Agent loop
         iteration = 0
@@ -592,7 +653,31 @@ class AgentLoop:
             "completion_tokens": 0,
             "total_tokens": usage_acc["prompt_tokens"],
         }
-        session.add_message("user", msg.content, token_usage=user_token_usage)
+        
+        user_message_kwargs: dict[str, Any] = {"token_usage": user_token_usage}
+        
+        if msg.media:
+            import base64
+            user_images: list[str] = []
+            for media_path in msg.media:
+                try:
+                    with open(media_path, "rb") as f:
+                        img_data = base64.b64encode(f.read()).decode("utf-8")
+                        ext = Path(media_path).suffix.lower()
+                        mime_type = "image/jpeg"
+                        if ext in [".png"]:
+                            mime_type = "image/png"
+                        elif ext in [".gif"]:
+                            mime_type = "image/gif"
+                        elif ext in [".webp"]:
+                            mime_type = "image/webp"
+                        user_images.append(f"data:{mime_type};base64,{img_data}")
+                except Exception as e:
+                    logger.warning(f"Failed to read media file {media_path}: {e}")
+            if user_images:
+                user_message_kwargs["images"] = user_images
+        
+        session.add_message("user", msg.content, **user_message_kwargs)
         session.add_message(
             "assistant",
             final_content,
@@ -612,6 +697,140 @@ class AgentLoop:
             chat_id=msg.chat_id,
             content=final_content
         )
+    
+    async def _inline_image_recognition(
+        self,
+        media_paths: list[str],
+        user_text: str = "",
+    ) -> str | None:
+        """
+        使用视觉模型对图片进行 inline 识别（同步 await）。
+
+        对 DashScope 模型绕过 LiteLLM（LiteLLM 存在已知 Bug #16007 会丢弃图片），
+        直接调用 DashScope OpenAI 兼容 API。其他 provider 走正常 provider.chat() 路径。
+
+        Returns:
+            图片描述文本，识别失败时返回 None。
+        """
+        import base64
+        import mimetypes as _mimetypes
+
+        vision_model = self.subagent_model if self.subagent_model else self.model
+
+        images: list[dict[str, Any]] = []
+        for path_str in media_paths:
+            p = Path(path_str)
+            mime, _ = _mimetypes.guess_type(path_str)
+            if not p.is_file() or not mime or not mime.startswith("image/"):
+                continue
+            try:
+                b64 = base64.b64encode(p.read_bytes()).decode()
+                images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            except Exception as e:
+                logger.warning("Failed to read media file for recognition %s: %s", path_str, e)
+
+        if not images:
+            return None
+
+        image_count = len(images)
+        task = user_text or (
+            f"请详细分析这{image_count}张图片的内容，包括："
+            "1) 图片中的主要内容和对象；"
+            "2) 场景和环境；"
+            "3) 文字信息（如果有）；"
+            "4) 任何值得注意的细节。用中文回复。"
+        )
+
+        model_lower = vision_model.lower()
+        is_dashscope = any(k in model_lower for k in ("dashscope", "qwen"))
+
+        if is_dashscope:
+            return await self._dashscope_image_call(images, task, vision_model, image_count)
+
+        user_content: list[dict[str, Any]] = images + [{"type": "text", "text": task}]
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "你是一个图片分析助手。请仔细观察并描述图片内容。"},
+            {"role": "user", "content": user_content},
+        ]
+        try:
+            response = await self.provider.chat(
+                messages=messages,
+                tools=None,
+                model=vision_model,
+            )
+            if response.content and response.content.strip():
+                logger.info("Inline image recognition completed (%d images, model: %s)", image_count, vision_model)
+                return response.content.strip()
+            return None
+        except Exception as e:
+            logger.warning("Inline image recognition failed (model: %s): %s", vision_model, e)
+            return None
+
+    async def _dashscope_image_call(
+        self,
+        images: list[dict[str, Any]],
+        task: str,
+        vision_model: str,
+        image_count: int,
+    ) -> str | None:
+        """
+        直接调用 DashScope OpenAI 兼容 API 进行图片识别。
+        绕过 LiteLLM 的 DashScope 适配层（存在已知 Bug 会丢弃 image_url 内容）。
+        """
+        import os
+        import httpx
+
+        api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        if not api_key:
+            from nanobot.config.loader import load_config
+            cfg = load_config()
+            api_key = (cfg.providers.dashscope.api_key or "").strip()
+        if not api_key:
+            logger.warning("DashScope API key not found, cannot perform image recognition")
+            return None
+
+        model_name = vision_model
+        if "/" in model_name:
+            model_name = model_name.split("/", 1)[1]
+
+        user_content: list[dict[str, Any]] = images + [{"type": "text", "text": task}]
+        payload: dict[str, Any] = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": "你是一个图片分析助手。请仔细观察并描述图片内容。"},
+                {"role": "user", "content": user_content},
+            ],
+        }
+
+        url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if content and content.strip():
+                logger.info(
+                    "DashScope image recognition completed (%d images, model: %s)",
+                    image_count, model_name,
+                )
+                return content.strip()
+            return None
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                "DashScope image recognition HTTP error (model: %s): %s %s",
+                model_name, e.response.status_code, e.response.text[:500],
+            )
+            return None
+        except Exception as e:
+            logger.warning("DashScope image recognition failed (model: %s): %s", model_name, e)
+            return None
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
@@ -868,6 +1087,9 @@ class AgentLoop:
             media=media or [],
         )
 
+        if media and not content:
+            return await self._handle_image_only(media, session_key, channel, chat_id)
+
         try:
             await self._check_cancelled()
             response = await self._process_message(msg)
@@ -875,3 +1097,55 @@ class AgentLoop:
         except asyncio.CancelledError:
             logger.info("Agent request was cancelled")
             return ""
+    
+    async def _handle_image_only(
+        self,
+        media: list[str],
+        session_key: str,
+        channel: str,
+        chat_id: str,
+    ) -> str:
+        """Handle the case when user sends only images without any text."""
+        logger.info(f"Processing image-only message with {len(media)} images")
+
+        key = session_key
+        self.sessions.get_or_create(key)
+
+        import base64
+        user_images: list[str] = []
+        for media_path in media:
+            try:
+                with open(media_path, "rb") as f:
+                    img_data = base64.b64encode(f.read()).decode("utf-8")
+                    ext = Path(media_path).suffix.lower()
+                    mime_type = "image/jpeg"
+                    if ext in [".png"]:
+                        mime_type = "image/png"
+                    elif ext in [".gif"]:
+                        mime_type = "image/gif"
+                    elif ext in [".webp"]:
+                        mime_type = "image/webp"
+                    user_images.append(f"data:{mime_type};base64,{img_data}")
+            except Exception as e:
+                logger.warning(f"Failed to read media file {media_path}: {e}")
+
+        if not user_images:
+            return "无法读取图片文件"
+
+        user_message_kwargs: dict[str, Any] = {
+            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "images": user_images,
+        }
+
+        session = self.sessions.get(key)
+        if session:
+            session.add_message("user", "[图片消息]", **user_message_kwargs)
+            self.sessions.save(session)
+
+        desc = await self._inline_image_recognition(media)
+        if desc:
+            if session:
+                session.add_message("assistant", desc)
+                self.sessions.save(session)
+            return desc
+        return "无法识别图片内容，请确认已配置视觉模型（如 dashscope/qwen-vl-plus）。"

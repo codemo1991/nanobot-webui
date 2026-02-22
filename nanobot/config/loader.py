@@ -1,8 +1,5 @@
 """Configuration loading utilities."""
 
-import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +7,6 @@ from loguru import logger
 
 from nanobot.config.schema import Config
 from nanobot.storage.config_repository import ConfigRepository
-
-
-def get_config_path() -> Path:
-    """Get the default configuration file path."""
-    return Path.home() / ".nanobot" / "config.json"
 
 
 def get_db_path() -> Path:
@@ -27,29 +19,25 @@ def get_config_repository() -> ConfigRepository:
     return ConfigRepository(get_db_path())
 
 
-def ensure_initial_config(config_path: Path | None = None) -> Config:
+def ensure_initial_config() -> Config:
     """
     确保 .nanobot 目录和配置存在；若不存在则创建默认配置和工作空间。
-    用于首次启动 web-ui 时自动初始化，用户无需先执行 nanobot onboard。
+    用于首次启动 web-ui 时自动初始化。
     """
-    path = config_path or get_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    
+    get_db_path().parent.mkdir(parents=True, exist_ok=True)
+
     repo = get_config_repository()
-    
+
     if not repo.has_config():
-        if path.exists():
-            _migrate_json_to_sqlite(path, repo)
-        else:
-            config = Config()
-            save_config(config)
-            ws_path = config.workspace_path
-            ws_path.mkdir(parents=True, exist_ok=True)
-            logger.info(
-                "已创建默认配置到 SQLite 数据库和工作空间目录，请在配置页添加 API Key 以使用对话功能"
-            )
-            return config
-    
+        config = Config()
+        save_config(config)
+        ws_path = config.workspace_path
+        ws_path.mkdir(parents=True, exist_ok=True)
+        logger.info(
+            "已创建默认配置到 SQLite 数据库和工作空间目录，请在配置页添加 API Key 以使用对话功能"
+        )
+        return config
+
     return load_config()
 
 
@@ -59,108 +47,29 @@ def get_data_dir() -> Path:
     return get_data_path()
 
 
-def load_config(config_path: Path | None = None) -> Config:
-    """
-    Load configuration from SQLite (primary) or JSON file (fallback).
-    
-    Args:
-        config_path: Optional path to config file for fallback.
-    
-    Returns:
-        Loaded configuration object.
-    """
+def load_config() -> Config:
+    """Load configuration from SQLite."""
     repo = get_config_repository()
-    
-    if repo.has_config():
-        try:
-            config_data = repo.load_full_config()
-            data = convert_keys(config_data)
-            return Config.model_validate(data)
-        except Exception as e:
-            logger.warning(f"Failed to load config from SQLite: {e}, will try JSON fallback")
-    
-    path = config_path or get_config_path()
-    
-    if path.exists():
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            config = Config.model_validate(convert_keys(data))
-            _migrate_json_to_sqlite(path, repo)
-            return config
-        except json.JSONDecodeError as e:
-            logger.error(f"Config file {path} is not valid JSON: {e}. Please check the file format.")
-        except ValueError as e:
-            logger.error(f"Config validation failed: {e}. Please check the config schema.")
-        except Exception as e:
-            logger.error(f"Failed to load config from {path}: {e}")
-    
-    logger.info("Using default configuration. You can configure API keys in the web UI.")
-    return Config()
-
-
-def _migrate_json_to_sqlite(json_path: Path, repo: ConfigRepository) -> None:
-    """
-    Migrate configuration from JSON file to SQLite.
-    
-    Args:
-        json_path: Path to the JSON config file.
-        repo: ConfigRepository instance.
-    """
     try:
-        with open(json_path) as f:
-            data = json.load(f)
-        
-        repo.save_full_config(data)
-        logger.info(f"Migrated config from {json_path} to SQLite")
-        
-        backup_path = json_path.with_suffix(".json.bak")
-        if not backup_path.exists():
-            import shutil
-            shutil.copy(json_path, backup_path)
-            logger.info(f"Created backup at {backup_path}")
+        config_data = repo.load_full_config()
+        data = convert_keys(config_data)
+        return Config.model_validate(data)
     except Exception as e:
-        logger.warning(f"Failed to migrate config to SQLite: {e}")
+        logger.warning(f"Failed to load config from SQLite: {e}, using defaults")
+        return Config()
 
 
-def save_config(config: Config, config_path: Path | None = None) -> None:
-    """
-    Save configuration to SQLite (primary) and optionally JSON file.
-    Uses atomic write (temp file + rename) for JSON to avoid corruption.
-
-    Args:
-        config: Configuration to save.
-        config_path: Optional path to save JSON backup. Uses default if not provided.
-    """
+def save_config(config: Config) -> None:
+    """Save configuration to SQLite."""
     data = config.model_dump()
     data = convert_to_camel(data)
-    
+
     repo = get_config_repository()
     try:
         repo.save_full_config(data)
         logger.debug("Config saved to SQLite")
     except Exception as e:
         logger.exception("Failed to save config to SQLite")
-        raise
-    
-    path = Path(config_path) if config_path else get_config_path()
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    fd, tmp = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
         raise
 
 
