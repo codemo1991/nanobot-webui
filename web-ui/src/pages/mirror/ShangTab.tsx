@@ -257,8 +257,8 @@ function ShangTab() {
           </div>
         )}
 
-        {/* 选择阶段 */}
-        {todayRecord && todayRecord.status === 'choosing' && (
+        {/* 选择阶段 - 仅当查看的是当天记录且处于choosing状态时显示 */}
+        {selectedRecord && selectedRecord.id === todayRecord?.id && todayRecord.status === 'choosing' && (
           <div className="shang-content">
             <div style={{ fontSize: 16, fontWeight: 600, width: '100%', maxWidth: 680 }}>{todayRecord.topic}</div>
             <div className="shang-images">
@@ -368,8 +368,8 @@ function ShangTab() {
           </div>
         )}
 
-        {/* 已完成 或 查看历史 */}
-        {selectedRecord && (selectedRecord.status === 'done' || todayDone) && (
+        {/* 已完成 - 显示选中的记录（当天已完成或历史记录） */}
+        {selectedRecord && selectedRecord.status === 'done' && (
           <div className="shang-record-detail">
             <h2 style={{ marginBottom: 16 }}>{selectedRecord.topic}</h2>
             <div className="shang-images" style={{ marginBottom: 24 }}>
