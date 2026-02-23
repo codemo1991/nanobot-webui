@@ -109,7 +109,58 @@ class NanobotWebAPI:
             workspace=config.workspace_path,
             sessions_manager=self.sessions,
         )
-        
+
+        # 初始化仅用于发送的渠道客户端（供 cron 任务推送回复使用，不启动 inbound 监听）
+        self._channel_senders: dict = {}
+        if config.channels.feishu.enabled:
+            from nanobot.channels.feishu import FeishuChannel
+            from nanobot.bus.queue import MessageBus as _SenderBus
+            _feishu_sender = FeishuChannel(config.channels.feishu, _SenderBus())
+            _feishu_sender.setup_client()
+            self._channel_senders["feishu"] = _feishu_sender
+
+        # Cron service — 与 ConfigRepository 共用同一个 chat.db
+        cron_db_path = data_dir / "chat.db"
+        from nanobot.cron.service import CronService
+
+        async def cron_job_callback(job: dict):
+            """执行定时任务：调用 LLM，若开启推送则发送到对应渠道。"""
+            from nanobot.bus.events import OutboundMessage
+            payload = job.get("payload", {})
+            message = payload.get("message", "")
+            deliver = payload.get("deliver", False)
+            channel_name = (payload.get("channel") or "feishu").strip()
+            to = (payload.get("to") or "").strip()
+            job_id = job.get("id", "unknown")
+            job_name = job.get("name", "unknown")
+
+            response = await self.agent.process_direct(
+                message,
+                session_key=f"cron:{job_id}",
+                channel=channel_name,
+                chat_id=to or "direct",
+            )
+
+            if deliver and to:
+                sender = self._channel_senders.get(channel_name)
+                if sender:
+                    try:
+                        await sender.send(OutboundMessage(
+                            channel=channel_name,
+                            chat_id=to,
+                            content=response or "",
+                        ))
+                        logger.info(f"定时任务 '{job_name}' 已推送至 {channel_name}:{to}")
+                    except Exception as _e:
+                        logger.error(f"定时任务 '{job_name}' 推送失败: {_e}")
+                else:
+                    logger.warning(
+                        f"定时任务 '{job_name}': 渠道 '{channel_name}' 未配置或未启用，跳过推送"
+                    )
+            return response
+
+        self.cron_service = CronService(db_path=cron_db_path, on_job=cron_job_callback)
+
         # Initial gateway sync
         self._sync_gateway()
 
@@ -1508,6 +1559,90 @@ class NanobotWebAPI:
             logger.exception("Failed to read logs")
             return [f"Error reading logs: {e}"]
 
+    # ========== Cron API ==========
+
+    def list_cron_jobs(self, include_disabled: bool = False) -> list[dict[str, Any]]:
+        """List all cron jobs."""
+        return self.cron_service.list_jobs(include_disabled=include_disabled)
+
+    def create_cron_job(
+        self,
+        name: str,
+        trigger_type: str,
+        trigger_date_ms: int | None = None,
+        trigger_interval_seconds: int | None = None,
+        trigger_cron_expr: str | None = None,
+        trigger_tz: str | None = None,
+        payload_kind: str = "agent_turn",
+        payload_message: str = "",
+        payload_deliver: bool = False,
+        payload_channel: str | None = None,
+        payload_to: str | None = None,
+        delete_after_run: bool = False,
+    ) -> dict[str, Any]:
+        """Create a new cron job."""
+        return self.cron_service.add_job(
+            name=name,
+            trigger_type=trigger_type,
+            trigger_date_ms=trigger_date_ms,
+            trigger_interval_seconds=trigger_interval_seconds,
+            trigger_cron_expr=trigger_cron_expr,
+            trigger_tz=trigger_tz,
+            payload_kind=payload_kind,
+            payload_message=payload_message,
+            payload_deliver=payload_deliver,
+            payload_channel=payload_channel,
+            payload_to=payload_to,
+            delete_after_run=delete_after_run,
+        )
+
+    def update_cron_job(
+        self,
+        job_id: str,
+        name: str | None = None,
+        enabled: bool | None = None,
+        trigger_type: str | None = None,
+        trigger_date_ms: int | None = None,
+        trigger_interval_seconds: int | None = None,
+        trigger_cron_expr: str | None = None,
+        trigger_tz: str | None = None,
+        payload_kind: str | None = None,
+        payload_message: str | None = None,
+        payload_deliver: bool | None = None,
+        payload_channel: str | None = None,
+        payload_to: str | None = None,
+        delete_after_run: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """Update a cron job."""
+        return self.cron_service.update_job(
+            job_id=job_id,
+            name=name,
+            enabled=enabled,
+            trigger_type=trigger_type,
+            trigger_date_ms=trigger_date_ms,
+            trigger_interval_seconds=trigger_interval_seconds,
+            trigger_cron_expr=trigger_cron_expr,
+            trigger_tz=trigger_tz,
+            payload_kind=payload_kind,
+            payload_message=payload_message,
+            payload_deliver=payload_deliver,
+            payload_channel=payload_channel,
+            payload_to=payload_to,
+            delete_after_run=delete_after_run,
+        )
+
+    def delete_cron_job(self, job_id: str) -> bool:
+        """Delete a cron job."""
+        return self.cron_service.remove_job(job_id)
+
+    async def run_cron_job(self, job_id: str, force: bool = False) -> bool:
+        """Manually run a cron job."""
+        return await self.cron_service.run_job(job_id, force=force)
+
+    def get_cron_status(self) -> dict:
+        """Get cron service status."""
+        return self.cron_service.status()
+
     def export_config(self) -> dict[str, Any]:
         """Export system configuration from SQLite."""
         try:
@@ -1835,6 +1970,31 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(config_data["skills"]))
                 return
 
+            # ==================== Cron GET ====================
+
+            # GET /api/v1/cron/status
+            if path == "/api/v1/cron/status":
+                status = app.get_cron_status()
+                self._write_json(HTTPStatus.OK, _ok(status))
+                return
+
+            # GET /api/v1/cron/jobs
+            if path == "/api/v1/cron/jobs":
+                include_disabled = query.get("includeDisabled", ["false"])[0].lower() == "true"
+                jobs = app.list_cron_jobs(include_disabled=include_disabled)
+                self._write_json(HTTPStatus.OK, _ok({"jobs": jobs}))
+                return
+
+            # GET /api/v1/cron/jobs/{jobId}
+            if len(parts) == 5 and parts[:3] == ["api", "v1", "cron"] and parts[3] == "jobs":
+                job_id = parts[4]
+                job = app.cron_service.get_job(job_id)
+                if job:
+                    self._write_json(HTTPStatus.OK, _ok(job))
+                else:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("CRON_JOB_NOT_FOUND", "定时任务不存在"))
+                return
+
             # ==================== Mirror Room GET ====================
 
             # GET /api/v1/mirror/profile
@@ -1977,6 +2137,68 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.exception("Config import failed")
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("IMPORT_FAILED", str(e)))
+            return
+
+        # ==================== Cron POST ====================
+
+        # POST /api/v1/cron/jobs
+        if path == "/api/v1/cron/jobs":
+            body = self._read_json()
+            name = (body.get("name") or "").strip()
+            if not name:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "name 不能为空"))
+                return
+
+            trigger_type = body.get("triggerType")
+            if trigger_type not in ("at", "every", "cron"):
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "triggerType 必须是 at, every 或 cron"))
+                return
+
+            # Validate trigger params based on type
+            if trigger_type == "at" and not body.get("triggerDateMs"):
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "at 触发器需要 triggerDateMs"))
+                return
+            if trigger_type == "every" and not body.get("triggerIntervalSeconds"):
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "every 触发器需要 triggerIntervalSeconds"))
+                return
+            if trigger_type == "cron" and not body.get("triggerCronExpr"):
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "cron 触发器需要 triggerCronExpr"))
+                return
+
+            try:
+                job = app.create_cron_job(
+                    name=name,
+                    trigger_type=trigger_type,
+                    trigger_date_ms=body.get("triggerDateMs"),
+                    trigger_interval_seconds=body.get("triggerIntervalSeconds"),
+                    trigger_cron_expr=body.get("triggerCronExpr"),
+                    trigger_tz=body.get("triggerTz"),
+                    payload_kind=body.get("payloadKind", "agent_turn"),
+                    payload_message=body.get("payloadMessage", ""),
+                    payload_deliver=body.get("payloadDeliver", False),
+                    payload_channel=body.get("payloadChannel"),
+                    payload_to=body.get("payloadTo"),
+                    delete_after_run=body.get("deleteAfterRun", False),
+                )
+                self._write_json(HTTPStatus.CREATED, _ok(job))
+            except Exception as e:
+                logger.exception("Failed to create cron job")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("CRON_JOB_CREATE_FAILED", str(e)))
+            return
+
+        # POST /api/v1/cron/jobs/{jobId}/run
+        if len(parts) == 6 and parts[:3] == ["api", "v1", "cron"] and parts[3] == "jobs" and parts[5] == "run":
+            job_id = parts[4]
+            force = query.get("force", ["false"])[0].lower() == "true"
+            try:
+                success = asyncio.run(app.run_cron_job(job_id, force=force))
+                if success:
+                    self._write_json(HTTPStatus.OK, _ok({"success": True}))
+                else:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("CRON_JOB_NOT_FOUND", "定时任务不存在"))
+            except Exception as e:
+                logger.exception("Failed to run cron job")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("CRON_JOB_RUN_FAILED", str(e)))
             return
 
         if path == "/api/v1/chat/sessions":
@@ -2546,6 +2768,38 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(data))
             return
 
+        # ==================== Cron PATCH ====================
+
+        # PATCH /api/v1/cron/jobs/{jobId}
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "cron"] and parts[3] == "jobs":
+            job_id = parts[4]
+            body = self._read_json()
+            try:
+                job = app.update_cron_job(
+                    job_id=job_id,
+                    name=body.get("name"),
+                    enabled=body.get("enabled"),
+                    trigger_type=body.get("triggerType"),
+                    trigger_date_ms=body.get("triggerDateMs"),
+                    trigger_interval_seconds=body.get("triggerIntervalSeconds"),
+                    trigger_cron_expr=body.get("triggerCronExpr"),
+                    trigger_tz=body.get("triggerTz"),
+                    payload_kind=body.get("payloadKind"),
+                    payload_message=body.get("payloadMessage"),
+                    payload_deliver=body.get("payloadDeliver"),
+                    payload_channel=body.get("payloadChannel"),
+                    payload_to=body.get("payloadTo"),
+                    delete_after_run=body.get("deleteAfterRun"),
+                )
+                if job:
+                    self._write_json(HTTPStatus.OK, _ok(job))
+                else:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("CRON_JOB_NOT_FOUND", "定时任务不存在"))
+            except Exception as e:
+                logger.exception("Failed to update cron job")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("CRON_JOB_UPDATE_FAILED", str(e)))
+            return
+
         self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", f"Unknown path: {path}"))
 
     def do_DELETE(self) -> None:
@@ -2581,6 +2835,18 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("PROVIDER_NOT_FOUND", "Provider 不存在"))
+            return
+
+        # ==================== Cron DELETE ====================
+
+        # DELETE /api/v1/cron/jobs/{jobId}
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "cron"] and parts[3] == "jobs":
+            job_id = parts[4]
+            deleted = app.delete_cron_job(job_id)
+            if deleted:
+                self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
+            else:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("CRON_JOB_NOT_FOUND", "定时任务不存在"))
             return
 
         # DELETE /api/v1/mirror/sessions/{sessionId}?type=wu|bian
@@ -2703,7 +2969,13 @@ class NanobotHTTPServer(ThreadingHTTPServer):
 def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | None = None) -> None:
     """Run the web API server."""
     app = NanobotWebAPI()
-    
+
+    # Start cron service
+    try:
+        asyncio.run(app.cron_service.start())
+    except Exception as e:
+        logger.warning(f"Failed to start cron service: {e}")
+
     # Determine static directory
     if static_dir is None:
         # Try to find built web-ui
@@ -2758,5 +3030,10 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
     except KeyboardInterrupt:
         logger.info("\nStopping web API server...")
     finally:
+        # Stop cron service
+        try:
+            app.cron_service.stop()
+        except Exception as e:
+            logger.warning(f"Error stopping cron service: {e}")
         app.shutdown()
         server.server_close()

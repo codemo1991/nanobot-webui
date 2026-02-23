@@ -34,6 +34,8 @@ dependencies = [
     "python-telegram-bot>=21.0",
     "watchdog>=3.0.0",
     "claude-agent-sdk>=0.1.39",
+    "apscheduler>=3.10.0",
+    "pytz>=2024.1",
 ]
 
 [project.optional-dependencies]

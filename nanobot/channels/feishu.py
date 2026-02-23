@@ -244,6 +244,21 @@ class FeishuChannel(BaseChannel):
         # chat_id -> 上次 patch 时间戳（用于节流控制）
         self._last_card_update: dict[str, float] = {}
 
+    def setup_client(self) -> None:
+        """初始化 Feishu Client（仅用于发送消息，不启动 WebSocket 监听）。"""
+        if not FEISHU_AVAILABLE:
+            logger.warning("Feishu SDK not installed. Run: pip install lark-oapi")
+            return
+        if not self.config.app_id or not self.config.app_secret:
+            logger.warning("Feishu app_id/app_secret not configured, send-only client skipped")
+            return
+        self._client = lark.Client.builder() \
+            .app_id(self.config.app_id) \
+            .app_secret(self.config.app_secret) \
+            .log_level(lark.LogLevel.INFO) \
+            .build()
+        logger.debug("Feishu send-only client initialized")
+
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
         if not FEISHU_AVAILABLE:

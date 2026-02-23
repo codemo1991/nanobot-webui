@@ -1,346 +1,451 @@
-"""Cron service for scheduling agent tasks."""
+"""Cron service using APScheduler for scheduling agent tasks."""
 
 import asyncio
-import json
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
+from apscheduler.executors.asyncio import AsyncIOExecutor
+from apscheduler.job import Job
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
 
-from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore
+from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule
+from nanobot.storage.cron_repository import CronRepository
 
 
 def _now_ms() -> int:
+    """Get current timestamp in milliseconds."""
+    import time
     return int(time.time() * 1000)
 
 
-def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
-    """Compute next run time in ms."""
-    if schedule.kind == "at":
-        return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
-    
-    if schedule.kind == "every":
-        if not schedule.every_ms or schedule.every_ms <= 0:
-            return None
-        # Next interval from now
-        return now_ms + schedule.every_ms
-    
-    if schedule.kind == "cron" and schedule.expr:
+def _compute_next_run_ms(trigger_type: str, trigger_date_ms: int | None,
+                          trigger_interval_seconds: int | None,
+                          trigger_cron_expr: str | None) -> int | None:
+    """Compute next run time in ms based on trigger config."""
+    from croniter import croniter
+    import time
+
+    if trigger_type == "at":
+        if trigger_date_ms and trigger_date_ms > _now_ms():
+            return trigger_date_ms
+        return None
+
+    if trigger_type == "every":
+        if trigger_interval_seconds and trigger_interval_seconds > 0:
+            return _now_ms() + (trigger_interval_seconds * 1000)
+        return None
+
+    if trigger_type == "cron" and trigger_cron_expr:
         try:
-            from croniter import croniter
-            cron = croniter(schedule.expr, time.time())
+            cron = croniter(trigger_cron_expr, time.time())
             next_time = cron.get_next()
             return int(next_time * 1000)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Invalid cron expression: {trigger_cron_expr}: {e}")
             return None
-    
+
     return None
 
 
 class CronService:
-    """Service for managing and executing scheduled jobs."""
-    
+    """Service for managing and executing scheduled jobs using APScheduler."""
+
     def __init__(
         self,
-        store_path: Path,
-        on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None
+        db_path: Path,
+        on_job: Callable[[dict[str, Any]], Coroutine[Any, Any, str | None]] | None = None
     ):
-        self.store_path = store_path
+        self.db_path = db_path
+        self.repository = CronRepository(db_path)
         self.on_job = on_job  # Callback to execute job, returns response text
-        self._store: CronStore | None = None
-        self._timer_task: asyncio.Task | None = None
-        self._running = False
-    
-    def _load_store(self) -> CronStore:
-        """Load jobs from disk."""
-        if self._store:
-            return self._store
-        
-        if self.store_path.exists():
-            try:
-                data = json.loads(self.store_path.read_text())
-                jobs = []
-                for j in data.get("jobs", []):
-                    jobs.append(CronJob(
-                        id=j["id"],
-                        name=j["name"],
-                        enabled=j.get("enabled", True),
-                        schedule=CronSchedule(
-                            kind=j["schedule"]["kind"],
-                            at_ms=j["schedule"].get("atMs"),
-                            every_ms=j["schedule"].get("everyMs"),
-                            expr=j["schedule"].get("expr"),
-                            tz=j["schedule"].get("tz"),
-                        ),
-                        payload=CronPayload(
-                            kind=j["payload"].get("kind", "agent_turn"),
-                            message=j["payload"].get("message", ""),
-                            deliver=j["payload"].get("deliver", False),
-                            channel=j["payload"].get("channel"),
-                            to=j["payload"].get("to"),
-                        ),
-                        state=CronJobState(
-                            next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
-                            last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
-                            last_status=j.get("state", {}).get("lastStatus"),
-                            last_error=j.get("state", {}).get("lastError"),
-                        ),
-                        created_at_ms=j.get("createdAtMs", 0),
-                        updated_at_ms=j.get("updatedAtMs", 0),
-                        delete_after_run=j.get("deleteAfterRun", False),
-                    ))
-                self._store = CronStore(jobs=jobs)
-            except Exception as e:
-                logger.warning(f"Failed to load cron store: {e}")
-                self._store = CronStore()
-        else:
-            self._store = CronStore()
-        
-        return self._store
-    
-    def _save_store(self) -> None:
-        """Save jobs to disk."""
-        if not self._store:
-            return
-        
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        data = {
-            "version": self._store.version,
-            "jobs": [
-                {
-                    "id": j.id,
-                    "name": j.name,
-                    "enabled": j.enabled,
-                    "schedule": {
-                        "kind": j.schedule.kind,
-                        "atMs": j.schedule.at_ms,
-                        "everyMs": j.schedule.every_ms,
-                        "expr": j.schedule.expr,
-                        "tz": j.schedule.tz,
-                    },
-                    "payload": {
-                        "kind": j.payload.kind,
-                        "message": j.payload.message,
-                        "deliver": j.payload.deliver,
-                        "channel": j.payload.channel,
-                        "to": j.payload.to,
-                    },
-                    "state": {
-                        "nextRunAtMs": j.state.next_run_at_ms,
-                        "lastRunAtMs": j.state.last_run_at_ms,
-                        "lastStatus": j.state.last_status,
-                        "lastError": j.state.last_error,
-                    },
-                    "createdAtMs": j.created_at_ms,
-                    "updatedAtMs": j.updated_at_ms,
-                    "deleteAfterRun": j.delete_after_run,
-                }
-                for j in self._store.jobs
-            ]
-        }
-        
-        self.store_path.write_text(json.dumps(data, indent=2))
-    
+
+        # APScheduler setup
+        self._scheduler: AsyncIOScheduler | None = None
+        self._executors = {"default": AsyncIOExecutor()}
+        self._job_defaults = {"coalesce": True, "max_instances": 1}
+
     async def start(self) -> None:
-        """Start the cron service."""
-        self._running = True
-        self._load_store()
-        self._recompute_next_runs()
-        self._save_store()
-        self._arm_timer()
-        logger.info(f"Cron service started with {len(self._store.jobs if self._store else [])} jobs")
-    
-    def stop(self) -> None:
-        """Stop the cron service."""
-        self._running = False
-        if self._timer_task:
-            self._timer_task.cancel()
-            self._timer_task = None
-    
-    def _recompute_next_runs(self) -> None:
-        """Recompute next run times for all enabled jobs."""
-        if not self._store:
+        """Start the cron service and scheduler."""
+        # Load existing jobs from database and add to scheduler
+        jobs = self.repository.get_all_jobs(include_disabled=True)
+
+        self._scheduler = AsyncIOScheduler(
+            executors=self._executors,
+            job_defaults=self._job_defaults,
+        )
+
+        # Start scheduler first
+        self._scheduler.start()
+
+        # Add all enabled jobs to scheduler
+        for job in jobs:
+            if job["enabled"]:
+                self._add_job_to_scheduler(job)
+
+        logger.info(f"Cron service started with {len([j for j in jobs if j['enabled']])} enabled jobs")
+
+    async def sync_from_db(self) -> None:
+        """将调度器与数据库中的任务同步（用于 gateway 感知 web-ui 创建/更新的任务）。"""
+        if not self._scheduler:
             return
-        now = _now_ms()
-        for job in self._store.jobs:
-            if job.enabled:
-                job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
-    
-    def _get_next_wake_ms(self) -> int | None:
-        """Get the earliest next run time across all jobs."""
-        if not self._store:
-            return None
-        times = [j.state.next_run_at_ms for j in self._store.jobs 
-                 if j.enabled and j.state.next_run_at_ms]
-        return min(times) if times else None
-    
-    def _arm_timer(self) -> None:
-        """Schedule the next timer tick."""
-        if self._timer_task:
-            self._timer_task.cancel()
-        
-        next_wake = self._get_next_wake_ms()
-        if not next_wake or not self._running:
-            return
-        
-        delay_ms = max(0, next_wake - _now_ms())
-        delay_s = delay_ms / 1000
-        
-        async def tick():
-            await asyncio.sleep(delay_s)
-            if self._running:
-                await self._on_timer()
-        
-        self._timer_task = asyncio.create_task(tick())
-    
-    async def _on_timer(self) -> None:
-        """Handle timer tick - run due jobs."""
-        if not self._store:
-            return
-        
-        now = _now_ms()
-        due_jobs = [
-            j for j in self._store.jobs
-            if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
-        ]
-        
-        for job in due_jobs:
-            await self._execute_job(job)
-        
-        self._save_store()
-        self._arm_timer()
-    
-    async def _execute_job(self, job: CronJob) -> None:
-        """Execute a single job."""
-        start_ms = _now_ms()
-        logger.info(f"Cron: executing job '{job.name}' ({job.id})")
-        
         try:
+            db_jobs = {j["id"]: j for j in self.repository.get_all_jobs(include_disabled=True)}
+            scheduled_ids = {j.id for j in self._scheduler.get_jobs()}
+
+            # 移除调度器中已不存在或已禁用的任务
+            for job_id in list(scheduled_ids):
+                db_job = db_jobs.get(job_id)
+                if not db_job or not db_job["enabled"]:
+                    self._scheduler.remove_job(job_id)
+                    logger.debug(f"Cron sync: 移除任务 {job_id}")
+
+            # 将 DB 中新启用的任务加入调度器
+            scheduled_ids = {j.id for j in self._scheduler.get_jobs()}
+            added = 0
+            for job_id, job in db_jobs.items():
+                if job["enabled"] and job_id not in scheduled_ids:
+                    self._add_job_to_scheduler(job)
+                    added += 1
+                    logger.info(f"Cron sync: 新增任务 '{job['name']}' ({job_id})")
+
+            if added:
+                logger.info(f"Cron sync: 共新增 {added} 个任务")
+        except Exception as e:
+            logger.warning(f"Cron DB sync 失败: {e}")
+
+    def stop(self) -> None:
+        """Stop the cron service and scheduler."""
+        if self._scheduler:
+            self._scheduler.shutdown(wait=False)
+            self._scheduler = None
+        logger.info("Cron service stopped")
+
+    def _add_job_to_scheduler(self, job: dict[str, Any]) -> None:
+        """Add a job to the APScheduler."""
+        if not self._scheduler:
+            return
+
+        job_id = job["id"]
+        trigger = self._build_trigger(job["trigger"])
+
+        if trigger:
+            try:
+                self._scheduler.add_job(
+                    self._execute_job_callback,
+                    trigger=trigger,
+                    id=job_id,
+                    name=job["name"],
+                    replace_existing=True,
+                    next_run_time=None,  # Will be set by APScheduler
+                    jobstore="default",
+                    job_id=job_id,  # Pass job_id as kwarg so callback receives it
+                )
+            except Exception as e:
+                logger.error(f"Failed to add job {job_id} to scheduler: {e}")
+
+    def _build_trigger(self, trigger_config: dict[str, Any]):
+        """Build APScheduler trigger from job trigger config."""
+        import pytz
+
+        trigger_type = trigger_config.get("type")
+
+        if trigger_type == "at":
+            date_ms = trigger_config.get("dateMs")
+            if date_ms:
+                from datetime import datetime
+                # Convert ms to datetime
+                dt = datetime.fromtimestamp(date_ms / 1000, tz=pytz.UTC)
+                return DateTrigger(run_date=dt)
+
+        elif trigger_type == "every":
+            interval_sec = trigger_config.get("intervalSeconds")
+            if interval_sec and interval_sec > 0:
+                return IntervalTrigger(seconds=interval_sec)
+
+        elif trigger_type == "cron":
+            expr = trigger_config.get("cronExpr")
+            if expr:
+                tz = trigger_config.get("tz") or "UTC"
+                try:
+                    tz_obj = pytz.timezone(tz)
+                except Exception:
+                    tz_obj = pytz.UTC
+                return CronTrigger.from_crontab(expr, timezone=tz_obj)
+
+        return None
+
+    async def _execute_job_callback(self, job_id: str = None) -> None:
+        """Callback wrapper to execute a job."""
+        if job_id is None:
+            logger.warning("Cron job callback received no job_id")
+            return
+        await self._execute_job(job_id)
+
+    async def _execute_job(self, job_id: str) -> None:
+        """Execute a single job."""
+        job = self.repository.get_job(job_id)
+        if not job:
+            logger.warning(f"Cron job not found: {job_id}")
+            return
+
+        start_ms = _now_ms()
+        logger.info(f"Cron: executing job '{job['name']}' ({job_id})")
+
+        try:
+            # Call the on_job callback if provided
             response = None
             if self.on_job:
                 response = await self.on_job(job)
-            
-            job.state.last_status = "ok"
-            job.state.last_error = None
-            logger.info(f"Cron: job '{job.name}' completed")
-            
+
+            # Update job status
+            self.repository.update_job_status(
+                job_id=job_id,
+                last_run_at_ms=start_ms,
+                last_status="ok",
+                last_error=None,
+            )
+            logger.info(f"Cron: job '{job['name']}' completed")
+
         except Exception as e:
-            job.state.last_status = "error"
-            job.state.last_error = str(e)
-            logger.error(f"Cron: job '{job.name}' failed: {e}")
-        
-        job.state.last_run_at_ms = start_ms
-        job.updated_at_ms = _now_ms()
-        
-        # Handle one-shot jobs
-        if job.schedule.kind == "at":
-            if job.delete_after_run:
-                self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
+            self.repository.update_job_status(
+                job_id=job_id,
+                last_run_at_ms=start_ms,
+                last_status="error",
+                last_error=str(e),
+            )
+            logger.error(f"Cron: job '{job['name']}' failed: {e}")
+
+        # Handle one-shot jobs ("at" trigger)
+        if job["trigger"]["type"] == "at":
+            if job["deleteAfterRun"]:
+                self.repository.delete_job(job_id)
+                if self._scheduler:
+                    self._scheduler.remove_job(job_id)
+                logger.info(f"Cron: deleted one-shot job {job_id}")
             else:
-                job.enabled = False
-                job.state.next_run_at_ms = None
+                # Disable the job after running
+                self.repository.update_job(job_id, enabled=False)
+                if self._scheduler:
+                    self._scheduler.remove_job(job_id)
         else:
-            # Compute next run
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
-    
+            # 更新下次运行时间到数据库（APScheduler 的 Interval/CronTrigger 会自动重新调度）
+            next_run_ms = _compute_next_run_ms(
+                job["trigger"]["type"],
+                job["trigger"].get("dateMs"),
+                job["trigger"].get("intervalSeconds"),
+                job["trigger"].get("cronExpr"),
+            )
+            if next_run_ms:
+                self.repository.update_job_status(job_id, next_run_at_ms=next_run_ms)
+
+    def _reschedule_job(self, job: dict[str, Any]) -> None:
+        """Reschedule a job in APScheduler."""
+        if not self._scheduler:
+            return
+
+        trigger = self._build_trigger(job["trigger"])
+        if trigger:
+            try:
+                self._scheduler.reschedule_job(job["id"], trigger=trigger)
+            except Exception as e:
+                logger.error(f"Failed to reschedule job {job['id']}: {e}")
+
     # ========== Public API ==========
-    
-    def list_jobs(self, include_disabled: bool = False) -> list[CronJob]:
+
+    def list_jobs(self, include_disabled: bool = False) -> list[dict[str, Any]]:
         """List all jobs."""
-        store = self._load_store()
-        jobs = store.jobs if include_disabled else [j for j in store.jobs if j.enabled]
-        return sorted(jobs, key=lambda j: j.state.next_run_at_ms or float('inf'))
-    
+        return self.repository.get_all_jobs(include_disabled=include_disabled)
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        """Get a single job by ID."""
+        return self.repository.get_job(job_id)
+
     def add_job(
         self,
         name: str,
-        schedule: CronSchedule,
-        message: str,
-        deliver: bool = False,
-        channel: str | None = None,
-        to: str | None = None,
+        trigger_type: str,
+        trigger_date_ms: int | None = None,
+        trigger_interval_seconds: int | None = None,
+        trigger_cron_expr: str | None = None,
+        trigger_tz: str | None = None,
+        payload_kind: str = "agent_turn",
+        payload_message: str = "",
+        payload_deliver: bool = False,
+        payload_channel: str | None = None,
+        payload_to: str | None = None,
         delete_after_run: bool = False,
-    ) -> CronJob:
+    ) -> dict[str, Any]:
         """Add a new job."""
-        store = self._load_store()
-        now = _now_ms()
-        
-        job = CronJob(
-            id=str(uuid.uuid4())[:8],
+        job_id = str(uuid.uuid4())[:8]
+        next_run_ms = _compute_next_run_ms(
+            trigger_type, trigger_date_ms, trigger_interval_seconds, trigger_cron_expr
+        )
+
+        job = self.repository.create_job(
+            job_id=job_id,
             name=name,
-            enabled=True,
-            schedule=schedule,
-            payload=CronPayload(
-                kind="agent_turn",
-                message=message,
-                deliver=deliver,
-                channel=channel,
-                to=to,
-            ),
-            state=CronJobState(next_run_at_ms=_compute_next_run(schedule, now)),
-            created_at_ms=now,
-            updated_at_ms=now,
+            trigger_type=trigger_type,
+            trigger_date_ms=trigger_date_ms,
+            trigger_interval_seconds=trigger_interval_seconds,
+            trigger_cron_expr=trigger_cron_expr,
+            trigger_tz=trigger_tz,
+            payload_kind=payload_kind,
+            payload_message=payload_message,
+            payload_deliver=payload_deliver,
+            payload_channel=payload_channel,
+            payload_to=payload_to,
             delete_after_run=delete_after_run,
         )
-        
-        store.jobs.append(job)
-        self._save_store()
-        self._arm_timer()
-        
-        logger.info(f"Cron: added job '{name}' ({job.id})")
+
+        # Update next run time in DB
+        if next_run_ms:
+            self.repository.update_job_status(job_id, next_run_at_ms=next_run_ms)
+
+        # Add to scheduler if enabled
+        if self._scheduler:
+            job["trigger"] = {
+                "type": trigger_type,
+                "dateMs": trigger_date_ms,
+                "intervalSeconds": trigger_interval_seconds,
+                "cronExpr": trigger_cron_expr,
+                "tz": trigger_tz,
+            }
+            job["enabled"] = True
+            try:
+                self._add_job_to_scheduler(job)
+            except RuntimeError as e:
+                # Event loop issue - try to recover
+                if "loop is closed" in str(e).lower():
+                    logger.warning(f"Event loop issue when adding job {job_id}, will be scheduled on next restart")
+                else:
+                    raise
+
+        logger.info(f"Cron: added job '{name}' ({job_id})")
+        return self.repository.get_job(job_id)
+
+    def update_job(
+        self,
+        job_id: str,
+        name: str | None = None,
+        enabled: bool | None = None,
+        trigger_type: str | None = None,
+        trigger_date_ms: int | None = None,
+        trigger_interval_seconds: int | None = None,
+        trigger_cron_expr: str | None = None,
+        trigger_tz: str | None = None,
+        payload_kind: str | None = None,
+        payload_message: str | None = None,
+        payload_deliver: bool | None = None,
+        payload_channel: str | None = None,
+        payload_to: str | None = None,
+        delete_after_run: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """Update an existing job."""
+        existing = self.repository.get_job(job_id)
+        if not existing:
+            return None
+
+        # Determine new trigger values
+        new_trigger_type = trigger_type if trigger_type is not None else existing["trigger"]["type"]
+        new_trigger_date_ms = trigger_date_ms if trigger_date_ms is not None else existing["trigger"].get("dateMs")
+        new_trigger_interval = trigger_interval_seconds if trigger_interval_seconds is not None else existing["trigger"].get("intervalSeconds")
+        new_trigger_cron = trigger_cron_expr if trigger_cron_expr is not None else existing["trigger"].get("cronExpr")
+        new_trigger_tz = trigger_tz if trigger_tz is not None else existing["trigger"].get("tz")
+
+        # Compute new next run time
+        new_next_run_ms = None
+        if enabled is None or enabled:
+            new_next_run_ms = _compute_next_run_ms(
+                new_trigger_type, new_trigger_date_ms, new_trigger_interval, new_trigger_cron
+            )
+
+        # Update job in database
+        job = self.repository.update_job(
+            job_id=job_id,
+            name=name,
+            enabled=enabled,
+            trigger_type=trigger_type,
+            trigger_date_ms=trigger_date_ms,
+            trigger_interval_seconds=trigger_interval_seconds,
+            trigger_cron_expr=trigger_cron_expr,
+            trigger_tz=trigger_tz,
+            payload_kind=payload_kind,
+            payload_message=payload_message,
+            payload_deliver=payload_deliver,
+            payload_channel=payload_channel,
+            payload_to=payload_to,
+            delete_after_run=delete_after_run,
+        )
+
+        if job and new_next_run_ms:
+            self.repository.update_job_status(job_id, next_run_at_ms=new_next_run_ms)
+            job["nextRunAtMs"] = new_next_run_ms
+
+        # Update scheduler
+        if self._scheduler and job:
+            # Remove existing job from scheduler
+            try:
+                self._scheduler.remove_job(job_id)
+            except Exception:
+                pass
+
+            # Add back if enabled
+            if job["enabled"]:
+                job["trigger"] = {
+                    "type": new_trigger_type,
+                    "dateMs": new_trigger_date_ms,
+                    "intervalSeconds": new_trigger_interval,
+                    "cronExpr": new_trigger_cron,
+                    "tz": new_trigger_tz,
+                }
+                self._add_job_to_scheduler(job)
+
+        logger.info(f"Cron: updated job '{job_id}'")
         return job
-    
+
     def remove_job(self, job_id: str) -> bool:
         """Remove a job by ID."""
-        store = self._load_store()
-        before = len(store.jobs)
-        store.jobs = [j for j in store.jobs if j.id != job_id]
-        removed = len(store.jobs) < before
-        
+        # Remove from scheduler
+        if self._scheduler:
+            try:
+                self._scheduler.remove_job(job_id)
+            except Exception:
+                pass
+
+        # Remove from database
+        removed = self.repository.delete_job(job_id)
         if removed:
-            self._save_store()
-            self._arm_timer()
             logger.info(f"Cron: removed job {job_id}")
-        
         return removed
-    
-    def enable_job(self, job_id: str, enabled: bool = True) -> CronJob | None:
-        """Enable or disable a job."""
-        store = self._load_store()
-        for job in store.jobs:
-            if job.id == job_id:
-                job.enabled = enabled
-                job.updated_at_ms = _now_ms()
-                if enabled:
-                    job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
-                else:
-                    job.state.next_run_at_ms = None
-                self._save_store()
-                self._arm_timer()
-                return job
-        return None
-    
+
     async def run_job(self, job_id: str, force: bool = False) -> bool:
         """Manually run a job."""
-        store = self._load_store()
-        for job in store.jobs:
-            if job.id == job_id:
-                if not force and not job.enabled:
-                    return False
-                await self._execute_job(job)
-                self._save_store()
-                self._arm_timer()
-                return True
-        return False
-    
+        job = self.repository.get_job(job_id)
+        if not job:
+            return False
+
+        if not force and not job["enabled"]:
+            return False
+
+        await self._execute_job(job_id)
+        return True
+
     def status(self) -> dict:
         """Get service status."""
-        store = self._load_store()
+        jobs = self.repository.get_all_jobs(include_disabled=True)
+        enabled_jobs = [j for j in jobs if j["enabled"]]
+        next_wake = None
+        if enabled_jobs:
+            next_wake = min(j.get("nextRunAtMs") for j in enabled_jobs if j.get("nextRunAtMs"))
+
         return {
-            "enabled": self._running,
-            "jobs": len(store.jobs),
-            "next_wake_at_ms": self._get_next_wake_ms(),
+            "enabled": self._scheduler is not None,
+            "jobs": len(jobs),
+            "enabled_jobs": len(enabled_jobs),
+            "next_wake_at_ms": next_wake,
         }

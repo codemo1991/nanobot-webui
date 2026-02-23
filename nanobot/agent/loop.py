@@ -57,6 +57,10 @@ CONTINUE_KEYWORDS = {
     "继续执行", "继续任务", "go on", "proceed",
 }
 
+# 用户回复"扩容"时，自动扩大本轮工具调用上限 20% 并继续执行
+EXPAND_KEYWORDS = {"扩容", "扩大容量", "增加工具数", "扩大工具上限"}
+EXPAND_RATIO = 1.2
+
 
 class AgentLoop:
     """
@@ -460,19 +464,29 @@ class AgentLoop:
                 self._mcp_fail_time = now + mcp_cooldown
                 logger.exception("MCP tool loading failed")
         
-        # Detect "继续" / "continue" command after a limit-reached pause.
+        # Detect "继续" / "continue" / "扩容" command after a limit-reached pause.
         # If the last assistant message has the LIMIT_REACHED_MARKER and the user
-        # is asking to continue, replace the bare keyword with an explicit instruction
-        # so the LLM understands it should resume the interrupted task.
+        # is asking to continue or expand capacity, handle accordingly.
         current_message = msg.content
-        if msg.content.strip().lower() in CONTINUE_KEYWORDS:
+        _user_cmd = msg.content.strip()
+        _is_continue = _user_cmd.lower() in CONTINUE_KEYWORDS
+        _is_expand = _user_cmd in EXPAND_KEYWORDS
+        if _is_continue or _is_expand:
             last_msgs = session.messages[-3:] if session.messages else []
             last_assistant = next(
                 (m for m in reversed(last_msgs) if m.get("role") == "assistant"),
                 None,
             )
             if last_assistant and LIMIT_REACHED_MARKER in str(last_assistant.get("content", "")):
-                logger.info("Detected continue command after limit-reached pause; resetting iteration budget")
+                if _is_expand:
+                    expanded = max(int(self.max_iterations * EXPAND_RATIO), self.max_iterations + 1)
+                    logger.info(
+                        "User requested capacity expansion: max_iterations %d -> %d",
+                        self.max_iterations, expanded,
+                    )
+                    self.update_agent_params(max_iterations=expanded)
+                else:
+                    logger.info("Detected continue command after limit-reached pause; resetting iteration budget")
                 current_message = (
                     "请继续执行上一条消息中未完成的任务，从上次中断的地方接着做，"
                     "不需要重新解释已完成的部分。"
@@ -573,13 +587,22 @@ class AgentLoop:
                     progress({"type": "thinking"})
                 except Exception:
                     pass
-            # Call LLM
+            # Call LLM（单次调用最长 120 秒，防止 context 过大或网络问题导致请求永久挂住）
+            _LLM_CALL_TIMEOUT = 120
             selected_tools = self._select_tools_for_message(msg.content)
-            response = await self.provider.chat(
-                messages=messages,
-                tools=selected_tools,
-                model=self.model
-            )
+            try:
+                response = await asyncio.wait_for(
+                    self.provider.chat(
+                        messages=messages,
+                        tools=selected_tools,
+                        model=self.model,
+                    ),
+                    timeout=_LLM_CALL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("LLM call timed out after %ds, breaking agent loop", _LLM_CALL_TIMEOUT)
+                exit_reason = "time"
+                break
             _accumulate_usage(response.usage)
 
             # Handle tool calls
@@ -659,45 +682,67 @@ class AgentLoop:
             exit_reason = "iterations"
 
         if final_content is None:
-            # Hit max_iterations with only tool calls - force one final LLM call without tools
-            # to get a proper summary/response instead of generic fallback
-            logger.info("Max iterations reached with no text response; requesting final synthesis (no tools)")
-            progress = msg.metadata.get("progress_callback")
-            if progress:
-                try:
-                    progress({"type": "thinking"})
-                except Exception:
-                    pass
-            try:
-                synth = await self.provider.chat(
-                    messages=messages,
-                    tools=None,
-                    model=self.model,
-                )
-                _accumulate_usage(synth.usage)
-                if synth.content and synth.content.strip():
-                    final_content = synth.content.strip()
-                else:
-                    final_content = _make_fallback_from_tools(tool_steps)
-            except Exception as e:
-                logger.warning("Final synthesis call failed: %s", e)
+            if exit_reason == "time":
+                # 已超时，直接降级，不再发起可能同样挂住的 LLM 请求
+                logger.info("Time limit exceeded; skipping synthesis to avoid further hang")
                 final_content = _make_fallback_from_tools(tool_steps)
+            else:
+                # Hit max_iterations with only tool calls - force one final LLM call without tools
+                # to get a proper summary/response instead of generic fallback
+                logger.info("Max iterations reached with no text response; requesting final synthesis (no tools)")
+                progress = msg.metadata.get("progress_callback")
+                if progress:
+                    try:
+                        progress({"type": "thinking"})
+                    except Exception:
+                        pass
+                # 综合调用限时 60 秒，避免大 context 下挂住整个请求
+                _SYNTHESIS_TIMEOUT = 60
+                try:
+                    synth = await asyncio.wait_for(
+                        self.provider.chat(
+                            messages=messages,
+                            tools=None,
+                            model=self.model,
+                        ),
+                        timeout=_SYNTHESIS_TIMEOUT,
+                    )
+                    _accumulate_usage(synth.usage)
+                    if synth.content and synth.content.strip():
+                        final_content = synth.content.strip()
+                    else:
+                        final_content = _make_fallback_from_tools(tool_steps)
+                except asyncio.TimeoutError:
+                    logger.warning("Final synthesis call timed out after %ds", _SYNTHESIS_TIMEOUT)
+                    final_content = _make_fallback_from_tools(tool_steps)
+                except Exception as e:
+                    logger.warning("Final synthesis call failed: %s", e)
+                    final_content = _make_fallback_from_tools(tool_steps)
 
         # Append user-visible limit notice so the user knows why the agent stopped
-        # and can explicitly ask to continue.
+        # and can explicitly ask to continue or expand capacity.
         if exit_reason in ("iterations", "time"):
             if exit_reason == "iterations":
+                expanded = max(int(self.max_iterations * EXPAND_RATIO), self.max_iterations + 1)
                 reason_zh = f"工具调用次数已达上限（{self.max_iterations} 次）"
+                limit_notice = (
+                    f"\n\n---\n"
+                    f"⚠️ **任务已暂停**：{reason_zh}。\n"
+                    f"- 回复 **扩容** 自动将本轮上限扩大至 {expanded} 次并继续执行\n"
+                    f"- 回复 **继续** 保持当前上限继续执行\n"
+                    f"- 或直接描述下一步您希望做什么。"
+                    f"{LIMIT_REACHED_MARKER}"
+                )
             else:
                 elapsed_s = int(time.monotonic() - loop_start)
                 reason_zh = f"执行时间已达上限（{elapsed_s} 秒 / 上限 {self.max_execution_time} 秒）"
-            limit_notice = (
-                f"\n\n---\n"
-                f"⚠️ **任务已暂停**：{reason_zh}。\n"
-                f"如需继续执行，请回复 **继续**；"
-                f"或直接描述下一步您希望做什么。"
-                f"{LIMIT_REACHED_MARKER}"
-            )
+                limit_notice = (
+                    f"\n\n---\n"
+                    f"⚠️ **任务已暂停**：{reason_zh}。\n"
+                    f"如需继续执行，请回复 **继续**；"
+                    f"或直接描述下一步您希望做什么。"
+                    f"{LIMIT_REACHED_MARKER}"
+                )
             final_content = (final_content or "") + limit_notice
 
         # Save to session (include tool_steps for UI display)

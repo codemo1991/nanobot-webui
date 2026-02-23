@@ -7,6 +7,8 @@
 #
 # 当 nanobot 以退出码 42 退出时（self_update 触发），本脚本会自动
 # 执行 git pull 及 pip install -e . 并重新启动服务。
+#
+# 默认启用 --verbose 以输出详细日志
 
 set -euo pipefail
 
@@ -16,14 +18,17 @@ RAPID_RESTART_WINDOW=60
 
 HOST="127.0.0.1"
 PORT=6788
+# 默认启用 verbose 模式
+VERBOSE=true
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --host) HOST="$2"; shift 2 ;;
         --port|-p) PORT="$2"; shift 2 ;;
-        --verbose|-v) EXTRA_ARGS+=("--verbose"); shift ;;
-        --debug|-d) EXTRA_ARGS+=("--debug"); shift ;;
+        --verbose|-v) VERBOSE=true; shift ;;
+        --no-verbose|-q) VERBOSE=false; shift ;;
+        --debug|-d) EXTRA_ARGS+=("--debug"); VERBOSE=true; shift ;;
         *) EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
@@ -33,28 +38,67 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 restart_times=()
 
+# 打印分隔线
+print_separator() {
+    echo "============================================================================"
+}
+
+print_separator
+echo "  🐈 Nanobot Launcher (Guardian Mode)"
+print_separator
 echo ""
-echo "  ================================"
-echo "   nanobot launcher (guardian mode)"
-echo "  ================================"
+echo "  📋 Configuration:"
+echo "     Host:     $HOST"
+echo "     Port:     $PORT"
+echo "     Verbose:  $VERBOSE"
+echo "     Repo:     $REPO_DIR"
+echo "     Python:   $(which python)"
+echo "     Python Version: $(python --version 2>&1)"
 echo ""
+
+# 打印当前 git 状态
+if [ -d "$REPO_DIR/.git" ]; then
+    echo "  � Git Status:"
+    cd "$REPO_DIR"
+    GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    echo "     Branch:   $GIT_BRANCH"
+    echo "     Commit:   $GIT_COMMIT"
+    echo ""
+fi
+
+print_separator
+echo ""
+
+    # 显示额外参数（如果有）
+    EXTRA_DISPLAY=""
+    if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+        EXTRA_DISPLAY=" ${EXTRA_ARGS[*]:-}"
+    fi
 
 while true; do
-    echo "[launcher] Starting: nanobot web-ui --host $HOST --port $PORT ${EXTRA_ARGS[*]:-}"
-    echo "[launcher] Restart exit code: $RESTART_EXIT_CODE | Ctrl+C to stop"
+    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[launcher] [$TIMESTAMP] Starting: nanobot web-ui --host $HOST --port $PORT$EXTRA_DISPLAY"
+    echo "[launcher] [$TIMESTAMP] Restart exit code: $RESTART_EXIT_CODE | Ctrl+C to stop"
     echo ""
 
+    # 根据 VERBOSE 决定是否添加 --verbose
     set +e
-    if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
-        nanobot web-ui --host "$HOST" --port "$PORT"
-    else
-        nanobot web-ui --host "$HOST" --port "$PORT" "${EXTRA_ARGS[@]}"
+    ARGS=("web-ui" "--host" "$HOST" "--port" "$PORT")
+    if [ "$VERBOSE" = true ]; then
+        ARGS+=("--verbose")
     fi
+    if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+        ARGS+=("${EXTRA_ARGS[@]}")
+    fi
+
+    nanobot "${ARGS[@]}"
     exit_code=$?
     set -e
 
+    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
     echo ""
-    echo "[launcher] nanobot exited with code: $exit_code"
+    echo "[launcher] [$TIMESTAMP] nanobot exited with code: $exit_code"
 
     if [ "$exit_code" -eq "$RESTART_EXIT_CODE" ]; then
         now=$(date +%s)
@@ -74,6 +118,7 @@ while true; do
         fi
 
         echo "[launcher] Self-update restart requested. Pulling & reinstalling..."
+        print_separator
 
         if [ -f "$REPO_DIR/pyproject.toml" ]; then
             echo "[launcher] Running: git pull (in $REPO_DIR)"
@@ -92,6 +137,7 @@ while true; do
             echo "[launcher] pip install done (exit: $?)"
         fi
 
+        print_separator
         echo "[launcher] Restarting in 2 seconds..."
         sleep 2
         continue
