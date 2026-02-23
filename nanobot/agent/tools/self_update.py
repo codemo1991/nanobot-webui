@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -219,17 +220,20 @@ IMPORTANT:
         """触发优雅重启：通知用户后以特殊退出码退出进程。"""
         logger.info(f"Self-update: 触发重启，退出码 {RESTART_EXIT_CODE}")
 
-        # 给一点时间让响应返回给用户
-        async def _delayed_exit():
-            await asyncio.sleep(2)
+        # 使用 daemon 线程而非 asyncio task：asyncio.run() 结束时会取消所有 task，
+        # 导致进程过早退出（响应尚未送达客户端）。线程不受 event loop 生命周期影响，
+        # 能确保等到 HTTP 响应完全发送后才退出。
+        def _delayed_exit() -> None:
+            import time
+            time.sleep(5)  # 等待 HTTP 响应完全送达客户端
             logger.info("Self-update: 正在退出进程...")
             os._exit(RESTART_EXIT_CODE)
 
-        asyncio.create_task(_delayed_exit())
+        threading.Thread(target=_delayed_exit, daemon=True, name="restart-delay").start()
         return (
-            "正在准备重启 nanobot 服务...\n"
-            "如果使用 nanobot-launcher 启动，服务将在几秒后自动重新上线。\n"
-            "如果直接运行 nanobot web-ui，需要手动重新启动。"
+            "✅ 重启指令已收到，nanobot 服务将在 **5 秒后**重启。\n"
+            "- 如果使用 nanobot-launcher 启动，服务将自动重新上线，稍后刷新页面即可继续使用。\n"
+            "- 如果直接运行 `nanobot web-ui`，需要手动重新启动。"
         )
 
     async def _evolve(

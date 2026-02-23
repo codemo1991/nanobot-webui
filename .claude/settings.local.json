@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source ~/.zshrc)",
+      "Bash(defaults write com.apple.finder AppleShowAllFiles -bool true && killall Finder)"
+    ]
+  }
+}
