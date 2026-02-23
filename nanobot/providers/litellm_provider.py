@@ -222,8 +222,8 @@ class LiteLLMProvider(LLMProvider):
         self.default_model = model
         if api_key is not None:
             self.api_key = api_key
-        if api_base is not None:
-            self.api_base = api_base
+        # 始终更新 api_base（包括 None），避免切换 provider 后仍使用旧的 base URL
+        self.api_base = api_base
 
         # 重新检测 provider
         self._detected_provider = self._detect_provider_from_api_base(self.api_base)
@@ -253,8 +253,8 @@ class LiteLLMProvider(LLMProvider):
                 else:
                     _set_provider_env_key(self.api_key, model)
 
-        if self.api_base:
-            litellm.api_base = self.api_base
+        # 同步更新全局 litellm.api_base（切换到无自定义端点的 provider 时需清空）
+        litellm.api_base = self.api_base
 
     def ensure_api_key_for_model(self, model: str, api_key: str, api_base: str | None = None) -> None:
         """
