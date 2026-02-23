@@ -2749,7 +2749,7 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
         logger.info(f"Serving static files from: {static_dir}")
         logger.info(f"Open http://{host}:{actual_port} in your browser")
     else:
-        logger.warning("No static files found. Run 'cd web-ui && npm install && npm run build' to build the frontend.")
+        logger.info("No static files found (frontend not built). Run 'cd web-ui && npm install && npm run build' to build the frontend.")
     logger.info("Press Ctrl+C to stop")
     
     try:
