@@ -365,6 +365,7 @@ function ProvidersConfig() {
     { value: 'openai', label: 'OpenAI' },
     { value: 'openrouter', label: 'OpenRouter' },
     { value: 'deepseek', label: 'DeepSeek' },
+    { value: 'minimax', label: 'Minimax' },
     { value: 'groq', label: 'Groq' },
     { value: 'zhipu', label: 'Zhipu (智谱)' },
     { value: 'dashscope', label: 'Qwen (通义 / DashScope)' },

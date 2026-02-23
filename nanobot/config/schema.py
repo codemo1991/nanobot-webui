@@ -104,6 +104,7 @@ class ProvidersConfig(BaseModel):
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # Qwen via Aliyun DashScope
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    minimax: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
 class MirrorConfig(BaseModel):
@@ -190,11 +191,12 @@ class Config(BaseSettings):
         ("gemini/", "gemini"): "gemini",
         ("groq/", "groq"): "groq",
         ("vllm/", "vllm"): "vllm",
+        ("minimax/", "minimax"): "minimax",
     }
     
     _FALLBACK_PROVIDER_ORDER: list[str] = [
         "openrouter", "deepseek", "anthropic", "openai",
-        "gemini", "zhipu", "dashscope", "groq", "vllm"
+        "gemini", "zhipu", "dashscope", "groq", "vllm", "minimax"
     ]
     
     _MODEL_API_BASE_MAP: dict[str, str | None] = {
@@ -207,6 +209,7 @@ class Config(BaseSettings):
         "gemini": None,
         "groq": None,
         "vllm": None,
+        "minimax": "https://api.minimax.chat/v1",
     }
 
     def _get_provider_for_model(self, model: str | None) -> str | None:

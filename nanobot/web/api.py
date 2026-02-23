@@ -1027,9 +1027,10 @@ class NanobotWebAPI:
             "dashscope": "Qwen (通义)",
             "gemini": "Gemini",
             "vllm": "vLLM",
+            "minimax": "Minimax",
         }
         providers = []
-        for provider_name in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm']:
+        for provider_name in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'minimax']:
             provider_config = getattr(config.providers, provider_name)
             if provider_config.api_key or provider_config.api_base:
                 providers.append({
@@ -1107,7 +1108,7 @@ class NanobotWebAPI:
         config = load_config()
         provider_type = data.get("type", "").lower()
         
-        if not provider_type or provider_type not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm']:
+        if not provider_type or provider_type not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'minimax']:
             raise ValueError("Invalid provider type")
         
         provider_config = getattr(config.providers, provider_type)
@@ -1130,7 +1131,7 @@ class NanobotWebAPI:
         """Update AI provider configuration."""
         config = load_config()
         
-        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm']:
+        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'minimax']:
             raise KeyError("Provider not found")
         
         provider_config = getattr(config.providers, provider_id)
@@ -1155,7 +1156,7 @@ class NanobotWebAPI:
         """Disable AI provider configuration."""
         config = load_config()
         
-        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm']:
+        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'minimax']:
             return False
         
         provider_config = getattr(config.providers, provider_id)

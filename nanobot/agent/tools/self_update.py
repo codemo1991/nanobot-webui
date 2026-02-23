@@ -38,6 +38,7 @@ class SelfUpdateTool(Tool):
 Actions:
 - commit_and_push: Git add, commit, and push changes to the remote repository.
 - pull: Git pull latest changes from the remote repository.
+- pull_and_push: Git pull then push existing commits to the remote repository (sync).
 - restart: Gracefully restart the nanobot service (requires launcher wrapper).
 - evolve: Full self-evolution pipeline — commit, push, pip install, then restart.
 - pull_and_restart: Pull latest code from remote, pip install, then restart. Use this
@@ -45,6 +46,7 @@ Actions:
 
 IMPORTANT:
 - Use 'commit_and_push' after Claude Code finishes modifying nanobot's own code.
+- Use 'pull_and_push' to sync with remote (pull first to avoid conflicts, then push).
 - Use 'pull' to fetch and apply remote updates without restarting.
 - Use 'pull_and_restart' to fetch remote updates and restart to apply them.
 - Use 'restart' only when code changes require a process restart to take effect.
@@ -59,7 +61,7 @@ IMPORTANT:
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["commit_and_push", "pull", "restart", "evolve", "pull_and_restart"],
+                    "enum": ["commit_and_push", "pull", "pull_and_push", "restart", "evolve", "pull_and_restart"],
                     "description": "The action to perform."
                 },
                 "commit_message": {
@@ -89,6 +91,8 @@ IMPORTANT:
             return await self._commit_and_push(repo_dir, commit_message, branch)
         elif action == "pull":
             return await self._git_pull(repo_dir)
+        elif action == "pull_and_push":
+            return await self._pull_and_push(repo_dir, branch)
         elif action == "restart":
             return await self._restart()
         elif action == "evolve":
@@ -96,7 +100,7 @@ IMPORTANT:
         elif action == "pull_and_restart":
             return await self._pull_and_restart(repo_dir)
         else:
-            return f"Error: 未知 action '{action}'。可选: commit_and_push, pull, restart, evolve, pull_and_restart"
+            return f"Error: 未知 action '{action}'。可选: commit_and_push, pull, pull_and_push, restart, evolve, pull_and_restart"
 
     def _find_repo_dir(self) -> Path | None:
         """定位 nanobot 源码仓库根目录。"""
@@ -182,6 +186,26 @@ IMPORTANT:
         if code != 0:
             return f"Error: git pull 失败: {out}"
         return f"git pull 成功:\n{out}"
+
+    async def _pull_and_push(self, repo_dir: Path, branch: str | None = None) -> str:
+        """先 git pull，再 git push，同步本地提交到远端。"""
+        results = []
+
+        # Step 1: git pull
+        pull_result = await self._git_pull(repo_dir)
+        if pull_result.startswith("Error:"):
+            return pull_result
+        results.append(f"[1/2 Git Pull]\n{pull_result}")
+
+        # Step 2: git push
+        branch_arg = branch or ""
+        push_cmd = f"git push origin {branch_arg}".strip() if branch_arg else "git push"
+        code, out = await self._run_cmd(push_cmd, repo_dir, timeout=120)
+        if code != 0:
+            return "\n\n".join(results) + f"\n\nError: git push 失败: {out}"
+        results.append(f"[2/2 Git Push]\n{out}")
+
+        return "\n\n".join(results)
 
     async def _pull_and_restart(self, repo_dir: Path) -> str:
         """从远端拉取最新代码，重新安装依赖，然后触发重启。"""
