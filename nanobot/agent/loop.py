@@ -24,6 +24,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.claude_code import ClaudeCodeTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.git_manager import GitManagerHandler, create_git_manager_handler
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import parse_session_key, estimate_tokens
 
@@ -148,6 +149,9 @@ class AgentLoop:
         self._cancel_event = asyncio.Event()
         self._register_default_tools()
         self._init_mcp_loader()
+
+        # Initialize git-manager skill handler
+        self.git_manager_handler = create_git_manager_handler(self)
 
     def _select_tools_for_message(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
         """
@@ -407,6 +411,21 @@ class AgentLoop:
         if self.claude_code_manager.resolve_decision(msg.session_key, msg.content):
             logger.info(f"Message routed as Claude Code decision reply for {msg.session_key}")
             return None
+
+        # 检查是否是 git-manager 技能命令（直接执行git操作，不走LLM）
+        git_result = await self.git_manager_handler.handle(msg.content)
+        if git_result is not None:
+            logger.info("Git-manager skill handled the message directly")
+            # 保存到会话历史
+            session = self.sessions.get_or_create(msg.session_key)
+            session.add_message("user", msg.content)
+            session.add_message("assistant", git_result)
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=git_result
+            )
 
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
         
