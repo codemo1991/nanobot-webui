@@ -35,6 +35,7 @@
 | **MCP** | Model Context Protocol 集成，通过 stdio/HTTP/SSE 接入外部工具 |
 | **Skills** | `claude-code`、`git-manager`、`xlsx`、`pdf`、`pptx`、`skill-creator`、`mirror-system`、`code-review-expert` |
 | **模型提供商** | 智谱、通义千问、vLLM、OpenRouter、Anthropic、OpenAI、DeepSeek、Groq、Gemini、Minimax |
+| **启动脚本** | `nanobot-launcher.sh` (Linux/macOS) + `nanobot-launcher.ps1` (Windows) — 自动环境检查、依赖更新、前端构建、一键启动 |
 | **系统** | StatusRepository (SQLite)、SystemStatusService（运行时长、会话数）、集中日志 |
 
 ---
@@ -123,21 +124,37 @@ cd nanobot-webui
 pip install -e .
 ```
 
-### 快捷启动
+### 🚀 一键启动（推荐新用户使用）⭐
 
-一键启动脚本，会自动检查 Python/Node.js 环境、安装依赖、构建前端并启动 Web UI：
+`scripts/` 目录下的智能启动脚本帮您搞定一切 — 最简单的启动方式：
 
-- **Windows：** 双击 `startup.bat` 或在项目根目录执行：
-  ```batch
-  startup.bat
+**支持平台：**
+- **Linux / macOS：** `nanobot-launcher.sh`
+- **Windows PowerShell：** `nanobot-launcher.ps1`
+
+**功能特性：**
+- ✅ 自动检查 Python (≥3.11) 和 Node.js 环境
+- ✅ 自动安装/更新 Python 依赖
+- ✅ 自动构建前端
+- ✅ 一键启动 Web UI 服务
+
+**使用方法：**
+
+- **Windows (PowerShell)：**
+  ```powershell
+  .\scripts\nanobot-launcher.ps1
   ```
 - **Linux / macOS：**
   ```bash
-  chmod +x startup.sh
-  ./startup.sh
+  chmod +x scripts/nanobot-launcher.sh
+  ./scripts/nanobot-launcher.sh
   ```
 
 然后访问 http://127.0.0.1:6788
+
+> **小提示：** 再次运行脚本即可更新依赖并重启服务 — 保持程序最新最简单的办法！
+
+### 手动启动（不使用脚本）
 
 ### Web 界面
 
@@ -221,6 +238,7 @@ nanobot/
 ├── config/         # 扩展配置（Discord、QQ、钉钉、MCP）
 └── cli/            # web-ui 命令、status 等
 web-ui/             # React 单页应用（聊天、配置、系统）
+scripts/            # 启动脚本（nanobot-launcher.sh、nanobot-launcher.ps1）
 ```
 
 ---

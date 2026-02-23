@@ -35,6 +35,7 @@ This fork extends nanobot with **Web UI**, **MCP support**, **additional channel
 | **MCP** | Model Context Protocol integration — connect external tools via stdio/HTTP/SSE |
 | **Skills** | `claude-code`, `git-manager`, `xlsx`, `pdf`, `pptx`, `skill-creator`, `mirror-system`, `code-review-expert` |
 | **Providers** | Zhipu (智谱), DashScope (通义千问), vLLM, OpenRouter, Anthropic, OpenAI, DeepSeek, Groq, Gemini, Minimax |
+| **Startup Scripts** | `nanobot-launcher.sh` (Linux/macOS) + `nanobot-launcher.ps1` (Windows) — Auto environment check, dependency update, frontend build, one-click launch |
 | **System** | StatusRepository (SQLite), SystemStatusService (uptime, session count), centralized logging |
 
 ---
@@ -123,21 +124,37 @@ cd nanobot-webui
 pip install -e .
 ```
 
-### Quick Launch
+### 🚀 One-Click Startup (Recommended for New Users) ⭐
 
-One-click startup — the script checks Python/Node.js, installs dependencies, builds the frontend, and starts the Web UI:
+The intelligent startup scripts in the `scripts/` directory handle everything automatically — the simplest way to get started:
 
-- **Windows:** Double-click `startup.bat` or run:
-  ```batch
-  startup.bat
+**Supported Platforms:**
+- **Linux / macOS:** `nanobot-launcher.sh`
+- **Windows PowerShell:** `nanobot-launcher.ps1`
+
+**What it does:**
+- ✅ Automatically checks Python (≥3.11) and Node.js environment
+- ✅ Automatically installs/updates Python dependencies
+- ✅ Automatically builds the frontend
+- ✅ One-click launches the Web UI service
+
+**Usage:**
+
+- **Windows (PowerShell):**
+  ```powershell
+  .\scripts\nanobot-launcher.ps1
   ```
 - **Linux / macOS:**
   ```bash
-  chmod +x startup.sh
-  ./startup.sh
+  chmod +x scripts/nanobot-launcher.sh
+  ./scripts/nanobot-launcher.sh
   ```
 
 Then open http://127.0.0.1:6788
+
+> **Tip:** Run the script again anytime to update dependencies and restart the service — the simplest way to keep your installation up-to-date!
+
+### Manual Startup (Without Scripts)
 
 ### Web UI
 
@@ -221,6 +238,7 @@ nanobot/
 ├── config/         # Extended schema (Discord, QQ, DingTalk, MCP)
 └── cli/            # web-ui command, status, etc.
 web-ui/             # React SPA (Chat, Config, System)
+scripts/             # Startup scripts (nanobot-launcher.sh, nanobot-launcher.ps1)
 ```
 
 ---

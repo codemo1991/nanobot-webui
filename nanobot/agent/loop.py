@@ -41,7 +41,7 @@ TOOL_KEYWORDS = {
     "spawn": ["子代理", "subagent", "spawn", "并行"],
     "cron": ["定时", "计划", "cron", "schedule"],
     "claude_code": ["claude code", "claude-code", "代码实现", "实现功能", "写代码"],
-    "self_update": ["自更新", "自我更新", "self-update", "self_update", "evolve", "自我进化", "重启", "restart", "推送", "push", "更新自己"],
+    "self_update": ["自更新", "自我更新", "self-update", "self_update", "evolve", "自我进化", "更新自己", "更新nanobot", "重启nanobot", "拉取最新", "更新并重启", "git pull", "git push"],
 }
 
 for tool, keywords in TOOL_KEYWORDS.items():
