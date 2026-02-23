@@ -2,7 +2,26 @@
   "permissions": {
     "allow": [
       "Bash(source ~/.zshrc)",
-      "Bash(defaults write com.apple.finder AppleShowAllFiles -bool true && killall Finder)"
+      "Bash(defaults write com.apple.finder AppleShowAllFiles -bool true && killall Finder)",
+      "Bash(cd /Users/linhome/.nanobot/web-ui/nanobot-webui/web-ui && npm install @fullcalendar/react @fullcalendar/daygrid @fullcalendar/timegrid @fullcalendar/interaction @fullcalendar/core date-fns uuid)",
+      "Bash(npm install -D @types/uuid)",
+      "Bash(cd /Users/linhome/.nanobot/web-ui/nanobot-webui/web-ui && npm run build 2>&1 | head -100)",
+      "Bash(npm run build 2>&1 | head -100)",
+      "Bash(npm run build 2>&1 | head -50)",
+      "Bash(pkill -f \"nanobot web-ui\" 2>/dev/null || true)",
+      "Bash(curl -s -X POST http://127.0.0.1:6788/api/v1/cron/jobs \\\\\n  -H \"Content-Type: application/json\" \\\\\n  -d '{\"name\":\"测试任务\",\"triggerType\":\"cron\",\"triggerCronExpr\":\"0 8 * * *\",\"triggerTz\":\"Asia/Shanghai\",\"payloadKind\":\"agent_turn\",\"payloadMessage\":\"hello\",\"payloadDeliver\":false}')",
+      "Bash(python -c \"from apscheduler.triggers.cron import CronTrigger; import inspect; print\\(inspect.signature\\(CronTrigger.__init__\\)\\)\")",
+      "Bash(python -c \"from apscheduler.triggers.cron import CronTrigger; help\\(CronTrigger.from_crontab\\)\")",
+      "Bash(python -c \"import apscheduler; print\\(apscheduler.__version__\\)\")",
+      "Bash(python -c \"\nfrom apscheduler.schedulers.asyncio import AsyncIOScheduler\nfrom apscheduler.executors.asyncio import AsyncIOExecutor\nimport asyncio\n\nasync def my_job\\(job\\):\n    print\\('Job executed:', job.id\\)\n\nscheduler = AsyncIOScheduler\\(\n    executors={'default': AsyncIOExecutor\\(\\)},\n    job_defaults={'coalesce': True, 'max_instances': 1}\n\\)\n\nfrom apscheduler.triggers.cron import CronTrigger\nimport pytz\n\ntrigger = CronTrigger.from_crontab\\('0 8 * * *', timezone=pytz.timezone\\('Asia/Shanghai'\\)\\)\nscheduler.add_job\\(my_job, trigger=trigger, id='test_job', name='Test Job'\\)\nprint\\('Job added successfully'\\)\nscheduler.start\\(\\)\nasyncio.get_event_loop\\(\\).run_until_complete\\(asyncio.sleep\\(1\\)\\)\nscheduler.shutdown\\(\\)\nprint\\('Test completed'\\)\n\")",
+      "Bash(python -c \"\nfrom apscheduler.schedulers.asyncio import AsyncIOScheduler\nfrom apscheduler.executors.asyncio import AsyncIOExecutor\nimport asyncio\n\n# Try with a simple function that accepts **kwargs\nasync def my_job\\(\\):\n    print\\('Job executed'\\)\n\nscheduler = AsyncIOScheduler\\(\n    executors={'default': AsyncIOExecutor\\(\\)},\n    job_defaults={'coalesce': True, 'max_instances': 1}\n\\)\n\nfrom apscheduler.triggers.cron import CronTrigger\nimport pytz\n\ntrigger = CronTrigger.from_crontab\\('0 8 * * *', timezone=pytz.timezone\\('Asia/Shanghai'\\)\\)\nscheduler.add_job\\(my_job, trigger=trigger, id='test_job', name='Test Job'\\)\nprint\\('Job added successfully'\\)\nscheduler.start\\(\\)\nasyncio.get_event_loop\\(\\).run_until_complete\\(asyncio.sleep\\(1\\)\\)\nscheduler.shutdown\\(\\)\nprint\\('Test completed'\\)\n\")",
+      "Bash(python -c \"\nfrom apscheduler.schedulers.asyncio import AsyncIOScheduler\nfrom apscheduler.executors.asyncio import AsyncIOExecutor\nimport asyncio\n\n# Use a lambda or partial to pass job_id\nasync def my_job\\(job_id=None\\):\n    print\\('Job executed:', job_id\\)\n\nscheduler = AsyncIOScheduler\\(\n    executors={'default': AsyncIOExecutor\\(\\)},\n    job_defaults={'coalesce': True, 'max_instances': 1}\n\\)\n\nfrom apscheduler.triggers.cron import CronTrigger\nimport pytz\n\ntrigger = CronTrigger.from_crontab\\('0 8 * * *', timezone=pytz.timezone\\('Asia/Shanghai'\\)\\)\nscheduler.add_job\\(my_job, trigger=trigger, id='test_job', name='Test Job', job_id='test_job'\\)\nprint\\('Job added successfully'\\)\nscheduler.start\\(\\)\nasyncio.get_event_loop\\(\\).run_until_complete\\(asyncio.sleep\\(1\\)\\)\nscheduler.shutdown\\(\\)\nprint\\('Test completed'\\)\n\")",
+      "Bash(curl -s http://127.0.0.1:6788/api/v1/cron/jobs)",
+      "Bash(curl -s -X POST http://127.0.0.1:6788/api/v1/cron/jobs \\\\\n  -H \"Content-Type: application/json\" \\\\\n  -d '{\"name\":\"新任务测试\",\"triggerType\":\"every\",\"triggerIntervalSeconds\":60,\"payloadKind\":\"agent_turn\",\"payloadMessage\":\"测试消息\",\"payloadDeliver\":false}')",
+      "Bash(curl -s http://127.0.0.1:6788/api/v1/cron/status)",
+      "Bash(pkill -f \"nanobot\" 2>/dev/null || true)",
+      "Bash(curl -s http://127.0.0.1:6788/api/v1/health)",
+      "Bash(curl -s http://127.0.0.1:6788/api/v1/cron/jobs | python -m json.tool)"
     ]
   }
 }

@@ -28,6 +28,12 @@ function Layout() {
           <NavLink to="/mirror" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
             🪞 {t('nav.mirror')}
           </NavLink>
+          <NavLink to="/calendar" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
+            📅 {t('nav.calendar')}
+          </NavLink>
+          <NavLink to="/cron" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
+            ⏰ {t('nav.cron')}
+          </NavLink>
           <NavLink to="/config" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
             ⚙️ {t('nav.config')}
           </NavLink>

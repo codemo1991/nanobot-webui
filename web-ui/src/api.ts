@@ -20,7 +20,7 @@ async function request<T>(path: string, options?: RequestInit & { skipJsonConten
   }
 
   const data: ApiResponse<T> = await response.json()
-  
+
   if (!data.success) {
     const err = new Error(data.error?.message || i18n.t('api.requestFailed'))
     ;(err as Error & { code?: string }).code = data.error?.code
@@ -29,6 +29,8 @@ async function request<T>(path: string, options?: RequestInit & { skipJsonConten
 
   return data.data!
 }
+
+export { request }
 
 export const api = {
   // Health check
