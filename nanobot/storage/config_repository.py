@@ -569,6 +569,7 @@ class ConfigRepository:
             "dashscope": "DashScope",
             "vllm": "vLLM",
             "gemini": "Gemini",
+            "minimax": "Minimax",
         }
         for provider_id, provider_data in providers_config.items():
             api_key = provider_data.get("apiKey", "")

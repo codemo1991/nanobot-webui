@@ -127,7 +127,7 @@ export interface ChannelsConfig {
 export interface Provider {
   id: string
   name: string
-  type: 'openai' | 'anthropic' | 'azure' | 'deepseek' | 'openrouter' | 'groq' | 'zhipu' | 'dashscope' | 'gemini' | 'vllm'
+  type: 'openai' | 'anthropic' | 'azure' | 'deepseek' | 'openrouter' | 'groq' | 'zhipu' | 'dashscope' | 'gemini' | 'vllm' | 'minimax'
   apiKey?: string
   apiBase?: string
   enabled: boolean

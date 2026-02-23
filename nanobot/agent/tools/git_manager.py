@@ -9,12 +9,12 @@ from loguru import logger
 
 # Keywords that trigger git-manager skill
 GIT_MANAGER_KEYWORDS = {
-    # Push related
-    "推送代码到github": "push",
-    "推送到github": "push",
-    "推送代码": "push",
-    "push到github": "push",
-    "git push": "push",
+    # Push related (pull first to avoid conflicts, then push)
+    "推送代码到github": "pull_and_push",
+    "推送到github": "pull_and_push",
+    "推送代码": "pull_and_push",
+    "push到github": "pull_and_push",
+    "git push": "pull_and_push",
     # Pull and restart related
     "更新并重启": "pull_and_restart",
     "更新并重启服务": "pull_and_restart",
@@ -91,7 +91,7 @@ class GitManagerHandler:
         args: dict[str, Any] = {"action": action}
 
         # For commit actions, try to extract commit message from the message
-        if action in ("push", "evolve"):
+        if action in ("commit_and_push", "evolve"):
             commit_message = self._extract_commit_message(message)
             if commit_message:
                 args["commit_message"] = commit_message
