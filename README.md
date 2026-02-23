@@ -1,6 +1,6 @@
 <div align="center">
   <img src="logo.png" alt="nanobot" width="500">
-  <h1>nanobot: Ultra-Lightweight Personal AI Assistant</h1>
+  <h1>nanobot-webui: Ultra-Lightweight Personal AI Assistant</h1>
   <p>
     <img src="https://img.shields.io/badge/python-≥3.11-blue" alt="Python">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
@@ -28,12 +28,35 @@ This fork extends nanobot with **Web UI**, **MCP support**, **additional channel
 
 | Category | Features |
 |----------|----------|
+| **Core Capabilities** | Multi-platform: Web UI, Telegram, Feishu, CLI; Local运行，保护隐私; Support for multiple LLMs (DeepSeek, Claude, GPT, etc.) |
+| **Function Modules** | File system operations, Code execution, Memory system (long-term + daily notes), Extensible skill system |
 | **Web UI** | React + TypeScript SPA: Chat, Config (Channels/Providers/Models/MCP/Skills), System Status |
 | **Channels** | Discord, QQ (qq-botpy), DingTalk (钉钉), plus original Telegram, WhatsApp, Feishu |
 | **MCP** | Model Context Protocol integration — connect external tools via stdio/HTTP/SSE |
-| **Skills** | `code-review-expert`, `docx`, `pdf`, `pptx`, `xlsx`, `skill-creator` |
-| **Providers** | Zhipu (智谱), DashScope (通义千问), vLLM, OpenRouter, Anthropic, OpenAI, DeepSeek, Groq, Gemini |
+| **Skills** | `claude-code`, `git-manager`, `xlsx`, `pdf`, `pptx`, `skill-creator`, `mirror-system`, `code-review-expert` |
+| **Providers** | Zhipu (智谱), DashScope (通义千问), vLLM, OpenRouter, Anthropic, OpenAI, DeepSeek, Groq, Gemini, Minimax |
 | **System** | StatusRepository (SQLite), SystemStatusService (uptime, session count), centralized logging |
+
+---
+
+## 🛠️ Built-in Skills
+
+nanobot-webui comes with a powerful skill system that extends the AI's capabilities:
+
+| Skill | Description |
+|-------|-------------|
+| **claude-code** | Delegate coding tasks to Claude Code CLI for advanced code generation and refactoring |
+| **git-manager** | Git repository management — commit, push, pull, branch operations |
+| **xlsx** | Excel spreadsheet operations — read, write, edit .xlsx files |
+| **pdf** | PDF operations — read, write, merge, split PDF documents |
+| **pptx** | PowerPoint presentation operations — create and edit .pptx files |
+| **skill-creator** | Create new skills to extend nanobot's capabilities |
+| **mirror-system** | Self-awareness exploration system for personal growth |
+| **code-review-expert** | Git diff code review — analyze changes and provide feedback |
+
+### Creating Custom Skills
+
+The skill system is extensible. You can create custom skills by implementing skill functions that the AI can invoke. See the `skill-creator` skill for a template.
 
 ---
 
@@ -95,8 +118,8 @@ Manage AI skills — select skill folders for upload to workspace, view installe
 ### Install
 
 ```bash
-git clone https://github.com/HKUDS/nanobot.git
-cd nanobot
+git clone https://github.com/codemo1991/nanobot-webui.git
+cd nanobot-webui
 pip install -e .
 ```
 
@@ -108,7 +131,7 @@ One-click startup — the script checks Python/Node.js, installs dependencies, b
   ```batch
   startup.bat
   ```
-- **Linux / macOS:** 
+- **Linux / macOS:**
   ```bash
   chmod +x startup.sh
   ./startup.sh
@@ -153,9 +176,12 @@ Then open http://127.0.0.1:6788. On first launch, the app auto-creates `~/.nanob
 
 ---
 
-## 🖥️ Web UI Details
+## 💻 Web Interface Features
 
 - **Chat** — Create sessions, multi-turn conversations, Markdown rendering, session persistence
+- **File Browser** — Browse and manage workspace files directly from the UI
+- **Session History** — View and manage conversation history
+- **Model Switching** — Easily switch between different AI models
 - **Config** — Manage Channels (IM), Providers, Models, MCP servers, Skills
 - **System** — Health check, uptime, session count, system info, config export
 
@@ -190,11 +216,48 @@ nanobot/
 ├── mcp/            # MCP loader
 ├── storage/        # StatusRepository (SQLite)
 ├── services/       # SystemStatusService
-├── skills/         # code-review-expert, docx, pdf, pptx, xlsx, skill-creator...
+├── skills/         # claude-code, git-manager, xlsx, pdf, pptx, skill-creator, mirror-system, code-review-expert...
+├── providers/      # LLM providers (OpenAI, Anthropic, DeepSeek, etc.)
 ├── config/         # Extended schema (Discord, QQ, DingTalk, MCP)
 └── cli/            # web-ui command, status, etc.
 web-ui/             # React SPA (Chat, Config, System)
 ```
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request or open an Issue for bugs and feature requests.
+
+### Development Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/codemo1991/nanobot-webui.git
+cd nanobot-webui
+
+# Install in development mode
+pip install -e .
+
+# Install web-ui dependencies
+cd web-ui && npm install
+
+# Run development server
+cd ..
+nanobot web-ui
+```
+
+### Code Style
+
+- Python: Follow PEP 8
+- JavaScript/TypeScript: Follow ESLint configuration
+- Commit messages: Use clear, descriptive messages
+
+---
+
+## 📄 License
+
+MIT License — see LICENSE file for details.
 
 ---
 
@@ -206,5 +269,5 @@ web-ui/             # React SPA (Chat, Config, System)
 ---
 
 <p align="center">
-  <em>Thanks for visiting ✨ nanobot!</em>
+  <em>Thanks for visiting ✨ nanobot-webui!</em>
 </p>

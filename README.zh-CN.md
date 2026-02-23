@@ -20,7 +20,7 @@
 
 ## 📢 本分支新特性
 
-鉴于openclaw，nanobot都是通过命令行的配置方式，且缺乏直观的配置管理，同时改更配置项目需要重启服务的问题，本分支在 nanobot 基础上新增 **Web 管理界面**、**MCP 协议支持**、**更多 IM 渠道**（Discord、QQ、钉钉）、**文档/办公 Skills**、**系统状态监控** 等能力。
+鉴于 openclaw、nanobot 都是通过命令行的配置方式，且缺乏直观的配置管理，同时修改配置项目需要重启服务的问题，本分支在 nanobot 基础上新增 **Web 管理界面**、**MCP 协议支持**、**更多 IM 渠道**（Discord、QQ、钉钉）、**文档/办公 Skills**、**系统状态监控** 等能力。
 
 ---
 
@@ -28,12 +28,35 @@
 
 | 类别 | 功能 |
 |------|------|
+| **核心能力** | 多平台支持：Web UI、Telegram、飞书、CLI; 本地运行，保护隐私; 支持多种大语言模型（DeepSeek、Claude、GPT等） |
+| **功能模块** | 文件系统操作、代码执行、记忆系统（长期记忆+每日笔记）、可扩展技能系统 |
 | **Web UI** | React + TypeScript 单页应用：聊天、配置（Channels/Providers/Models/MCP/Skills）、系统状态 |
 | **渠道** | Discord、QQ (qq-botpy)、钉钉，以及原有 Telegram、WhatsApp、飞书 |
 | **MCP** | Model Context Protocol 集成，通过 stdio/HTTP/SSE 接入外部工具 |
-| **Skills** | `code-review-expert`、`docx`、`pdf`、`pptx`、`xlsx`、`skill-creator` |
-| **模型提供商** | 智谱、通义千问、vLLM、OpenRouter、Anthropic、OpenAI、DeepSeek、Groq、Gemini |
+| **Skills** | `claude-code`、`git-manager`、`xlsx`、`pdf`、`pptx`、`skill-creator`、`mirror-system`、`code-review-expert` |
+| **模型提供商** | 智谱、通义千问、vLLM、OpenRouter、Anthropic、OpenAI、DeepSeek、Groq、Gemini、Minimax |
 | **系统** | StatusRepository (SQLite)、SystemStatusService（运行时长、会话数）、集中日志 |
+
+---
+
+## 🛠️ 内置技能
+
+nanobot-webui 配备了强大的技能系统，可扩展 AI 的能力：
+
+| 技能 | 描述 |
+|------|------|
+| **claude-code** | 委托编码任务给 Claude Code CLI，用于高级代码生成和重构 |
+| **git-manager** | Git 仓库管理 —— 提交、推送、拉取、分支操作 |
+| **xlsx** | Excel 电子表格操作 —— 读取、写入、编辑 .xlsx 文件 |
+| **pdf** | PDF 操作 —— 读取、写入、合并、分割 PDF 文档 |
+| **pptx** | PowerPoint 演示文稿操作 —— 创建和编辑 .pptx 文件 |
+| **skill-creator** | 创建新技能以扩展 nanobot 的能力 |
+| **mirror-system** | 自我认知探索系统，助力个人成长 |
+| **code-review-expert** | Git diff 代码审查 —— 分析变更并提供反馈 |
+
+### 创建自定义技能
+
+技能系统是可扩展的。你可以通过实现技能函数来创建自定义技能，供 AI 调用。请参考 `skill-creator` 技能作为模板。
 
 ---
 
@@ -75,7 +98,7 @@
 </p>
 
 ### 配置 — MCP
-管理 Model Context Protocol 服务器，支持 stdio、http、sse、streamable_http 等协议，可导入/生成 JSON 或新增 MCP 服务。
+管理 Model Context Protocol 服务器，支持 stdio、http、sse、streamable_http 协议，可导入/生成 JSON 或新增 MCP 服务。
 
 <p align="center">
   <img src="case/mcp.png" alt="MCP 配置" width="800">
@@ -90,16 +113,13 @@
 
 ---
 
-
-
-
 ## 🚀 快速开始
 
 ### 安装
 
 ```bash
-git clone https://github.com/HKUDS/nanobot.git
-cd nanobot
+git clone https://github.com/codemo1991/nanobot-webui.git
+cd nanobot-webui
 pip install -e .
 ```
 
@@ -156,9 +176,12 @@ docker run -d -p 6788:6788 -v ~/.nanobot:/root/.nanobot --name nanobot nanobot-w
 
 ---
 
-## 🖥️ Web 界面说明
+## 💻 Web 界面功能
 
 - **聊天** — 创建会话、多轮对话、Markdown 渲染、会话持久化
+- **文件浏览器** — 直接在界面中浏览和管理工作区文件
+- **会话历史** — 查看和管理对话历史
+- **模型切换** — 轻松在不同 AI 模型之间切换
 - **配置** — 管理 Channels（IM）、Providers、Models、MCP 服务、Skills
 - **系统状态** — 健康检查、运行时长、会话数量、系统信息、配置导出
 
@@ -188,16 +211,53 @@ pip install nanobot-ai[mcp]
 nanobot/
 ├── agent/          # 核心 Agent（loop、context、memory、tools）
 │   └── tools/      # mcp.py、filesystem、shell、registry...
-├── channels/       # telegram、whatsapp、feishu、discord、qq、dingtalk
+├── channels/       # telegram、whatsapp、飞书、discord、qq、dingtalk
 ├── web/            # REST API 服务 (api.py)
 ├── mcp/            # MCP 加载器
 ├── storage/        # StatusRepository (SQLite)
 ├── services/       # SystemStatusService
-├── skills/         # code-review-expert、docx、pdf、pptx、xlsx、skill-creator...
+├── skills/         # claude-code、git-manager、xlsx、pdf、pptx、skill-creator、mirror-system、code-review-expert...
+├── providers/      # LLM 提供商（OpenAI、Anthropic、DeepSeek 等）
 ├── config/         # 扩展配置（Discord、QQ、钉钉、MCP）
 └── cli/            # web-ui 命令、status 等
 web-ui/             # React 单页应用（聊天、配置、系统）
 ```
+
+---
+
+## 🤝 贡献指南
+
+欢迎贡献代码！请随时提交 Pull Request 或提交 Issue 报告 bug 和功能请求。
+
+### 开发环境设置
+
+```bash
+# 克隆仓库
+git clone https://github.com/codemo1991/nanobot-webui.git
+cd nanobot-webui
+
+# 以开发模式安装
+pip install -e .
+
+# 安装 web-ui 依赖
+cd web-ui && npm install
+
+# 运行开发服务器
+cd ..
+nanobot web-ui
+```
+
+### 代码规范
+
+- Python：遵循 PEP 8
+- JavaScript/TypeScript：遵循 ESLint 配置
+- 提交信息：使用清晰、描述性的消息
+
+---
+
+## 📄 许可证
+
+MIT 许可证 — 详见 LICENSE 文件。
 
 ---
 
@@ -209,5 +269,5 @@ web-ui/             # React 单页应用（聊天、配置、系统）
 ---
 
 <p align="center">
-  <em>感谢访问 ✨ nanobot！</em>
+  <em>感谢访问 ✨ nanobot-webui！</em>
 </p>
