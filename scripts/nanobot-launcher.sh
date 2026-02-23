@@ -6,7 +6,7 @@
 #   ./nanobot-launcher.sh [--host HOST] [--port PORT] [--verbose] [--debug]
 #
 # 当 nanobot 以退出码 42 退出时（self_update 触发），本脚本会自动
-# 执行 pip install -e . 并重新启动服务。
+# 执行 git pull 及 pip install -e . 并重新启动服务。
 
 set -euo pipefail
 
@@ -45,7 +45,11 @@ while true; do
     echo ""
 
     set +e
-    nanobot web-ui --host "$HOST" --port "$PORT" "${EXTRA_ARGS[@]:-}"
+    if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
+        nanobot web-ui --host "$HOST" --port "$PORT"
+    else
+        nanobot web-ui --host "$HOST" --port "$PORT" "${EXTRA_ARGS[@]}"
+    fi
     exit_code=$?
     set -e
 
@@ -69,9 +73,18 @@ while true; do
             exit 1
         fi
 
-        echo "[launcher] Self-update restart requested. Reinstalling..."
+        echo "[launcher] Self-update restart requested. Pulling & reinstalling..."
 
         if [ -f "$REPO_DIR/pyproject.toml" ]; then
+            echo "[launcher] Running: git pull (in $REPO_DIR)"
+            set +e
+            (cd "$REPO_DIR" && git pull 2>&1 | sed 's/^/  /')
+            git_exit=$?
+            set -e
+            if [ "$git_exit" -ne 0 ]; then
+                echo "[launcher] Warning: git pull failed (exit $git_exit), continuing anyway..."
+            fi
+
             echo "[launcher] Running: pip install -e . (in $REPO_DIR)"
             # 使用 --no-deps 加速，主要目的是让 Python 识别代码变更
             (cd "$REPO_DIR" && pip install -e . --no-deps --quiet 2>&1 | sed 's/^/  /') || \
