@@ -49,6 +49,14 @@ for tool, keywords in TOOL_KEYWORDS.items():
 
 ESSENTIAL_TOOLS = ["read_file", "write_file", "exec", "remember"]
 
+# Marker embedded in assistant reply when limits are hit.
+# Used to detect "continue" commands from the user in the next turn.
+LIMIT_REACHED_MARKER = "<!-- LIMIT_REACHED -->"
+CONTINUE_KEYWORDS = {
+    "继续", "continue", "重置", "reset",
+    "继续执行", "继续任务", "go on", "proceed",
+}
+
 
 class AgentLoop:
     """
@@ -362,18 +370,21 @@ class AgentLoop:
 
     def cancel_current_request(self) -> None:
         """Cancel the current running request by setting the cancel event."""
-        if not self._cancel_event.is_set():
-            self._cancel_event.set()
-            logger.info("Agent request cancellation requested")
+        # Always try to set the event (set() is idempotent and safe to call multiple times)
+        # This ensures that multiple clicks on stop button will correctly propagate the cancellation
+        self._cancel_event.set()
+        logger.info(f"Agent request cancellation requested, event is now set: {self._cancel_event.is_set()}")
 
     async def _check_cancelled(self) -> None:
         """Check if cancellation was requested and raise if so."""
         if self._cancel_event.is_set():
             self._cancel_event.clear()
+            logger.info("Cancellation detected, event cleared, raising CancelledError")
             raise asyncio.CancelledError("Request cancelled by user")
 
     def _reset_cancel_event(self) -> None:
         """Reset the cancel event for a new request."""
+        logger.debug(f"Resetting cancel event, current state: {self._cancel_event.is_set()}")
         self._cancel_event.clear()
     
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -448,11 +459,29 @@ class AgentLoop:
                 self._mcp_fail_time = now + mcp_cooldown
                 logger.exception("MCP tool loading failed")
         
+        # Detect "继续" / "continue" command after a limit-reached pause.
+        # If the last assistant message has the LIMIT_REACHED_MARKER and the user
+        # is asking to continue, replace the bare keyword with an explicit instruction
+        # so the LLM understands it should resume the interrupted task.
+        current_message = msg.content
+        if msg.content.strip().lower() in CONTINUE_KEYWORDS:
+            last_msgs = session.messages[-3:] if session.messages else []
+            last_assistant = next(
+                (m for m in reversed(last_msgs) if m.get("role") == "assistant"),
+                None,
+            )
+            if last_assistant and LIMIT_REACHED_MARKER in str(last_assistant.get("content", "")):
+                logger.info("Detected continue command after limit-reached pause; resetting iteration budget")
+                current_message = (
+                    "请继续执行上一条消息中未完成的任务，从上次中断的地方接着做，"
+                    "不需要重新解释已完成的部分。"
+                )
+
         # Build initial messages (use get_history for LLM-formatted messages)
         mirror_attack_level = msg.metadata.get("attack_level") if msg.metadata else None
         messages = self.context.build_messages(
             history=session.get_history(max_messages=self.max_history_messages),
-            current_message=msg.content,
+            current_message=current_message,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -495,6 +524,7 @@ class AgentLoop:
         # Agent loop
         iteration = 0
         final_content = None
+        exit_reason: str | None = None  # "time" | "iterations" | "loop" | None=normal
         tool_steps: list[dict[str, Any]] = []
         usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         loop_start = time.monotonic()
@@ -532,6 +562,7 @@ class AgentLoop:
                 elapsed = time.monotonic() - loop_start
                 if elapsed >= self.max_execution_time:
                     logger.info("Max execution time %ds reached (elapsed %.0fs)", self.max_execution_time, elapsed)
+                    exit_reason = "time"
                     break
 
             # Notify progress: thinking / about to call LLM
@@ -616,11 +647,15 @@ class AgentLoop:
                         except Exception:
                             pass
                 if loop_detected:
+                    exit_reason = "loop"
                     break
             else:
                 # No tool calls, we're done
                 final_content = response.content
                 break
+
+        if final_content is None and exit_reason is None:
+            exit_reason = "iterations"
 
         if final_content is None:
             # Hit max_iterations with only tool calls - force one final LLM call without tools
@@ -646,6 +681,23 @@ class AgentLoop:
             except Exception as e:
                 logger.warning("Final synthesis call failed: %s", e)
                 final_content = _make_fallback_from_tools(tool_steps)
+
+        # Append user-visible limit notice so the user knows why the agent stopped
+        # and can explicitly ask to continue.
+        if exit_reason in ("iterations", "time"):
+            if exit_reason == "iterations":
+                reason_zh = f"工具调用次数已达上限（{self.max_iterations} 次）"
+            else:
+                elapsed_s = int(time.monotonic() - loop_start)
+                reason_zh = f"执行时间已达上限（{elapsed_s} 秒 / 上限 {self.max_execution_time} 秒）"
+            limit_notice = (
+                f"\n\n---\n"
+                f"⚠️ **任务已暂停**：{reason_zh}。\n"
+                f"如需继续执行，请回复 **继续**；"
+                f"或直接描述下一步您希望做什么。"
+                f"{LIMIT_REACHED_MARKER}"
+            )
+            final_content = (final_content or "") + limit_notice
 
         # Save to session (include tool_steps for UI display)
         user_token_usage = {
@@ -1063,6 +1115,7 @@ class AgentLoop:
             The agent's response.
         """
         self._reset_cancel_event()
+        logger.info(f"Starting new request, cancel event reset, state: {self._cancel_event.is_set()}")
         
         if ":" in session_key:
             try:
