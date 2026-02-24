@@ -253,6 +253,7 @@ export default function CronPage() {
                   title={
                     <Space>
                       <span className="job-name">{job.name}</span>
+                      {job.is_system && <Tag color="purple">{t('cron.systemJob')}</Tag>}
                       {getStatusTag(job)}
                     </Space>
                   }
@@ -282,16 +283,22 @@ export default function CronPage() {
                           onClick={() => handleEdit(job)}
                         />
                       </Tooltip>
-                      <Popconfirm
-                        title={t('cron.confirmDelete')}
-                        onConfirm={() => handleDelete(job.id)}
-                        okText={t('cron.yes')}
-                        cancelText={t('cron.no')}
-                      >
-                        <Tooltip title={t('cron.delete')}>
-                          <Button type="text" danger icon={<DeleteOutlined />} />
+                      {job.is_system ? (
+                        <Tooltip title={t('cron.cannotDeleteSystemJob')}>
+                          <Button type="text" danger icon={<DeleteOutlined />} disabled />
                         </Tooltip>
-                      </Popconfirm>
+                      ) : (
+                        <Popconfirm
+                          title={t('cron.confirmDelete')}
+                          onConfirm={() => handleDelete(job.id)}
+                          okText={t('cron.yes')}
+                          cancelText={t('cron.no')}
+                        >
+                          <Tooltip title={t('cron.delete')}>
+                            <Button type="text" danger icon={<DeleteOutlined />} />
+                          </Tooltip>
+                        </Popconfirm>
+                      )}
                     </Space>
                   }
                 >
@@ -337,8 +344,13 @@ export default function CronPage() {
         confirmLoading={submitting}
       >
         <Form form={form} layout="vertical">
-          <Form.Item name="name" label={t('cron.jobName')} rules={[{ required: true, message: t('cron.jobNameRequired') }]}>
-            <Input placeholder={t('cron.jobNamePlaceholder')} />
+          <Form.Item
+            name="name"
+            label={t('cron.jobName')}
+            rules={[{ required: true, message: t('cron.jobNameRequired') }]}
+            help={editingJob?.is_system ? t('cron.systemJobTip') : undefined}
+          >
+            <Input placeholder={t('cron.jobNamePlaceholder')} disabled={editingJob?.is_system} />
           </Form.Item>
 
           <Form.Item name="triggerType" label={t('cron.triggerType')} rules={[{ required: true }]}>
@@ -348,6 +360,7 @@ export default function CronPage() {
                 { value: 'every', label: t('cron.triggerInterval') },
                 { value: 'at', label: t('cron.triggerOnce') },
               ]}
+              disabled={editingJob?.is_system}
             />
           </Form.Item>
 

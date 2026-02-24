@@ -170,6 +170,16 @@
   border-radius: 8px;
 }
 
+.memory-config-actions {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #f0f0f0;
+}
+
+.memory-config-actions .ant-btn {
+  border-radius: 8px;
+}
+
 .workspace-tip {
   margin-top: 12px;
   padding: 12px 16px;

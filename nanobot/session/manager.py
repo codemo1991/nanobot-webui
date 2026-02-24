@@ -77,15 +77,20 @@ class Session:
 class SessionManager:
     """
     Manages conversation sessions.
-    
+
     Sessions are stored in a SQLite database.
     """
-    
+
     DEFAULT_CACHE_MAX = 500
 
     def __init__(self, workspace: Path, max_cache_size: int | None = None):
         self.workspace = workspace
-        data_dir = ensure_dir(Path.home() / ".nanobot")
+        # 优先使用 workspace 特定的数据库，否则使用默认数据库
+        workspace_db_path = workspace / ".nanobot" / "chat.db"
+        if workspace_db_path.exists():
+            data_dir = workspace_db_path.parent
+        else:
+            data_dir = Path.home() / ".nanobot"
         self.db_path = data_dir / "chat.db"
         self._cache: OrderedDict[str, Session] = OrderedDict()
         self._locks: dict[str, threading.Lock] = {}
@@ -429,6 +434,64 @@ class SessionManager:
             extras = json.loads(row["extras_json"]) if row["extras_json"] else {}
             result.append(
                 {
+                    "sequence": int(row["sequence"]),
+                    "role": row["role"],
+                    "content": row["content"],
+                    "timestamp": row["timestamp"],
+                    **extras,
+                }
+            )
+        return result
+
+    def get_recent_messages(
+        self,
+        since_timestamp: str,
+        limit: int = 100,
+        exclude_subagent: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Get messages from all sessions since the given timestamp.
+
+        Args:
+            since_timestamp: Start timestamp (ISO format)
+            limit: Maximum number of messages to return
+            exclude_subagent: Whether to exclude subagent sessions (starting with "subagent:")
+
+        Returns:
+            List of messages sorted by timestamp ascending
+        """
+        safe_limit = max(1, min(limit, 500))
+
+        with self._connect() as conn:
+            if exclude_subagent:
+                rows = conn.execute(
+                    """
+                    SELECT session_key, sequence, role, content, timestamp, extras_json
+                    FROM chat_messages
+                    WHERE timestamp >= ? AND session_key NOT LIKE 'subagent:%'
+                    ORDER BY timestamp ASC, sequence ASC
+                    LIMIT ?
+                    """,
+                    (since_timestamp, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT session_key, sequence, role, content, timestamp, extras_json
+                    FROM chat_messages
+                    WHERE timestamp >= ?
+                    ORDER BY timestamp ASC, sequence ASC
+                    LIMIT ?
+                    """,
+                    (since_timestamp, safe_limit),
+                ).fetchall()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            extras = json.loads(row["extras_json"]) if row["extras_json"] else {}
+            result.append(
+                {
+                    "session_key": row["session_key"],
                     "sequence": int(row["sequence"]),
                     "role": row["role"],
                     "content": row["content"],

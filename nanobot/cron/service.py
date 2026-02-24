@@ -202,12 +202,12 @@ class CronService:
             if self.on_job:
                 response = await self.on_job(job)
 
-            # Update job status
+            # Update job status (成功时清除错误信息)
             self.repository.update_job_status(
                 job_id=job_id,
                 last_run_at_ms=start_ms,
                 last_status="ok",
-                last_error=None,
+                clear_error=True,
             )
             logger.info(f"Cron: job '{job['name']}' completed")
 

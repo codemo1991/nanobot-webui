@@ -308,11 +308,11 @@ class SkillsLoader:
             emoji = f"{meta.emoji} " if meta.emoji else ""
             
             if level == 0:
-                line = f"- **{name}**: {meta.short_description} ({status})"
+                line = f"- **{name}**: {meta.short_description} ({status}) — `{meta.path}`"
             elif level == 1:
-                line = f"- **{emoji}{name}**: {meta.description} ({status})"
+                line = f"- **{emoji}{name}**: {meta.description} ({status}) — `{meta.path}`"
             else:
-                line = f"- **{emoji}{name}**: {meta.description} ({status})"
+                line = f"- **{emoji}{name}**: {meta.description} ({status}) — `{meta.path}`"
             
             if not meta.available and meta.missing_requirements:
                 line += f" — requires: {meta.missing_requirements}"
@@ -359,7 +359,7 @@ class SkillsLoader:
             
             status = "✓" if meta.available else "✗"
             emoji = f"{meta.emoji} " if meta.emoji else ""
-            line = f"- **{emoji}{name}**: {meta.description} ({status})"
+            line = f"- **{emoji}{name}**: {meta.description} ({status}) — `{meta.path}`"
             lines.append(line)
             shown_count += 1
         
@@ -373,7 +373,7 @@ class SkillsLoader:
                 break
             
             status = "✓" if meta.available else "✗"
-            line = f"- **{name}**: {meta.short_description} ({status})"
+            line = f"- **{name}**: {meta.short_description} ({status}) — `{meta.path}`"
             lines.append(line)
             shown_count += 1
         

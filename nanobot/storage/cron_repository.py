@@ -34,6 +34,7 @@ class CronRepository:
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             enabled INTEGER DEFAULT 1,
+            is_system INTEGER DEFAULT 0,
             trigger_type TEXT NOT NULL,
             trigger_date_ms INTEGER,
             trigger_interval_seconds INTEGER,
@@ -57,10 +58,39 @@ class CronRepository:
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run_at_ms);
     """
 
+    # 系统任务 ID 常量
+    SYSTEM_MEMORY_INTEGRATE = "system:memory_auto_integrate"
+    SYSTEM_MEMORY_MAINTENANCE = "system:memory_maintenance"
+
+    # 默认系统任务配置
+    DEFAULT_SYSTEM_JOBS = [
+        {
+            "id": SYSTEM_MEMORY_INTEGRATE,
+            "name": "自动记忆整合",
+            "name_en": "Auto Memory Integration",
+            "description": "从对话历史中自动提取长期记忆",
+            "trigger_type": "every",
+            "trigger_interval_seconds": 30 * 60,  # 30 分钟
+            "payload_kind": "system_event",
+            "payload_message": "auto_memory_integrate",
+        },
+        {
+            "id": SYSTEM_MEMORY_MAINTENANCE,
+            "name": "记忆维护总结",
+            "name_en": "Memory Maintenance",
+            "description": "压缩和合并长期记忆",
+            "trigger_type": "every",
+            "trigger_interval_seconds": 60 * 60,  # 60 分钟
+            "payload_kind": "system_event",
+            "payload_message": "memory_maintenance",
+        },
+    ]
+
     def _init_tables(self) -> None:
         """Initialize cron jobs table structure.
 
         如果数据库文件损坏（file is not a database），自动备份并重建。
+        如果表已存在但缺少新列，自动迁移。
         """
         try:
             conn = self._connect()
@@ -90,6 +120,27 @@ class CronRepository:
         except Exception:
             logger.exception("Failed to initialize cron jobs table")
             raise
+        finally:
+            # 确保迁移新列（如果表已存在但缺少 is_system 列）
+            self._migrate_columns()
+
+    def _migrate_columns(self) -> None:
+        """迁移表结构，添加缺失的列"""
+        try:
+            conn = self._connect()
+
+            # 检查 is_system 列是否存在
+            cursor = conn.execute("PRAGMA table_info(cron_jobs)")
+            columns = [row[1] for row in cursor.fetchall()]
+
+            if "is_system" not in columns:
+                conn.execute("ALTER TABLE cron_jobs ADD COLUMN is_system INTEGER DEFAULT 0")
+                conn.commit()
+                logger.info("Migrated cron_jobs: added is_system column")
+
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to migrate cron_jobs columns: {e}")
 
     def _get_timestamp_ms(self) -> int:
         """Get current timestamp in milliseconds."""
@@ -101,6 +152,7 @@ class CronRepository:
             "id": row["id"],
             "name": row["name"],
             "enabled": bool(row["enabled"]),
+            "is_system": bool(row["is_system"]),
             "trigger": {
                 "type": row["trigger_type"],
                 "dateMs": row["trigger_date_ms"],
@@ -187,6 +239,7 @@ class CronRepository:
         payload_channel: str | None = None,
         payload_to: str | None = None,
         delete_after_run: bool = False,
+        is_system: bool = False,
     ) -> dict[str, Any]:
         """
         Create a new cron job.
@@ -205,6 +258,7 @@ class CronRepository:
             payload_channel: Channel for delivery
             payload_to: Recipient for delivery
             delete_after_run: Delete job after execution
+            is_system: Whether this is a system job (cannot be deleted)
 
         Returns:
             Created job dict
@@ -215,15 +269,15 @@ class CronRepository:
                 conn.execute(
                     """
                     INSERT INTO cron_jobs (
-                        id, name, enabled, trigger_type, trigger_date_ms,
+                        id, name, enabled, is_system, trigger_type, trigger_date_ms,
                         trigger_interval_seconds, trigger_cron_expr, trigger_tz,
                         payload_kind, payload_message, payload_deliver,
                         payload_channel, payload_to, delete_after_run,
                         created_at_ms, updated_at_ms
-                    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        job_id, name, trigger_type, trigger_date_ms,
+                        job_id, name, int(is_system), trigger_type, trigger_date_ms,
                         trigger_interval_seconds, trigger_cron_expr, trigger_tz,
                         payload_kind, payload_message, int(payload_deliver),
                         payload_channel, payload_to, int(delete_after_run),
@@ -370,6 +424,7 @@ class CronRepository:
         last_run_at_ms: int | None = None,
         last_status: str | None = None,
         last_error: str | None = None,
+        clear_error: bool = False,
     ) -> None:
         """
         Update job execution status.
@@ -379,7 +434,8 @@ class CronRepository:
             next_run_at_ms: Next scheduled run time in ms
             last_run_at_ms: Last run time in ms
             last_status: Last execution status
-            last_error: Last error message
+            last_error: Last error message (set to None to clear)
+            clear_error: If True, explicitly set last_error to NULL
         """
         now_ms = self._get_timestamp_ms()
         updates = []
@@ -394,7 +450,10 @@ class CronRepository:
         if last_status is not None:
             updates.append("last_status = ?")
             values.append(last_status)
-        if last_error is not None:
+        if clear_error:
+            # 显式清除错误
+            updates.append("last_error = NULL")
+        elif last_error is not None:
             updates.append("last_error = ?")
             values.append(last_error)
 
@@ -439,3 +498,20 @@ class CronRepository:
         except Exception as e:
             logger.warning(f"Failed to get next cron jobs: {e}")
             return []
+
+    def ensure_system_jobs(self) -> None:
+        """确保系统默认任务存在，如果不存在则创建"""
+        for job_config in self.DEFAULT_SYSTEM_JOBS:
+            existing = self.get_job(job_config["id"])
+            if not existing:
+                # 创建系统任务
+                self.create_job(
+                    job_id=job_config["id"],
+                    name=job_config["name"],
+                    trigger_type=job_config["trigger_type"],
+                    trigger_interval_seconds=job_config["trigger_interval_seconds"],
+                    payload_kind=job_config["payload_kind"],
+                    payload_message=job_config["payload_message"],
+                    is_system=True,
+                )
+                logger.info(f"Created system cron job: {job_config['id']}")

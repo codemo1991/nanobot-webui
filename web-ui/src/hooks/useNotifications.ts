@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { useCalendarStore } from '../store/calendarStore'
-import type { CalendarEvent } from '../types/calendar'
+import type { CalendarEvent } from '../types'
 
 // Check if browser supports notifications
 const isNotificationSupported = typeof window !== 'undefined' && 'Notification' in window
@@ -57,7 +57,7 @@ export function useNotifications() {
     events.forEach((event) => {
       const eventStart = new Date(event.start)
 
-      event.reminders.forEach((reminder) => {
+      ;(event.reminders || []).forEach((reminder) => {
         if (reminder.notified) return
 
         // Calculate when to notify
@@ -78,7 +78,9 @@ export function useNotifications() {
           }
 
           // Mark as notified
-          markReminderNotified(event.id, reminder.id)
+          if (reminder.id) {
+            markReminderNotified(event.id, reminder.id)
+          }
         }
       })
     })

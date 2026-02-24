@@ -654,15 +654,18 @@ function McpConfig() {
   }
 
   const handleDelete = (mcp: McpServer) => {
+    console.log('Delete clicked for MCP:', mcp)
     Modal.confirm({
       title: t('config.mcp.confirmDelete'),
       content: t('config.mcp.confirmDeleteContent', { name: mcp.name }),
       onOk: async () => {
         try {
+          console.log('Calling deleteMcp with id:', mcp.id)
           await api.deleteMcp(mcp.id)
           message.success(t('config.mcp.deleted'))
           loadMcps()
         } catch (error) {
+          console.error('Delete MCP error:', error)
           message.error(t('config.mcp.deleteFailed'))
         }
       },

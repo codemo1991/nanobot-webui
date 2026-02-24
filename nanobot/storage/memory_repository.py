@@ -52,26 +52,59 @@ def entries_to_text_preserve_dates(entries_with_dates: list[tuple[str, str]]) ->
 class MemoryRepository:
     """SQLite-based memory storage with FTS5 full-text search."""
 
-    _instance: "MemoryRepository | None" = None
+    # 按路径缓存实例，支持多数据库
+    _instances: dict[Path, "MemoryRepository"] = {}
     _lock = threading.Lock()
 
+    # 默认数据库路径（用于迁移）
+    DEFAULT_DB_PATH = Path.home() / ".nanobot" / "chat.db"
+
+    @classmethod
+    def get_default_db_path(cls) -> Path:
+        """获取默认数据库路径 ~/.nanobot/chat.db"""
+        return cls.DEFAULT_DB_PATH
+
+    @classmethod
+    def get_workspace_db_path(cls, workspace: Path) -> Path:
+        """获取 workspace 内的数据库路径 {workspace}/.nanobot/chat.db"""
+        return Path(workspace).resolve() / ".nanobot" / "chat.db"
+
+    @classmethod
+    def get_default_repository(cls) -> "MemoryRepository":
+        """获取默认数据库的实例（用于迁移）"""
+        return cls(cls.DEFAULT_DB_PATH)
+
     def __new__(cls, db_path: Path | None = None):
-        """Singleton pattern to ensure single repository instance."""
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._initialized = False
-        return cls._instance
+        """按路径缓存实例，支持多数据库并行"""
+        if db_path is None:
+            db_path = cls.DEFAULT_DB_PATH
+
+        db_path = Path(db_path).resolve()
+
+        with cls._lock:
+            if db_path not in cls._instances:
+                instance = super().__new__(cls)
+                instance._initialized = False
+                cls._instances[db_path] = instance
+        return cls._instances[db_path]
+
+    @classmethod
+    def clear_instance(cls, db_path: Path | None = None) -> None:
+        """清除指定路径的实例缓存"""
+        if db_path is None:
+            cls._instances.clear()
+        else:
+            db_path = Path(db_path).resolve()
+            cls._instances.pop(db_path, None)
 
     def __init__(self, db_path: Path | None = None):
         if self._initialized:
             return
 
         if db_path is None:
-            db_path = Path.home() / ".nanobot" / "chat.db"
+            db_path = self.DEFAULT_DB_PATH
 
-        self.db_path = db_path
+        self.db_path = Path(db_path).resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._init_tables()
@@ -1196,16 +1229,114 @@ class MemoryRepository:
 _memory_repository: MemoryRepository | None = None
 
 
-def get_memory_repository(db_path: Path | None = None) -> MemoryRepository:
-    """Get or create the global memory repository instance."""
-    global _memory_repository
-    if _memory_repository is None:
-        _memory_repository = MemoryRepository(db_path)
-    return _memory_repository
+def get_memory_repository(workspace: Path | None = None) -> MemoryRepository:
+    """
+    Get or create a memory repository instance.
+
+    Args:
+        workspace: If provided, use workspace-specific database at {workspace}/.nanobot/chat.db
+                  If None, use default database at ~/.nanobot/chat.db
+    """
+    if workspace is not None:
+        db_path = MemoryRepository.get_workspace_db_path(workspace)
+    else:
+        db_path = None
+    return MemoryRepository(db_path)
 
 
 def reset_memory_repository() -> None:
-    """Reset the global repository instance (for testing)."""
-    global _memory_repository
-    _memory_repository = None
-    MemoryRepository._instance = None
+    """Reset all repository instances (for testing)."""
+    MemoryRepository._instances.clear()
+
+
+# ========== Workspace Database Operations ==========
+
+import shutil
+
+
+def get_default_db_path() -> Path:
+    """获取默认数据库路径 ~/.nanobot/chat.db"""
+    return MemoryRepository.get_default_db_path()
+
+
+def get_workspace_db_path(workspace: Path) -> Path:
+    """获取 workspace 内的数据库路径 {workspace}/.nanobot/chat.db"""
+    return MemoryRepository.get_workspace_db_path(workspace)
+
+
+def workspace_db_exists(workspace: Path) -> bool:
+    """检查 workspace 数据库是否已存在"""
+    db_path = get_workspace_db_path(workspace)
+    return db_path.exists()
+
+
+def has_default_db() -> bool:
+    """检查默认数据库是否存在"""
+    return MemoryRepository.get_default_db_path().exists()
+
+
+def copy_db_to_workspace(workspace: Path) -> bool:
+    """
+    将默认数据库复制到 workspace。
+
+    Args:
+        workspace: 目标 workspace 路径
+
+    Returns:
+        True 表示成功，False 表示失败
+    """
+    default_path = get_default_db_path()
+    target_path = get_workspace_db_path(workspace)
+
+    if not default_path.exists():
+        return False
+
+    # 确保目标目录存在
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 复制数据库文件（包括 WAL 和 SHM）
+    try:
+        # 复制主数据库文件
+        shutil.copy2(default_path, target_path)
+
+        # 复制 WAL 文件（如果存在）
+        wal_path = Path(str(default_path) + "-wal")
+        if wal_path.exists():
+            shutil.copy2(wal_path, Path(str(target_path) + "-wal"))
+
+        # 复制 SHM 文件（如果存在）
+        shm_path = Path(str(default_path) + "-shm")
+        if shm_path.exists():
+            shutil.copy2(shm_path, Path(str(target_path) + "-shm"))
+
+        # 清除新 workspace 的实例缓存，确保重新加载
+        MemoryRepository.clear_instance(target_path)
+
+        return True
+    except Exception as e:
+        # 复制失败，清理可能创建的文件
+        if target_path.exists():
+            target_path.unlink()
+        raise e
+
+
+def create_empty_workspace_db(workspace: Path) -> bool:
+    """
+    在 workspace 内创建空的数据库。
+
+    Args:
+        workspace: workspace 路径
+
+    Returns:
+        True 表示成功
+    """
+    target_path = get_workspace_db_path(workspace)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 创建一个新的空数据库
+    repo = MemoryRepository(target_path)
+
+    # 清除实例缓存，下次使用时会重新创建
+    MemoryRepository.clear_instance(target_path)
+
+    return target_path.exists()

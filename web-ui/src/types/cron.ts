@@ -29,6 +29,7 @@ export interface CronJob {
   id: string;
   name: string;
   enabled: boolean;
+  is_system?: boolean;  // 是否为系统任务
   trigger: CronTrigger;
   payload: CronPayload;
   nextRunAtMs?: number;
