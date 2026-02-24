@@ -129,8 +129,14 @@
   font-size: 14px;
 }
 
+/* 定时任务卡片间距 */
+.cron-page .ant-list-grid .ant-col {
+  padding-bottom: 16px;
+}
+
 .cron-page .ant-list-grid .ant-col > .ant-list-item {
   margin-bottom: 0;
+  height: 100%;
 }
 
 .cron-page .ant-tag {
@@ -189,5 +195,9 @@
 
   .cron-page .ant-list-grid .ant-list-item {
     width: 100%;
+  }
+  
+  .cron-page .ant-list-grid .ant-col {
+    padding-bottom: 12px;
   }
 }

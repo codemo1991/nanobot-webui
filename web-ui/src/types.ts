@@ -426,3 +426,30 @@ export interface CalendarSettings {
   soundEnabled: boolean
   notificationEnabled: boolean
 }
+
+// ==================== Claude Code Task Types ====================
+
+export type TaskStatus = 'running' | 'done' | 'timeout' | 'error' | 'cancelled'
+
+export interface TaskOrigin {
+  channel?: string
+  chat_id?: string
+}
+
+export interface Task {
+  task_id: string
+  prompt: string
+  status: TaskStatus
+  start_time: string | null
+  end_time: string | null
+  result: string | null
+  workdir: string | null
+  origin: TaskOrigin
+}
+
+export interface TaskListResponse {
+  items: Task[]
+  page: number
+  pageSize: number
+  total: number
+}

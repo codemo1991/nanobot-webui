@@ -624,7 +624,7 @@
 .claude-code-progress {
   margin-top: 8px;
   padding: 8px 12px;
-  background: #1a1a2e;
+  background: #000000;
   border-radius: 6px;
   border-left: 3px solid #6c5ce7;
   max-height: 300px;
@@ -664,4 +664,117 @@
 .sessions-list::-webkit-scrollbar-thumb:hover,
 .chat-content::-webkit-scrollbar-thumb:hover {
   background: #bfbfbf;
+}
+
+/* Tasks Dropdown */
+.tasks-dropdown {
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+  min-width: 400px;
+  max-width: 500px;
+  max-height: 400px;
+  overflow: hidden;
+}
+
+.tasks-dropdown-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.tasks-empty {
+  padding: 24px;
+  text-align: center;
+}
+
+.tasks-list {
+  max-height: 350px;
+  overflow-y: auto;
+}
+
+.task-item {
+  padding: 12px 16px;
+  border-bottom: 1px solid #f0f0f0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.task-item:last-child {
+  border-bottom: none;
+}
+
+.task-item:hover {
+  background: #fafafa;
+}
+
+.task-item-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.task-item-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* Task Detail Modal */
+.task-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.task-detail-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.task-result {
+  margin-top: 8px;
+  padding: 12px;
+  background: #f5f5f5;
+  border-radius: 6px;
+  max-height: 200px;
+  overflow: auto;
+}
+
+.task-result pre {
+  margin: 0;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Tasks Pagination & Error States */
+.tasks-error {
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: #fff2f0;
+  border-bottom: 1px solid #ffccc7;
+}
+
+.tasks-loading {
+  padding: 24px;
+  text-align: center;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.tasks-pagination {
+  padding: 8px 16px;
+  border-top: 1px solid #f0f0f0;
+  display: flex;
+  justify-content: center;
 }
