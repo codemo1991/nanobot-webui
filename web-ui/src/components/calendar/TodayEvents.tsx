@@ -1,9 +1,9 @@
 import { Empty } from 'antd'
 import { useTranslation } from 'react-i18next'
 import { useCalendarStore } from '../../store/calendarStore'
-import { priorityColors } from '../../types/calendar'
+import { priorityColors } from '../../types'
 import { format, parseISO, isToday } from 'date-fns'
-import type { CalendarEvent } from '../../types/calendar'
+import type { CalendarEvent } from '../../types'
 
 interface TodayEventItemProps {
   event: CalendarEvent

@@ -70,7 +70,8 @@ class MemoryStore:
     def __init__(self, workspace: Path, agent_id: str | None = None):
         self.workspace = workspace
         self.agent_id = agent_id
-        self._repo = get_memory_repository()
+        # 使用 workspace 特定的数据库
+        self._repo = get_memory_repository(workspace)
 
         # Keep directory paths for backward compatibility (some code may check these)
         if agent_id:

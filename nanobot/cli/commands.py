@@ -411,6 +411,12 @@ def launcher(
     debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug (TRACE) logging, most verbose"),
 ):
     """Start nanobot with auto-restart guardian (supports self-update)."""
+    # 防止 --debug 被误解析为 --host 的值（如 --host --debug）
+    if host.startswith("-"):
+        console.print("[yellow]Warning: --host 的值不能是选项，已恢复默认 127.0.0.1，并启用 debug[/yellow]")
+        host = "127.0.0.1"
+        debug = True
+
     import subprocess
     import sys
     import time

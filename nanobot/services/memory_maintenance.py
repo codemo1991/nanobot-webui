@@ -1,8 +1,9 @@
 """
-Memory maintenance service: 定时总结 MEMORY.md、每日合并昨日 date.md。
+Memory maintenance service: 定时总结长期记忆、每日合并昨日笔记。
 
 - 每 60 分钟检查：若 MEMORY > 80 条 或 > 25KB，则调用 LLM 总结、去重、重写
-- 每日 00:05：处理昨日 YYYY-MM-DD.md，提取重要信息追加到 MEMORY.md
+- 每日 00:05：处理昨日笔记，提取重要信息追加到长期记忆
+- 支持重试机制：LLM 调用失败时自动重试
 """
 
 import asyncio
@@ -14,8 +15,6 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.memory import (
-    MEMORY_READ_MAX_CHARS,
-    MEMORY_READ_MAX_ENTRIES,
     entries_to_text_preserve_dates,
     parse_memory_entries_with_dates,
     truncate_entries_to_limit,
@@ -23,28 +22,54 @@ from nanobot.agent.memory import (
 from nanobot.storage.memory_repository import get_memory_repository
 
 
-async def _call_llm_summarize(provider: Any, model: str, text: str, prompt: str) -> str:
-    """调用 LLM 进行总结/提取。"""
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": text},
-    ]
-    resp = await provider.chat(messages=messages, model=model, max_tokens=4096)
-    return (resp.content or "").strip()
+async def _call_llm_with_retry(
+    provider: Any,
+    model: str,
+    text: str,
+    prompt: str,
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+) -> str | None:
+    """调用 LLM 进行总结/提取，支持重试。"""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text},
+            ]
+            resp = await provider.chat(messages=messages, model=model, max_tokens=4096)
+            return (resp.content or "").strip()
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                logger.warning(
+                    "LLM call failed (attempt {}/{}): {}, retrying in {}s...",
+                    attempt + 1,
+                    max_retries,
+                    e,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2  # 指数退避
+
+    logger.error("LLM call failed after {} attempts: {}", max_retries, last_error)
+    return None
 
 
 MEMORY_SUMMARIZE_PROMPT = """你是一个记忆整理助手。将以下长期记忆条目进行总结、去重、合并相似内容。
 要求：
 1. 保留所有重要信息，合并表述相似或重复的条目
-2. 每条输出格式为：- [YYYY-MM-DD HH:MM] 内容（保留最早日期）
+2. 每条输出格式为：- [YYYY-MM-DD HH:MM] 内容（保留最早日期和时间）
 3. 精简表述，去除冗余；内容中避免使用 # 开头的行，以免被误解析
-4. 输出直接可写入 MEMORY.md 的 Markdown，不要额外说明"""
+4. 输出直接可写入长期记忆的 Markdown 列表格式，不要额外说明"""
 
 DAILY_EXTRACT_PROMPT = """你是一个记忆提取助手。从以下当日笔记中提取值得长期记住的信息。
 提取：用户偏好、重要决定、项目信息、习惯设定等跨天仍有价值的内容。
 忽略：临时待办、当天会议安排、一次性任务等。
-每条输出格式：- [YYYY-MM-DD] 内容（内容中避免 # 开头的行）
-若无值得长期记忆的内容，输出空。输出直接可追加到 MEMORY.md，不要额外说明"""
+每条输出格式：- [YYYY-MM-DD HH:MM] 内容（使用当前时间，如果笔记没有明确时间则用 00:00）
+内容中避免使用 # 开头的行。
+若无值得长期记忆的内容，输出空。输出直接可追加到长期记忆的 Markdown 列表格式，不要额外说明"""
 
 
 class MemoryMaintenanceService:
@@ -59,9 +84,12 @@ class MemoryMaintenanceService:
         summarize_interval_min: int = 60,
         scope: str = "global",
         agent_id: str | None = None,
+        max_entries: int = 200,
+        max_chars: int = 200 * 1024,
     ):
         self.workspace = Path(workspace).resolve()
-        self._repo = get_memory_repository()
+        # 使用 workspace 特定的数据库
+        self._repo = get_memory_repository(self.workspace)
         self.provider = provider
         self.model = model or (
             provider.get_default_model() if hasattr(provider, "get_default_model") else "anthropic/claude-sonnet-4-5"
@@ -70,6 +98,9 @@ class MemoryMaintenanceService:
         self.summarize_interval_min = summarize_interval_min
         self.scope = scope
         self.agent_id = agent_id
+        # 记忆阈值配置
+        self._max_entries = max_entries
+        self._max_chars = max_chars
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_daily_run_date: datetime.date | None = None
@@ -135,7 +166,7 @@ class MemoryMaintenanceService:
             agent_id=self.agent_id, scope=self.scope
         )
 
-        if entry_count <= MEMORY_READ_MAX_ENTRIES and char_count <= MEMORY_READ_MAX_CHARS:
+        if entry_count <= self._max_entries and char_count <= self._max_chars:
             return
 
         logger.info(
@@ -153,7 +184,7 @@ class MemoryMaintenanceService:
             if not raw.strip():
                 return
 
-            summarized = await _call_llm_summarize(
+            summarized = await _call_llm_with_retry(
                 self.provider, self.model, raw, MEMORY_SUMMARIZE_PROMPT
             )
             if not summarized:
@@ -198,7 +229,7 @@ class MemoryMaintenanceService:
         logger.info("Daily merge: extracting from {} (scope={})", yesterday, self.scope)
 
         try:
-            extracted = await _call_llm_summarize(
+            extracted = await _call_llm_with_retry(
                 self.provider, self.model, content, DAILY_EXTRACT_PROMPT
             )
             if not extracted or not extracted.strip():

@@ -20,15 +20,27 @@ HOST="127.0.0.1"
 PORT=6788
 # 默认启用 verbose 模式
 VERBOSE=true
+DEBUG_MODE=false
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --host) HOST="$2"; shift 2 ;;
+        --host)
+            if [[ "${2:-}" == -* ]] || [[ -z "${2:-}" ]]; then
+                echo "[launcher] Warning: --host 需要传值，已恢复默认 127.0.0.1，并启用 debug"
+                HOST="127.0.0.1"
+                DEBUG_MODE=true
+                EXTRA_ARGS+=("--debug")
+                shift 1
+            else
+                HOST="$2"
+                shift 2
+            fi
+            ;;
         --port|-p) PORT="$2"; shift 2 ;;
         --verbose|-v) VERBOSE=true; shift ;;
         --no-verbose|-q) VERBOSE=false; shift ;;
-        --debug|-d) EXTRA_ARGS+=("--debug"); VERBOSE=true; shift ;;
+        --debug|-d) EXTRA_ARGS+=("--debug"); VERBOSE=true; DEBUG_MODE=true; shift ;;
         *) EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
@@ -57,6 +69,7 @@ echo "  📋 Configuration:"
 echo "     Host:     $HOST"
 echo "     Port:     $PORT"
 echo "     Verbose:  $VERBOSE"
+echo "     Debug:    $DEBUG_MODE"
 echo "     Repo:     $REPO_DIR"
 echo "     Venv:     $VENV_DIR"
 echo "     Python:   $(which python3 2>/dev/null || which python)"

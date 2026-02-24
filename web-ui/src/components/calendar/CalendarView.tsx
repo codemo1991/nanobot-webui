@@ -6,7 +6,7 @@ import interactionPlugin from '@fullcalendar/interaction'
 import { DateSelectArg, EventClickArg, EventInput, EventDropArg } from '@fullcalendar/core'
 import zhCnLocale from '@fullcalendar/core/locales/zh-cn'
 import { useCalendarStore } from '../../store/calendarStore'
-import { priorityColors } from '../../types/calendar'
+import { priorityColors } from '../../types'
 
 function CalendarView() {
   const calendarRef = useRef<FullCalendar>(null)

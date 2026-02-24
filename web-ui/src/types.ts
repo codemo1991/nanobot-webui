@@ -317,6 +317,18 @@ export interface ConfigData {
   agent?: AgentConfig
   mcps: McpServer[]
   skills: InstalledSkill[]
+  memory?: MemoryConfig
+}
+
+export interface MemoryConfig {
+  auto_integrate_enabled: boolean
+  auto_integrate_interval_minutes: number
+  lookback_minutes: number
+  max_messages: number
+  max_entries: number
+  max_chars: number
+  read_max_entries: number
+  read_max_chars: number
 }
 
 export interface SystemStatus {
@@ -339,4 +351,78 @@ export interface SystemStatus {
     skills: number
     tokens: TokenUsage
   }
+}
+
+// ==================== Calendar Types ====================
+
+export interface Reminder {
+  id?: string
+  time: number  // 提前分钟数，0表示事件发生时
+  notified?: boolean  // 是否已提醒
+}
+
+export interface RecurrenceRule {
+  frequency: 'daily' | 'weekly' | 'monthly' | 'yearly'
+  interval: number
+  endType?: 'never' | 'count' | 'until'
+  endCount?: number
+  endDate?: string
+  weekdays?: number[]
+}
+
+// 紧急程度颜色映射
+export const priorityColors = {
+  high: {
+    bg: '#fff2f0',
+    border: '#ffccc7',
+    text: '#cf1322',
+    dot: '#FF4D4F',
+    css: '#FF4D4F'
+  },
+  medium: {
+    bg: '#fffbe6',
+    border: '#ffe58f',
+    text: '#d48806',
+    dot: '#FAAD14',
+    css: '#FAAD14'
+  },
+  low: {
+    bg: '#f6ffed',
+    border: '#b7eb8f',
+    text: '#389e0d',
+    dot: '#52C41A',
+    css: '#52C41A'
+  }
+}
+
+// 提醒时间选项
+export const reminderOptions = [
+  { label: '事件发生时', value: 0 },
+  { label: '提前 5 分钟', value: 5 },
+  { label: '提前 15 分钟', value: 15 },
+  { label: '提前 30 分钟', value: 30 },
+  { label: '提前 1 小时', value: 60 },
+  { label: '提前 1 天', value: 1440 },
+];
+
+export interface CalendarEvent {
+  id: string
+  title: string
+  description?: string
+  start: string
+  end: string
+  isAllDay: boolean
+  priority: 'high' | 'medium' | 'low'
+  reminders?: Reminder[]
+  recurrence?: RecurrenceRule
+  recurrenceId?: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface CalendarSettings {
+  defaultView: 'dayGridMonth' | 'timeGridWeek' | 'timeGridDay' | 'listWeek'
+  defaultPriority: 'high' | 'medium' | 'low'
+  soundEnabled: boolean
+  notificationEnabled: boolean
 }

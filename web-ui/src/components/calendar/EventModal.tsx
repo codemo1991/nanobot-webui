@@ -4,9 +4,10 @@ import { DeleteOutlined } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import dayjs from 'dayjs'
 import { useCalendarStore } from '../../store/calendarStore'
-import { priorityColors, reminderOptions } from '../../types/calendar'
-import type { Priority, Reminder, RecurrenceRule } from '../../types/calendar'
+import { priorityColors, reminderOptions, type Reminder, type RecurrenceRule } from '../../types'
 import { v4 as uuidv4 } from 'uuid'
+
+type Priority = 'high' | 'medium' | 'low'
 
 const { TextArea } = Input
 
@@ -55,7 +56,7 @@ function EventModal() {
           end: selectedEvent.end ? dayjs(selectedEvent.end) : null,
           priority: selectedEvent.priority,
           isAllDay: selectedEvent.isAllDay,
-          reminders: selectedEvent.reminders.map((r) => r.time),
+          reminders: (selectedEvent.reminders || []).map((r) => r.time),
           recurrence: recurrence ? recurrence.frequency : 'none',
           recurrenceInterval: recurrence?.interval || 1,
           recurrenceEndType: recurrence?.endType || 'never',

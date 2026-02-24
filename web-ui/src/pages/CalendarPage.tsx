@@ -15,7 +15,15 @@ function CalendarPage() {
   const { t } = useTranslation()
   const {
     setEventModalOpen,
+    loadEvents,
+    loadSettings,
   } = useCalendarStore()
+
+  // Load calendar data on mount
+  useEffect(() => {
+    loadSettings()
+    loadEvents()
+  }, [loadEvents, loadSettings])
 
   // Initialize notifications
   useNotifications()

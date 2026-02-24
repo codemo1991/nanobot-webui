@@ -20,7 +20,8 @@ class MirrorService:
         self.workspace = Path(workspace)
         self.sessions = sessions_manager
         self._mirror_dir = self.workspace / "mirror"
-        self._repo = get_memory_repository()
+        # 使用 workspace 特定的数据库
+        self._repo = get_memory_repository(self.workspace)
         self._ensure_dirs()
 
     def _ensure_dirs(self) -> None:

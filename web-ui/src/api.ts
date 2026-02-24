@@ -153,7 +153,17 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(agent),
     }),
-  
+
+  // Memory Configuration
+  getMemoryConfig: () =>
+    request<import('./types').MemoryConfig>('/config/memory'),
+
+  updateMemoryConfig: (memory: Partial<import('./types').MemoryConfig>) =>
+    request<import('./types').MemoryConfig>('/config/memory', {
+      method: 'PUT',
+      body: JSON.stringify(memory),
+    }),
+
   // IM Channels (WhatsApp, Telegram, Feishu)
   getChannels: () => request<import('./types').ChannelsConfig>('/channels'),
   
@@ -233,6 +243,41 @@ export const api = {
       method: 'POST',
     }),
 
+  // Calendar
+  getCalendarEvents: (start?: string, end?: string) => {
+    const params = new URLSearchParams()
+    if (start) params.append('start', start)
+    if (end) params.append('end', end)
+    const query = params.toString() ? `?${params}` : ''
+    return request<import('./types').CalendarEvent[]>(`/calendar/events${query}`)
+  },
+
+  createCalendarEvent: (event: Partial<import('./types').CalendarEvent>) =>
+    request<import('./types').CalendarEvent>('/calendar/events', {
+      method: 'POST',
+      body: JSON.stringify(event),
+    }),
+
+  updateCalendarEvent: (eventId: string, event: Partial<import('./types').CalendarEvent>) =>
+    request<import('./types').CalendarEvent>(`/calendar/events/${eventId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(event),
+    }),
+
+  deleteCalendarEvent: (eventId: string) =>
+    request<{ deleted: boolean }>(`/calendar/events/${eventId}`, {
+      method: 'DELETE',
+    }),
+
+  getCalendarSettings: () =>
+    request<import('./types').CalendarSettings>('/calendar/settings'),
+
+  updateCalendarSettings: (settings: Partial<import('./types').CalendarSettings>) =>
+    request<import('./types').CalendarSettings>('/calendar/settings', {
+      method: 'PATCH',
+      body: JSON.stringify(settings),
+    }),
+
   // Skills
   getInstalledSkills: () => request<import('./types').InstalledSkill[]>('/skills/installed'),
 
@@ -272,10 +317,10 @@ export const api = {
     window.location.href = '/api/v1/system/config/export'
   },
 
-  switchWorkspace: (workspace: string) =>
-    request<{ workspace: string }>('/system/workspace', {
+  switchWorkspace: (workspace: string, copyDb?: boolean) =>
+    request<{ workspace: string } | { needPrompt: boolean; hasDefaultDb: boolean; workspace: string }>('/system/workspace', {
       method: 'POST',
-      body: JSON.stringify({ workspace }),
+      body: JSON.stringify({ workspace, copy_db: copyDb }),
     }),
 
   importConfig: (config: object, reloadWorkspace = true) =>

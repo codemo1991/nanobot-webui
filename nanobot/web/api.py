@@ -30,6 +30,7 @@ from nanobot.services.mirror_service import MirrorService
 from nanobot.services.system_status_service import SystemStatusService
 from nanobot.session.manager import SessionManager
 from nanobot.storage.status_repository import StatusRepository
+from nanobot.storage import memory_repository
 
 
 def _ok(data: Any) -> dict[str, Any]:
@@ -92,21 +93,28 @@ class NanobotWebAPI:
             claude_code_config=config.tools.claude_code,
         )
         self.sessions = self.agent.sessions
-        
+
         # Initialize system status service
-        data_dir = Path.home() / ".nanobot"
+        # 优先使用 workspace 特定的数据库，否则使用默认数据库
+        workspace_path = config.workspace_path
+        workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
+        if workspace_db_path.exists():
+            status_db_path = workspace_db_path
+        else:
+            status_db_path = memory_repository.get_default_db_path()
+        data_dir = status_db_path.parent
         (data_dir / "media").mkdir(parents=True, exist_ok=True)
-        status_repo = StatusRepository(data_dir / "chat.db")
+        status_repo = StatusRepository(status_db_path)
         self.status_service = SystemStatusService(
             status_repo=status_repo,
             session_manager=self.sessions,
-            workspace=config.workspace_path
+            workspace=workspace_path
         )
         self.status_service.initialize()
 
         # Mirror service
         self.mirror = MirrorService(
-            workspace=config.workspace_path,
+            workspace=workspace_path,
             sessions_manager=self.sessions,
         )
 
@@ -119,14 +127,15 @@ class NanobotWebAPI:
             _feishu_sender.setup_client()
             self._channel_senders["feishu"] = _feishu_sender
 
-        # Cron service — 与 ConfigRepository 共用同一个 chat.db
-        cron_db_path = data_dir / "chat.db"
+        # Cron service — 使用与 status 相同的数据库
+        cron_db_path = status_db_path
         from nanobot.cron.service import CronService
 
         async def cron_job_callback(job: dict):
             """执行定时任务：调用 LLM，若开启推送则发送到对应渠道。"""
             from nanobot.bus.events import OutboundMessage
             payload = job.get("payload", {})
+            payload_kind = payload.get("kind", "")
             message = payload.get("message", "")
             deliver = payload.get("deliver", False)
             channel_name = (payload.get("channel") or "feishu").strip()
@@ -134,6 +143,11 @@ class NanobotWebAPI:
             job_id = job.get("id", "unknown")
             job_name = job.get("name", "unknown")
 
+            # 处理系统任务
+            if payload_kind == "system_event":
+                return await self._handle_system_event_job(job, message)
+
+            # 处理普通任务（调用 LLM）
             response = await self.agent.process_direct(
                 message,
                 session_key=f"cron:{job_id}",
@@ -161,6 +175,34 @@ class NanobotWebAPI:
 
         self.cron_service = CronService(db_path=cron_db_path, on_job=cron_job_callback)
 
+        # 确保系统默认任务存在
+        self.cron_service.repository.ensure_system_jobs()
+
+        # 初始化日历仓库
+        from nanobot.storage.calendar_repository import get_calendar_repository
+        self.calendar_repo = get_calendar_repository(workspace_path)
+
+        # 初始化自动记忆整合服务
+        from nanobot.services.auto_memory_integration import AutoMemoryIntegrationService
+        self.auto_memory_integration = AutoMemoryIntegrationService(
+            workspace=workspace_path,
+            provider=provider,
+            model=config.agents.defaults.model,
+            lookback_minutes=config.memory.lookback_minutes,
+            max_messages=config.memory.max_messages,
+        )
+
+        # 初始化记忆维护服务
+        from nanobot.services.memory_maintenance import MemoryMaintenanceService
+        self.memory_maintenance = MemoryMaintenanceService(
+            workspace=workspace_path,
+            provider=provider,
+            model=config.agents.defaults.model,
+            summarize_interval_min=config.memory.auto_integrate_interval_minutes,
+            max_entries=config.memory.max_entries,
+            max_chars=config.memory.max_chars,
+        )
+
         # Initial gateway sync
         self._sync_gateway()
 
@@ -170,6 +212,47 @@ class NanobotWebAPI:
             asyncio.run(self.agent.reload_mcp_config())
         except Exception as e:
             logger.warning(f"MCP reload failed: {e}", exc_info=True)
+
+    async def _handle_system_event_job(self, job: dict, message: str):
+        """处理系统事件任务"""
+        job_id = job.get("id", "")
+        job_name = job.get("name", "unknown")
+
+        logger.info(f"系统任务 '{job_name}' 开始执行")
+
+        try:
+            if message == "auto_memory_integrate":
+                # 检查自动记忆整合是否启用
+                config = load_config()
+                if not config.memory.auto_integrate_enabled:
+                    logger.info("自动记忆整合已禁用，跳过执行")
+                    return {"skipped": True, "reason": "disabled"}
+
+                # 自动记忆整合任务
+                if hasattr(self, 'auto_memory_integration') and self.auto_memory_integration:
+                    await self.auto_memory_integration.integrate_now()
+                    logger.info("自动记忆整合完成")
+                else:
+                    logger.warning("自动记忆整合服务未初始化")
+                    return None
+
+            elif message == "memory_maintenance":
+                # 记忆维护任务
+                if hasattr(self, 'memory_maintenance') and self.memory_maintenance:
+                    await self.memory_maintenance._run_summarize_if_needed()
+                    logger.info("记忆维护完成")
+                else:
+                    logger.warning("记忆维护服务未初始化")
+                    return None
+
+            else:
+                logger.warning(f"未知的系统事件类型: {message}")
+
+            return None
+
+        except Exception as e:
+            logger.error(f"系统任务 '{job_name}' 执行失败: {e}")
+            return None
 
     def _reinit_agent_and_status(self, workspace_path: Path) -> None:
         """Reinitialize agent and status service with new workspace (hot reload)."""
@@ -192,6 +275,12 @@ class NanobotWebAPI:
                 provider.ensure_api_key_for_model(
                     subagent_model_cfg, sa_key, config.get_api_base(subagent_model_cfg)
                 )
+        # 使用 workspace 特定的数据库路径
+        workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
+        if workspace_db_path.exists():
+            status_db_path = workspace_db_path
+        else:
+            status_db_path = memory_repository.get_default_db_path()
         self.agent = AgentLoop(
             bus=self.agent.bus,
             provider=provider,
@@ -206,31 +295,81 @@ class NanobotWebAPI:
             claude_code_config=config.tools.claude_code,
         )
         self.sessions = self.agent.sessions
-        data_dir = Path.home() / ".nanobot"
-        status_repo = StatusRepository(data_dir / "chat.db")
+        # 使用 workspace 特定的数据库（如果存在），否则使用默认数据库
+        workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
+        if workspace_db_path.exists():
+            status_db_path = workspace_db_path
+        else:
+            status_db_path = memory_repository.get_default_db_path()
+        # 确保 media 目录存在
+        (status_db_path.parent / "media").mkdir(parents=True, exist_ok=True)
+        status_repo = StatusRepository(status_db_path)
         self.status_service = SystemStatusService(
             status_repo=status_repo,
             session_manager=self.sessions,
             workspace=workspace_path,
         )
         self.status_service.initialize()
+        from nanobot.storage.calendar_repository import get_calendar_repository
+        self.calendar_repo = get_calendar_repository(workspace_path)
         self.mirror = MirrorService(
             workspace=workspace_path,
             sessions_manager=self.sessions,
         )
         logger.info(f"Workspace hot-reloaded to: {workspace_path}")
 
-    def switch_workspace(self, workspace_path: str) -> dict[str, Any]:
+    def switch_workspace(
+        self, workspace_path: str, copy_db: bool | None = None
+    ) -> dict[str, Any]:
         """
         Switch workspace and hot-reload. Updates config and reinitializes agent/status.
+
+        Args:
+            workspace_path: 目标 workspace 路径
+            copy_db: True 表示复制现有数据库，False 表示创建新的空数据库，None 表示需要用户选择
+
+        Returns:
+            如果需要用户选择，返回 {"needPrompt": True, "hasDefaultDb": bool}
+            否则返回 {"workspace": str(path)}
         """
         path = Path(workspace_path).expanduser().resolve()
         if not path.exists():
             path.mkdir(parents=True, exist_ok=True)
+
+        # 检查新 workspace 是否已有数据库
+        has_workspace_db = memory_repository.workspace_db_exists(path)
+        has_default_db = memory_repository.has_default_db()
+
+        # 如果 workspace 已有数据库，直接切换
+        if has_workspace_db:
+            config = load_config()
+            config.agents.defaults.workspace = str(path)
+            save_config(config)
+            self._reinit_agent_and_status(path)
+            return {"workspace": str(path)}
+
+        # 如果没有传递 copy_db 参数，需要提示用户选择
+        if copy_db is None:
+            return {
+                "needPrompt": True,
+                "hasDefaultDb": has_default_db,
+                "workspace": str(path),
+            }
+
+        # 用户已选择，执行相应操作
+        try:
+            if copy_db and has_default_db:
+                memory_repository.copy_db_to_workspace(path)
+            else:
+                memory_repository.create_empty_workspace_db(path)
+        except Exception as e:
+            logger.error(f"Failed to setup workspace database: {e}")
+            raise ValueError(f"设置工作空间数据库失败: {e}")
+
         config = load_config()
         config.agents.defaults.workspace = str(path)
         save_config(config)
-        self._reinit_agent_and_status(path)
+        self._reinit_agent_and_status(path, force_new_db=path)
         return {"workspace": str(path)}
 
     def import_config(self, config_data: dict[str, Any], reload_workspace: bool = True) -> dict[str, Any]:
@@ -1139,6 +1278,16 @@ class NanobotWebAPI:
             "providers": providers,
             "models": models,
             "agent": agent,
+            "memory": {
+                "auto_integrate_enabled": config.memory.auto_integrate_enabled,
+                "auto_integrate_interval_minutes": config.memory.auto_integrate_interval_minutes,
+                "lookback_minutes": config.memory.lookback_minutes,
+                "max_messages": config.memory.max_messages,
+                "max_entries": config.memory.max_entries,
+                "max_chars": config.memory.max_chars,
+                "read_max_entries": config.memory.read_max_entries,
+                "read_max_chars": config.memory.read_max_chars,
+            },
             "mcps": [
                 {
                     "id": m.id,
@@ -1283,11 +1432,14 @@ class NanobotWebAPI:
     def delete_mcp(self, mcp_id: str) -> bool:
         """Delete MCP server configuration."""
         config = load_config()
+        logger.info(f"Deleting MCP: {mcp_id}, available MCPs: {[m.id for m in config.mcps]}")
         before = len(config.mcps)
         config.mcps = [m for m in config.mcps if m.id != mcp_id]
         if len(config.mcps) == before:
+            logger.warning(f"MCP not found: {mcp_id}")
             return False
         save_config(config)
+        logger.info(f"MCP deleted successfully: {mcp_id}")
         return True
 
     def test_mcp(self, mcp_id: str) -> dict[str, Any]:
@@ -1347,6 +1499,80 @@ class NanobotWebAPI:
             "maxToolIterations": defaults.max_tool_iterations,
             "maxExecutionTime": defaults.max_execution_time,
         }
+
+    def update_memory_config(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Update memory system configuration. Hot-updates running memory services."""
+        config = load_config()
+        memory = config.memory
+
+        if "auto_integrate_enabled" in data and data["auto_integrate_enabled"] is not None:
+            memory.auto_integrate_enabled = bool(data["auto_integrate_enabled"])
+        if "auto_integrate_interval_minutes" in data and data["auto_integrate_interval_minutes"] is not None:
+            memory.auto_integrate_interval_minutes = max(1, int(data["auto_integrate_interval_minutes"]))
+        if "lookback_minutes" in data and data["lookback_minutes"] is not None:
+            memory.lookback_minutes = max(1, int(data["lookback_minutes"]))
+        if "max_messages" in data and data["max_messages"] is not None:
+            memory.max_messages = max(1, int(data["max_messages"]))
+        if "max_entries" in data and data["max_entries"] is not None:
+            memory.max_entries = max(10, int(data["max_entries"]))
+        if "max_chars" in data and data["max_chars"] is not None:
+            memory.max_chars = max(1024, int(data["max_chars"]))
+        if "read_max_entries" in data and data["read_max_entries"] is not None:
+            memory.read_max_entries = max(1, int(data["read_max_entries"]))
+        if "read_max_chars" in data and data["read_max_chars"] is not None:
+            memory.read_max_chars = max(1024, int(data["read_max_chars"]))
+
+        save_config(config)
+
+        # Hot-update running memory services
+        self._update_memory_services()
+
+        return {
+            "auto_integrate_enabled": memory.auto_integrate_enabled,
+            "auto_integrate_interval_minutes": memory.auto_integrate_interval_minutes,
+            "lookback_minutes": memory.lookback_minutes,
+            "max_messages": memory.max_messages,
+            "max_entries": memory.max_entries,
+            "max_chars": memory.max_chars,
+            "read_max_entries": memory.read_max_entries,
+            "read_max_chars": memory.read_max_chars,
+        }
+
+    def _update_memory_services(self) -> None:
+        """Hot-update running memory services with new config."""
+        config = load_config()
+
+        # Update MemoryMaintenanceService if running
+        if hasattr(self, 'memory_maintenance') and self.memory_maintenance:
+            self.memory_maintenance.tick_interval_min = config.memory.auto_integrate_interval_minutes
+            self.memory_maintenance.summarize_interval_min = config.memory.auto_integrate_interval_minutes
+            self.memory_maintenance._max_entries = config.memory.max_entries
+            self.memory_maintenance._max_chars = config.memory.max_chars
+            logger.info("MemoryMaintenanceService hot-updated with new config")
+
+        # Update AutoMemoryIntegrationService if running
+        if hasattr(self, 'auto_memory_integration') and self.auto_memory_integration:
+            self.auto_memory_integration.lookback_minutes = config.memory.lookback_minutes
+            self.auto_memory_integration.max_messages = config.memory.max_messages
+            logger.info("AutoMemoryIntegrationService hot-updated with new config")
+
+        # Update cron job intervals to match memory config
+        try:
+            from nanobot.storage.cron_repository import CronRepository
+            integrate_interval = config.memory.auto_integrate_interval_minutes * 60
+            maintenance_interval = config.memory.auto_integrate_interval_minutes * 60  # Use same interval for now
+
+            self.cron_service.update_job(
+                job_id=CronRepository.SYSTEM_MEMORY_INTEGRATE,
+                trigger_interval_seconds=integrate_interval,
+            )
+            self.cron_service.update_job(
+                job_id=CronRepository.SYSTEM_MEMORY_MAINTENANCE,
+                trigger_interval_seconds=maintenance_interval,
+            )
+            logger.info(f"Cron jobs intervals updated: integrate={integrate_interval}s, maintenance={maintenance_interval}s")
+        except Exception as e:
+            logger.warning(f"Failed to update cron job intervals: {e}")
 
     def update_channels(self, data: dict[str, Any]) -> dict[str, Any]:
         """Update IM channels configuration."""
@@ -1475,6 +1701,36 @@ class NanobotWebAPI:
             model_name = config.agents.defaults.model if model_id == "default" else model_id
             data = {**data, "modelName": model_name}
         return self.create_model(data)
+
+    # ==================== Calendar ====================
+
+    def get_calendar_events(
+        self,
+        start_time: str | None = None,
+        end_time: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get calendar events within a time range."""
+        return self.calendar_repo.get_events(start_time=start_time, end_time=end_time)
+
+    def create_calendar_event(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Create a new calendar event."""
+        return self.calendar_repo.create_event(data)
+
+    def update_calendar_event(self, event_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        """Update an existing calendar event."""
+        return self.calendar_repo.update_event(event_id, data)
+
+    def delete_calendar_event(self, event_id: str) -> bool:
+        """Delete a calendar event."""
+        return self.calendar_repo.delete_event(event_id)
+
+    def get_calendar_settings(self) -> dict[str, Any]:
+        """Get calendar settings."""
+        return self.calendar_repo.get_settings()
+
+    def update_calendar_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Update calendar settings."""
+        return self.calendar_repo.update_settings(data)
 
     def get_system_status(self) -> dict[str, Any]:
         """Get system status."""
@@ -1633,6 +1889,10 @@ class NanobotWebAPI:
 
     def delete_cron_job(self, job_id: str) -> bool:
         """Delete a cron job."""
+        # 检查是否为系统任务
+        job = self.cron_service.get_job(job_id)
+        if job and job.get("is_system"):
+            raise ValueError("系统任务无法删除")
         return self.cron_service.remove_job(job_id)
 
     async def run_cron_job(self, job_id: str, force: bool = False) -> bool:
@@ -1642,6 +1902,31 @@ class NanobotWebAPI:
     def get_cron_status(self) -> dict:
         """Get cron service status."""
         return self.cron_service.status()
+
+    # ------------------------------------------------------------------
+    # Calendar
+    # ------------------------------------------------------------------
+
+    def get_calendar_events(self) -> list[dict[str, Any]]:
+        return self.calendar_repo.get_events()
+
+    def create_calendar_event(self, data: dict[str, Any]) -> dict[str, Any]:
+        return self.calendar_repo.create_event(data)
+
+    def update_calendar_event(self, event_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        result = self.calendar_repo.update_event(event_id, data)
+        if result is None:
+            raise KeyError(event_id)
+        return result
+
+    def delete_calendar_event(self, event_id: str) -> bool:
+        return self.calendar_repo.delete_event(event_id)
+
+    def get_calendar_settings(self) -> dict[str, Any]:
+        return self.calendar_repo.get_settings()
+
+    def update_calendar_settings(self, data: dict[str, Any]) -> dict[str, Any]:
+        return self.calendar_repo.update_settings(data)
 
     def export_config(self) -> dict[str, Any]:
         """Export system configuration from SQLite."""
@@ -1922,6 +2207,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(app.get_config()))
                 return
 
+            if path == "/api/v1/config/memory":
+                config_data = app.get_config()
+                self._write_json(HTTPStatus.OK, _ok(config_data["memory"]))
+                return
+
             if path == "/api/v1/channels":
                 config_data = app.get_config()
                 self._write_json(HTTPStatus.OK, _ok(config_data["channels"]))
@@ -1940,6 +2230,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/mcps":
                 config_data = app.get_config()
                 self._write_json(HTTPStatus.OK, _ok(config_data["mcps"]))
+                return
+
+            # Calendar endpoints
+            if path == "/api/v1/calendar/events":
+                start_time = self._get_query_param("start")
+                end_time = self._get_query_param("end")
+                events = app.get_calendar_events(start_time=start_time, end_time=end_time)
+                self._write_json(HTTPStatus.OK, _ok(events))
+                return
+
+            if path == "/api/v1/calendar/settings":
+                settings = app.get_calendar_settings()
+                self._write_json(HTTPStatus.OK, _ok(settings))
                 return
 
             if path == "/api/v1/system/status":
@@ -1993,6 +2296,18 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.OK, _ok(job))
                 else:
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CRON_JOB_NOT_FOUND", "定时任务不存在"))
+                return
+
+            # ==================== Calendar GET ====================
+
+            # GET /api/v1/calendar/events
+            if path == "/api/v1/calendar/events":
+                self._write_json(HTTPStatus.OK, _ok(app.get_calendar_events()))
+                return
+
+            # GET /api/v1/calendar/settings
+            if path == "/api/v1/calendar/settings":
+                self._write_json(HTTPStatus.OK, _ok(app.get_calendar_settings()))
                 return
 
             # ==================== Mirror Room GET ====================
@@ -2106,8 +2421,10 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if not workspace:
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "workspace 不能为空"))
                 return
+            # copy_db 可以是 true、false 或 undefined
+            copy_db = body.get("copy_db")
             try:
-                data = app.switch_workspace(workspace)
+                data = app.switch_workspace(workspace, copy_db)
                 self._write_json(HTTPStatus.OK, _ok(data))
             except Exception as e:
                 logger.exception("Workspace switch failed")
@@ -2326,6 +2643,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.CREATED, _ok(data))
             except ValueError as e:
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
+
+        # POST /api/v1/calendar/events - Create calendar event
+        if path == "/api/v1/calendar/events":
+            body = self._read_json()
+            try:
+                data = app.create_calendar_event(body)
+                self._write_json(HTTPStatus.CREATED, _ok(data))
+            except Exception as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("CALENDAR_ERROR", str(e)))
             return
 
         # POST /api/v1/mcps/{mcpId}/test
@@ -2800,6 +3127,30 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("CRON_JOB_UPDATE_FAILED", str(e)))
             return
 
+        # PATCH /api/v1/calendar/events/{eventId}
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "calendar"] and parts[3] == "events" and len(parts) == 5:
+            body = self._read_json()
+            event_id = parts[4]
+            try:
+                data = app.update_calendar_event(event_id, body)
+                if data:
+                    self._write_json(HTTPStatus.OK, _ok(data))
+                else:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("CALENDAR_EVENT_NOT_FOUND", "日历事件不存在"))
+            except Exception as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("CALENDAR_ERROR", str(e)))
+            return
+
+        # PATCH /api/v1/calendar/settings
+        if path == "/api/v1/calendar/settings":
+            body = self._read_json()
+            try:
+                data = app.update_calendar_settings(body)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except Exception as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("CALENDAR_ERROR", str(e)))
+            return
+
         self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", f"Unknown path: {path}"))
 
     def do_DELETE(self) -> None:
@@ -2814,6 +3165,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
+            return
+
+        # DELETE /api/v1/calendar/events/{eventId}
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "calendar", "events"]:
+            event_id = parts[4]
+            deleted = app.delete_calendar_event(event_id)
+            if deleted:
+                self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
+            else:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("CALENDAR_EVENT_NOT_FOUND", "日历事件不存在"))
             return
 
         # DELETE /api/v1/mcps/{mcpId}
@@ -2842,11 +3203,14 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         # DELETE /api/v1/cron/jobs/{jobId}
         if len(parts) == 5 and parts[:3] == ["api", "v1", "cron"] and parts[3] == "jobs":
             job_id = parts[4]
-            deleted = app.delete_cron_job(job_id)
-            if deleted:
-                self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
-            else:
-                self._write_json(HTTPStatus.NOT_FOUND, _err("CRON_JOB_NOT_FOUND", "定时任务不存在"))
+            try:
+                deleted = app.delete_cron_job(job_id)
+                if deleted:
+                    self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
+                else:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("CRON_JOB_NOT_FOUND", "定时任务不存在"))
+            except ValueError as e:
+                self._write_json(HTTPStatus.FORBIDDEN, _err("CANNOT_DELETE_SYSTEM_JOB", str(e)))
             return
 
         # DELETE /api/v1/mirror/sessions/{sessionId}?type=wu|bian
@@ -2902,6 +3266,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             try:
                 data = app.update_agent_config(body)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except (ValueError, TypeError) as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
+
+        # PUT /api/v1/config/memory
+        if path == "/api/v1/config/memory":
+            body = self._read_json()
+            try:
+                data = app.update_memory_config(body)
                 self._write_json(HTTPStatus.OK, _ok(data))
             except (ValueError, TypeError) as e:
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))

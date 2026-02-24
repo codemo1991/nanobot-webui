@@ -112,6 +112,23 @@ class MirrorConfig(BaseModel):
     qwen_image_model: str = ""  # 如 qwen-image-plus，留空则赏 Tab 用文字描述
 
 
+class MemoryConfig(BaseModel):
+    """记忆系统配置。"""
+    # 自动整合配置
+    auto_integrate_enabled: bool = True  # 是否启用自动记忆整合
+    auto_integrate_interval_minutes: int = 30  # 自动整合间隔（分钟）
+    lookback_minutes: int = 60  # 每次回溯时间窗口（分钟）
+    max_messages: int = 100  # 每次最多处理消息数
+
+    # 长期记忆阈值（超过时触发总结）
+    max_entries: int = 200  # 最大记忆条数
+    max_chars: int = 200 * 1024  # 最大字符数 (200KB)
+
+    # 读取配置（用于上下文构建）
+    read_max_entries: int = 80  # 超过此条数全量读取
+    read_max_chars: int = 25 * 1024  # 超过此字符截断 (25KB)
+
+
 class GatewayConfig(BaseModel):
     """Gateway/server configuration."""
     host: str = "0.0.0.0"
@@ -174,6 +191,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     mirror: MirrorConfig = Field(default_factory=MirrorConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     mcps: list[McpServerConfig] = Field(default_factory=list)
     
     @property

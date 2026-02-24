@@ -13,17 +13,38 @@
 .PARAMETER Port
     Web UI 监听端口，默认 6788
 
+.PARAMETER EnableVerbose
+    启用 verbose 日志（DEBUG 级别），可简写为 -v
+
+.PARAMETER EnableDebug
+    启用 debug 模式，输出最详细的 TRACE 级别日志，可简写为 -d
+
 .EXAMPLE
     .\nanobot-launcher.ps1
     .\nanobot-launcher.ps1 -ListenHost 0.0.0.0 -Port 8080
+    .\nanobot-launcher.ps1 -EnableDebug
+    .\nanobot-launcher.ps1 -d
+    .\nanobot-launcher.ps1 --debug
 #>
 
 param(
     [string]$ListenHost = "127.0.0.1",
     [int]$Port = 6788,
-    [switch]$Verbose,
-    [switch]$Debug
+    [Alias("v")][switch]$EnableVerbose,
+    [Alias("d")][switch]$EnableDebug,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Remaining
 )
+
+# 支持 --debug 传参（Linux 风格）
+if (-not $EnableDebug -and $Remaining -contains "--debug") { $EnableDebug = $true }
+
+# 防止 --debug 被误解析为 --host 的值（如 -ListenHost --debug）
+if ($ListenHost -match '^-') {
+    Write-Host "[launcher] Warning: ListenHost 不能以 - 开头，已恢复默认 127.0.0.1" -ForegroundColor Yellow
+    $ListenHost = "127.0.0.1"
+    $EnableDebug = $true
+}
 
 $RESTART_EXIT_CODE = 42
 $MAX_RAPID_RESTARTS = 5
@@ -54,8 +75,8 @@ function Write-Banner {
 
 function Get-NanobotArgs {
     $args_list = @("web-ui", "--host", $ListenHost, "--port", $Port)
-    if ($Verbose) { $args_list += "--verbose" }
-    if ($Debug) { $args_list += "--debug" }
+    if ($EnableVerbose) { $args_list += "--verbose" }
+    if ($EnableDebug) { $args_list += "--debug" }
     return $args_list
 }
 
@@ -141,8 +162,9 @@ function Ensure-VenvReady {
 }
 
 Write-Banner
-Write-Host "[launcher] Repo:  $REPO_DIR" -ForegroundColor DarkGray
-Write-Host "[launcher] Venv:  $VENV_DIR" -ForegroundColor DarkGray
+Write-Host "[launcher] Repo:   $REPO_DIR" -ForegroundColor DarkGray
+Write-Host "[launcher] Venv:   $VENV_DIR" -ForegroundColor DarkGray
+Write-Host "[launcher] Debug:  $($EnableDebug.IsPresent)" -ForegroundColor DarkGray
 Write-Host ""
 Ensure-VenvReady
 
