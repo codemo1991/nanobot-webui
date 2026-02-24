@@ -2298,6 +2298,43 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CRON_JOB_NOT_FOUND", "定时任务不存在"))
                 return
 
+            # ==================== Claude Code Tasks GET ====================
+
+            # GET /api/v1/tasks?page=1&pageSize=20&status=all - List all Claude Code tasks with pagination
+            if path == "/api/v1/tasks":
+                try:
+                    page = int(query.get("page", ["1"])[0])
+                    page_size = int(query.get("pageSize", ["20"])[0])
+                    status = query.get("status", ["all"])[0]
+                    # Validate status parameter
+                    valid_statuses = ("all", "running", "done", "error", "timeout", "cancelled")
+                    if status not in valid_statuses:
+                        status = "all"
+                    tasks = app.agent.claude_code_manager.get_all_tasks(
+                        page=page,
+                        page_size=page_size,
+                        status=status,
+                    )
+                    self._write_json(HTTPStatus.OK, _ok(tasks))
+                except Exception as e:
+                    logger.error(f"Error getting Claude Code tasks: {e}")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TASKS_ERROR", "获取任务列表失败", str(e)))
+                return
+
+            # GET /api/v1/tasks/{taskId} - Get single task details
+            if len(parts) == 4 and parts[:2] == ["api", "v1"] and parts[2] == "tasks":
+                task_id = parts[3]
+                try:
+                    task = app.agent.claude_code_manager.get_task(task_id)
+                    if task:
+                        self._write_json(HTTPStatus.OK, _ok(task))
+                    else:
+                        self._write_json(HTTPStatus.NOT_FOUND, _err("TASK_NOT_FOUND", "任务不存在"))
+                except Exception as e:
+                    logger.error(f"Error getting Claude Code task {task_id}: {e}")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TASK_ERROR", "获取任务详情失败", str(e)))
+                return
+
             # ==================== Calendar GET ====================
 
             # GET /api/v1/calendar/events
@@ -2516,6 +2553,22 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.exception("Failed to run cron job")
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("CRON_JOB_RUN_FAILED", str(e)))
+            return
+
+        # ==================== Claude Code Tasks POST ====================
+
+        # POST /api/v1/tasks/{taskId}/cancel - Cancel a running task
+        if len(parts) == 5 and parts[:2] == ["api", "v1"] and parts[2] == "tasks" and parts[4] == "cancel":
+            task_id = parts[3]
+            try:
+                success = app.agent.claude_code_manager.cancel_task(task_id)
+                if success:
+                    self._write_json(HTTPStatus.OK, _ok({"cancelled": True}))
+                else:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("TASK_NOT_FOUND", "任务不存在或已完成"))
+            except Exception as e:
+                logger.error(f"Error cancelling Claude Code task {task_id}: {e}")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TASK_CANCEL_FAILED", "取消任务失败", str(e)))
             return
 
         if path == "/api/v1/chat/sessions":

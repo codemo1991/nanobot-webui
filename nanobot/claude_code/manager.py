@@ -926,6 +926,19 @@ if __name__ == "__main__":
         result_path = self.result_dir / f"{task_id}.json"
         result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
 
+    async def _write_cancelled_result(self, task_id: str) -> None:
+        """Write a cancelled result file."""
+        origin = self._task_origins.pop(task_id, {})
+        result = {
+            "task_id": task_id,
+            "timestamp": datetime.now().isoformat(),
+            "output": "Task was cancelled by user",
+            "status": "cancelled",
+            "origin": origin,
+        }
+        result_path = self.result_dir / f"{task_id}.json"
+        result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+
     def _handle_result(self, result: dict[str, Any]) -> None:
         """Handle a result from the watcher."""
         task_id = result.get("task_id", "")
@@ -934,12 +947,168 @@ if __name__ == "__main__":
     def get_running_count(self) -> int:
         """Return the number of currently running tasks."""
         return len(self._running_tasks)
-    
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        """
+        Get details of a single task by ID.
+
+        Args:
+            task_id: The task ID to retrieve.
+
+        Returns:
+            Task info dict with task_id, prompt, status, start_time, end_time, result,
+            or None if task not found.
+        """
+        # Check if task is still running
+        if task_id in self._running_tasks:
+            task = self._running_tasks[task_id]
+            # Load metadata from meta file
+            meta_path = self.result_dir / f"{task_id}.meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    return {
+                        "task_id": task_id,
+                        "prompt": meta.get("prompt", ""),
+                        "status": "running" if not task.done() else "done",
+                        "start_time": meta.get("timestamp", ""),
+                        "end_time": None,
+                        "result": None,
+                        "workdir": meta.get("workdir", ""),
+                        "origin": meta.get("origin", {}),
+                    }
+                except (json.JSONDecodeError, IOError):
+                    pass
+
+            return {
+                "task_id": task_id,
+                "prompt": "",
+                "status": "running" if not task.done() else "done",
+                "start_time": None,
+                "end_time": None,
+                "result": None,
+                "workdir": None,
+                "origin": {},
+            }
+
+        # Task completed - read from result file
+        result_path = self.result_dir / f"{task_id}.json"
+        if result_path.exists():
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                # Also try to get metadata for prompt
+                meta_path = self.result_dir / f"{task_id}.meta.json"
+                prompt = ""
+                workdir = None
+                origin = {}
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                        prompt = meta.get("prompt", "")
+                        workdir = meta.get("workdir", "")
+                        origin = meta.get("origin", {})
+                    except (json.JSONDecodeError, IOError):
+                        pass
+
+                return {
+                    "task_id": task_id,
+                    "prompt": prompt,
+                    "status": result.get("status", "unknown"),
+                    "start_time": result.get("timestamp", ""),
+                    "end_time": result.get("timestamp", ""),
+                    "result": result.get("output", ""),
+                    "workdir": workdir,
+                    "origin": origin,
+                }
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        return None
+
+    def get_all_tasks(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        status: str = "all",
+    ) -> dict[str, Any]:
+        """
+        Get all Claude Code tasks (both running and completed) with pagination.
+
+        Args:
+            page: Page number (1-indexed).
+            page_size: Number of items per page.
+            status: Filter by status ("running", "done", or "all").
+
+        Returns:
+            Dict with items array and total count.
+        """
+        tasks: list[dict[str, Any]] = []
+
+        # Get running tasks
+        for task_id in self._running_tasks:
+            task_info = self.get_task(task_id)
+            if task_info:
+                tasks.append(task_info)
+
+        # Get completed tasks from result files
+        if self.result_dir.exists():
+            for file_path in self.result_dir.glob("*.json"):
+                # Skip meta and hook files
+                if file_path.name.endswith(".meta.json") or file_path.name.endswith(".hook.json"):
+                    continue
+                if file_path.name.startswith("."):
+                    continue
+
+                task_id = file_path.stem
+                # Skip if already in running tasks
+                if task_id in self._running_tasks:
+                    continue
+
+                task_info = self.get_task(task_id)
+                if task_info:
+                    tasks.append(task_info)
+
+        # Filter by status
+        if status != "all":
+            tasks = [t for t in tasks if t.get("status") == status]
+
+        # Sort by start_time descending (most recent first)
+        tasks.sort(key=lambda x: x.get("start_time", ""), reverse=True)
+
+        # Calculate pagination
+        total = len(tasks)
+        safe_page = max(1, page)
+        safe_page_size = max(1, min(page_size, 100))
+        start = (safe_page - 1) * safe_page_size
+        end = start + safe_page_size
+        paginated_items = tasks[start:end]
+
+        return {
+            "items": paginated_items,
+            "page": safe_page,
+            "pageSize": safe_page_size,
+            "total": total,
+        }
+
     def cancel_task(self, task_id: str) -> bool:
         """Cancel a running task."""
         task = self._running_tasks.get(task_id)
         if task and not task.done():
             task.cancel()
+            # Write cancelled result file synchronously
+            try:
+                origin = self._task_origins.pop(task_id, {})
+                result = {
+                    "task_id": task_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "output": "Task was cancelled by user",
+                    "status": "cancelled",
+                    "origin": origin,
+                }
+                result_path = self.result_dir / f"{task_id}.json"
+                result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"Failed to write cancelled result file: {e}")
             logger.info(f"Claude Code task [{task_id}] cancelled")
             return True
         return False

@@ -1,4 +1,15 @@
 {
+  "common": {
+    "yes": "是",
+    "no": "否",
+    "close": "关闭",
+    "cancel": "取消",
+    "confirm": "确认",
+    "save": "保存",
+    "delete": "删除",
+    "edit": "编辑",
+    "loading": "加载中..."
+  },
   "nav": {
     "chat": "聊天",
     "mirror": "镜室",
@@ -118,7 +129,34 @@
     "resetSessionTokensFailed": "重置当前会话 Token 失败",
     "errorBoundaryTitle": "聊天加载异常",
     "errorBoundaryUnknown": "未知错误",
-    "errorBoundaryRetry": "重试"
+    "errorBoundaryRetry": "重试",
+    "tasks": {
+      "title": "Claude Code 任务",
+      "running": "运行中",
+      "done": "已完成",
+      "timeout": "超时",
+      "error": "错误",
+      "cancelled": "已取消",
+      "runningCount": "{{count}} 个任务运行中",
+      "noRunningTasks": "暂无运行中的任务",
+      "cancel": "取消任务",
+      "cancelConfirm": "确定要取消这个任务吗？",
+      "cancelSuccess": "任务已取消",
+      "cancelFailed": "取消任务失败",
+      "loadFailed": "加载任务失败",
+      "retry": "重试",
+      "total": "共 {{total}} 条",
+      "prompt": "任务描述",
+      "workdir": "工作目录",
+      "startTime": "开始时间",
+      "endTime": "结束时间",
+      "result": "执行结果",
+      "viewDetails": "查看详情",
+      "empty": "暂无任务记录",
+      "pendingTasksTitle": "后台任务进行中",
+      "pendingTasksContent": "当前有 {{count}} 个 Claude Code 任务正在后台运行，继续发送消息可能会影响任务执行。\n\n第一个任务：{{prompt}}",
+      "sendAnyway": "仍要发送"
+    }
   },
   "system": {
     "title": "系统状态",

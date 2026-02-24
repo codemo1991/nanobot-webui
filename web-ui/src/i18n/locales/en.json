@@ -1,4 +1,15 @@
 {
+  "common": {
+    "yes": "Yes",
+    "no": "No",
+    "close": "Close",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "save": "Save",
+    "delete": "Delete",
+    "edit": "Edit",
+    "loading": "Loading..."
+  },
   "nav": {
     "chat": "Chat",
     "mirror": "Mirror Room",
@@ -118,7 +129,34 @@
     "resetSessionTokensFailed": "Failed to reset session token counters",
     "errorBoundaryTitle": "Chat loading error",
     "errorBoundaryUnknown": "Unknown error",
-    "errorBoundaryRetry": "Retry"
+    "errorBoundaryRetry": "Retry",
+    "tasks": {
+      "title": "Claude Code Tasks",
+      "running": "Running",
+      "done": "Done",
+      "timeout": "Timeout",
+      "error": "Error",
+      "cancelled": "Cancelled",
+      "runningCount": "{{count}} tasks running",
+      "noRunningTasks": "No running tasks",
+      "cancel": "Cancel Task",
+      "cancelConfirm": "Are you sure you want to cancel this task?",
+      "cancelSuccess": "Task cancelled",
+      "cancelFailed": "Failed to cancel task",
+      "loadFailed": "Failed to load tasks",
+      "retry": "Retry",
+      "total": "{{total}} items",
+      "prompt": "Prompt",
+      "workdir": "Working Directory",
+      "startTime": "Start Time",
+      "endTime": "End Time",
+      "result": "Result",
+      "viewDetails": "View Details",
+      "empty": "No task records",
+      "pendingTasksTitle": "Background Tasks Running",
+      "pendingTasksContent": "There are {{count}} Claude Code tasks running in the background. Sending new messages may affect task execution.\n\nFirst task: {{prompt}}",
+      "sendAnyway": "Send Anyway"
+    }
   },
   "system": {
     "title": "System Status",

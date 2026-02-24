@@ -1,5 +1,5 @@
 import i18n from './i18n'
-import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, TokenUsage } from './types'
+import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, TokenUsage, Task, TaskListResponse } from './types'
 
 const API_BASE = '/api/v1'
 
@@ -534,5 +534,17 @@ export const api = {
   deleteShangRecord: (recordId: string) =>
     request<{ deleted: boolean }>(`/mirror/shang/records/${recordId}`, {
       method: 'DELETE',
+    }),
+
+  // ==================== Claude Code Tasks ====================
+
+  getTasks: (page = 1, pageSize = 20, status: 'all' | 'running' | 'done' | 'error' | 'timeout' | 'cancelled' = 'all') =>
+    request<TaskListResponse>(`/tasks?page=${page}&pageSize=${pageSize}&status=${status}`),
+
+  getTask: (taskId: string) => request<import('./types').Task>(`/tasks/${taskId}`),
+
+  cancelTask: (taskId: string) =>
+    request<{ cancelled: boolean }>(`/tasks/${taskId}/cancel`, {
+      method: 'POST',
     }),
 }
