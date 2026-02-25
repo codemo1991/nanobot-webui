@@ -26,7 +26,7 @@ from nanobot.agent.tools.claude_code import ClaudeCodeTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
-from nanobot.utils.helpers import parse_session_key, estimate_tokens
+from nanobot.utils.helpers import parse_session_key
 
 # Forward declaration to avoid circular imports
 SystemStatusService = "SystemStatusService"
@@ -50,35 +50,6 @@ TOOL_KEYWORDS = {
 
 for tool, keywords in TOOL_KEYWORDS.items():
     TOOL_KEYWORDS[tool] = [kw.lower() for kw in keywords]
-
-# Claude Code 专注意图关键词 - 当检测到这些意图时，只提供 claude_code 工具
-# 这些关键词会覆盖原有逻辑，直接返回 claude_code 工具
-CLAUDE_CODE_INTENTS = [
-    # 英文
-    "claude code",
-    "claude-code",
-    "implement with claude code",
-    "use claude code to",
-    "let claude code",
-    "delegate to claude code",
-    # 中文
-    "用 claude code",
-    "用Claude Code",
-    "用 claude_code",
-    "用ClaudeCode",
-    "代码实现",
-    "实现功能",
-    "写代码",
-    "开发一个",
-    "帮我写代码",
-    "帮我实现",
-    "用代码实现",
-    "写一个功能",
-    "开发功能",
-    "实现一个",
-    "做一个",
-    "claude code 实现",
-]
 
 ESSENTIAL_TOOLS = ["read_file", "write_file", "exec", "remember"]
 
@@ -234,7 +205,7 @@ class AgentLoop:
         self._init_mcp_loader()
 
 
-    def _select_tools_for_message(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
+    async def _select_tools_for_message(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
         """
         根据消息内容选择相关工具定义。
 
@@ -259,7 +230,7 @@ class AgentLoop:
             return self._get_claude_code_tools()
 
         # 2. LLM 意图判断 + 缓存
-        need_claude_code = self._get_cached_intent_or_judge(message)
+        need_claude_code = await self._get_cached_intent_or_judge(message)
 
         if need_claude_code:
             logger.info("LLM judged Claude Code intent, returning claude_code only")
@@ -362,7 +333,7 @@ class AgentLoop:
             logger.debug(f"Explicit Claude Code intent detected (keyword): {message[:50]}...")
         return detected
 
-    def _get_cached_intent_or_judge(self, message: str) -> bool:
+    async def _get_cached_intent_or_judge(self, message: str) -> bool:
         """
         获取缓存的意图判断结果，或调用 LLM 判断。
 
@@ -390,7 +361,7 @@ class AgentLoop:
                 del self._intent_cache[cache_key]
 
         # 缓存未命中，调用 LLM 判断
-        result = self._llm_judge_claude_code_intent(message)
+        result = await self._llm_judge_claude_code_intent(message)
 
         # 缓存结果
         self._intent_cache[cache_key] = (result, now)
@@ -524,10 +495,6 @@ Claude Code 适合执行：
         if memory_max_tokens is not None:
             self._memory_max_tokens = max(200, memory_max_tokens)
             self.context.update_token_budget(memory=self._memory_max_tokens)
-
-    def _get_thread_pool(self) -> ThreadPoolExecutor:
-        """获取线程池（用于CPU密集型任务）"""
-        return self._thread_pool_executor
 
     async def close(self) -> None:
         """关闭agent并清理资源"""
@@ -1136,7 +1103,7 @@ Claude Code 适合执行：
                     pass
             # Call LLM（单次调用最长 120 秒，防止 context 过大或网络问题导致请求永久挂住）
             _LLM_CALL_TIMEOUT = 120
-            selected_tools = self._select_tools_for_message(msg.content)
+            selected_tools = await self._select_tools_for_message(msg.content)
             try:
                 response = await asyncio.wait_for(
                     self.provider.chat(
@@ -1583,7 +1550,7 @@ Claude Code 适合执行：
                     logger.info("System msg: max execution time %ds reached", self.max_execution_time)
                     break
 
-            selected_tools = self._select_tools_for_message(msg.content)
+            selected_tools = await self._select_tools_for_message(msg.content)
             response = await self.provider.chat(
                 messages=messages,
                 tools=selected_tools,

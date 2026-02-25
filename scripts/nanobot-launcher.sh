@@ -63,8 +63,8 @@ kill_existing_nanobot() {
     # 使用 pgrep 或 ps 来查找进程
     local pid=""
     if command -v pgrep &>/dev/null; then
-        # pgrep 返回匹配的 PID 列表
-        pid=$(pgrep -f "nanobot.*web-ui" 2>/dev/null | head -1)
+        # pgrep 返回匹配的 PID 列表，使用 || true 确保即使没找到进程也不会失败
+        pid=$(pgrep -f "nanobot.*web-ui" 2>/dev/null | head -1) || true
     elif command -v ps &>/dev/null; then
         # 使用 ps 查找
         pid=$(ps aux 2>/dev/null | grep -E "nanobot.*web-ui" | grep -v grep | awk '{print $2}' | head -1)
