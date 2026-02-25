@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -26,6 +27,9 @@ from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import parse_session_key, estimate_tokens
+
+# Forward declaration to avoid circular imports
+SystemStatusService = "SystemStatusService"
 
 
 TOOL_KEYWORDS = {
@@ -94,6 +98,16 @@ class AgentLoop:
         smart_tool_selection: bool = True,
         system_prompt_max_tokens: int = 5000,
         memory_max_tokens: int = 2000,
+        # 并发配置
+        max_parallel_tool_calls: int = 5,
+        enable_parallel_tools: bool = True,
+        thread_pool_size: int = 4,
+        thread_pool_tools: list[str] | None = None,
+        # 智能并行判断配置
+        enable_smart_parallel: bool = True,
+        smart_parallel_model: str | None = None,
+        # 状态服务（用于监控指标）
+        status_service: "SystemStatusService | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig, ClaudeCodeConfig
         from nanobot.cron.service import CronService
@@ -115,6 +129,32 @@ class AgentLoop:
         self._smart_tool_selection = smart_tool_selection
         self._system_prompt_max_tokens = system_prompt_max_tokens
         self._memory_max_tokens = memory_max_tokens
+
+        # 并发配置
+        self._max_parallel_tool_calls = max_parallel_tool_calls
+        self._enable_parallel_tools = enable_parallel_tools
+        self._thread_pool_size = thread_pool_size
+        self._thread_pool_tools = thread_pool_tools or ["exec", "spawn", "claude_code"]
+        self._enable_smart_parallel = enable_smart_parallel
+        self._smart_parallel_model = smart_parallel_model
+        self._status_service = status_service
+
+        # 初始化智能并行判断器
+        self._smart_parallel_decider = None
+        if enable_smart_parallel:
+            try:
+                from nanobot.services.smart_parallel_decider import SmartParallelDecider
+                self._smart_parallel_decider = SmartParallelDecider(
+                    provider=provider,
+                    model=smart_parallel_model,
+                    use_simple_prompt=True,
+                )
+                logger.info("Smart parallel decider initialized")
+            except Exception as e:
+                logger.warning(f"Failed to initialize smart parallel decider: {e}")
+
+        # 初始化线程池（用于CPU密集型任务）
+        self._thread_pool: asyncio.AbstractEventLoop | None = None
         
         token_budget = {
             "total": system_prompt_max_tokens,
@@ -122,7 +162,9 @@ class AgentLoop:
         }
         self.context = ContextBuilder(workspace, token_budget=token_budget)
         self.sessions = SessionManager(workspace)
-        self.tools = ToolRegistry()
+        # 初始化线程池
+        self._thread_pool_executor = ThreadPoolExecutor(max_workers=self._thread_pool_size)
+        self.tools = ToolRegistry(thread_pool_executor=self._thread_pool_executor)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -131,6 +173,7 @@ class AgentLoop:
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             sessions=self.sessions,
+            max_concurrent_subagents=self._max_parallel_tool_calls,
         )
         
         from nanobot.claude_code.manager import ClaudeCodeManager
@@ -222,41 +265,296 @@ class AgentLoop:
             self._memory_max_tokens = max(200, memory_max_tokens)
             self.context.update_token_budget(memory=self._memory_max_tokens)
 
+    def _get_thread_pool(self) -> ThreadPoolExecutor:
+        """获取线程池（用于CPU密集型任务）"""
+        return self._thread_pool_executor
+
+    async def close(self) -> None:
+        """关闭agent并清理资源"""
+        # 关闭线程池
+        if hasattr(self, '_thread_pool_executor') and self._thread_pool_executor:
+            self._thread_pool_executor.shutdown(wait=True)
+            self._thread_pool_executor = None
+
+        # 关闭subagent manager
+        if hasattr(self, 'subagents'):
+            # 取消所有运行中的子agent任务
+            for task_id, task in list(getattr(self.subagents, '_running_tasks', {}).items()):
+                if not task.done():
+                    task.cancel()
+                    logger.info(f"Cancelled subagent task: {task_id}")
+
+    async def _execute_tool_parallel(
+        self,
+        tool_calls: list,
+        progress: Callable | None = None,
+    ) -> list[tuple]:
+        """
+        并行执行多个工具调用。
+
+        Args:
+            tool_calls: 工具调用列表
+            progress: 进度回调函数
+
+        Returns:
+            按顺序排列的 (tool_call, result) 元组列表
+        """
+        if not self._enable_parallel_tools or len(tool_calls) <= 1:
+            # 串行执行（兼容模式或单工具调用）
+            # 记录串行执行指标
+            if self._status_service and len(tool_calls) > 0:
+                try:
+                    for _ in tool_calls:
+                        self._status_service.increment_tool_call(is_parallel=False)
+                except Exception as e:
+                    logger.debug(f"Failed to record serial tool metrics: {e}")
+            results = []
+            for tool_call in tool_calls:
+                result = await self._execute_single_tool(tool_call, progress)
+                results.append((tool_call, result))
+            return results
+
+        # 智能并行判断
+        should_parallel = True
+        reason = "default"
+
+        if self._smart_parallel_decider and len(tool_calls) >= 2:
+            try:
+                decision = await self._smart_parallel_decider.should_parallel(tool_calls)
+                should_parallel = decision.get("parallel", True)
+                reason = decision.get("reason", "")
+                logger.info(f"Smart parallel decision: parallel={should_parallel}, reason={reason}")
+
+                # 如果需要分组执行（串行组）
+                groups = decision.get("groups", [])
+                if groups and len(groups) > 1:
+                    # 分组串行执行
+                    results = []
+                    for group in groups:
+                        for tool_call in group:
+                            result = await self._execute_single_tool(tool_call, progress)
+                            results.append((tool_call, result))
+                    return results
+            except Exception as e:
+                logger.warning(f"Smart parallel decision failed, using default: {e}")
+
+        if not should_parallel:
+            # 智能判断认为不适合并行，串行执行
+            logger.info(f"Smart parallel disabled: {reason}")
+            # 记录串行执行指标
+            if self._status_service:
+                try:
+                    for _ in tool_calls:
+                        self._status_service.increment_tool_call(is_parallel=False)
+                except Exception as e:
+                    logger.debug(f"Failed to record serial tool metrics: {e}")
+            results = []
+            for tool_call in tool_calls:
+                result = await self._execute_single_tool(tool_call, progress)
+                results.append((tool_call, result))
+            return results
+
+        # 并行执行多个独立的工具调用
+        logger.info(f"并行执行 {len(tool_calls)} 个工具调用")
+
+        # 记录并行执行指标
+        if self._status_service:
+            try:
+                for _ in tool_calls:
+                    self._status_service.increment_tool_call(is_parallel=True)
+            except Exception as e:
+                logger.debug(f"Failed to record parallel tool metrics: {e}")
+
+        async def execute_with_progress(tc):
+            try:
+                result = await self._execute_single_tool(tc, progress)
+                return (tc, result)
+            except Exception as e:
+                logger.exception(f"Tool execution failed in parallel: {tc.name}")
+                return (tc, f"Error executing {tc.name}: {str(e)}")
+
+        # 使用 asyncio.gather 并行执行，捕获异常避免整体失败
+        results = await asyncio.gather(
+            *[execute_with_progress(tc) for tc in tool_calls],
+            return_exceptions=True
+        )
+
+        # 处理异常结果
+        processed_results = []
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error(f"Parallel tool execution exception: {r}")
+                processed_results.append((None, f"Error: {str(r)}"))
+            else:
+                processed_results.append(r)
+
+        # 按原始顺序返回结果
+        return processed_results
+
+    async def _execute_single_tool(
+        self,
+        tool_call,
+        progress: Callable | None = None,
+    ) -> str:
+        """
+        执行单个工具调用。
+
+        Args:
+            tool_call: 工具调用对象
+            progress: 进度回调函数
+
+        Returns:
+            工具执行结果
+        """
+        # 循环检测
+        call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
+        logger.debug(f"Executing tool: {tool_call.name} with arguments: {json.dumps(tool_call.arguments)}")
+
+        if progress:
+            try:
+                progress({"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments})
+            except Exception:
+                pass
+
+        # 设置进度回调（用于 claude_code 工具）
+        if tool_call.name == "claude_code":
+            claude_code_tool = self.tools.get("claude_code")
+            if claude_code_tool and hasattr(claude_code_tool, "set_progress_callback"):
+                claude_code_tool.set_progress_callback(progress)
+
+        # 记录工具执行开始时间
+        tool_start_time = time.time()
+        tool_execution_error = None
+
+        # 检查是否需要在线程池中执行
+        try:
+            use_thread_pool = tool_call.name in self._thread_pool_tools
+            if use_thread_pool and self._thread_pool_executor:
+                result = await self.tools.execute_in_thread_pool(
+                    tool_call.name,
+                    tool_call.arguments,
+                    self._thread_pool_executor
+                )
+            else:
+                result = await self.tools.execute(tool_call.name, tool_call.arguments)
+        except Exception as e:
+            tool_execution_error = e
+            result = f"Error: {str(e)}"
+
+        # 记录工具执行指标
+        execution_time = time.time() - tool_start_time
+        if self._status_service:
+            try:
+                self._status_service.update_tool_execution_time(execution_time)
+                if tool_execution_error:
+                    self._status_service.increment_failed_tool_call()
+            except Exception as e:
+                logger.debug(f"Failed to record tool metrics: {e}")
+
+        # 清除进度回调
+        if tool_call.name == "claude_code":
+            claude_code_tool = self.tools.get("claude_code")
+            if claude_code_tool and hasattr(claude_code_tool, "set_progress_callback"):
+                claude_code_tool.set_progress_callback(None)
+
+        if progress:
+            try:
+                truncated = _truncate(result)
+                progress({"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated})
+            except Exception:
+                pass
+
+        return result
+
     def _init_mcp_loader(self) -> None:
-        """Initialize MCP tool loader from config."""
+        """Initialize MCP tool loader from config - 按需加载模式。"""
         self.mcp_loader = None
+        self._mcp_loaded = False  # 标记：是否已完成按需加载
+        self._mcp_loop_id = None
+        self._mcp_fail_time = 0.0  # 失败冷却时间
+
         try:
             from nanobot.config.loader import load_config
             from nanobot.mcp.loader import McpToolLoader
+            from nanobot.agent.tools.mcp import McpLazyToolAdapter
+
             config = load_config()
             mcps = getattr(config, "mcps", None) or []
-            if mcps:
-                self.mcp_loader = McpToolLoader(mcps, self.workspace)
+            if not mcps:
+                return
+
+            self.mcp_loader = McpToolLoader(mcps, self.workspace)
+
+            # 为每个 MCP 服务器注册懒加载工具
+            # 注意：这里只注册工具代理，不建立任何连接
+            for mcp_cfg in mcps:
+                if not getattr(mcp_cfg, "enabled", True):
+                    continue
+
+                server_id = getattr(mcp_cfg, "id", "") or self._safe_mcp_id(getattr(mcp_cfg, "name", "mcp"))
+
+                # 获取该 MCP 的工具列表（从配置中）
+                # 由于是懒加载，我们不知道具体有哪些工具
+                # 所以我们需要一个通用的方法来获取工具列表
+                # 这里我们先尝试获取，如果失败则注册一个通用代理
+                tools = getattr(mcp_cfg, "tools", None) or []
+
+                if tools:
+                    # 如果配置中指定了工具列表，直接注册
+                    lazy_tools: dict[str, McpLazyToolAdapter] = {}
+                    for tool_cfg in tools:
+                        tool_name = getattr(tool_cfg, "name", None)
+                        if not tool_name:
+                            continue
+
+                        description = getattr(tool_cfg, "description", "") or f"MCP tool {tool_name}"
+                        parameters = getattr(tool_cfg, "parameters", {}) or {"type": "object", "properties": {}}
+
+                        adapter = McpLazyToolAdapter(
+                            server_id=server_id,
+                            tool_name=tool_name,
+                            description=description,
+                            parameters=parameters,
+                            mcp_loader=self.mcp_loader,
+                            lazy_tools=lazy_tools,
+                        )
+                        lazy_tools[tool_name] = adapter
+                        self.tools.register(adapter)
+
+                    logger.info(f"MCP {server_id}: registered {len(lazy_tools)} lazy tools (will connect on first call)")
+                else:
+                    # 如果没有配置工具列表，我们无法预知有哪些工具
+                    # 这种情况下，需要一个不同的策略：让 MCP 服务器自己声明工具
+                    # 暂时跳过，等待后续实现
+                    logger.debug(f"MCP {server_id}: no tools defined in config, skipping lazy registration")
+
         except Exception as e:
             logger.warning(f"MCP loader init skipped: {e}", exc_info=True)
+
+    def _safe_mcp_id(self, name: str) -> str:
+        """Convert MCP name to safe ID."""
+        import re
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", name) or "mcp"
 
     async def reload_mcp_config(self) -> None:
         """
         Reload MCP config and tools (hot-add). Call after MCP create/update/delete.
-        Next message will trigger re-registration with fresh config.
+        使用懒加载模式：重新注册工具代理。
         """
         # Unregister existing MCP tools
         removed = self.tools.unregister_by_prefix("mcp_")
         if removed:
             logger.debug(f"MCP: unregistered {removed} tools for reload")
-        # Close old loader (releases connections)
-        if self.mcp_loader:
-            try:
-                await self.mcp_loader.close()
-            except BaseException as e:
-                logger.debug("MCP loader close: %s", e)
-            self.mcp_loader = None
+
+        # 重置状态
         self._mcp_loaded = False
         self._mcp_loop_id = None
         self._mcp_fail_time = 0.0
+
+        # 重新初始化（会注册新的懒加载工具）
         self._init_mcp_loader()
         if self.mcp_loader:
-            logger.info("MCP config reloaded (tools will load on next message)")
+            logger.info("MCP config reloaded (using lazy load mode)")
 
     def update_model(self, model: str) -> None:
         """Update default model at runtime (hot config)."""
@@ -316,7 +614,10 @@ class AgentLoop:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
         logger.info("Agent loop started")
-        
+
+        # 按需加载模式：不再在启动时检查 MCP
+        # MCP 工具会在首次被调用时才会建立连接
+
         while self._running:
             try:
                 # Wait for next message
@@ -414,28 +715,28 @@ class AgentLoop:
             return None
 
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
-        
+
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
-        
+
         # Update tool contexts
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
             message_tool.set_context(msg.channel, msg.chat_id)
-        
+
         spawn_tool = self.tools.get("spawn")
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(msg.channel, msg.chat_id)
             spawn_tool.set_media(msg.media if msg.media else [])
-        
+
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
-        
+
         claude_code_tool = self.tools.get("claude_code")
         if isinstance(claude_code_tool, ClaudeCodeTool):
             claude_code_tool.set_context(msg.channel, msg.chat_id)
-        
+
         # MCP tools are tied to the event loop that created them. Web uses asyncio.run() per request,
         # so each request gets a new loop; prior MCP sessions become stale (ClosedResourceError).
         # Reload MCP when the loop has changed.
@@ -446,25 +747,11 @@ class AgentLoop:
         if self.mcp_loader and self._mcp_loaded and self._mcp_loop_id is not None and current_loop_id != self._mcp_loop_id:
             logger.debug("Event loop changed, reloading MCP for fresh connections")
             await self.reload_mcp_config()
-        # Lazy-load MCP tools on first message (requires async)
-        # Cooldown: skip retry for 5 min after a failure to avoid hammering unreachable servers
-        mcp_cooldown = 300.0
-        now = time.monotonic()
-        if self.mcp_loader and not self._mcp_loaded and now >= self._mcp_fail_time:
-            try:
-                n = await self.mcp_loader.register_tools_async(self.tools)
-                if n > 0:
-                    self._mcp_loaded = True
-                    self._mcp_loop_id = id(asyncio.get_running_loop())
-                    logger.info(f"MCP: registered {n} tools from configured servers")
-            except (asyncio.CancelledError, BaseExceptionGroup) as e:
-                self._mcp_fail_time = now + mcp_cooldown
-                logger.warning("MCP connection failed (%s), continuing without MCP tools (retry in 5 min)", type(e).__name__)
-            except Exception as e:
-                self._mcp_fail_time = now + mcp_cooldown
-                logger.exception("MCP tool loading failed")
-        
-        # Detect "继续" / "continue" / "扩容" command after a limit-reached pause.
+        # 按需加载模式：不再在这里预加载 MCP
+        # MCP 工具已作为懒加载代理注册，会在首次被调用时建立连接
+        # 见 McpLazyToolAdapter 类
+
+        # Detect "继续" / "continue" / "扩容" command after a limit-reached pause..
         # If the last assistant message has the LIMIT_REACHED_MARKER and the user
         # is asking to continue or expand capacity, handle accordingly.
         current_message = msg.content
@@ -605,6 +892,17 @@ class AgentLoop:
                 break
             _accumulate_usage(response.usage)
 
+            # 记录 LLM 调用指标
+            if self._status_service:
+                try:
+                    self._status_service.increment_llm_call()
+                    if response.usage:
+                        total = response.usage.get("total_tokens") or response.usage.get("tokens_used") or 0
+                        if total:
+                            self._status_service.update_token_usage(int(total))
+                except Exception as e:
+                    logger.debug(f"Failed to record LLM metrics: {e}")
+
             # Handle tool calls
             if response.has_tool_calls:
                 # Add assistant message with tool calls
@@ -625,7 +923,16 @@ class AgentLoop:
 
                 # Execute tools and collect steps for UI display
                 loop_detected = False
-                for tool_call in response.tool_calls:
+
+                # 并行/串行执行工具
+                progress = msg.metadata.get("progress_callback")
+                tool_results = await self._execute_tool_parallel(response.tool_calls, progress)
+
+                for tool_call, result in tool_results:
+                    # 跳过异常结果（tool_call 为 None）
+                    if tool_call is None:
+                        continue
+
                     # 循环检测: 连续两次完全相同的调用视为 loop，提前终止
                     call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
                     if len(tool_steps) >= 1:
@@ -634,28 +941,7 @@ class AgentLoop:
                             logger.info("Loop detected: identical tool call %s, forcing synthesis", tool_call.name)
                             loop_detected = True
                             break
-                    progress = msg.metadata.get("progress_callback")
-                    if progress:
-                        try:
-                            progress({"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments})
-                        except Exception:
-                            pass  # Non-blocking; don't fail agent on callback error
-                    
-                    # Set progress callback for claude_code tool
-                    if tool_call.name == "claude_code":
-                        claude_code_tool = self.tools.get("claude_code")
-                        if claude_code_tool and hasattr(claude_code_tool, "set_progress_callback"):
-                            claude_code_tool.set_progress_callback(progress)
-                    
-                    args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    
-                    # Clear progress callback after execution
-                    if tool_call.name == "claude_code":
-                        claude_code_tool = self.tools.get("claude_code")
-                        if claude_code_tool and hasattr(claude_code_tool, "set_progress_callback"):
-                            claude_code_tool.set_progress_callback(None)
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -665,11 +951,7 @@ class AgentLoop:
                         "arguments": tool_call.arguments,
                         "result": truncated,
                     })
-                    if progress:
-                        try:
-                            progress({"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated})
-                        except Exception:
-                            pass
+
                 if loop_detected:
                     exit_reason = "loop"
                     break
@@ -708,6 +990,15 @@ class AgentLoop:
                         timeout=_SYNTHESIS_TIMEOUT,
                     )
                     _accumulate_usage(synth.usage)
+                    # 记录 LLM 调用指标
+                    if self._status_service and synth.usage:
+                        try:
+                            self._status_service.increment_llm_call()
+                            total = synth.usage.get("total_tokens") or synth.usage.get("tokens_used") or 0
+                            if total:
+                                self._status_service.update_token_usage(int(total))
+                        except Exception as e:
+                            logger.debug(f"Failed to record synthesis LLM metrics: {e}")
                     if synth.content and synth.content.strip():
                         final_content = synth.content.strip()
                     else:
@@ -776,6 +1067,8 @@ class AgentLoop:
                 user_message_kwargs["images"] = user_images
         
         session.add_message("user", msg.content, **user_message_kwargs)
+        # 立即保存用户消息，确保即使后续处理失败也不丢失
+        self.sessions.save(session)
         session.add_message(
             "assistant",
             final_content,
@@ -977,20 +1270,9 @@ class AgentLoop:
             _loop_id = None
         if self.mcp_loader and self._mcp_loaded and self._mcp_loop_id is not None and _loop_id != self._mcp_loop_id:
             await self.reload_mcp_config()
-        # Lazy-load MCP tools if not yet loaded (same cooldown as _process_message)
-        now = time.monotonic()
-        if self.mcp_loader and not self._mcp_loaded and now >= self._mcp_fail_time:
-            try:
-                n = await self.mcp_loader.register_tools_async(self.tools)
-                if n > 0:
-                    self._mcp_loaded = True
-                    self._mcp_loop_id = id(asyncio.get_running_loop())
-            except (asyncio.CancelledError, BaseExceptionGroup):
-                self._mcp_fail_time = now + 300.0
-                logger.warning("MCP connection failed (system msg), continuing without MCP tools")
-            except Exception as e:
-                self._mcp_fail_time = now + 300.0
-                logger.warning(f"MCP tool loading failed (system message): {e}", exc_info=True)
+
+        # 按需加载模式：不再预加载 MCP
+        # MCP 工具已作为懒加载代理注册
         
         # Build messages with the announce content
         messages = self.context.build_messages(
@@ -1049,6 +1331,17 @@ class AgentLoop:
             )
             _accumulate_usage(response.usage)
 
+            # 记录 LLM 调用指标
+            if self._status_service:
+                try:
+                    self._status_service.increment_llm_call()
+                    if response.usage:
+                        total = response.usage.get("total_tokens") or response.usage.get("tokens_used") or 0
+                        if total:
+                            self._status_service.update_token_usage(int(total))
+                except Exception as e:
+                    logger.debug(f"Failed to record LLM metrics: {e}")
+
             if response.has_tool_calls:
                 loop_detected = False
                 tool_call_dicts = [
@@ -1100,6 +1393,15 @@ class AgentLoop:
                     model=self.model,
                 )
                 _accumulate_usage(synth.usage)
+                # 记录 LLM 调用指标
+                if self._status_service and synth.usage:
+                    try:
+                        self._status_service.increment_llm_call()
+                        total = synth.usage.get("total_tokens") or synth.usage.get("tokens_used") or 0
+                        if total:
+                            self._status_service.update_token_usage(int(total))
+                    except Exception as e:
+                        logger.debug(f"Failed to record synthesis LLM metrics: {e}")
                 if synth.content and synth.content.strip():
                     final_content = synth.content.strip()
                 else:
@@ -1115,6 +1417,8 @@ class AgentLoop:
             "total_tokens": usage_acc["prompt_tokens"],
         }
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}", token_usage=user_token_usage)
+        # 立即保存用户消息，确保即使后续处理失败也不丢失
+        self.sessions.save(session)
         session.add_message(
             "assistant",
             final_content,

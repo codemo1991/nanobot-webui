@@ -36,6 +36,8 @@ dependencies = [
     "claude-agent-sdk>=0.1.39",
     "apscheduler>=3.10.0",
     "pytz>=2024.1",
+    "psutil>=5.9.0",
+    "psutil-windows>=3.0.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

@@ -208,7 +208,7 @@ def gateway(
     
     # Create cron service first (callback set after agent creation)
     cron = CronService(get_db_path())
-    
+
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
@@ -223,6 +223,9 @@ def gateway(
         filesystem_config=config.tools.filesystem,
         claude_code_config=config.tools.claude_code,
         cron_service=cron,
+        max_parallel_tool_calls=getattr(config.agents.defaults, "max_parallel_tool_calls", 5),
+        enable_parallel_tools=getattr(config.agents.defaults, "enable_parallel_tools", True),
+        thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
     )
     
     # Set cron callback (needs agent)
@@ -524,6 +527,9 @@ def agent(
         exec_config=config.tools.exec,
         filesystem_config=config.tools.filesystem,
         claude_code_config=config.tools.claude_code,
+        max_parallel_tool_calls=getattr(config.agents.defaults, "max_parallel_tool_calls", 5),
+        enable_parallel_tools=getattr(config.agents.defaults, "enable_parallel_tools", True),
+        thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
     )
     
     if message:

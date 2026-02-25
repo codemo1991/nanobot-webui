@@ -4,14 +4,19 @@ Centralized logging configuration for nanobot.
 - File sink: ~/.nanobot/nanobot.log with rotation, captures all levels (DEBUG and up)
 - Unhandled exceptions: Full traceback to stderr and file via sys.excepthook
 - Use logger.exception() in catch blocks for detailed error logging with traceback
+- On Windows: uses enqueue=True to avoid PermissionError [WinError 32] during rotation
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
+
+# Windows 下文件轮换时 os.rename 易触发 PermissionError，enqueue 可将写操作移到单独线程降低冲突
+_USE_ENQUEUE = sys.platform == "win32"
 
 LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
@@ -71,6 +76,7 @@ def setup_logging(
             rotation="10 MB",
             retention="5 days",
             encoding="utf-8",
+            enqueue=_USE_ENQUEUE,  # Windows 下避免轮换时 PermissionError [WinError 32]
         )
     except Exception as e:
         logger.warning(f"Could not add log file sink to {log_path}: {e}")
@@ -112,6 +118,7 @@ def reconfigure_logging(level: str) -> None:
             rotation="10 MB",
             retention="5 days",
             encoding="utf-8",
+            enqueue=_USE_ENQUEUE,  # Windows 下避免轮换时 PermissionError [WinError 32]
         )
     except Exception:
         pass  # 文件 sink 可能已存在，忽略错误

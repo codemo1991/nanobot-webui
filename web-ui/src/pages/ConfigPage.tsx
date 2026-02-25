@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography } from 'antd'
-import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined } from '@ant-design/icons'
+import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography, Row, Col } from 'antd'
+import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined } from '@ant-design/icons'
 import { api } from '../api'
-import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig } from '../types'
+import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig, WebConcurrencyConfig, WebMemoryConfig } from '../types'
 import './ConfigPage.css'
 
 const { Title, Text } = Typography
@@ -437,21 +437,100 @@ function ProvidersConfig() {
 function SystemConfig() {
   const { t } = useTranslation()
   const [loading, setLoading] = useState(false)
-  const [form] = Form.useForm()
+  const [agentLoading, setAgentLoading] = useState(false)
+  const [concurrencyLoading, setConcurrencyLoading] = useState(false)
+  const [memoryLoading, setMemoryLoading] = useState(false)
+  const [workspaceModalVisible, setWorkspaceModalVisible] = useState(false)
+  const [workspaceValue, setWorkspaceValue] = useState('')
+  const [currentWorkspace, setCurrentWorkspace] = useState('')
+  const [agentForm] = Form.useForm()
+  const [concurrencyForm] = Form.useForm()
+  const [memoryForm] = Form.useForm()
 
   useEffect(() => {
     loadAgent()
+    loadConcurrency()
+    loadMemory()
+    loadCurrentWorkspace()
   }, [])
+
+  const loadCurrentWorkspace = async () => {
+    try {
+      const status = await api.getSystemStatus()
+      if (status?.web?.workspace) {
+        setCurrentWorkspace(status.web.workspace)
+      }
+    } catch (error) {
+      console.error('Failed to load workspace:', error)
+    }
+  }
 
   const loadAgent = async () => {
     try {
-      setLoading(true)
+      setAgentLoading(true)
       const data = await api.getConfig()
       const agent = data?.agent ?? { maxToolIterations: 40, maxExecutionTime: 600 }
-      form.setFieldsValue({
+      agentForm.setFieldsValue({
         maxToolIterations: agent.maxToolIterations,
         maxExecutionTime: agent.maxExecutionTime,
       })
+    } catch (error) {
+      console.error(error)
+    } finally {
+      setAgentLoading(false)
+    }
+  }
+
+  const loadConcurrency = async () => {
+    try {
+      setConcurrencyLoading(true)
+      const data = await api.getConcurrencyConfig()
+      concurrencyForm.setFieldsValue({
+        maxParallelToolCalls: data.max_parallel_tool_calls || 5,
+        maxConcurrentSubagents: data.max_concurrent_subagents || 10,
+        enableParallelTools: data.enable_parallel_tools !== false,
+        threadPoolSize: data.thread_pool_size || 4,
+        enableSubagentParallel: data.enable_subagent_parallel !== false,
+        claudeCodeMaxConcurrent: data.claude_code_max_concurrent || 3,
+        enableSmartParallel: data.enable_smart_parallel !== false,
+        smartParallelModel: data.smart_parallel_model || '',
+      })
+    } catch (error) {
+      console.error(error)
+    } finally {
+      setConcurrencyLoading(false)
+    }
+  }
+
+  const loadMemory = async () => {
+    try {
+      setMemoryLoading(true)
+      const data = await api.getMemoryConfig()
+      memoryForm.setFieldsValue({
+        autoIntegrateEnabled: data.auto_integrate_enabled !== false,
+        autoIntegrateIntervalMinutes: data.auto_integrate_interval_minutes || 60,
+        lookbackMinutes: data.lookback_minutes || 60,
+        maxMessages: data.max_messages || 100,
+        maxEntries: data.max_entries || 100,
+        maxChars: data.max_chars || 100000,
+        readMaxEntries: data.read_max_entries || 10,
+        readMaxChars: data.read_max_chars || 50000,
+      })
+    } catch (error) {
+      console.error(error)
+    } finally {
+      setMemoryLoading(false)
+    }
+  }
+
+  const handleAgentSave = async (values: Partial<AgentConfig>) => {
+    try {
+      setLoading(true)
+      await api.updateAgentConfig({
+        maxToolIterations: values.maxToolIterations != null ? Number(values.maxToolIterations) : undefined,
+        maxExecutionTime: values.maxExecutionTime != null ? Number(values.maxExecutionTime) : undefined,
+      })
+      message.success(t('config.agent.saveSuccess'))
     } catch (error) {
       console.error(error)
       message.error(t('config.agent.saveFailed'))
@@ -460,49 +539,329 @@ function SystemConfig() {
     }
   }
 
-  const handleSave = async (values: Partial<AgentConfig>) => {
+  const handleConcurrencySave = async (values: WebConcurrencyConfig) => {
     try {
-      await api.updateAgentConfig({
-        maxToolIterations: values.maxToolIterations != null ? Number(values.maxToolIterations) : undefined,
-        maxExecutionTime: values.maxExecutionTime != null ? Number(values.maxExecutionTime) : undefined,
+      setLoading(true)
+      // 发送 camelCase 格式以匹配后端期望
+      await api.updateConcurrencyConfig({
+        maxParallelToolCalls: Number(values.maxParallelToolCalls),
+        maxConcurrentSubagents: Number(values.maxConcurrentSubagents),
+        enableParallelTools: values.enableParallelTools,
+        threadPoolSize: Number(values.threadPoolSize),
+        enableSubagentParallel: values.enableSubagentParallel,
+        claudeCodeMaxConcurrent: Number(values.claudeCodeMaxConcurrent),
+        enableSmartParallel: values.enableSmartParallel,
+        smartParallelModel: values.smartParallelModel || undefined,
       })
-      message.success(t('config.agent.saveSuccess'))
-      loadAgent()
+      message.success(t('config.saveSuccess'))
     } catch (error) {
       console.error(error)
-      message.error(t('config.agent.saveFailed'))
+      message.error(t('config.saveFailed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleMemorySave = async (values: WebMemoryConfig) => {
+    try {
+      setLoading(true)
+      await api.updateMemoryConfig({
+        auto_integrate_enabled: values.autoIntegrateEnabled,
+        auto_integrate_interval_minutes: Number(values.autoIntegrateIntervalMinutes),
+        lookback_minutes: Number(values.lookbackMinutes),
+        max_messages: Number(values.maxMessages),
+        max_entries: Number(values.maxEntries),
+        max_chars: Number(values.maxChars),
+        read_max_entries: Number(values.readMaxEntries),
+        read_max_chars: Number(values.readMaxChars),
+      })
+      message.success(t('config.saveSuccess'))
+    } catch (error) {
+      console.error(error)
+      message.error(t('config.saveFailed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleWorkspaceSwitch = async () => {
+    if (!workspaceValue.trim()) {
+      message.error(t('config.workspace.pathRequired'))
+      return
+    }
+    try {
+      setLoading(true)
+      await api.switchWorkspace(workspaceValue.trim())
+      message.success(t('config.workspace.switchSuccess'))
+      setWorkspaceModalVisible(false)
+      setWorkspaceValue('')
+      // Reload page to apply new workspace
+      window.location.reload()
+    } catch (error) {
+      console.error(error)
+      message.error(t('config.workspace.switchFailed'))
+    } finally {
+      setLoading(false)
     }
   }
 
   return (
     <div className="config-panel">
-      <Card
-        title={t('config.system')}
-        loading={loading}
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>{t('config.systemSubtitle')}</Text>}
-      >
-        <Form form={form} layout="vertical" initialValues={{ maxToolIterations: 40, maxExecutionTime: 600 }} onFinish={handleSave}>
-          <Form.Item
-            name="maxToolIterations"
-            label={t('config.agent.maxToolIterations')}
-            rules={[{ required: true }, { type: 'number', min: 1, max: 200 }]}
-            help={t('config.agent.maxToolIterationsHelp')}
-          >
-            <InputNumber min={1} max={200} style={{ width: '100%' }} />
-          </Form.Item>
-          <Form.Item
-            name="maxExecutionTime"
-            label={t('config.agent.maxExecutionTime')}
-            rules={[{ required: true }, { type: 'number', min: 0 }]}
-            help={t('config.agent.maxExecutionTimeHelp')}
-          >
-            <InputNumber min={0} style={{ width: '100%' }} />
-          </Form.Item>
-          <Form.Item>
-            <Button type="primary" htmlType="submit">{t('config.save')}</Button>
-          </Form.Item>
-        </Form>
-      </Card>
+      <Spin spinning={loading}>
+        {/* Agent 配置 */}
+        <Card
+          title={t('config.system')}
+          extra={<Text type="secondary" style={{ fontSize: 12 }}>{t('config.systemSubtitle')}</Text>}
+          style={{ marginBottom: 16 }}
+        >
+          <Form form={agentForm} layout="vertical" onFinish={handleAgentSave}>
+            <Row gutter={16}>
+              <Col span={12}>
+                <Form.Item
+                  name="maxToolIterations"
+                  label={t('config.agent.maxToolIterations')}
+                  rules={[{ required: true }, { type: 'number', min: 1, max: 200 }]}
+                  help={t('config.agent.maxToolIterationsHelp')}
+                >
+                  <InputNumber min={1} max={200} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item
+                  name="maxExecutionTime"
+                  label={t('config.agent.maxExecutionTime')}
+                  rules={[{ required: true }, { type: 'number', min: 0 }]}
+                  help={t('config.agent.maxExecutionTimeHelp')}
+                >
+                  <InputNumber min={0} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Form.Item>
+              <Button type="primary" htmlType="submit" loading={agentLoading}>{t('config.save')}</Button>
+            </Form.Item>
+          </Form>
+        </Card>
+
+        {/* 并发/线程池配置 */}
+        <Card
+          title={t('config.concurrency.title') || '并发配置'}
+          style={{ marginBottom: 16 }}
+        >
+          <Form form={concurrencyForm} layout="vertical" onFinish={handleConcurrencySave}>
+            <Row gutter={16}>
+              <Col span={8}>
+                <Form.Item
+                  name="threadPoolSize"
+                  label={t('config.concurrency.threadPoolSize') || '线程池大小'}
+                  rules={[{ type: 'number', min: 1, max: 32 }]}
+                >
+                  <InputNumber min={1} max={32} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item
+                  name="maxParallelToolCalls"
+                  label={t('config.concurrency.maxParallelToolCalls') || '最大并行工具数'}
+                  rules={[{ type: 'number', min: 1, max: 20 }]}
+                >
+                  <InputNumber min={1} max={20} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item
+                  name="maxConcurrentSubagents"
+                  label={t('config.concurrency.maxConcurrentSubagents') || '最大并行子代理数'}
+                  rules={[{ type: 'number', min: 1, max: 50 }]}
+                >
+                  <InputNumber min={1} max={50} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Row gutter={16}>
+              <Col span={8}>
+                <Form.Item
+                  name="enableParallelTools"
+                  label={t('config.concurrency.enableParallelTools') || '启用工具并行'}
+                  valuePropName="checked"
+                >
+                  <Switch />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item
+                  name="enableSubagentParallel"
+                  label={t('config.concurrency.enableSubagentParallel') || '启用子代理并行'}
+                  valuePropName="checked"
+                >
+                  <Switch />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item
+                  name="enableSmartParallel"
+                  label={t('config.concurrency.enableSmartParallel') || '启用智能并行'}
+                  valuePropName="checked"
+                >
+                  <Switch />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Row gutter={16}>
+              <Col span={12}>
+                <Form.Item
+                  name="claudeCodeMaxConcurrent"
+                  label={t('config.concurrency.claudeCodeMaxConcurrent') || 'Claude Code 最大并发'}
+                  rules={[{ type: 'number', min: 1, max: 10 }]}
+                >
+                  <InputNumber min={1} max={10} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item
+                  name="smartParallelModel"
+                  label={t('config.concurrency.smartParallelModel') || '智能并行模型'}
+                >
+                  <Input placeholder={t('config.concurrency.smartParallelModelPlaceholder') || '留空使用默认模型'} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Form.Item>
+              <Button type="primary" htmlType="submit" loading={concurrencyLoading}>{t('config.save')}</Button>
+            </Form.Item>
+          </Form>
+        </Card>
+
+        {/* Memory 配置 */}
+        <Card
+          title={t('config.memory.title') || '记忆系统配置'}
+          style={{ marginBottom: 16 }}
+        >
+          <Form form={memoryForm} layout="vertical" onFinish={handleMemorySave}>
+            <Row gutter={16}>
+              <Col span={8}>
+                <Form.Item
+                  name="autoIntegrateEnabled"
+                  label={t('config.memory.autoIntegrateEnabled') || '启用自动整合'}
+                  valuePropName="checked"
+                >
+                  <Switch />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item
+                  name="autoIntegrateIntervalMinutes"
+                  label={t('config.memory.autoIntegrateInterval') || '整合间隔(分钟)'}
+                  rules={[{ type: 'number', min: 1 }]}
+                >
+                  <InputNumber min={1} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item
+                  name="lookbackMinutes"
+                  label={t('config.memory.lookbackMinutes') || '回顾时间(分钟)'}
+                  rules={[{ type: 'number', min: 1 }]}
+                >
+                  <InputNumber min={1} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Row gutter={16}>
+              <Col span={8}>
+                <Form.Item
+                  name="maxMessages"
+                  label={t('config.memory.maxMessages') || '最大消息数'}
+                  rules={[{ type: 'number', min: 10 }]}
+                >
+                  <InputNumber min={10} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item
+                  name="maxEntries"
+                  label={t('config.memory.maxEntries') || '最大长期记忆条目'}
+                  rules={[{ type: 'number', min: 1 }]}
+                >
+                  <InputNumber min={1} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item
+                  name="maxChars"
+                  label={t('config.memory.maxChars') || '最大字符数'}
+                  rules={[{ type: 'number', min: 1000 }]}
+                >
+                  <InputNumber min={1000} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Row gutter={16}>
+              <Col span={12}>
+                <Form.Item
+                  name="readMaxEntries"
+                  label={t('config.memory.readMaxEntries') || '读取最大条目'}
+                  rules={[{ type: 'number', min: 1 }]}
+                >
+                  <InputNumber min={1} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item
+                  name="readMaxChars"
+                  label={t('config.memory.readMaxChars') || '读取最大字符'}
+                  rules={[{ type: 'number', min: 1000 }]}
+                >
+                  <InputNumber min={1000} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Form.Item>
+              <Button type="primary" htmlType="submit" loading={memoryLoading}>{t('config.save')}</Button>
+            </Form.Item>
+          </Form>
+        </Card>
+
+        {/* 工作目录切换 */}
+        <Card
+          title={t('config.workspace.title') || '工作目录'}
+          extra={
+            <Button icon={<SwapOutlined />} onClick={() => setWorkspaceModalVisible(true)}>
+              {t('config.workspace.switch') || '切换'}
+            </Button>
+          }
+        >
+          <Space direction="vertical" size="small">
+            <Text type="secondary">{t('config.workspace.current') || '当前工作目录'}:</Text>
+            <Text code copyable>{currentWorkspace || '-'}</Text>
+          </Space>
+        </Card>
+
+        {/* 工作目录切换弹窗 */}
+        <Modal
+          title={t('config.workspace.switchTitle') || '切换工作目录'}
+          open={workspaceModalVisible}
+          onOk={handleWorkspaceSwitch}
+          onCancel={() => {
+            setWorkspaceModalVisible(false)
+            setWorkspaceValue('')
+          }}
+          confirmLoading={loading}
+        >
+          <Form layout="vertical">
+            <Form.Item
+              label={t('config.workspace.path') || '路径'}
+              required
+            >
+              <Input
+                value={workspaceValue}
+                onChange={(e) => setWorkspaceValue(e.target.value)}
+                placeholder={t('config.workspace.pathPlaceholder') || '例如: ~/my-workspace'}
+              />
+            </Form.Item>
+          </Form>
+        </Modal>
+      </Spin>
     </div>
   )
 }
@@ -700,6 +1059,10 @@ function McpConfig() {
     if (!raw || typeof raw !== 'object') return null
     const o = raw as Record<string, unknown>
     let id = explicitId || (typeof o.id === 'string' ? o.id.trim() : undefined)
+    // Sanitize ID: replace invalid chars with underscore (same as backend)
+    if (id) {
+      id = id.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '')
+    }
     let name = typeof o.name === 'string' ? o.name.trim() : undefined
     const transportRaw = typeof o.transport === 'string' ? o.transport : typeof o.type === 'string' ? o.type : 'stdio'
     const transport = mapTypeToTransport(transportRaw)
@@ -716,7 +1079,10 @@ function McpConfig() {
     }
     if (!name) name = id || 'unnamed'
     if (!id) id = name.replace(/\s+/g, '-').toLowerCase().replace(/[^a-z0-9._-]/g, '') || 'mcp'
-    return { id, name, transport, command, args, url, enabled: o.enabled !== false }
+    // Extract env and headers
+    const env = (o.env && typeof o.env === 'object') ? o.env as Record<string, string> : undefined
+    const headers = (o.headers && typeof o.headers === 'object') ? o.headers as Record<string, string> : undefined
+    return { id, name, transport, command, args, url, enabled: o.enabled !== false, env, headers }
   }
 
   const normOne = (raw: unknown) => normalizeMcpItem(raw)

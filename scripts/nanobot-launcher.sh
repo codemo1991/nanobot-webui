@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# nanobot 守护启动器 — 支持自更新后自动重启。
+# nanobot 守护启动器 — 支持自更新后自动重启，并能自动修复损坏的安装。
 #
 # 用法:
 #   ./nanobot-launcher.sh [--host HOST] [--port PORT] [--verbose] [--debug]
 #
 # 当 nanobot 以退出码 42 退出时（self_update 触发），本脚本会自动
 # 执行 git pull 及 pip install -e . 并重新启动服务。
+# 启动时会检测 nanobot 安装是否可用；若检测到损坏（如 ModuleNotFoundError），
+# 会自动清除残留并重新执行 pip install -e . 进行修复。
 #
 # 默认启用 --verbose 以输出详细日志
 
@@ -52,7 +54,43 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 VENV_DIR="$REPO_DIR/.venv"
 NANOBOT_EXE="$VENV_DIR/bin/nanobot"
 VENV_PIP="$VENV_DIR/bin/pip"
+VENV_PYTHON="$VENV_DIR/bin/python"
 WEB_UI_DIR="$REPO_DIR/web-ui"
+
+# 检测并终止已运行的 nanobot 进程
+kill_existing_nanobot() {
+    # 查找正在运行的 nanobot 进程（排除当前脚本进程）
+    # 使用 pgrep 或 ps 来查找进程
+    local pid=""
+    if command -v pgrep &>/dev/null; then
+        # pgrep 返回匹配的 PID 列表
+        pid=$(pgrep -f "nanobot.*web-ui" 2>/dev/null | head -1)
+    elif command -v ps &>/dev/null; then
+        # 使用 ps 查找
+        pid=$(ps aux 2>/dev/null | grep -E "nanobot.*web-ui" | grep -v grep | awk '{print $2}' | head -1)
+    fi
+
+    if [ -n "$pid" ]; then
+        echo "[launcher] 检测到已有 nanobot 进程运行中 (PID: $pid)，正在终止..."
+        kill "$pid" 2>/dev/null || true
+        # 等待进程终止
+        local count=0
+        while [ $count -lt 10 ]; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "[launcher] 已终止旧进程 (PID: $pid)"
+                return 0
+            fi
+            sleep 0.5
+            count=$((count + 1))
+        done
+        # 如果进程仍未终止，强制杀死
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "[launcher] 进程未响应，强制杀死 (PID: $pid)"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    fi
+    return 0
+}
 
 restart_times=()
 
@@ -89,6 +127,9 @@ fi
 
 print_separator
 echo ""
+
+# 终止已存在的 nanobot 进程
+kill_existing_nanobot
 
 # 构建前端（npm install + npm run build）
 # 参数: force=true 时强制重新安装/构建，不论目录是否存在
@@ -132,6 +173,51 @@ ensure_frontend_built() {
     echo ""
 }
 
+# 检测 nanobot 安装是否可用（可执行且能正常导入模块）
+test_nanobot_health() {
+    "$NANOBOT_EXE" --help &>/dev/null
+}
+
+# 修复损坏的 nanobot 安装：清除残留后重新安装
+repair_nanobot_install() {
+    echo "[launcher] 正在修复 nanobot 安装..."
+
+    # 1. 尝试卸载（可能因损坏而失败，忽略）
+    "$VENV_PIP" uninstall nanobot-ai -y &>/dev/null || true
+    "$VENV_PIP" uninstall nanobot_ai -y &>/dev/null || true
+
+    # 2. 清除 site-packages 中可能残留的损坏文件
+    SITE_PACKAGES=$("$VENV_PYTHON" -c "import site; print(site.getsitepackages()[0])" 2>/dev/null) || true
+    if [ -n "$SITE_PACKAGES" ] && [ -d "$SITE_PACKAGES" ]; then
+        for d in "$SITE_PACKAGES"/nanobot "$SITE_PACKAGES"/nanobot_ai* "$SITE_PACKAGES"/~anobot*; do
+            [ -e "$d" ] || [ -d "$d" ] 2>/dev/null || continue
+            rm -rf "$d" 2>/dev/null || true
+            echo "[launcher] 已清除: $(basename "$d" 2>/dev/null || echo "$d")"
+        done
+    fi
+
+    # 3. 移除可能损坏的可执行文件
+    rm -f "$NANOBOT_EXE" 2>/dev/null || true
+
+    # 4. 重新安装
+    if [ ! -f "$REPO_DIR/pyproject.toml" ]; then
+        echo "[launcher] 未找到 pyproject.toml，无法修复。"
+        exit 1
+    fi
+    echo "[launcher] Running: pip install -e . (in $REPO_DIR)"
+    if (cd "$REPO_DIR" && "$VENV_PIP" install -e . 2>&1 | sed 's/^/  /'); then
+        if [ ! -f "$NANOBOT_EXE" ]; then
+            echo "[launcher] 修复完成但未找到可执行文件: $NANOBOT_EXE"
+            exit 1
+        fi
+        echo "[launcher] nanobot 安装已修复。"
+        echo ""
+    else
+        echo "[launcher] 修复失败。"
+        exit 1
+    fi
+}
+
 # 确保虚拟环境存在且 nanobot 已安装
 ensure_venv_ready() {
     # 1. 如果 venv 不存在则创建
@@ -149,8 +235,9 @@ ensure_venv_ready() {
     # 2. 构建前端（npm install + npm run build）
     ensure_frontend_built
 
-    # 3. 如果 nanobot 尚未安装到 venv，则安装
+    # 3. 检查 nanobot 是否已安装且可用
     if [ ! -f "$NANOBOT_EXE" ]; then
+        # 未安装 -> 执行安装
         if [ ! -f "$REPO_DIR/pyproject.toml" ]; then
             echo "[launcher] 未找到 pyproject.toml（路径：$REPO_DIR），无法自动安装。"
             exit 1
@@ -168,6 +255,10 @@ ensure_venv_ready() {
             echo "[launcher] 安装失败，请手动执行: cd $REPO_DIR && $VENV_PIP install -e ."
             exit 1
         fi
+    elif ! test_nanobot_health; then
+        # 已安装但运行失败（如 ModuleNotFoundError）-> 执行修复
+        echo "[launcher] 检测到 nanobot 安装损坏，正在修复..."
+        repair_nanobot_install
     fi
 }
 

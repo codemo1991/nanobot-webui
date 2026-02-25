@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Button, Input, Modal, Spin, message, Typography, Switch, InputNumber, Tooltip } from 'antd'
-import { FolderOutlined, FileTextOutlined, DownloadOutlined, ReloadOutlined, SwapOutlined, UploadOutlined, SettingOutlined } from '@ant-design/icons'
+import { Button, Modal, Spin, message, Row, Col, Statistic, Space, Card } from 'antd'
+import { FileTextOutlined, DownloadOutlined, ReloadOutlined, UploadOutlined, DeleteOutlined } from '@ant-design/icons'
 import { api } from '../api'
 import { formatUptime } from '../utils/formatUptime'
-import type { SystemStatus, MemoryConfig } from '../types'
+import type { SystemStatus, Metrics } from '../types'
 import './SystemPage.css'
 
 function SystemPage() {
@@ -16,18 +16,13 @@ function SystemPage() {
   const [logsVisible, setLogsVisible] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
   const [logsLoading, setLogsLoading] = useState(false)
-  const [workspaceModalVisible, setWorkspaceModalVisible] = useState(false)
-  const [workspaceInput, setWorkspaceInput] = useState('')
-  const [workspaceSwitching, setWorkspaceSwitching] = useState(false)
   const [importing, setImporting] = useState(false)
-  const [memoryConfig, setMemoryConfig] = useState<MemoryConfig | null>(null)
-  const [memoryConfigLoading, setMemoryConfigLoading] = useState(false)
-  const [memoryConfigSaving, setMemoryConfigSaving] = useState(false)
+  const [metrics, setMetrics] = useState<Metrics | null>(null)
+  const [metricsLoading, setMetricsLoading] = useState(false)
   const importInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     loadStatus()
-    loadMemoryConfig()
   }, [])
 
   const loadStatus = async () => {
@@ -81,75 +76,6 @@ function SystemPage() {
     })
   }
 
-  const handleOpenWorkspaceModal = () => {
-    setWorkspaceInput(status?.web.workspace ?? '')
-    setWorkspaceModalVisible(true)
-  }
-
-  // 内部函数，带 copyDb 参数
-  const switchWorkspaceWithOptions = async (copyDb?: boolean) => {
-    const path = workspaceInput.trim()
-    if (!path) {
-      message.warning(t('system.enterWorkspacePath'))
-      return
-    }
-    try {
-      setWorkspaceSwitching(true)
-      const result = await api.switchWorkspace(path, copyDb)
-
-      // 检查是否需要用户选择数据库操作
-      if ('needPrompt' in result && result.needPrompt) {
-        // 弹出选择对话框
-        const dbOptions = [
-          {
-            key: 'copy',
-            label: result.hasDefaultDb
-              ? t('system.copyExistingDb')
-              : t('system.noExistingDb'),
-            disabled: !result.hasDefaultDb,
-          },
-          {
-            key: 'new',
-            label: t('system.createNewDb'),
-          },
-        ]
-
-        // 如果只有一个选项，直接使用
-        const enabledOptions = dbOptions.filter((o) => !o.disabled)
-        if (enabledOptions.length === 1) {
-          await switchWorkspaceWithOptions(enabledOptions[0].key === 'copy')
-          return
-        }
-
-        // 弹出确认框让用户选择
-        Modal.confirm({
-          title: t('system.chooseDbOption'),
-          content: t('system.chooseDbOptionDesc'),
-          okText: dbOptions[0].label,
-          cancelText: dbOptions[1].label,
-          onOk: async () => {
-            await switchWorkspaceWithOptions(true)
-          },
-          onCancel: async () => {
-            await switchWorkspaceWithOptions(false)
-          },
-        })
-        return
-      }
-
-      message.success(t('system.workspaceSwitched'))
-      setWorkspaceModalVisible(false)
-      loadStatus()
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : t('system.switchWorkspaceFailed'))
-    } finally {
-      setWorkspaceSwitching(false)
-    }
-  }
-
-  // Modal 按钮调用的版本（不带参数）
-  const handleSwitchWorkspace = () => switchWorkspaceWithOptions()
-
   const handleImportConfig = () => {
     importInputRef.current?.click()
   }
@@ -176,31 +102,33 @@ function SystemPage() {
     reader.readAsText(file, 'utf-8')
   }
 
-  const loadMemoryConfig = async () => {
+  const loadMetrics = async () => {
     try {
-      setMemoryConfigLoading(true)
-      const data = await api.getMemoryConfig()
-      setMemoryConfig(data)
+      setMetricsLoading(true)
+      const data = await api.getMetrics()
+      setMetrics(data)
     } catch (err) {
-      console.error('Failed to load memory config:', err)
+      console.error('Failed to load metrics:', err)
     } finally {
-      setMemoryConfigLoading(false)
+      setMetricsLoading(false)
     }
   }
 
-  const handleSaveMemoryConfig = async () => {
-    if (!memoryConfig) return
+  const handleResetMetrics = async () => {
     try {
-      setMemoryConfigSaving(true)
-      const updated = await api.updateMemoryConfig(memoryConfig)
-      setMemoryConfig(updated)
-      message.success(t('system.saveSuccess') || '保存成功')
+      await api.resetMetrics()
+      message.success(t('config.metrics.resetSuccess') || '重置成功')
+      loadMetrics()
     } catch (err) {
-      message.error(err instanceof Error ? err.message : t('system.saveFailed') || '保存失败')
-    } finally {
-      setMemoryConfigSaving(false)
+      console.error('Failed to reset metrics:', err)
+      message.error(t('config.metrics.resetFailed') || '重置失败')
     }
   }
+
+  // Load metrics on mount
+  useEffect(() => {
+    loadMetrics()
+  }, [])
 
   return (
     <div className="system-page">
@@ -268,193 +196,56 @@ function SystemPage() {
           </div>
         </div>
 
-        <div className="card">
-          <h2>
-            <FolderOutlined style={{ marginRight: 8 }} />
-            {t('system.workspace')}
-          </h2>
-          <div className="info-list">
-            <div className="info-item">
-              <span className="info-label">{t('system.workspacePath')}</span>
-              <span className="info-value workspace-path">
-                {loading ? (
-                  <Spin size="small" />
-                ) : status?.web.workspace ? (
-                  <Typography.Text
-                    copyable
-                    style={{ fontFamily: 'monospace', fontSize: 13, wordBreak: 'break-all' }}
-                  >
-                    {status.web.workspace}
-                  </Typography.Text>
-                ) : (
-                  '--'
-                )}
-              </span>
-            </div>
-            <div className="workspace-actions">
-              <Button
-                type="primary"
-                icon={<SwapOutlined />}
-                onClick={handleOpenWorkspaceModal}
-                size="small"
-              >
-                {t('system.switchWorkspace')}
+        {/* 监控指标 */}
+        <Card
+          title={t('config.metrics.title')}
+          extra={
+            <Space>
+              <Button icon={<ReloadOutlined />} size="small" onClick={loadMetrics}>
+                {t('config.metrics.refresh')}
               </Button>
-            </div>
-            <div className="workspace-tip">
-              <small>
-                {t('system.workspaceTip')}
-              </small>
-            </div>
-          </div>
-        </div>
-
-        <div className="card">
-          <h2>
-            <SettingOutlined style={{ marginRight: 8 }} />
-            {t('system.memoryConfig') || '记忆系统配置'}
-          </h2>
-          {memoryConfigLoading ? (
-            <Spin size="small" />
-          ) : memoryConfig ? (
-            <div className="info-list">
-              <div className="info-item">
-                <span className="info-label">
-                  <Tooltip title={t('system.autoIntegrateEnabledTip') || '自动从聊天记录中提取长期记忆'}>
-                    {t('system.autoIntegrateEnabled') || '自动记忆整合'}
-                  </Tooltip>
-                </span>
-                <Switch
-                  checked={memoryConfig.auto_integrate_enabled}
-                  onChange={(checked) => setMemoryConfig({ ...memoryConfig, auto_integrate_enabled: checked })}
-                />
-              </div>
-
-              <div className="info-item">
-                <span className="info-label">
-                  <Tooltip title={t('system.autoIntegrateIntervalTip') || '自动整合的执行间隔'}>
-                    {t('system.autoIntegrateInterval') || '整合间隔 (分钟)'}
-                  </Tooltip>
-                </span>
-                <InputNumber
-                  min={1}
-                  max={1440}
-                  value={memoryConfig.auto_integrate_interval_minutes}
-                  onChange={(value) => setMemoryConfig({ ...memoryConfig, auto_integrate_interval_minutes: value || 30 })}
-                  style={{ width: 100 }}
-                />
-              </div>
-
-              <div className="info-item">
-                <span className="info-label">
-                  <Tooltip title={t('system.lookbackMinutesTip') || '每次整合时回溯的时间窗口'}>
-                    {t('system.lookbackMinutes') || '回溯窗口 (分钟)'}
-                  </Tooltip>
-                </span>
-                <InputNumber
-                  min={1}
-                  max={10080}
-                  value={memoryConfig.lookback_minutes}
-                  onChange={(value) => setMemoryConfig({ ...memoryConfig, lookback_minutes: value || 60 })}
-                  style={{ width: 100 }}
-                />
-              </div>
-
-              <div className="info-item">
-                <span className="info-label">
-                  <Tooltip title={t('system.maxMessagesTip') || '每次整合最多处理的消息数'}>
-                    {t('system.maxMessages') || '每次最大消息数'}
-                  </Tooltip>
-                </span>
-                <InputNumber
-                  min={1}
-                  max={1000}
-                  value={memoryConfig.max_messages}
-                  onChange={(value) => setMemoryConfig({ ...memoryConfig, max_messages: value || 100 })}
-                  style={{ width: 100 }}
-                />
-              </div>
-
-              <div className="info-item">
-                <span className="info-label">
-                  <Tooltip title={t('system.maxEntriesTip') || '长期记忆最大条数，超过时触发LLM总结'}>
-                    {t('system.maxEntries') || '长期记忆上限 (条)'}
-                  </Tooltip>
-                </span>
-                <InputNumber
-                  min={10}
-                  max={10000}
-                  value={memoryConfig.max_entries}
-                  onChange={(value) => setMemoryConfig({ ...memoryConfig, max_entries: value || 200 })}
-                  style={{ width: 100 }}
-                />
-              </div>
-
-              <div className="info-item">
-                <span className="info-label">
-                  <Tooltip title={t('system.maxCharsTip') || '长期记忆最大字符数，超过时触发LLM总结'}>
-                    {t('system.maxChars') || '长期记忆上限 (字符)'}
-                  </Tooltip>
-                </span>
-                <InputNumber
-                  min={1024}
-                  max={10 * 1024 * 1024}
-                  step={1024}
-                  value={memoryConfig.max_chars}
-                  onChange={(value) => setMemoryConfig({ ...memoryConfig, max_chars: value || 204800 })}
-                  style={{ width: 120 }}
-                  formatter={(value) => `${(Number(value) / 1024).toFixed(0)} KB`}
-                  parser={(value) => Number(value?.replace(' KB', '')) * 1024}
-                />
-              </div>
-
-              <div className="info-item">
-                <span className="info-label">
-                  <Tooltip title={t('system.readMaxEntriesTip') || '读取时若超过此条数则全量读取'}>
-                    {t('system.readMaxEntries') || '读取阈值 (条)'}
-                  </Tooltip>
-                </span>
-                <InputNumber
-                  min={1}
-                  max={10000}
-                  value={memoryConfig.read_max_entries}
-                  onChange={(value) => setMemoryConfig({ ...memoryConfig, read_max_entries: value || 80 })}
-                  style={{ width: 100 }}
-                />
-              </div>
-
-              <div className="info-item">
-                <span className="info-label">
-                  <Tooltip title={t('system.readMaxCharsTip') || '读取时若超过此字符数则截断'}>
-                    {t('system.readMaxChars') || '读取截断 (字符)'}
-                  </Tooltip>
-                </span>
-                <InputNumber
-                  min={1024}
-                  max={10 * 1024 * 1024}
-                  step={1024}
-                  value={memoryConfig.read_max_chars}
-                  onChange={(value) => setMemoryConfig({ ...memoryConfig, read_max_chars: value || 25600 })}
-                  style={{ width: 120 }}
-                  formatter={(value) => `${(Number(value) / 1024).toFixed(0)} KB`}
-                  parser={(value) => Number(value?.replace(' KB', '')) * 1024}
-                />
-              </div>
-
-              <div className="memory-config-actions">
-                <Button
-                  type="primary"
-                  onClick={handleSaveMemoryConfig}
-                  loading={memoryConfigSaving}
-                >
-                  {t('system.save') || '保存'}
-                </Button>
-              </div>
-            </div>
-          ) : (
-            <div>{t('system.loadMemoryConfigFailed') || '加载记忆配置失败'}</div>
-          )}
-        </div>
+              <Button danger icon={<DeleteOutlined />} size="small" onClick={handleResetMetrics}>
+                {t('config.metrics.reset')}
+              </Button>
+            </Space>
+          }
+          loading={metricsLoading}
+          style={{ marginBottom: 16 }}
+        >
+          <Row gutter={16}>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.totalToolCalls')} value={metrics?.total_tool_calls || 0} />
+            </Col>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.parallelToolCalls')} value={metrics?.parallel_tool_calls || 0} valueStyle={{ color: '#3f8600' }} />
+            </Col>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.serialToolCalls')} value={metrics?.serial_tool_calls || 0} valueStyle={{ color: '#cf1322' }} />
+            </Col>
+          </Row>
+          <Row gutter={16} style={{ marginTop: 16 }}>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.failedToolCalls')} value={metrics?.failed_tool_calls || 0} valueStyle={{ color: '#cf1322' }} />
+            </Col>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.totalSubagentSpawns')} value={metrics?.total_subagent_spawns || 0} />
+            </Col>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.llmCallCount')} value={metrics?.llm_call_count || 0} />
+            </Col>
+          </Row>
+          <Row gutter={16} style={{ marginTop: 16 }}>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.avgToolExecutionTime')} value={metrics?.avg_tool_execution_time?.toFixed(2) || 0} suffix="s" />
+            </Col>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.maxConcurrentTools')} value={metrics?.max_concurrent_tools || 0} valueStyle={{ color: '#1890ff' }} />
+            </Col>
+            <Col span={8}>
+              <Statistic title={t('config.metrics.totalTokenUsage')} value={metrics?.total_token_usage || 0} />
+            </Col>
+          </Row>
+        </Card>
 
         <div className="card">
           <h2>{t('system.systemInfo')}</h2>
@@ -518,28 +309,6 @@ function SystemPage() {
           />
         </div>
       </div>
-
-      <Modal
-        title={t('system.switchWorkspaceModal')}
-        open={workspaceModalVisible}
-        onCancel={() => setWorkspaceModalVisible(false)}
-        onOk={handleSwitchWorkspace}
-        confirmLoading={workspaceSwitching}
-        okText={t('system.switch')}
-      >
-        <div style={{ marginBottom: 16 }}>
-          <label style={{ display: 'block', marginBottom: 8 }}>{t('system.workspacePathLabel')}</label>
-          <Input
-            placeholder={t('system.workspacePathPlaceholder')}
-            value={workspaceInput}
-            onChange={(e) => setWorkspaceInput(e.target.value)}
-            onPressEnter={handleSwitchWorkspace}
-          />
-          <small style={{ color: '#666', marginTop: 8, display: 'block' }}>
-            {t('system.workspacePathHint')}
-          </small>
-        </div>
-      </Modal>
 
       <Modal
         title={t('system.logsTitle')}

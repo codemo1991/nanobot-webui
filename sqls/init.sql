@@ -115,6 +115,13 @@ CREATE TABLE IF NOT EXISTS config_tools (
 -- ------------------------------------------------------------
 
 -- 系统状态：存储运行时状态
+-- 并发配置存储格式：key = "concurrency_{config_key}", value = JSON
+-- 监控指标存储格式：key = "metric_{metric_key}", value = JSON
+-- 例如：
+--   concurrency_max_parallel_tool_calls = "5"
+--   concurrency_enable_parallel_tools = "true"
+--   metric_total_tool_calls = "100"
+--   metric_parallel_tool_calls = "30"
 CREATE TABLE IF NOT EXISTS system_status (
     key TEXT PRIMARY KEY,                       -- 键
     value TEXT NOT NULL,                        -- 值

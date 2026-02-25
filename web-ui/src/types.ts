@@ -161,6 +161,8 @@ export interface McpServer {
   args?: string[]
   url?: string
   enabled: boolean
+  env?: Record<string, string>
+  headers?: Record<string, string>
 }
 
 export interface InstalledSkill {
@@ -176,6 +178,50 @@ export interface InstalledSkill {
 export interface AgentConfig {
   maxToolIterations: number
   maxExecutionTime: number
+  // 并发配置
+  maxParallelToolCalls?: number
+  maxConcurrentSubagents?: number
+  enableParallelTools?: boolean
+  threadPoolSize?: number
+  enableSubagentParallel?: boolean
+  claudeCodeMaxConcurrent?: number
+}
+
+// 并发配置类型
+export interface ConcurrencyConfig {
+  max_parallel_tool_calls: number
+  max_concurrent_subagents: number
+  enable_parallel_tools: boolean
+  thread_pool_size: number
+  enable_subagent_parallel: boolean
+  claude_code_max_concurrent: number
+  enable_smart_parallel: boolean
+  smart_parallel_model: string
+}
+
+// 前端格式的并发配置
+export interface WebConcurrencyConfig {
+  maxParallelToolCalls: number
+  maxConcurrentSubagents: number
+  enableParallelTools: boolean
+  threadPoolSize: number
+  enableSubagentParallel: boolean
+  claudeCodeMaxConcurrent: number
+  enableSmartParallel: boolean
+  smartParallelModel: string
+}
+
+// 监控指标类型
+export interface Metrics {
+  total_tool_calls?: number
+  parallel_tool_calls?: number
+  serial_tool_calls?: number
+  failed_tool_calls?: number
+  total_subagent_spawns?: number
+  avg_tool_execution_time?: number
+  max_concurrent_tools?: number
+  llm_call_count?: number
+  total_token_usage?: number
 }
 
 // ==================== Mirror Room Types ====================
@@ -329,6 +375,18 @@ export interface MemoryConfig {
   max_chars: number
   read_max_entries: number
   read_max_chars: number
+}
+
+// 前端格式的记忆配置
+export interface WebMemoryConfig {
+  autoIntegrateEnabled: boolean
+  autoIntegrateIntervalMinutes: number
+  lookbackMinutes: number
+  maxMessages: number
+  maxEntries: number
+  maxChars: number
+  readMaxEntries: number
+  readMaxChars: number
 }
 
 export interface SystemStatus {
