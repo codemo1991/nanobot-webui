@@ -1186,6 +1186,25 @@ class NanobotWebAPI:
             ),
         }
 
+    def subagent_progress_stream(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
+        """
+        订阅指定 web session 的子 Agent 进度事件队列。
+
+        origin_key = "web:{session_id}"（与 SpawnTool.set_context("web", session_id) 对应）。
+        返回的 Queue 会持续接收 subagent_start / subagent_progress / subagent_end 事件，
+        直到调用方手动取消订阅。
+        """
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+        origin_key = f"web:{session_id}"
+        return SubagentProgressBus.get().subscribe(origin_key, replay=True)
+
+    def unsubscribe_subagent_progress(
+        self, session_id: str, q: "queue.Queue[dict[str, Any]]"
+    ) -> None:
+        """取消订阅子 Agent 进度队列。"""
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+        SubagentProgressBus.get().unsubscribe(f"web:{session_id}", q)
+
     async def chat(self, session_id: str, content: str, images: list[str] | None = None) -> dict[str, Any]:
         """Non-streaming chat. Reuses _chat_with_progress without callback."""
         media_paths = self._save_images_to_temp(images or [])
@@ -2329,6 +2348,65 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if thread.is_alive():
                 logger.debug("Chat stream thread still running after response end")
 
+    def _handle_subagent_progress_stream(
+        self, app: "NanobotWebAPI", session_id: str
+    ) -> None:
+        """
+        以 SSE 形式持续推送子 Agent 进度事件。
+
+        订阅 SubagentProgressBus 的 "web:{session_id}" origin_key，
+        将事件实时流给前端；5 分钟无事件后自动关闭并发送 {"type": "timeout"}。
+        """
+        evt_queue = app.subagent_progress_stream(session_id)
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        idle_timeout = 300  # 5 分钟无事件自动关闭
+        heartbeat_interval = 30
+        last_event = time.time()
+        last_heartbeat = time.time()
+
+        try:
+            while True:
+                try:
+                    evt = evt_queue.get(timeout=0.5)
+                    last_event = time.time()
+                except queue.Empty:
+                    now = time.time()
+                    if now - last_event >= idle_timeout:
+                        try:
+                            self.wfile.write(b'data: {"type":"timeout"}\n\n')
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        break
+                    if now - last_heartbeat >= heartbeat_interval:
+                        try:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                            last_heartbeat = now
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            break
+                    continue
+
+                try:
+                    payload = json.dumps(evt, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    continue
+
+                try:
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+        finally:
+            app.unsubscribe_subagent_progress(session_id, evt_queue)
+
     def _handle_mirror_chat_stream(
         self, app: "NanobotWebAPI", session_type: str, session_id: str, content: str
     ) -> None:
@@ -2449,6 +2527,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.OK, _ok(app.get_messages(session_id, before, limit)))
                 except KeyError:
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
+                return
+
+            # GET /api/v1/chat/sessions/{sessionId}/subagent-progress  (SSE)
+            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "subagent-progress":
+                session_id = parts[4]
+                try:
+                    self._handle_subagent_progress_stream(app, session_id)
+                except Exception as exc:
+                    logger.exception("Subagent progress stream failed")
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        _err("SUBAGENT_PROGRESS_FAILED", "子 Agent 进度流失败", str(exc)),
+                    )
                 return
 
             # GET /api/v1/chat/sessions/{sessionId}/token-summary

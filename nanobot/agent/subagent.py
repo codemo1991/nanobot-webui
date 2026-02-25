@@ -5,11 +5,16 @@ import base64
 import json
 import mimetypes
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
+if TYPE_CHECKING:
+    from nanobot.claude_code.manager import ClaudeCodeManager
+
+from nanobot.agent.subagent_progress import SubagentProgressBus
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -29,6 +34,8 @@ class SubagentManager:
     isolated context and a focused system prompt.
 
     Supports session persistence for multi-turn conversations.
+    When template="coder" and a ClaudeCodeManager is provided, the backend
+    can be auto-selected between Claude Code CLI and the native LLM runner.
     """
 
     def __init__(
@@ -41,6 +48,7 @@ class SubagentManager:
         exec_config: "ExecToolConfig | None" = None,
         sessions: "SessionManager | None" = None,
         max_concurrent_subagents: int = 10,
+        claude_code_manager: "ClaudeCodeManager | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.session.manager import SessionManager
@@ -51,6 +59,7 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.sessions = sessions
+        self._claude_code_manager = claude_code_manager
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
 
         # 并发控制
@@ -76,6 +85,34 @@ class SubagentManager:
         
         return {"role": "user", "content": images + [{"type": "text", "text": text}]}
 
+    def _resolve_backend(self, template: str, backend: str) -> str:
+        """
+        决定实际使用的执行后端。
+
+        仅当 template=="coder" 时才有 claude_code 后端可选；
+        其他模板始终使用 native LLM。
+
+        Args:
+            template: 子 Agent 模板名称
+            backend: 用户指定的后端偏好（"auto" / "native" / "claude_code"）
+
+        Returns:
+            "claude_code" 或 "native"
+        """
+        if template != "coder":
+            return "native"
+        if backend == "native":
+            return "native"
+        if backend == "claude_code":
+            if self._claude_code_manager and self._claude_code_manager.check_claude_available():
+                return "claude_code"
+            logger.warning("Claude Code CLI 不可用，回退到 native LLM 后端")
+            return "native"
+        # auto：优先 Claude Code CLI，不可用时降级
+        if self._claude_code_manager and self._claude_code_manager.check_claude_available():
+            return "claude_code"
+        return "native"
+
     async def spawn(
         self,
         task: str,
@@ -86,6 +123,7 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         media: list[str] | None = None,
+        backend: str = "auto",
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -138,8 +176,11 @@ class SubagentManager:
             "chat_id": origin_chat_id,
         }
 
+        resolved_backend = self._resolve_backend(template, backend)
+        logger.info(f"Subagent [{task_id}] backend resolved: template={template}, requested={backend}, actual={resolved_backend}")
+
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, template, session_id, enable_memory, media)
+            self._run_subagent(task_id, task, display_label, origin, template, session_id, enable_memory, media, resolved_backend)
         )
         self._running_tasks[task_id] = bg_task
 
@@ -156,6 +197,87 @@ class SubagentManager:
         else:
             return f"Continuing subagent session [{task_id}]. I'll notify you when it completes."
 
+    async def _run_via_claude_code(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+    ) -> None:
+        """
+        使用 Claude Code Agent SDK 后端在后台执行编码任务。
+
+        通过 SubagentProgressBus 将进度事件广播给所有订阅者（Web SSE / 飞书卡片等），
+        完成后通过 _announce_result 发布最终通知。
+        """
+        assert self._claude_code_manager is not None
+        logger.info(f"Subagent [{task_id}] running via Claude Code Agent SDK backend (background)")
+
+        origin_key = f"{origin['channel']}:{origin['chat_id']}"
+        bus = SubagentProgressBus.get()
+
+        bus.push(origin_key, {
+            "type": "subagent_start",
+            "task_id": task_id,
+            "label": label,
+            "backend": "claude_code",
+            "task": task[:120],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        def _progress_callback(payload: dict) -> None:
+            """将 SDK 流式事件通过 SubagentProgressBus 广播给所有订阅者。"""
+            subtype = payload.get("subtype", "")
+            content = payload.get("content", "")
+            if not subtype:
+                return
+            bus.push(origin_key, {
+                "type": "subagent_progress",
+                "task_id": task_id,
+                "label": label,
+                "subtype": subtype,
+                "content": content,
+                "tool_name": payload.get("tool_name"),
+                "subagent_type": payload.get("subagent_type"),
+            })
+
+        try:
+            result = await self._claude_code_manager.run_task(
+                prompt=task,
+                workdir=None,
+                permission_mode="auto",
+                enable_subagents=True,
+                timeout=self._claude_code_manager.default_timeout,
+                progress_callback=_progress_callback,
+            )
+            status = result.get("status", "unknown")
+            output = result.get("output", "")
+
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "ok" if status == "done" else "error",
+                "summary": (output or f"status={status}")[:300],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+            if status == "done":
+                await self._announce_result(task_id, label, task, output, origin, "ok")
+            else:
+                await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error")
+        except Exception as e:
+            logger.error(f"Subagent [{task_id}] Claude Code backend failed: {e}")
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "error",
+                "summary": str(e)[:300],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            await self._announce_result(task_id, label, task, f"Error: {str(e)}", origin, "error")
+
     async def _run_subagent(
         self,
         task_id: str,
@@ -166,9 +288,27 @@ class SubagentManager:
         session_id: str | None = None,
         enable_memory: bool = False,
         media: list[str] | None = None,
+        backend: str = "native",
     ) -> None:
         """Execute the subagent task and announce the result."""
-        logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, memory: {enable_memory})")
+        logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, backend: {backend}, memory: {enable_memory})")
+
+        # 路由到 Claude Code CLI 后端
+        if backend == "claude_code":
+            await self._run_via_claude_code(task_id, task, label, origin)
+            return
+
+        origin_key = f"{origin['channel']}:{origin['chat_id']}"
+        bus = SubagentProgressBus.get()
+
+        bus.push(origin_key, {
+            "type": "subagent_start",
+            "task_id": task_id,
+            "label": label,
+            "backend": "native",
+            "task": task[:120],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
         try:
             tools = self._create_tools_for_template(template)
@@ -278,11 +418,27 @@ class SubagentManager:
                 self.sessions.save(subagent_session)
 
             logger.info(f"Subagent [{task_id}] completed successfully")
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "ok",
+                "summary": final_result[:300],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error(f"Subagent [{task_id}] failed: {e}")
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "error",
+                "summary": error_msg[:300],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
     
     async def _announce_result(

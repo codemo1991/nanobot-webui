@@ -1,5 +1,5 @@
 import i18n from './i18n'
-import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, TokenUsage, Task, TaskListResponse } from './types'
+import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, SubagentProgressEvent, TokenUsage, Task, TaskListResponse } from './types'
 
 const API_BASE = '/api/v1'
 
@@ -577,4 +577,49 @@ export const api = {
     request<{ cancelled: boolean }>(`/tasks/${taskId}/cancel`, {
       method: 'POST',
     }),
+
+  /**
+   * 订阅子 Agent 后台进度 SSE 流。
+   * 调用方传入 onEvent 回调，连接保持到 signal 中止或服务端发送 timeout 事件。
+   */
+  async subagentProgressStream(
+    sessionId: string,
+    onEvent: (evt: SubagentProgressEvent) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/subagent-progress`, {
+      method: 'GET',
+      headers: { Accept: 'text/event-stream' },
+      signal,
+    })
+    if (!res.ok) return
+    const reader = res.body?.getReader()
+    if (!reader) return
+    const dec = new TextDecoder()
+    let buf = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const blocks = buf.split('\n\n')
+        buf = blocks.pop() ?? ''
+        for (const block of blocks) {
+          const dataLine = block.split('\n').find(l => l.startsWith('data:'))
+          if (!dataLine) continue
+          const dataStr = dataLine.slice(5).trimStart()
+          if (!dataStr) continue
+          try {
+            const evt = JSON.parse(dataStr) as SubagentProgressEvent
+            onEvent(evt)
+            if (evt.type === 'timeout') return
+          } catch {
+            // 跳过非 JSON 行
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+  },
 }

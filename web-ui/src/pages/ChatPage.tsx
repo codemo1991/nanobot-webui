@@ -7,7 +7,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { api } from '../api'
-import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse } from '../types'
+import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, SubagentProgressEvent } from '../types'
 import './ChatPage.css'
 import 'highlight.js/styles/github-dark.css'
 import { useTaskPolling } from '../hooks/useTaskPolling'
@@ -210,6 +210,17 @@ function ChatPage() {
   // 用于驱动轮询 hook 的 state（ref 不会触发重新渲染）
   const [pollingTaskId, setPollingTaskId] = useState<string | null>(null)
 
+  // 后台子 Agent 进度状态
+  const [bgAgents, setBgAgents] = useState<Array<{
+    taskId: string
+    label: string
+    status: 'running' | 'done' | 'error'
+    progress: string
+    backend: string
+  }>>([])
+  const bgAgentsAbortRef = useRef<AbortController | null>(null)
+  const bgAgentsSessionRef = useRef<string | null>(null)
+
   // 使用任务轮询 hook，当页面从后台恢复时检查任务状态
   useTaskPolling({
     taskId: pollingTaskId,
@@ -239,6 +250,95 @@ function ChatPage() {
       console.error('Task polling error:', err)
     },
   })
+
+  // 启动子 Agent 进度 SSE 订阅
+  const startBgAgentStream = useCallback((sessionId: string) => {
+    // 已在监听同一 session，不重复创建
+    if (bgAgentsAbortRef.current && bgAgentsSessionRef.current === sessionId) return
+    // 关闭旧的连接
+    if (bgAgentsAbortRef.current) {
+      bgAgentsAbortRef.current.abort()
+      bgAgentsAbortRef.current = null
+    }
+    const ctrl = new AbortController()
+    bgAgentsAbortRef.current = ctrl
+    bgAgentsSessionRef.current = sessionId
+
+    const handleEvt = (evt: SubagentProgressEvent) => {
+      if (evt.type === 'subagent_start') {
+        setBgAgents(prev => {
+          if (prev.find(a => a.taskId === evt.task_id)) return prev
+          return [...prev, {
+            taskId: evt.task_id,
+            label: evt.label,
+            status: 'running',
+            progress: evt.task.slice(0, 80),
+            backend: evt.backend,
+          }]
+        })
+      } else if (evt.type === 'subagent_progress') {
+        const content = evt.content || ''
+        let line = ''
+        if (evt.subtype === 'tool_use') {
+          line = `[${evt.tool_name || 'Tool'}] ${content.slice(0, 100)}`
+        } else if (evt.subtype === 'assistant_text') {
+          line = content.length > 120 ? content.slice(0, 120) + '...' : content
+        } else if (evt.subtype === 'subagent_start') {
+          line = `🤖 ${content.slice(0, 80)}`
+        } else {
+          return
+        }
+        setBgAgents(prev => prev.map(a => {
+          if (a.taskId !== evt.task_id) return a
+          const lines = a.progress ? a.progress.split('\n') : []
+          lines.push(line)
+          const trimmed = lines.length > 20 ? lines.slice(-20) : lines
+          return { ...a, progress: trimmed.join('\n') }
+        }))
+      } else if (evt.type === 'subagent_end') {
+        setBgAgents(prev => prev.map(a =>
+          a.taskId === evt.task_id
+            ? { ...a, status: evt.status === 'ok' ? 'done' : 'error', progress: evt.summary }
+            : a
+        ))
+      } else if (evt.type === 'timeout') {
+        bgAgentsAbortRef.current = null
+        bgAgentsSessionRef.current = null
+      }
+    }
+
+    api.subagentProgressStream(sessionId, handleEvt, ctrl.signal).catch(() => {
+      bgAgentsAbortRef.current = null
+      bgAgentsSessionRef.current = null
+    })
+  }, [])
+
+  // 所有子 Agent 完成后，10 秒后自动清除面板
+  useEffect(() => {
+    if (bgAgents.length > 0 && bgAgents.every(a => a.status !== 'running')) {
+      const timer = setTimeout(() => {
+        setBgAgents([])
+        if (bgAgentsAbortRef.current) {
+          bgAgentsAbortRef.current.abort()
+          bgAgentsAbortRef.current = null
+          bgAgentsSessionRef.current = null
+        }
+      }, 12000)
+      return () => clearTimeout(timer)
+    }
+  }, [bgAgents])
+
+  // 切换 session 时清除子 Agent 状态
+  useEffect(() => {
+    return () => {
+      if (bgAgentsAbortRef.current) {
+        bgAgentsAbortRef.current.abort()
+        bgAgentsAbortRef.current = null
+        bgAgentsSessionRef.current = null
+      }
+      setBgAgents([])
+    }
+  }, [currentSession?.id])
 
   // 页面可见性变化处理
   useEffect(() => {
@@ -635,6 +735,10 @@ function ChatPage() {
         setStreamingThinking(false)
         if (evt.name === 'claude_code') {
           setClaudeCodeProgress('')
+        }
+        // spawn 工具调用时启动子 Agent 进度订阅
+        if (evt.name === 'spawn' && currentSession) {
+          startBgAgentStream(currentSession.id)
         }
         setStreamingToolSteps(prev => [...prev, { name: evt.name!, arguments: evt.arguments ?? {}, result: '' }])
       } else if (evt.type === 'tool_end' && evt.name) {
@@ -1098,6 +1202,32 @@ function ChatPage() {
             </div>
           )}
         </Content>
+
+        {/* 后台子 Agent 进度面板 */}
+        {bgAgents.length > 0 && (
+          <div className="bg-agents-panel">
+            <div className="bg-agents-header">
+              <SyncOutlined spin={bgAgents.some(a => a.status === 'running')} style={{ marginRight: 6 }} />
+              <span>后台子 Agent ({bgAgents.filter(a => a.status === 'running').length} 运行中)</span>
+            </div>
+            {bgAgents.map(agent => (
+              <div key={agent.taskId} className={`bg-agent-item ${agent.status}`}>
+                <div className="bg-agent-title">
+                  {agent.status === 'running' && <Spin size="small" style={{ marginRight: 6 }} />}
+                  {agent.status === 'done' && <span style={{ marginRight: 6 }}>✅</span>}
+                  {agent.status === 'error' && <span style={{ marginRight: 6 }}>❌</span>}
+                  <span className="bg-agent-label">{agent.label}</span>
+                  <Tag className="bg-agent-backend" color={agent.backend === 'claude_code' ? 'orange' : 'blue'}>
+                    {agent.backend === 'claude_code' ? 'Claude Code' : 'native'}
+                  </Tag>
+                </div>
+                {agent.progress && (
+                  <pre className="bg-agent-progress">{agent.progress}</pre>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
 
         <div className="chat-input-container">
           {pendingImages.length > 0 && (

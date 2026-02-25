@@ -64,6 +64,14 @@ export type StreamEvent =
   | { type: 'done'; content: string; assistantMessage: Message | null }
   | { type: 'error'; message: string }
 
+/** 子 Agent 后台进度 SSE 事件（来自 /subagent-progress 端点） */
+export type SubagentProgressEvent =
+  | { type: 'subagent_start'; task_id: string; label: string; backend: string; task: string }
+  | { type: 'subagent_progress'; task_id: string; label: string; subtype: string; content: string; tool_name?: string; subagent_type?: string }
+  | { type: 'subagent_end'; task_id: string; label: string; status: 'ok' | 'error'; summary: string }
+  | { type: 'heartbeat' }
+  | { type: 'timeout' }
+
 // Configuration Types
 
 // External IM Channel (WhatsApp, Telegram, Feishu)
