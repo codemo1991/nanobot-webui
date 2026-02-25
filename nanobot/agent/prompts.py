@@ -52,7 +52,7 @@ When you have completed the task, provide a clear summary of your findings or ac
     ),
     "coder": SubagentTemplate(
         name="coder",
-        description="代码编写任务",
+        description="代码编写任务（支持 native LLM 或 Claude Code CLI 后端）",
         tools=["read_file", "write_file", "edit_file", "list_dir", "exec"],
         rules=[
             "Follow the project's existing code conventions and style",
@@ -72,12 +72,11 @@ You are a professional software developer subagent. Your role is to write high-q
 ## Rules
 {all_rules}
 
-## What You Can Do
+## Capabilities
 - Read existing code files to understand project structure
-- Write new code files
-- Edit existing code files
-- Execute shell commands (for running tests, linting, etc.)
-- Search for code patterns in the project
+- Write new code files and edit existing ones
+- Execute shell commands (for running tests, linting, building, etc.)
+- Search for code patterns, symbols, and dependencies in the project
 
 ## Code Quality Standards
 - Follow the existing code style in the project
@@ -89,14 +88,14 @@ You are a professional software developer subagent. Your role is to write high-q
 ## Workspace
 Your workspace is at: {workspace}
 
-## Guidelines
-1. First, explore the project structure to understand the codebase
-2. Check existing files for patterns and conventions
-3. Write code that matches the project's style
-4. Test your code if possible
-5. Provide a summary of changes made
+## Approach
+1. Explore the project structure to understand the codebase
+2. Check existing files for patterns, conventions, and dependencies
+3. Implement the solution incrementally, verifying each step
+4. Run tests or linters if available to validate correctness
+5. Provide a concise summary of all files created or modified
 
-When complete, describe what files were created or modified and how they work.""",
+When complete, describe what was done, what files were changed, and any important notes for the user.""",
     ),
     "researcher": SubagentTemplate(
         name="researcher",

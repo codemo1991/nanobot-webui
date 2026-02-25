@@ -40,7 +40,11 @@ class SpawnTool(Tool):
         return (
             "Spawn a subagent to handle a task in the background. "
             "Use this for complex or time-consuming tasks that can run independently. "
-            "The subagent will complete the task and report back when done. "
+            "The subagent will complete the task and report back when done.\n\n"
+            "For coding tasks, use template='coder'. With backend='auto' (default), the system "
+            "automatically selects the best available backend: Claude Code CLI (if installed) or "
+            "the native LLM coder. You can also force a specific backend with backend='claude_code' "
+            "or backend='native'.\n\n"
             "Set attach_media=true to forward the current message's images to the subagent."
         )
     
@@ -60,8 +64,14 @@ class SpawnTool(Tool):
                 "template": {
                     "type": "string",
                     "enum": ["minimal", "coder", "researcher", "analyst"],
-                    "description": "The subagent template to use: minimal (simple tasks), coder (code writing), researcher (information gathering), analyst (data analysis)",
+                    "description": "The subagent template to use: minimal (simple tasks), coder (code writing - supports claude_code backend), researcher (information gathering), analyst (data analysis)",
                     "default": "minimal",
+                },
+                "backend": {
+                    "type": "string",
+                    "enum": ["auto", "native", "claude_code"],
+                    "description": "Execution backend for coder template. 'auto' (default): prefer Claude Code CLI if available, else native LLM. 'claude_code': force Claude Code CLI. 'native': force native LLM with file/exec tools. Ignored for non-coder templates.",
+                    "default": "auto",
                 },
                 "session_id": {
                     "type": "string",
@@ -86,6 +96,7 @@ class SpawnTool(Tool):
         task: str,
         label: str | None = None,
         template: str = "minimal",
+        backend: str = "auto",
         session_id: str | None = None,
         enable_memory: bool = False,
         attach_media: bool = False,
@@ -97,6 +108,7 @@ class SpawnTool(Tool):
             task=task,
             label=label,
             template=template,
+            backend=backend,
             session_id=session_id,
             enable_memory=enable_memory,
             origin_channel=self._origin_channel,

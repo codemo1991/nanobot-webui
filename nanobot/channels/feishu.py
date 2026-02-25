@@ -243,6 +243,10 @@ class FeishuChannel(BaseChannel):
         self._active_progress_cards: dict[str, str] = {}
         # chat_id -> 上次 patch 时间戳（用于节流控制）
         self._last_card_update: dict[str, float] = {}
+        # chat_id -> 子 Agent 独立进度卡片 message_id
+        self._subagent_cards: dict[str, str] = {}
+        # chat_id -> 正在监听子 Agent 进度的 asyncio.Task
+        self._subagent_watcher_tasks: dict[str, "asyncio.Task[None]"] = {}
 
     def setup_client(self) -> None:
         """初始化 Feishu Client（仅用于发送消息，不启动 WebSocket 监听）。"""
@@ -456,6 +460,152 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.debug(f"Card patch error: {e}")
             return False
+
+    async def _watch_subagent_progress(
+        self, chat_id: str, receive_id_type: str
+    ) -> None:
+        """
+        后台监听 SubagentProgressBus 中针对该飞书会话的子 Agent 进度事件，
+        并通过新的交互卡片实时展示给用户。
+
+        - subagent_start   → 发送新的子 Agent 进度卡片
+        - subagent_progress → 节流 patch 卡片（Claude Code 输出）
+        - subagent_end      → 更新卡片为最终状态
+
+        最多等待 5 分钟无事件后自动退出。
+        """
+        import queue as _queue
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+
+        origin_key = f"feishu:{chat_id}"
+        bus = SubagentProgressBus.get()
+        q = bus.subscribe(origin_key, replay=True)
+
+        idle_timeout = 300.0  # 5 分钟
+        last_event_time = time.time()
+        last_patch_time = 0.0
+        # task_id -> card_message_id
+        task_cards: dict[str, str] = {}
+        # task_id -> 最近的 claude_code 输出行（最多 25 行）
+        task_lines: dict[str, list[str]] = {}
+
+        _self = self
+
+        async def _send_subagent_card(label: str, body_md: str, color: str = "blue") -> str | None:
+            """发送新的子 Agent 进度卡片，返回 message_id。"""
+            if not _self._client:
+                return None
+            try:
+                content = _build_card_json(body_md, f"🤖 子 Agent: {label}", color)
+                request = CreateMessageRequest.builder() \
+                    .receive_id_type(receive_id_type) \
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(chat_id)
+                        .msg_type("interactive")
+                        .content(content)
+                        .build()
+                    ).build()
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(
+                    None, _self._client.im.v1.message.create, request
+                )
+                if response.success() and response.data and response.data.message_id:
+                    return response.data.message_id
+            except Exception as e:
+                logger.debug(f"发送子 Agent 卡片失败: {e}")
+            return None
+
+        try:
+            while True:
+                try:
+                    evt = q.get_nowait()
+                except _queue.Empty:
+                    await asyncio.sleep(0.5)
+                    if time.time() - last_event_time >= idle_timeout:
+                        break
+                    continue
+
+                last_event_time = time.time()
+                evt_type = evt.get("type", "")
+                task_id = evt.get("task_id", "")
+                label = evt.get("label", "子 Agent")
+
+                if evt_type == "subagent_start":
+                    backend = evt.get("backend", "native")
+                    task_preview = evt.get("task", "")[:80]
+                    body = f"**正在执行任务...**\n\n> {task_preview}\n\n_后端: {backend}_"
+                    card_id = await _send_subagent_card(label, body, "blue")
+                    if card_id:
+                        task_cards[task_id] = card_id
+                        task_lines[task_id] = []
+                    logger.debug(f"飞书子 Agent 卡片已发送: task_id={task_id} card={card_id}")
+
+                elif evt_type == "subagent_progress":
+                    card_id = task_cards.get(task_id)
+                    if not card_id:
+                        continue
+                    subtype = evt.get("subtype", "")
+                    content_text = evt.get("content", "")
+                    tool_name = evt.get("tool_name", "")
+                    lines = task_lines.setdefault(task_id, [])
+
+                    if subtype == "tool_use" and tool_name:
+                        lines.append(f"[{tool_name}] {content_text[:100]}")
+                    elif subtype == "assistant_text" and content_text:
+                        lines.append(content_text[:150])
+                    elif subtype == "subagent_start":
+                        lines.append(f"🤖 子任务: {content_text[:80]}")
+                    else:
+                        continue
+
+                    if len(lines) > 25:
+                        del lines[:-25]
+
+                    # 节流：最多每 2 秒 patch 一次
+                    now = time.time()
+                    if now - last_patch_time < 2.0:
+                        continue
+                    last_patch_time = now
+
+                    code_block = "\n".join(lines)
+                    body = f"**⚙️ 执行中...**\n\n```\n{code_block}\n```"
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        functools.partial(_self._patch_card_sync, card_id, body, f"🤖 {label}", "orange"),
+                    )
+
+                elif evt_type == "subagent_end":
+                    card_id = task_cards.pop(task_id, None)
+                    task_lines.pop(task_id, None)
+                    if not card_id:
+                        continue
+                    status = evt.get("status", "error")
+                    summary = evt.get("summary", "")[:300]
+                    if status == "ok":
+                        body = f"**✅ 任务完成**\n\n{summary}"
+                        color = "green"
+                    else:
+                        body = f"**❌ 任务失败**\n\n{summary}"
+                        color = "red"
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        functools.partial(_self._patch_card_sync, card_id, body, f"🤖 {label}", color),
+                    )
+                    logger.debug(f"飞书子 Agent 卡片更新完成: task_id={task_id} status={status}")
+
+                    # 如果所有任务都已结束且 idle，延迟退出
+                    if not task_cards:
+                        last_event_time = time.time() - (idle_timeout - 30)  # 再等 30 秒
+
+        except Exception:
+            logger.exception(f"飞书子 Agent 进度监听出错: chat_id={chat_id}")
+        finally:
+            bus.unsubscribe(origin_key, q)
+            self._subagent_watcher_tasks.pop(chat_id, None)
+            logger.debug(f"飞书子 Agent 进度监听退出: chat_id={chat_id}")
 
     async def _send_initial_progress_card(
         self, chat_id: str, receive_id_type: str
@@ -744,6 +894,14 @@ class FeishuChannel(BaseChannel):
                 media=media_paths,
                 metadata=metadata,
             )
+
+            # 启动子 Agent 进度监听（如果已有同 chat_id 的 watcher 则跳过）
+            if reply_to not in self._subagent_watcher_tasks or self._subagent_watcher_tasks[reply_to].done():
+                receive_id_type_for_watcher = receive_id_type
+                task = asyncio.ensure_future(
+                    self._watch_subagent_progress(reply_to, receive_id_type_for_watcher)
+                )
+                self._subagent_watcher_tasks[reply_to] = task
 
         except Exception:
             logger.exception("Error processing Feishu message")
