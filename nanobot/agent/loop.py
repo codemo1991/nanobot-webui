@@ -51,6 +51,35 @@ TOOL_KEYWORDS = {
 for tool, keywords in TOOL_KEYWORDS.items():
     TOOL_KEYWORDS[tool] = [kw.lower() for kw in keywords]
 
+# Claude Code 专注意图关键词 - 当检测到这些意图时，只提供 claude_code 工具
+# 这些关键词会覆盖原有逻辑，直接返回 claude_code 工具
+CLAUDE_CODE_INTENTS = [
+    # 英文
+    "claude code",
+    "claude-code",
+    "implement with claude code",
+    "use claude code to",
+    "let claude code",
+    "delegate to claude code",
+    # 中文
+    "用 claude code",
+    "用Claude Code",
+    "用 claude_code",
+    "用ClaudeCode",
+    "代码实现",
+    "实现功能",
+    "写代码",
+    "开发一个",
+    "帮我写代码",
+    "帮我实现",
+    "用代码实现",
+    "写一个功能",
+    "开发功能",
+    "实现一个",
+    "做一个",
+    "claude code 实现",
+]
+
 ESSENTIAL_TOOLS = ["read_file", "write_file", "exec", "remember"]
 
 # Marker embedded in assistant reply when limits are hit.
@@ -139,6 +168,14 @@ class AgentLoop:
         self._smart_parallel_model = smart_parallel_model
         self._status_service = status_service
 
+        # 意图判断缓存（LLM 判断结果缓存）
+        self._intent_cache: dict[str, tuple[bool, float]] = {}  # {message_hash: (result, timestamp)}
+        self._INTENT_CACHE_TTL = 300.0  # 5分钟缓存
+        # 工具定义缓存
+        self._tool_definitions_cache: dict[str, dict] = {}
+        self._tool_definitions_timestamp: float = 0.0
+        self._TOOL_CACHE_TTL = 60.0  # 1分钟缓存
+
         # 初始化智能并行判断器
         self._smart_parallel_decider = None
         if enable_smart_parallel:
@@ -200,20 +237,243 @@ class AgentLoop:
     def _select_tools_for_message(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
         """
         根据消息内容选择相关工具定义。
-        
+
+        策略：
+        1. 快速字符串匹配（高置信度关键词）
+        2. LLM 意图判断 + 缓存（低置信度场景）
+        3. 默认智能选择
+
         Args:
             message: 用户消息内容
             max_tools: 最大返回工具数量
-        
+
         Returns:
             选中的工具定义列表
         """
         if not self._smart_tool_selection:
-            return self.tools.get_definitions()
-        
+            return self._get_all_tool_definitions()
+
+        # 1. 快速字符串匹配 - 高置信度明确意图
+        if self._is_explicit_claude_code_intent(message):
+            logger.info("Explicit Claude Code intent detected (keyword), returning claude_code only")
+            return self._get_claude_code_tools()
+
+        # 2. LLM 意图判断 + 缓存
+        need_claude_code = self._get_cached_intent_or_judge(message)
+
+        if need_claude_code:
+            logger.info("LLM judged Claude Code intent, returning claude_code only")
+            return self._get_claude_code_tools()
+
+        # 3. 默认智能选择逻辑
+        return self._select_tools_default(message, max_tools)
+
+    def _get_claude_code_tools(self) -> list[dict[str, Any]]:
+        """
+        获取 Claude Code 相关工具定义（带缓存）。
+        只返回 claude_code 工具，避免 LLM 先调用其他工具。
+
+        Returns:
+            claude_code 工具定义列表
+        """
+        import time
+
+        # 检查缓存
+        if "claude_code" in self._tool_definitions_cache:
+            if time.time() - self._tool_definitions_timestamp < self._TOOL_CACHE_TTL:
+                return [self._tool_definitions_cache["claude_code"]]
+
+        # 获取工具并缓存
+        claude_code_tool = self.tools.get("claude_code")
+        if claude_code_tool:
+            schema = claude_code_tool.to_schema()
+            self._tool_definitions_cache["claude_code"] = schema
+            self._tool_definitions_timestamp = time.time()
+            return [schema]
+
+        # Tool not found - return empty and log warning
+        logger.warning("claude_code tool not found in registry, returning empty list")
+        return []
+
+    def _get_all_tool_definitions(self) -> list[dict[str, Any]]:
+        """
+        获取所有工具定义（带缓存）。
+
+        Returns:
+            所有工具定义列表
+        """
+        import time
+        import json
+
+        # 使用所有工具名称作为缓存 key
+        cache_key = "all_tools"
+        now = time.time()
+
+        if cache_key in self._tool_definitions_cache:
+            if now - self._tool_definitions_timestamp < self._TOOL_CACHE_TTL:
+                return self._tool_definitions_cache[cache_key]
+
+        # 重新获取
+        definitions = self.tools.get_definitions()
+        self._tool_definitions_cache[cache_key] = definitions
+        self._tool_definitions_timestamp = now
+        return definitions
+
+    def _is_explicit_claude_code_intent(self, message: str) -> bool:
+        """
+        快速字符串匹配 - 检测高置信度的 Claude Code 意图。
+
+        Args:
+            message: 用户消息内容
+
+        Returns:
+            True if message explicitly indicates Claude Code should be used
+        """
+        message_lower = message.lower()
+
+        # 高置信度关键词 - 明确要求代码实现
+        EXPLICIT_KEYWORDS = [
+            "claude code",
+            "claude-code",
+            "用 claude code",
+            "用Claude Code",
+            "用 claude_code",
+            "用ClaudeCode",
+            "代码实现",
+            "实现功能",
+            "写代码",
+            "开发一个",
+            "帮我写代码",
+            "帮我实现",
+            "用代码实现",
+            "写一个功能",
+            "开发功能",
+            "实现一个",
+            "做一个",
+            "implement with claude code",
+            "use claude code to",
+            "let claude code",
+            "delegate to claude code",
+            "claude code 实现",
+        ]
+
+        detected = any(kw in message_lower for kw in EXPLICIT_KEYWORDS)
+        if detected:
+            logger.debug(f"Explicit Claude Code intent detected (keyword): {message[:50]}...")
+        return detected
+
+    def _get_cached_intent_or_judge(self, message: str) -> bool:
+        """
+        获取缓存的意图判断结果，或调用 LLM 判断。
+
+        Args:
+            message: 用户消息内容
+
+        Returns:
+            True if LLM judges that Claude Code should be used
+        """
+        import time
+        import hashlib
+
+        # 使用消息前60字符的 hash 作为缓存 key
+        cache_key = hashlib.md5(message[:60].encode()).hexdigest()
+        now = time.time()
+
+        # 检查缓存
+        if cache_key in self._intent_cache:
+            result, timestamp = self._intent_cache[cache_key]
+            if now - timestamp < self._INTENT_CACHE_TTL:
+                logger.debug(f"Intent cache hit: {cache_key[:8]}... -> need_claude_code={result}")
+                return result
+            else:
+                # 缓存过期，删除
+                del self._intent_cache[cache_key]
+
+        # 缓存未命中，调用 LLM 判断
+        result = self._llm_judge_claude_code_intent(message)
+
+        # 缓存结果
+        self._intent_cache[cache_key] = (result, now)
+        logger.debug(f"Intent cache miss, LLM judged: need_claude_code={result}")
+
+        return result
+
+    async def _llm_judge_claude_code_intent(self, message: str) -> bool:
+        """
+        调用 LLM 判断用户消息是否需要使用 Claude Code。
+
+        Args:
+            message: 用户消息内容
+
+        Returns:
+            True if LLM judges that Claude Code should be used
+        """
+        import json
+
+        judgment_prompt = f"""你是一个任务分类器。
+
+用户任务: "{message}"
+
+请判断这个任务是否需要使用 Claude Code（专业的代码开发AI工具）来执行。
+
+Claude Code 适合执行：
+- 实现新功能，开发完整模块
+- 大规模代码重构
+- 编写测试用例
+- 复杂调试问题
+- 代码审查和改进
+- 创建新文件、修改多个文件
+
+不需要 Claude Code 的场景：
+- 简单文件操作（只读/写单个文件）
+- 搜索信息、回答问题
+- 日常聊天、数学计算
+- 只需要使用 exec 工具的任务
+
+请直接输出 JSON 格式的判断结果：
+{{"need_claude_code": true/false, "reason": "判断原因（10字以内）"}}
+
+只输出 JSON，不要其他内容："""
+
+        try:
+            # 调用 LLM（使用主 agent 的模型）
+            response = await self.provider.chat(
+                messages=[{"role": "user", "content": judgment_prompt}],
+                tools=None,  # 不需要工具
+                model=self.model,
+            )
+
+            # 解析 JSON 结果
+            content = response.content
+            start = content.find('{')
+            end = content.rfind('}') + 1
+            if start >= 0 and end > start:
+                json_str = content[start:end]
+                result = json.loads(json_str)
+                need_cc = result.get("need_claude_code", False)
+                reason = result.get("reason", "")
+                logger.info(f"LLM intent judgment: need_claude_code={need_cc}, reason={reason}")
+                return need_cc
+        except Exception as e:
+            logger.warning(f"LLM intent judgment failed: {e}")
+
+        # 失败时默认不强制使用 claude_code
+        return False
+
+    def _select_tools_default(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
+        """
+        默认的工具选择逻辑（原有实现）。
+
+        Args:
+            message: 用户消息内容
+            max_tools: 最大返回工具数量
+
+        Returns:
+            选中的工具定义列表
+        """
         message_lower = message.lower()
         selected_names = set(ESSENTIAL_TOOLS)
-        
+
         for tool_name, keywords in TOOL_KEYWORDS.items():
             if tool_name in selected_names:
                 continue
@@ -221,20 +481,20 @@ class AgentLoop:
                 selected_names.add(tool_name)
                 if len(selected_names) >= max_tools:
                     break
-        
+
         if len(selected_names) < max_tools:
             for tool_name in self.tools.tool_names:
                 if tool_name.startswith("mcp_"):
                     selected_names.add(tool_name)
                     if len(selected_names) >= max_tools:
                         break
-        
+
         definitions = []
         for name in selected_names:
             tool = self.tools.get(name)
             if tool:
                 definitions.append(tool.to_schema())
-        
+
         return definitions
 
     def update_agent_params(
