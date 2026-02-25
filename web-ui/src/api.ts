@@ -541,7 +541,7 @@ export const api = {
   getTasks: (page = 1, pageSize = 20, status: 'all' | 'running' | 'done' | 'error' | 'timeout' | 'cancelled' = 'all') =>
     request<TaskListResponse>(`/tasks?page=${page}&pageSize=${pageSize}&status=${status}`),
 
-  getTask: (taskId: string) => request<import('./types').Task>(`/tasks/${taskId}`),
+  getTask: (taskId: string) => request<Task>(`/tasks/${taskId}`),
 
   cancelTask: (taskId: string) =>
     request<{ cancelled: boolean }>(`/tasks/${taskId}/cancel`, {
