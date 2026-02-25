@@ -154,6 +154,25 @@ export const api = {
       body: JSON.stringify(agent),
     }),
 
+  // 并发配置
+  getConcurrencyConfig: () =>
+    request<import('./types').ConcurrencyConfig>('/config/concurrency'),
+
+  updateConcurrencyConfig: (config: Record<string, unknown>) =>
+    request<import('./types').ConcurrencyConfig>('/config/concurrency', {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    }),
+
+  // 监控指标
+  getMetrics: () =>
+    request<import('./types').Metrics>('/config/metrics'),
+
+  resetMetrics: () =>
+    request<void>('/config/metrics/reset', {
+      method: 'POST',
+    }),
+
   // Memory Configuration
   getMemoryConfig: () =>
     request<import('./types').MemoryConfig>('/config/memory'),
@@ -228,18 +247,18 @@ export const api = {
     }),
   
   updateMcp: (mcpId: string, mcp: Partial<import('./types').McpServer>) =>
-    request<import('./types').McpServer>(`/mcps/${mcpId}`, {
+    request<import('./types').McpServer>(`/mcps/${encodeURIComponent(mcpId)}`, {
       method: 'PUT',
       body: JSON.stringify(mcp),
     }),
   
   deleteMcp: (mcpId: string) =>
-    request<{ deleted: boolean }>(`/mcps/${mcpId}`, {
+    request<{ deleted: boolean }>(`/mcps/${encodeURIComponent(mcpId)}`, {
       method: 'DELETE',
     }),
-  
+
   testMcp: (mcpId: string) =>
-    request<{ connected: boolean; message: string }>(`/mcps/${mcpId}/test`, {
+    request<{ connected: boolean; message: string }>(`/mcps/${encodeURIComponent(mcpId)}/test`, {
       method: 'POST',
     }),
 
@@ -542,6 +561,17 @@ export const api = {
     request<TaskListResponse>(`/tasks?page=${page}&pageSize=${pageSize}&status=${status}`),
 
   getTask: (taskId: string) => request<Task>(`/tasks/${taskId}`),
+
+  // 轻量级任务状态查询（用于轮询）
+  getTaskStatus: (taskId: string) =>
+    request<{
+      taskId: string
+      status: 'pending' | 'running' | 'done' | 'error' | 'timeout' | 'cancelled'
+      prompt: string
+      startTime: string | null
+      endTime: string | null
+      result: string | null
+    }>(`/tasks/${taskId}/status`),
 
   cancelTask: (taskId: string) =>
     request<{ cancelled: boolean }>(`/tasks/${taskId}/cancel`, {

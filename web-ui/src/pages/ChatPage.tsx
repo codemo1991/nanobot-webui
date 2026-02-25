@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useLocation } from 'react-router-dom'
 import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Dropdown, Badge, Tag, Modal, Popconfirm, Pagination } from 'antd'
 import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, TagsOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
@@ -9,6 +10,8 @@ import { api } from '../api'
 import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse } from '../types'
 import './ChatPage.css'
 import 'highlight.js/styles/github-dark.css'
+import { useTaskPolling } from '../hooks/useTaskPolling'
+import { requestNotificationPermission, notifyTaskComplete } from '../utils/notification'
 
 const { Header, Sider, Content } = Layout
 const { TextArea } = Input
@@ -28,6 +31,8 @@ interface StreamingState {
   progress: string
   loading: boolean
   lastUpdate: number
+  taskId?: string  // 关联的任务 ID，用于后台轮询
+  sessionId?: string  // 关联的会话 ID
 }
 
 // 保存流式状态到 sessionStorage
@@ -162,6 +167,7 @@ function formatTokenNumber(n: number): string {
 
 function ChatPage() {
   const { t } = useTranslation()
+  const location = useLocation()
   const [sessions, setSessions] = useState<Session[]>([])
   const [currentSession, setCurrentSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -199,6 +205,40 @@ function ChatPage() {
   const isStreamingRef = useRef(false)
   // 追踪页面是否刚恢复
   const isRestoringRef = useRef(false)
+  // 追踪当前运行的 Claude Code 任务 ID（用于后台轮询）
+  const currentTaskIdRef = useRef<string | null>(null)
+  // 用于驱动轮询 hook 的 state（ref 不会触发重新渲染）
+  const [pollingTaskId, setPollingTaskId] = useState<string | null>(null)
+
+  // 使用任务轮询 hook，当页面从后台恢复时检查任务状态
+  useTaskPolling({
+    taskId: pollingTaskId,
+    enabled: !!pollingTaskId && !isStreamingRef.current,
+    interval: 3000,
+    onComplete: (result) => {
+      console.log('Task completed via polling:', result)
+      // 任务完成，清理状态
+      setLoading(false)
+      setStreamingThinking(false)
+      setClaudeCodeProgress('')
+      currentTaskIdRef.current = null
+      setPollingTaskId(null)
+
+      // 发送浏览器通知
+      if (result.status === 'done') {
+        notifyTaskComplete(result.taskId, result.result || undefined)
+      }
+
+      // 刷新消息列表
+      if (currentSession) {
+        clearStreamingState(currentSession.id)
+        void loadMessages(currentSession.id)
+      }
+    },
+    onError: (err) => {
+      console.error('Task polling error:', err)
+    },
+  })
 
   // 页面可见性变化处理
   useEffect(() => {
@@ -214,6 +254,8 @@ function ChatPage() {
             thinking: streamingThinking,
             progress: claudeCodeProgress,
             loading,
+            taskId: currentTaskIdRef.current || undefined,
+            sessionId: currentSession.id,
           })
           console.log('Saved streaming state to sessionStorage (hidden)')
         }
@@ -233,6 +275,37 @@ function ChatPage() {
           // 注意：不需要在这里处理 loading，因为 handleSend 的 finally 块会处理
           // 这里只需要设置 isRestoringRef 标志，让 finally 块知道页面正在恢复
           console.log('Restored streaming state from sessionStorage')
+
+          // 恢复 taskId 用于后台轮询
+          if (savedState.taskId) {
+            currentTaskIdRef.current = savedState.taskId
+            // 延迟启动轮询，让 SSE 有机会先恢复
+            setTimeout(() => {
+              if (!isStreamingRef.current && savedState.taskId) {
+                console.log('Starting task polling for:', savedState.taskId)
+                setPollingTaskId(savedState.taskId)
+              }
+            }, 1000)
+          }
+
+          // 重要：检查 SSE 连接是否已断开
+          // 如果 isStreamingRef.current 为 false，说明连接已断开，需要清理状态
+          setTimeout(() => {
+            if (!isStreamingRef.current) {
+              console.log('SSE connection lost during tab switch, clearing loading state')
+              // 如果有 taskId，则启用后台轮询（由 useTaskPolling 处理）
+              // 否则直接清理状态
+              if (!savedState.taskId) {
+                setLoading(false)
+                setStreamingThinking(false)
+                isRestoringRef.current = false
+                clearStreamingState(currentSession.id)
+                // 刷新消息列表，获取最新结果
+                void loadMessages(currentSession.id)
+              }
+              // 如果有 taskId，保持 loading 状态，让 useTaskPolling 来处理
+            }
+          }, 500) // 延迟检查，让 finally 块有机会先执行
         }
       }
     }
@@ -251,22 +324,89 @@ function ChatPage() {
         thinking: streamingThinking,
         progress: claudeCodeProgress,
         loading,
+        taskId: currentTaskIdRef.current || undefined,
+        sessionId: currentSession.id,
       })
     }
   }, [currentSession, streamingToolSteps, streamingThinking, claudeCodeProgress, loading])
 
   useEffect(() => {
     loadSessions()
+    // 请求浏览器通知权限（用于后台任务完成提醒）
+    void requestNotificationPermission()
   }, [])
 
+  // Session 切换时恢复状态
   useEffect(() => {
+    // 🔧 修复1：切换 session 时中止正在进行的请求
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+    }
+
+    // 🔧 修复2：切换 session 时清理之前的流式状态
+    setStreamingToolSteps([])
+    setStreamingThinking(false)
+    setClaudeCodeProgress('')
+    setLoading(false)
+    isStreamingRef.current = false
+
     if (currentSession) {
       loadMessages(currentSession.id)
       loadSessionTokenUsage(currentSession.id)
+
+      // 从 sessionStorage 恢复之前保存的状态
+      const savedState = loadStreamingState(currentSession.id)
+      if (savedState) {
+        // 检查 SSE 连接是否还在（通过 isStreamingRef）
+        // 如果流式请求已经结束但状态显示 loading，需要清理
+        setTimeout(() => {
+          if (!isStreamingRef.current && loading) {
+            console.log('Session switch: SSE disconnected, clearing loading')
+            setLoading(false)
+            clearStreamingState(currentSession.id)
+            // 刷新消息获取最新状态
+            void loadMessages(currentSession.id)
+          }
+        }, 500)
+      }
     } else {
       setSessionTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 })
     }
   }, [currentSession])
+
+  // 监听路由变化，当从其他页面切回聊天页面时恢复状态
+  useEffect(() => {
+    // 只有当前 session 存在时才尝试恢复状态
+    if (currentSession && location.pathname === '/chat') {
+      const savedState = loadStreamingState(currentSession.id)
+      if (savedState) {
+        // 如果当前没有流式状态，但 sessionStorage 中有，则恢复
+        if (!isStreamingRef.current && !streamingThinking && streamingToolSteps.length === 0) {
+          // 先恢复状态显示给用户
+          setStreamingToolSteps(savedState.toolSteps || [])
+          setStreamingThinking(savedState.thinking || false)
+          setClaudeCodeProgress(savedState.progress || '')
+          if (savedState.loading) {
+            setLoading(true)
+          }
+          console.log('Route changed: Restored streaming state for session:', currentSession.id)
+
+          // 延迟检查 SSE 连接是否断开
+          setTimeout(() => {
+            if (!isStreamingRef.current && loading) {
+              console.log('Route switch: SSE disconnected, clearing loading')
+              setLoading(false)
+              setStreamingThinking(false)
+              clearStreamingState(currentSession.id)
+              // 刷新消息获取最新状态
+              void loadMessages(currentSession.id)
+            }
+          }, 500)
+        }
+      }
+    }
+  }, [location.pathname])
 
   useEffect(() => {
     scrollToBottom()
@@ -488,7 +628,7 @@ function ChatPage() {
       setImageSendStatus(status)
     }
 
-    const handleStreamEvent = (evt: { type: string; name?: string; arguments?: Record<string, unknown>; result?: string; subtype?: string; content?: string; tool_name?: string }) => {
+    const handleStreamEvent = (evt: { type: string; name?: string; arguments?: Record<string, unknown>; result?: string; subtype?: string; content?: string; tool_name?: string; task_id?: string }) => {
       if (evt.type === 'thinking') {
         setStreamingThinking(true)
       } else if (evt.type === 'tool_start' && evt.name) {
@@ -514,6 +654,15 @@ function ChatPage() {
       } else if (evt.type === 'claude_code_progress') {
         const subtype = evt.subtype || 'text'
         const content = evt.content || ''
+        // 捕获任务 ID 用于后台轮询
+        if (evt.task_id && !currentTaskIdRef.current) {
+          currentTaskIdRef.current = evt.task_id
+          console.log('Captured Claude Code task ID:', evt.task_id)
+          // 如果页面当前不可见，立即启动轮询
+          if (document.visibilityState === 'hidden') {
+            setPollingTaskId(evt.task_id)
+          }
+        }
         let line = ''
         if (subtype === 'tool_use') {
           line = `[${evt.tool_name || 'Tool'}] ${content}`
@@ -584,6 +733,9 @@ function ChatPage() {
         if (savedState && !savedState.loading) {
           setLoading(false)
           abortControllerRef.current = null
+          // 请求完成，清理 taskId
+          currentTaskIdRef.current = null
+          setPollingTaskId(null)
         }
         // 无论哪种情况，都清除恢复标志和 sessionStorage
         clearStreamingState(currentSession.id)
@@ -591,10 +743,12 @@ function ChatPage() {
         return
       }
 
-      // 正常完成时清除流式状态
+      // 正常完成时清除流式状态和 taskId
       setStreamingToolSteps([])
       setStreamingThinking(false)
       setClaudeCodeProgress('')
+      currentTaskIdRef.current = null
+      setPollingTaskId(null)
 
       // 清除 sessionStorage 中的状态
       if (currentSession) {

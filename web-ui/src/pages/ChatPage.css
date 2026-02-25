@@ -1,4 +1,4 @@
-.chat-page {
+﻿.chat-page {
   height: 100vh;
   overflow: hidden;
 }
@@ -134,7 +134,7 @@
 
 .message-wrapper.assistant .message-bubble {
   align-items: flex-start;
-  margin-left: -12px; /* 机器人头像更靠左 */
+  margin-left: -12px; /* 鏈哄櫒浜哄ご鍍忔洿闈犲乏 */
 }
 
 .message-wrapper.assistant {
@@ -180,7 +180,7 @@
 
 .message-wrapper.user .message-bubble {
   align-items: flex-end;
-  margin-right: -12px; /* 用户头像更靠右 */
+  margin-right: -12px; /* 鐢ㄦ埛澶村儚鏇撮潬鍙?*/
 }
 
 .message-wrapper.user .message-avatar-row {
@@ -421,10 +421,7 @@
   margin-bottom: 4px;
 }
 
-.tool-step-detail pre {
-  margin: 0;
-  padding: 8px 12px;
-  background: rgba(0, 0, 0, 0.04);
+.tool-step-detail pre { margin: 0; padding: 8px 12px; background: rgba(0, 0, 0, 0.04);
   border-radius: 4px;
   font-size: 12px;
   overflow-x: auto;
@@ -621,22 +618,13 @@
 }
 
 /* Claude Code Progress */
-.claude-code-progress {
-  margin-top: 8px;
-  padding: 8px 12px;
-  background: #000000;
-  border-radius: 6px;
+.claude-code-progress { margin-top: 8px; padding: 8px 12px !important; background: #000000 !important; border-radius: 6px;
   border-left: 3px solid #6c5ce7;
   max-height: 300px;
   overflow-y: auto;
 }
 
-.claude-code-progress pre {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: #24F534;
-  white-space: pre-wrap;
+.claude-code-progress pre { margin: 0 !important; padding: 0 !important; background: transparent !important; font-size: 12px !important; line-height: 1.6 !important; color: #24F534 !important; white-space: pre-wrap !important;
   word-break: break-all;
   font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
 }
@@ -778,3 +766,5 @@
   display: flex;
   justify-content: center;
 }
+
+

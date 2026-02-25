@@ -81,6 +81,16 @@ class AgentDefaults(BaseModel):
     system_prompt_max_tokens: int = 5000
     memory_max_tokens: int = 2000
 
+    # 并发配置
+    max_parallel_tool_calls: int = 5  # 最大并行工具调用数
+    max_concurrent_subagents: int = 10  # 最大并发子Agent数
+    enable_parallel_tools: bool = True  # 是否启用并行工具调用
+    thread_pool_size: int = 4  # 线程池大小（用于CPU密集型任务）
+    thread_pool_tools: list[str] = Field(default_factory=lambda: ["exec", "spawn", "claude_code"])  # 线程池执行的工具列表
+    # 智能并行配置
+    enable_smart_parallel: bool = True  # 是否启用智能并行判断
+    smart_parallel_model: str = ""  # 智能并行判断使用的模型（留空使用默认轻量模型）
+
 
 class AgentsConfig(BaseModel):
     """Agent configuration."""
@@ -162,6 +172,7 @@ class ClaudeCodeConfig(BaseModel):
     enabled: bool = True
     default_timeout: int = 600  # Default task timeout in seconds
     max_concurrent_tasks: int = 3  # Maximum concurrent Claude Code tasks
+    enable_subagent_parallel: bool = True  # 是否启用子Agent并行执行
 
 
 class McpServerConfig(BaseModel):
@@ -173,6 +184,9 @@ class McpServerConfig(BaseModel):
     args: list[str] = Field(default_factory=list)
     url: str | None = None  # Required for http/sse/streamable_http
     enabled: bool = True
+    env: dict[str, str] = Field(default_factory=dict)  # Environment variables for stdio
+    headers: dict[str, str] = Field(default_factory=dict)  # HTTP headers for http/sse
+    tools: list[dict[str, str]] = Field(default_factory=list)  # Optional: pre-defined tool list for lazy loading
 
 
 class ToolsConfig(BaseModel):

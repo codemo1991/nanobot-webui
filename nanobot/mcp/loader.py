@@ -26,19 +26,52 @@ def _safe_id(name: str) -> str:
 class McpToolLoader:
     """
     Loads MCP servers from config, connects to them, and provides tools for the agent.
-    
+
     When mcp package is not installed, all methods no-op gracefully.
     """
-    
+
     def __init__(self, mcps_config: list[Any], workspace: Path) -> None:
         self.mcps_config = mcps_config or []
         self.workspace = workspace
         self._sessions: dict[str, Any] = {}
         self._transport_refs: list[Any] = []  # Keep transport contexts alive
         self._adapters: list[Any] = []
-    
+
     def _get_enabled_mcps(self) -> list[Any]:
         return [m for m in self.mcps_config if getattr(m, "enabled", True)]
+
+    async def health_check(self, timeout: float = 3.0) -> dict[str, bool]:
+        """
+        Quick health check for all enabled MCP servers.
+        Returns dict of server_id -> is_healthy.
+        Uses timeout to prevent hanging on unresponsive servers.
+        """
+        results: dict[str, bool] = {}
+        if not MCP_AVAILABLE:
+            return results
+
+        for mcp_cfg in self._get_enabled_mcps():
+            server_id = getattr(mcp_cfg, "id", "") or _safe_id(getattr(mcp_cfg, "name", "mcp"))
+            transport = (getattr(mcp_cfg, "transport", "stdio") or "stdio").lower()
+
+            try:
+                async def check_one():
+                    session = await self._connect_one(mcp_cfg, server_id, transport)
+                    if session:
+                        await session.close()
+                        return True
+                    return False
+
+                result = await asyncio.wait_for(check_one(), timeout=timeout)
+                results[server_id] = result
+            except asyncio.TimeoutError:
+                logger.warning(f"MCP {server_id}: health check timeout after {timeout}s")
+                results[server_id] = False
+            except Exception as e:
+                logger.warning(f"MCP {server_id}: health check failed: {e}")
+                results[server_id] = False
+
+        return results
     
     async def register_tools_async(self, tools_registry: Any) -> int:
         """
@@ -117,20 +150,28 @@ class McpToolLoader:
             if not url:
                 logger.warning(f"MCP {server_id}: streamable_http requires url")
                 return None
+
+            # Get optional headers
+            headers = getattr(mcp_cfg, "headers", None) or {}
+
             try:
                 from mcp.client.streamable_http import streamable_http_client
             except ImportError:
                 logger.warning(f"MCP {server_id}: streamable_http client not available")
                 return None
-            streamable_ctx = streamable_http_client(url)
-            read_stream, write_stream, _ = await streamable_ctx.__aenter__()
+
+            logger.debug(f"MCP {server_id}: connecting to streamable_http: {url}")
             try:
+                # streamable_http_client accepts url and optional auth headers
+                streamable_ctx = streamable_http_client(url, headers=headers if headers else None)
+                read_stream, write_stream, _ = await streamable_ctx.__aenter__()
                 session = ClientSession(read_stream, write_stream)
                 await session.__aenter__()
                 await session.initialize()
                 self._transport_refs.append(streamable_ctx)  # Only on full success
                 return session
-            except BaseException:
+            except Exception as e:
+                logger.warning(f"MCP {server_id}: streamable_http connection failed: {type(e).__name__}: {e}")
                 # Close in same task to avoid "exit cancel scope in different task".
                 exc_type, exc_val, exc_tb = sys.exc_info()
                 try:
@@ -194,3 +235,64 @@ class McpToolLoader:
         self._sessions.clear()
         self._transport_refs.clear()
         self._adapters.clear()
+
+    # ====================== 按需加载支持 ======================
+
+    async def connect_lazy(self, server_id: str, timeout: float = 3.0) -> tuple[Any, list[Any]] | None:
+        """
+        按需连接单个 MCP 服务器并获取工具列表。
+        返回 (session, tools) 或 None（如果连接失败）。
+
+        Args:
+            server_id: MCP 服务器 ID
+            timeout: 连接超时时间（秒）
+
+        Returns:
+            (session, list[tool]) 或 None
+        """
+        if not MCP_AVAILABLE:
+            logger.warning("MCP package not installed")
+            return None
+
+        # 找到对应的 MCP 配置
+        mcp_cfg = None
+        for cfg in self._get_enabled_mcps():
+            sid = getattr(cfg, "id", "") or _safe_id(getattr(cfg, "name", "mcp"))
+            if sid == server_id:
+                mcp_cfg = cfg
+                break
+
+        if not mcp_cfg:
+            logger.warning(f"MCP {server_id}: not found in config")
+            return None
+
+        transport = (getattr(mcp_cfg, "transport", "stdio") or "stdio").lower()
+
+        try:
+            session = await asyncio.wait_for(
+                self._connect_one(mcp_cfg, server_id, transport),
+                timeout=timeout
+            )
+            if session is None:
+                return None
+
+            # 获取工具列表
+            result = await session.list_tools()
+            self._sessions[server_id] = session
+            return session, result.tools
+        except asyncio.TimeoutError:
+            logger.warning(f"MCP {server_id}: connection timed out after {timeout}s")
+            return None
+        except Exception as e:
+            logger.warning(f"MCP {server_id}: lazy connection failed: {e}")
+            return None
+
+    async def disconnect_lazy(self, server_id: str) -> None:
+        """按需断开单个 MCP 服务器连接。"""
+        if server_id in self._sessions:
+            try:
+                session = self._sessions[server_id]
+                await session.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug(f"MCP {server_id} lazy disconnect: {e}")
+            del self._sessions[server_id]

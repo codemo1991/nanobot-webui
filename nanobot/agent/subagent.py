@@ -40,6 +40,7 @@ class SubagentManager:
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         sessions: "SessionManager | None" = None,
+        max_concurrent_subagents: int = 10,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.session.manager import SessionManager
@@ -51,6 +52,10 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.sessions = sessions
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+
+        # 并发控制
+        self._max_concurrent_subagents = max_concurrent_subagents
+        self._subagent_semaphore = asyncio.Semaphore(max_concurrent_subagents)
 
     def _build_user_message_with_media(self, text: str, media: list[str] | None = None) -> dict[str, Any]:
         """Build user message with optional base64-encoded images."""
@@ -98,6 +103,20 @@ class SubagentManager:
         Returns:
             Status message indicating the subagent was started.
         """
+        # 检查当前并发数并等待信号量
+        current_running = len(self._running_tasks)
+        if current_running >= self._max_concurrent_subagents:
+            logger.info(f"Subagent concurrency limit reached ({self._max_concurrent_subagents}), waiting for available slot...")
+            # 等待信号量，如果超时则返回错误
+            try:
+                async with asyncio.timeout(60):  # 最多等待60秒
+                    await self._subagent_semaphore.acquire()
+            except asyncio.TimeoutError:
+                return f"Error: Too many concurrent subagents ({current_running}). Please wait and try again."
+        else:
+            # 未达到上限，直接获取信号量（非阻塞）
+            self._subagent_semaphore.acquire()
+
         template_obj = get_template(template)
 
         if session_id and self.sessions:
@@ -124,7 +143,12 @@ class SubagentManager:
         )
         self._running_tasks[task_id] = bg_task
 
-        bg_task.add_done_callback(lambda _: self._running_tasks.pop(task_id, None))
+        # 任务完成后释放信号量
+        def release_semaphore(t):
+            self._subagent_semaphore.release()
+            self._running_tasks.pop(task_id, None)
+
+        bg_task.add_done_callback(release_semaphore)
 
         if not session_id or not self.sessions or not self.sessions.get(session_id):
             logger.info(f"Spawned subagent [{task_id}]: {display_label}")

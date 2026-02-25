@@ -1,11 +1,13 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    nanobot 守护启动器 — 支持自更新后自动重启。
+    nanobot 守护启动器 — 支持自更新后自动重启，并能自动修复损坏的安装。
 
 .DESCRIPTION
     以守护模式运行 nanobot web-ui。当 nanobot 通过 self_update 工具触发重启时
     （退出码 42），本脚本会自动执行 pip install 并重新启动服务。
+    启动时会检测 nanobot 安装是否可用；若检测到损坏（如 ModuleNotFoundError），
+    会自动清除残留并重新执行 pip install -e . 进行修复。
 
 .PARAMETER ListenHost
     Web UI 监听地址，默认 127.0.0.1
@@ -57,6 +59,8 @@ $REPO_DIR  = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $VENV_DIR  = Join-Path $REPO_DIR ".venv"
 $NANOBOT_EXE = Join-Path $VENV_DIR "Scripts\nanobot.exe"
 $VENV_PIP    = Join-Path $VENV_DIR "Scripts\pip.exe"
+$VENV_PYTHON = Join-Path $VENV_DIR "Scripts\python.exe"
+$SITE_PACKAGES = Join-Path $VENV_DIR "Lib\site-packages"
 $WEB_UI_DIR  = Join-Path $REPO_DIR "web-ui"
 
 # 设置 UTF-8 编码，避免 emoji/中文导致 UnicodeEncodeError
@@ -64,6 +68,10 @@ $WEB_UI_DIR  = Join-Path $REPO_DIR "web-ui"
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
+# 设置控制台代码页为 UTF-8
+if (Get-Command chcp -ErrorAction SilentlyContinue) {
+    chcp 65001 > $null
+}
 
 function Write-Banner {
     Write-Host ""
@@ -73,11 +81,92 @@ function Write-Banner {
     Write-Host ""
 }
 
+# 检测并终止已运行的 nanobot 进程
+function Stop-ExistingNanobot {
+    # 查找正在运行的 nanobot 进程
+    $nanobotProcesses = Get-Process -Name "nanobot" -ErrorAction SilentlyContinue
+    if (-not $nanobotProcesses) {
+        # 尝试通过命令行查找
+        $nanobotProcesses = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match "nanobot.*web-ui" }
+    }
+
+    if ($nanobotProcesses) {
+        Write-Host "[launcher] 检测到已有 nanobot 进程运行中，正在终止..." -ForegroundColor Yellow
+        if ($nanobotProcesses -is [System.Diagnostics.Process]) {
+            $nanobotProcesses | ForEach-Object {
+                Write-Host "[launcher] 终止进程: $($_.Id) ($($_.ProcessName))" -ForegroundColor DarkGray
+                Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            }
+        } else {
+            # CIMInstance 返回的是进程对象
+            $nanobotProcesses | ForEach-Object {
+                Write-Host "[launcher] 终止进程: $($_.ProcessId) ($($_.Name))" -ForegroundColor DarkGray
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+        }
+        # 等待进程终止
+        Start-Sleep -Milliseconds 500
+        Write-Host "[launcher] 已终止旧进程" -ForegroundColor Green
+    }
+}
+
 function Get-NanobotArgs {
     $args_list = @("web-ui", "--host", $ListenHost, "--port", $Port)
     if ($EnableVerbose) { $args_list += "--verbose" }
     if ($EnableDebug) { $args_list += "--debug" }
     return $args_list
+}
+
+# 检测 nanobot 安装是否可用（可执行且能正常导入模块）
+function Test-NanobotHealth {
+    $null = & $NANOBOT_EXE --help 2>&1
+    return $LASTEXITCODE -eq 0
+}
+
+# 修复损坏的 nanobot 安装：清除残留后重新安装
+function Repair-NanobotInstall {
+    Write-Host "[launcher] 正在修复 nanobot 安装..." -ForegroundColor Yellow
+
+    # 1. 尝试卸载（可能因损坏而失败，忽略）
+    & $VENV_PIP uninstall nanobot-ai -y 2>$null | Out-Null
+    & $VENV_PIP uninstall nanobot_ai -y 2>$null | Out-Null
+
+    # 2. 清除 site-packages 中可能残留的损坏文件
+    if (Test-Path $SITE_PACKAGES) {
+        Get-ChildItem -Path $SITE_PACKAGES -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq "nanobot" -or $_.Name -like "nanobot_ai*" -or $_.Name -like "~anobot*" } |
+            ForEach-Object {
+                Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "[launcher] 已清除: $($_.Name)" -ForegroundColor DarkGray
+            }
+    }
+
+    # 3. 移除可能损坏的可执行文件
+    if (Test-Path $NANOBOT_EXE) {
+        Remove-Item -Path $NANOBOT_EXE -Force -ErrorAction SilentlyContinue
+    }
+
+    # 4. 重新安装
+    if (-not (Test-Path (Join-Path $REPO_DIR "pyproject.toml"))) {
+        Write-Host "[launcher] 未找到 pyproject.toml，无法修复。" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[launcher] Running: pip install -e . (in $REPO_DIR)" -ForegroundColor DarkGray
+    Push-Location $REPO_DIR
+    & $VENV_PIP install -e . 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    $pipExit = $LASTEXITCODE
+    Pop-Location
+    if ($pipExit -ne 0) {
+        Write-Host "[launcher] 修复失败（pip exit $pipExit）。" -ForegroundColor Red
+        exit 1
+    }
+    if (-not (Test-Path $NANOBOT_EXE)) {
+        Write-Host "[launcher] 修复完成但未找到可执行文件: $NANOBOT_EXE" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[launcher] nanobot 安装已修复。" -ForegroundColor Green
+    Write-Host ""
 }
 
 function Ensure-FrontendBuilt {
@@ -136,8 +225,9 @@ function Ensure-VenvReady {
     # 2. 构建前端（npm install + npm run build）
     Ensure-FrontendBuilt
 
-    # 3. 如果 nanobot 尚未安装到 venv，则安装
+    # 3. 检查 nanobot 是否已安装且可用
     if (-not (Test-Path $NANOBOT_EXE)) {
+        # 未安装 -> 执行安装
         if (-not (Test-Path (Join-Path $REPO_DIR "pyproject.toml"))) {
             Write-Host "[launcher] 未找到 pyproject.toml（路径：$REPO_DIR），无法自动安装。" -ForegroundColor Red
             exit 1
@@ -159,6 +249,11 @@ function Ensure-VenvReady {
         Write-Host "[launcher] nanobot 安装成功。" -ForegroundColor Green
         Write-Host ""
     }
+    elseif (-not (Test-NanobotHealth)) {
+        # 已安装但运行失败（如 ModuleNotFoundError）-> 执行修复
+        Write-Host "[launcher] 检测到 nanobot 安装损坏，正在修复..." -ForegroundColor Yellow
+        Repair-NanobotInstall
+    }
 }
 
 Write-Banner
@@ -166,6 +261,10 @@ Write-Host "[launcher] Repo:   $REPO_DIR" -ForegroundColor DarkGray
 Write-Host "[launcher] Venv:   $VENV_DIR" -ForegroundColor DarkGray
 Write-Host "[launcher] Debug:  $($EnableDebug.IsPresent)" -ForegroundColor DarkGray
 Write-Host ""
+
+# 终止已存在的 nanobot 进程
+Stop-ExistingNanobot
+
 Ensure-VenvReady
 
 while ($true) {

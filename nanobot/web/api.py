@@ -15,7 +15,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, unquote
 from uuid import uuid4
 
 from loguru import logger
@@ -79,22 +79,7 @@ class NanobotWebAPI:
                     subagent_model_cfg, sa_key, config.get_api_base(subagent_model_cfg)
                 )
 
-        self.agent = AgentLoop(
-            bus=MessageBus(),
-            provider=provider,
-            workspace=config.workspace_path,
-            model=config.agents.defaults.model,
-            subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
-            max_iterations=config.agents.defaults.max_tool_iterations,
-            max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
-            brave_api_key=config.tools.web.search.api_key or None,
-            exec_config=config.tools.exec,
-            filesystem_config=config.tools.filesystem,
-            claude_code_config=config.tools.claude_code,
-        )
-        self.sessions = self.agent.sessions
-
-        # Initialize system status service
+        # Initialize system status service first (needed by AgentLoop)
         # 优先使用 workspace 特定的数据库，否则使用默认数据库
         workspace_path = config.workspace_path
         workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
@@ -107,9 +92,31 @@ class NanobotWebAPI:
         status_repo = StatusRepository(status_db_path)
         self.status_service = SystemStatusService(
             status_repo=status_repo,
-            session_manager=self.sessions,
+            session_manager=None,  # Will be set after agent is created
             workspace=workspace_path
         )
+
+        self.agent = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
+            brave_api_key=config.tools.web.search.api_key or None,
+            exec_config=config.tools.exec,
+            filesystem_config=config.tools.filesystem,
+            claude_code_config=config.tools.claude_code,
+            max_parallel_tool_calls=getattr(config.agents.defaults, "max_parallel_tool_calls", 5),
+            enable_parallel_tools=getattr(config.agents.defaults, "enable_parallel_tools", True),
+            thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
+            status_service=self.status_service,
+        )
+        self.sessions = self.agent.sessions
+
+        # Update status_service with session_manager now that it's available
+        self.status_service.session_manager = self.sessions
         self.status_service.initialize()
 
         # Mirror service
@@ -281,6 +288,16 @@ class NanobotWebAPI:
             status_db_path = workspace_db_path
         else:
             status_db_path = memory_repository.get_default_db_path()
+        # 确保 media 目录存在
+        (status_db_path.parent / "media").mkdir(parents=True, exist_ok=True)
+        status_repo = StatusRepository(status_db_path)
+        # 先创建 status_service（此时 session_manager 暂时为 None）
+        status_service = SystemStatusService(
+            status_repo=status_repo,
+            session_manager=None,
+            workspace=workspace_path,
+        )
+
         self.agent = AgentLoop(
             bus=self.agent.bus,
             provider=provider,
@@ -293,22 +310,13 @@ class NanobotWebAPI:
             exec_config=config.tools.exec,
             filesystem_config=config.tools.filesystem,
             claude_code_config=config.tools.claude_code,
+            status_service=status_service,
         )
         self.sessions = self.agent.sessions
-        # 使用 workspace 特定的数据库（如果存在），否则使用默认数据库
-        workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
-        if workspace_db_path.exists():
-            status_db_path = workspace_db_path
-        else:
-            status_db_path = memory_repository.get_default_db_path()
-        # 确保 media 目录存在
-        (status_db_path.parent / "media").mkdir(parents=True, exist_ok=True)
-        status_repo = StatusRepository(status_db_path)
-        self.status_service = SystemStatusService(
-            status_repo=status_repo,
-            session_manager=self.sessions,
-            workspace=workspace_path,
-        )
+
+        # Update status_service with session_manager now that it's available
+        status_service._session_manager = self.sessions
+        self.status_service = status_service
         self.status_service.initialize()
         from nanobot.storage.calendar_repository import get_calendar_repository
         self.calendar_repo = get_calendar_repository(workspace_path)
@@ -581,7 +589,10 @@ class NanobotWebAPI:
 
         def run_agent() -> None:
             try:
-                result = asyncio.run(
+                # 创建新的事件循环（避免与主线程冲突）
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(
                     self._mirror_chat_with_progress(session_type, session_id, content, on_progress)
                 )
                 evt_queue.put({"type": "done", **result})
@@ -590,6 +601,11 @@ class NanobotWebAPI:
             except Exception as e:
                 logger.exception("Mirror chat stream failed")
                 evt_queue.put({"type": "error", "message": str(e)})
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
 
         thread = threading.Thread(target=run_agent, daemon=False)
         return evt_queue, thread
@@ -691,6 +707,8 @@ class NanobotWebAPI:
         if not content:
             content = "你可以从以下方向开始：工作驱动力、情绪表达、人际关系。或者直接说你此刻想聊的。"
         session.add_message("user", trigger)
+        # 立即保存用户消息，确保即使后续处理失败也不丢失
+        self.sessions.save(session)
         session.add_message("assistant", content)
         self.sessions.save(session)
         return content
@@ -755,6 +773,8 @@ class NanobotWebAPI:
         if not content:
             content = "1. 加班是奋斗还是剥削 2. 内卷有没有意义 3. 自由与责任的边界。选一个开始，或直接提出你的辩题。"
         session.add_message("user", trigger)
+        # 立即保存用户消息，确保即使后续处理失败也不丢失
+        self.sessions.save(session)
         session.add_message("assistant", content)
         self.sessions.save(session)
         return content
@@ -1072,17 +1092,36 @@ class NanobotWebAPI:
                 pass
 
         def run_agent() -> None:
+            # 首先发送一个开始事件，确认线程已启动
             try:
-                result = asyncio.run(
+                evt_queue.put({"type": "start", "session_id": session_id})
+            except Exception:
+                pass
+
+            logger.info(f"Chat stream thread running for session {session_id}, content: {content[:50] if content else ''}")
+            loop = None
+            try:
+                # 创建新的事件循环（避免与主线程冲突）
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(
                     self._chat_with_progress(session_id, content, on_progress, media_paths)
                 )
+                logger.debug(f"Chat stream completed with result: {result}")
                 evt_queue.put({"type": "done", **result})
             except asyncio.CancelledError:
+                logger.debug("Chat stream cancelled")
                 evt_queue.put({"type": "error", "message": "cancelled"})
             except Exception as e:
-                logger.exception("Chat stream failed")
+                logger.exception(f"Chat stream failed: {e}")
                 evt_queue.put({"type": "error", "message": str(e)})
             finally:
+                logger.debug("Chat stream thread ending")
+                if loop:
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
                 for p in media_paths:
                     try:
                         Path(p).unlink(missing_ok=True)
@@ -1367,8 +1406,69 @@ class NanobotWebAPI:
         return True
 
     def create_mcp(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create a new MCP server configuration."""
+        """Create a new MCP server configuration.
+
+        Supports two formats:
+        1. Flat format: {"id": "...", "name": "...", "transport": "...", ...}
+        2. Standard MCP config format: {"mcpServers": {"name": {"type": "...", "url": "..."}}}
+        """
         config = load_config()
+
+        # Handle standard MCP config format (e.g., from Claude Desktop)
+        if "mcpServers" in data:
+            mcp_servers = data["mcpServers"]
+            if not isinstance(mcp_servers, dict) or not mcp_servers:
+                raise ValueError("mcpServers 必须是非空对象")
+
+            results = []
+            for server_name, server_config in mcp_servers.items():
+                if not isinstance(server_config, dict):
+                    raise ValueError(f"MCP server '{server_name}' 配置必须是对象")
+
+                # Convert standard format to internal format
+                # Standard uses "type", we use "transport"
+                transport = server_config.get("type", "stdio").lower()
+                # Convert hyphen to underscore (e.g., "streamable-http" -> "streamable_http")
+                transport = transport.replace("-", "_")
+
+                # Generate ID from name (or use existing name as ID)
+                mcp_id = server_name.strip()
+                # Sanitize ID: keep only allowed chars
+                mcp_id = re.sub(r'[^a-zA-Z0-9._-]', '_', mcp_id)
+                if not mcp_id:
+                    mcp_id = str(uuid4()).replace("-", "")[:12]
+
+                # Ensure unique ID
+                existing_ids = {m.id for m in config.mcps}
+                original_id = mcp_id
+                counter = 1
+                while mcp_id in existing_ids:
+                    mcp_id = f"{original_id}_{counter}"
+                    counter += 1
+
+                # Build internal format
+                internal_data = {
+                    "id": mcp_id,
+                    "name": server_name.strip() or mcp_id,
+                    "transport": transport,
+                    "command": server_config.get("command"),
+                    "args": server_config.get("args", []),
+                    "url": server_config.get("url"),
+                    "enabled": server_config.get("enabled", True),
+                    "env": server_config.get("env", {}),
+                    "headers": server_config.get("headers", {}),
+                }
+
+                result = self._create_mcp_internal(config, internal_data)
+                results.append(result)
+
+            return results[0] if len(results) == 1 else {"servers": results}
+
+        # Handle flat format (original)
+        return self._create_mcp_internal(config, data)
+
+    def _create_mcp_internal(self, config, data: dict[str, Any]) -> dict[str, Any]:
+        """Internal method to create a single MCP server configuration."""
         mcp_id = data.get("id") or str(uuid4()).replace("-", "")[:12]
         if not re.match(r"^[a-zA-Z0-9._-]+$", mcp_id):
             raise ValueError("MCP id 只能包含字母、数字、点、下划线、连字符")
@@ -1393,6 +1493,8 @@ class NanobotWebAPI:
             args=data.get("args") or [],
             url=data.get("url"),
             enabled=data.get("enabled", True),
+            env=data.get("env") or {},
+            headers=data.get("headers") or {},
         )
         config.mcps.append(mcp)
         save_config(config)
@@ -1404,6 +1506,8 @@ class NanobotWebAPI:
             "args": mcp.args,
             "url": mcp.url,
             "enabled": mcp.enabled,
+            "env": mcp.env,
+            "headers": mcp.headers,
         }
 
     def update_mcp(self, mcp_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -1426,20 +1530,60 @@ class NanobotWebAPI:
             mcp.url = data["url"] or None
         if "enabled" in data:
             mcp.enabled = bool(data["enabled"])
+        if "env" in data:
+            mcp.env = dict(data["env"]) if data["env"] else {}
+        if "headers" in data:
+            mcp.headers = dict(data["headers"]) if data["headers"] else {}
         save_config(config)
-        return {"id": mcp.id, "name": mcp.name, "transport": mcp.transport, "command": mcp.command, "args": mcp.args, "url": mcp.url, "enabled": mcp.enabled}
+        return {"id": mcp.id, "name": mcp.name, "transport": mcp.transport, "command": mcp.command, "args": mcp.args, "url": mcp.url, "enabled": mcp.enabled, "env": mcp.env, "headers": mcp.headers}
 
     def delete_mcp(self, mcp_id: str) -> bool:
         """Delete MCP server configuration."""
+        # 清理 ID：去除前后空格
+        mcp_id_clean = mcp_id.strip()
+        logger.info(f"Deleting MCP: '{mcp_id}' (cleaned: '{mcp_id_clean}')")
+
         config = load_config()
-        logger.info(f"Deleting MCP: {mcp_id}, available MCPs: {[m.id for m in config.mcps]}")
+
+        # 记录当前所有 MCP ID 用于调试
+        available_ids = [m.id.strip() if m.id else "" for m in config.mcps]
+        logger.info(f"Available MCPs: {available_ids}")
+
         before = len(config.mcps)
-        config.mcps = [m for m in config.mcps if m.id != mcp_id]
+
+        # 更宽松的匹配：清理空格后进行匹配
+        config.mcps = [m for m in config.mcps if (m.id or "").strip() != mcp_id_clean]
+
         if len(config.mcps) == before:
-            logger.warning(f"MCP not found: {mcp_id}")
-            return False
-        save_config(config)
-        logger.info(f"MCP deleted successfully: {mcp_id}")
+            logger.warning(f"MCP not found after cleanup: '{mcp_id_clean}'")
+            # 尝试大小写不敏感匹配
+            mcp_id_lower = mcp_id_clean.lower()
+            config.mcps = [m for m in config.mcps if (m.id or "").strip().lower() != mcp_id_lower]
+            if len(config.mcps) == before:
+                logger.error(f"MCP '{mcp_id_clean}' not found in configuration")
+                return False
+            else:
+                logger.info(f"MCP deleted using case-insensitive match: '{mcp_id_clean}'")
+        else:
+            logger.info(f"MCP deleted: '{mcp_id_clean}'")
+
+        # Also delete from database to ensure it's truly removed
+        repo = get_config_repository()
+        try:
+            repo.delete_mcp(mcp_id_clean)
+            logger.debug(f"MCP deleted from database: '{mcp_id_clean}'")
+        except Exception as e:
+            logger.warning(f"Failed to delete MCP from database: {e}")
+
+        # 保存配置并检查结果
+        try:
+            save_config(config)
+            logger.info(f"Config saved successfully after deleting MCP: '{mcp_id_clean}'")
+        except Exception as e:
+            logger.error(f"Failed to save config after deleting MCP '{mcp_id_clean}': {e}")
+            raise
+
+        logger.info(f"MCP deleted successfully: '{mcp_id_clean}'")
         return True
 
     def test_mcp(self, mcp_id: str) -> dict[str, Any]:
@@ -1499,6 +1643,78 @@ class NanobotWebAPI:
             "maxToolIterations": defaults.max_tool_iterations,
             "maxExecutionTime": defaults.max_execution_time,
         }
+
+    def get_concurrency_config(self) -> dict[str, Any]:
+        """Get concurrency configuration from database."""
+        try:
+            config = self.status_service.get_concurrency_config()
+            return config
+        except Exception as e:
+            logger.exception("Failed to get concurrency config")
+            return {
+                "max_parallel_tool_calls": 5,
+                "max_concurrent_subagents": 10,
+                "enable_parallel_tools": True,
+                "thread_pool_size": 4,
+                "enable_subagent_parallel": True,
+                "claude_code_max_concurrent": 3,
+            }
+
+    def update_concurrency_config(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Update concurrency configuration and persist to database."""
+        config_map = {
+            "maxParallelToolCalls": "max_parallel_tool_calls",
+            "maxConcurrentSubagents": "max_concurrent_subagents",
+            "enableParallelTools": "enable_parallel_tools",
+            "threadPoolSize": "thread_pool_size",
+            "enableSubagentParallel": "enable_subagent_parallel",
+            "claudeCodeMaxConcurrent": "claude_code_max_concurrent",
+            "enableSmartParallel": "enable_smart_parallel",
+            "smartParallelModel": "smart_parallel_model",
+        }
+
+        config = {}
+        for web_key, db_key in config_map.items():
+            if web_key in data and data[web_key] is not None:
+                if web_key in ("enableParallelTools", "enableSubagentParallel", "enableSmartParallel"):
+                    config[db_key] = bool(data[web_key])
+                elif web_key == "smartParallelModel":
+                    config[db_key] = str(data[web_key])
+                else:
+                    config[db_key] = int(data[web_key])
+
+        # 保存到数据库
+        self.status_service.set_concurrency_config(config)
+
+        # 更新运行中的 agent 配置
+        if self.agent:
+            if "maxParallelToolCalls" in data and data["maxParallelToolCalls"] is not None:
+                self.agent._max_parallel_tool_calls = int(data["maxParallelToolCalls"])
+            if "enableParallelTools" in data and data["enableParallelTools"] is not None:
+                self.agent._enable_parallel_tools = bool(data["enableParallelTools"])
+            if "threadPoolSize" in data and data["threadPoolSize"] is not None:
+                self.agent._thread_pool_size = int(data["threadPoolSize"])
+            if "enableSmartParallel" in data and data["enableSmartParallel"] is not None:
+                self.agent._enable_smart_parallel = bool(data["enableSmartParallel"])
+            if "smartParallelModel" in data and data["smartParallelModel"] is not None:
+                self.agent._smart_parallel_model = str(data["smartParallelModel"])
+
+        return self.get_concurrency_config()
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Get monitoring metrics from database."""
+        try:
+            return self.status_service.get_metrics()
+        except Exception as e:
+            logger.exception("Failed to get metrics")
+            return {}
+
+    def reset_metrics(self) -> None:
+        """Reset all monitoring metrics."""
+        try:
+            self.status_service.reset_metrics()
+        except Exception as e:
+            logger.exception("Failed to reset metrics")
 
     def update_memory_config(self, data: dict[str, Any]) -> dict[str, Any]:
         """Update memory system configuration. Hot-updates running memory services."""
@@ -2053,8 +2269,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self, app: "NanobotWebAPI", session_id: str, content: str, images: list[str] | None = None
     ) -> None:
         """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
+        logger.info(f"Starting chat stream for session {session_id}")
         evt_queue, thread = app.chat_stream(session_id, content, images)
+        logger.info(f"Chat stream thread created: {thread}")
         thread.start()
+        logger.info(f"Chat stream thread started: {thread.is_alive()}")
 
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -2063,11 +2282,31 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
+        heartbeat_interval = 30  # 心跳间隔（秒）
+        last_heartbeat = time.time()
+
         try:
+            loop_count = 0
             while thread.is_alive() or not evt_queue.empty():
+                loop_count += 1
+                if loop_count % 100 == 0:  # Log every ~50 seconds
+                    logger.debug(f"Chat stream loop: alive={thread.is_alive()}, queue_empty={evt_queue.empty()}, count={loop_count}")
                 try:
                     evt = evt_queue.get(timeout=0.5)
+                    if isinstance(evt, dict) and evt.get('type'):
+                        logger.debug(f"Got event: {evt.get('type')}")
                 except queue.Empty:
+                    # 发送心跳保持连接活跃
+                    now = time.time()
+                    if now - last_heartbeat >= heartbeat_interval:
+                        try:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                            last_heartbeat = now
+                            logger.debug("SSE heartbeat sent")
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            logger.debug("Client disconnected, stopping stream")
+                            break
                     continue
                 try:
                     payload = json.dumps(evt, ensure_ascii=False)
@@ -2104,11 +2343,30 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
+        heartbeat_interval = 30  # 心跳间隔（秒）
+        last_heartbeat = time.time()
+
         try:
+            loop_count = 0
             while thread.is_alive() or not evt_queue.empty():
+                loop_count += 1
+                if loop_count % 100 == 0:  # Log every ~50 seconds
+                    logger.debug(f"Chat stream loop: alive={thread.is_alive()}, queue_empty={evt_queue.empty()}, count={loop_count}")
                 try:
                     evt = evt_queue.get(timeout=0.5)
+                    if isinstance(evt, dict) and evt.get('type'):
+                        logger.debug(f"Got event: {evt.get('type')}")
                 except queue.Empty:
+                    # 发送心跳保持连接活跃
+                    now = time.time()
+                    if now - last_heartbeat >= heartbeat_interval:
+                        try:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                            last_heartbeat = now
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            logger.debug("Client disconnected, stopping stream")
+                            break
                     continue
                 try:
                     payload = json.dumps(evt, ensure_ascii=False)
@@ -2210,6 +2468,14 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/config/memory":
                 config_data = app.get_config()
                 self._write_json(HTTPStatus.OK, _ok(config_data["memory"]))
+                return
+
+            if path == "/api/v1/config/concurrency":
+                self._write_json(HTTPStatus.OK, _ok(app.get_concurrency_config()))
+                return
+
+            if path == "/api/v1/config/metrics":
+                self._write_json(HTTPStatus.OK, _ok(app.get_metrics()))
                 return
 
             if path == "/api/v1/channels":
@@ -2333,6 +2599,29 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     logger.error(f"Error getting Claude Code task {task_id}: {e}")
                     self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TASK_ERROR", "获取任务详情失败", str(e)))
+                return
+
+            # GET /api/v1/tasks/{taskId}/status - Get task status for polling
+            if len(parts) == 5 and parts[:2] == ["api", "v1"] and parts[2] == "tasks" and parts[4] == "status":
+                task_id = parts[3]
+                try:
+                    task = app.agent.claude_code_manager.get_task(task_id)
+                    if task:
+                        # Return lightweight status response
+                        status_response = {
+                            "taskId": task["task_id"],
+                            "status": task["status"],
+                            "prompt": task.get("prompt", "")[:100],  # Truncate for brevity
+                            "startTime": task.get("start_time"),
+                            "endTime": task.get("end_time"),
+                            "result": task.get("result")[:500] if task.get("result") else None,  # Truncate
+                        }
+                        self._write_json(HTTPStatus.OK, _ok(status_response))
+                    else:
+                        self._write_json(HTTPStatus.NOT_FOUND, _err("TASK_NOT_FOUND", "任务不存在"))
+                except Exception as e:
+                    logger.error(f"Error getting task status {task_id}: {e}")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TASK_STATUS_ERROR", "获取任务状态失败", str(e)))
                 return
 
             # ==================== Calendar GET ====================
@@ -2690,12 +2979,17 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         # POST /api/v1/mcps - Create MCP
         if path == "/api/v1/mcps":
             body = self._read_json()
+            logger.debug(f"Create MCP request body: {body}")
             try:
                 data = app.create_mcp(body)
                 app._reload_mcp()
                 self._write_json(HTTPStatus.CREATED, _ok(data))
             except ValueError as e:
+                logger.warning(f"Create MCP validation error: {e}, body: {body}")
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            except Exception as e:
+                logger.exception(f"Create MCP error: {e}, body: {body}")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("CREATE_MCP_ERROR", str(e)))
             return
 
         # POST /api/v1/calendar/events - Create calendar event
@@ -2710,7 +3004,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
         # POST /api/v1/mcps/{mcpId}/test
         if len(parts) == 5 and parts[:3] == ["api", "v1", "mcps"] and parts[4] == "test":
-            mcp_id = parts[3]
+            mcp_id = unquote(parts[3])  # URL 解码
             try:
                 data = app.test_mcp(mcp_id)
                 self._write_json(HTTPStatus.OK, _ok(data))
@@ -2774,11 +3068,22 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self.send_header("Connection", "keep-alive")
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
+                    heartbeat_interval = 30  # 心跳间隔（秒）
+                    last_heartbeat = time.time()
                     try:
                         while thread.is_alive() or not evt_queue.empty():
                             try:
                                 evt = evt_queue.get(timeout=0.5)
                             except queue.Empty:
+                                # 发送心跳保持连接活跃
+                                now = time.time()
+                                if now - last_heartbeat >= heartbeat_interval:
+                                    try:
+                                        self.wfile.write(b": heartbeat\n\n")
+                                        self.wfile.flush()
+                                        last_heartbeat = now
+                                    except (BrokenPipeError, ConnectionResetError, OSError):
+                                        break
                                 continue
                             payload = json.dumps(evt, ensure_ascii=False)
                             self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
@@ -2831,11 +3136,22 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self.send_header("Connection", "keep-alive")
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
+                    heartbeat_interval = 30  # 心跳间隔（秒）
+                    last_heartbeat = time.time()
                     try:
                         while thread.is_alive() or not evt_queue.empty():
                             try:
                                 evt = evt_queue.get(timeout=0.5)
                             except queue.Empty:
+                                # 发送心跳保持连接活跃
+                                now = time.time()
+                                if now - last_heartbeat >= heartbeat_interval:
+                                    try:
+                                        self.wfile.write(b": heartbeat\n\n")
+                                        self.wfile.flush()
+                                        last_heartbeat = now
+                                    except (BrokenPipeError, ConnectionResetError, OSError):
+                                        break
                                 continue
                             payload = json.dumps(evt, ensure_ascii=False)
                             self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
@@ -3232,7 +3548,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
         # DELETE /api/v1/mcps/{mcpId}
         if len(parts) == 4 and parts[:3] == ["api", "v1", "mcps"]:
-            mcp_id = parts[3]
+            mcp_id = unquote(parts[3])  # URL 解码
             deleted = app.delete_mcp(mcp_id)
             if deleted:
                 app._reload_mcp()
@@ -3324,6 +3640,25 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
             return
 
+        # PUT /api/v1/config/concurrency
+        if path == "/api/v1/config/concurrency":
+            body = self._read_json()
+            try:
+                data = app.update_concurrency_config(body)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except (ValueError, TypeError) as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
+
+        # POST /api/v1/config/metrics/reset
+        if path == "/api/v1/config/metrics/reset" and method == "POST":
+            try:
+                app.reset_metrics()
+                self._write_json(HTTPStatus.OK, _ok({"message": "Metrics reset successfully"}))
+            except Exception as e:
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("RESET_FAILED", str(e)))
+            return
+
         # PUT /api/v1/config/memory
         if path == "/api/v1/config/memory":
             body = self._read_json()
@@ -3359,7 +3694,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
         # PUT /api/v1/mcps/{mcpId}
         if len(parts) == 4 and parts[:3] == ["api", "v1", "mcps"]:
-            mcp_id = parts[3]
+            mcp_id = unquote(parts[3])  # URL 解码
             body = self._read_json()
             try:
                 data = app.update_mcp(mcp_id, body)
