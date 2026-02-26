@@ -30,6 +30,7 @@ export interface CronJob {
   name: string;
   enabled: boolean;
   is_system?: boolean;  // 是否为系统任务
+  source?: string;     // 任务来源：'system' | 'calendar' | ''
   trigger: CronTrigger;
   payload: CronPayload;
   nextRunAtMs?: number;

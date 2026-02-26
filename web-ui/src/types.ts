@@ -425,6 +425,8 @@ export interface Reminder {
   id?: string
   time: number  // 提前分钟数，0表示事件发生时
   notified?: boolean  // 是否已提醒
+  channel?: string  // 推送渠道
+  target?: string  // 推送目标
 }
 
 export interface RecurrenceRule {

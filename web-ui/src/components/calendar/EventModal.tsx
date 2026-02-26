@@ -1,9 +1,10 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Modal, Form, Input, DatePicker, Select, Radio, Switch, Row, Col, Button, message } from 'antd'
 import { DeleteOutlined } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import dayjs from 'dayjs'
 import { useCalendarStore } from '../../store/calendarStore'
+import { api } from '../../api'
 import { priorityColors, reminderOptions, type Reminder, type RecurrenceRule } from '../../types'
 import { v4 as uuidv4 } from 'uuid'
 
@@ -11,25 +12,24 @@ type Priority = 'high' | 'medium' | 'low'
 
 const { TextArea } = Input
 
-// Recurrence frequency options
+// 简化的重复规则选项
 const recurrenceOptions = [
   { label: '不重复', value: 'none' },
   { label: '每天', value: 'daily' },
   { label: '每周', value: 'weekly' },
   { label: '每月', value: 'monthly' },
-  { label: '每年', value: 'yearly' },
 ]
 
-// Recurrence end type options
-const endTypeOptions = [
-  { label: '永不', value: 'never' },
-  { label: '重复次数', value: 'count' },
-  { label: '结束日期', value: 'until' },
-]
+// 提醒时间选项（单选）
+const reminderTimeOptions = reminderOptions.map((opt) => ({
+  label: opt.label,
+  value: opt.value,
+}))
 
 function EventModal() {
   const { t } = useTranslation()
   const [form] = Form.useForm()
+  const [channels, setChannels] = useState<{ id: string; name: string }[]>([])
   const {
     isEventModalOpen,
     editingEventId,
@@ -43,12 +43,18 @@ function EventModal() {
 
   const isEditing = !!editingEventId
 
+  // 加载渠道列表
+  useEffect(() => {
+    api.getEnabledChannels().then(setChannels).catch(console.error)
+  }, [])
+
   // Reset form when modal opens/closes or selectedEvent changes
   useEffect(() => {
     if (isEventModalOpen) {
       if (selectedEvent && editingEventId) {
         // Editing existing event
         const recurrence = selectedEvent.recurrence
+        const reminder = (selectedEvent.reminders || [])[0]  // 只取第一个提醒
         form.setFieldsValue({
           title: selectedEvent.title,
           description: selectedEvent.description,
@@ -56,12 +62,9 @@ function EventModal() {
           end: selectedEvent.end ? dayjs(selectedEvent.end) : null,
           priority: selectedEvent.priority,
           isAllDay: selectedEvent.isAllDay,
-          reminders: (selectedEvent.reminders || []).map((r) => r.time),
+          reminderTime: reminder?.time ?? -1,  // 单选提醒时间
+          reminderChannel: reminder?.channel ?? '',  // 推送渠道
           recurrence: recurrence ? recurrence.frequency : 'none',
-          recurrenceInterval: recurrence?.interval || 1,
-          recurrenceEndType: recurrence?.endType || 'never',
-          recurrenceEndCount: recurrence?.endCount,
-          recurrenceEndDate: recurrence?.endDate ? dayjs(recurrence.endDate) : null,
         })
       } else {
         // Creating new event
@@ -75,10 +78,9 @@ function EventModal() {
           end: defaultEnd,
           priority: settings.defaultPriority,
           isAllDay: selectedEvent?.isAllDay ?? false,
-          reminders: [],
+          reminderTime: -1,
+          reminderChannel: '',
           recurrence: 'none',
-          recurrenceInterval: 1,
-          recurrenceEndType: 'never',
         })
       }
     }
@@ -95,20 +97,26 @@ function EventModal() {
     try {
       const values = await form.validateFields()
 
-      // Build recurrence rule if needed
+      // 构建简化的重复规则
       let recurrence: RecurrenceRule | undefined
       if (values.recurrence && values.recurrence !== 'none') {
         recurrence = {
           frequency: values.recurrence as RecurrenceRule['frequency'],
-          interval: values.recurrenceInterval || 1,
-          endType: values.recurrenceEndType,
+          interval: 1,
+          endType: 'never',
         }
+      }
 
-        if (values.recurrenceEndType === 'count') {
-          recurrence.endCount = values.recurrenceEndCount
-        } else if (values.recurrenceEndType === 'until' && values.recurrenceEndDate) {
-          recurrence.endDate = values.recurrenceEndDate.toISOString()
-        }
+      // 构建提醒配置（只支持1个提醒）
+      const reminders: Reminder[] = []
+      if (values.reminderTime !== undefined && values.reminderTime !== -1) {
+        reminders.push({
+          id: uuidv4(),
+          time: values.reminderTime,
+          notified: false,
+          channel: values.reminderChannel || undefined,
+          target: undefined,  // TODO: 后续可以添加目标选择
+        })
       }
 
       const eventData = {
@@ -118,11 +126,7 @@ function EventModal() {
         end: values.end.toISOString(),
         priority: values.priority as Priority,
         isAllDay: values.isAllDay || false,
-        reminders: (values.reminders || []).map((time: number): Reminder => ({
-          id: uuidv4(),
-          time,
-          notified: false,
-        })),
+        reminders,
         recurrence,
       }
 
@@ -153,21 +157,6 @@ function EventModal() {
       message.success(t('calendar.eventDeleted') || '事件已删除')
       handleCancel()
     }
-  }
-
-  // Custom reminder option to show "No reminder"
-  const reminderSelectOptions = [
-    { label: t('calendar.noReminder'), value: -1 },
-    ...reminderOptions.map((opt) => ({
-      label: opt.label,
-      value: opt.value,
-    })),
-  ]
-
-  // Filter out -1 from selected values
-  const handleReminderChange = (values: number[]) => {
-    const filtered = values.filter((v) => v !== -1)
-    form.setFieldValue('reminders', filtered)
   }
 
   return (
@@ -265,18 +254,32 @@ function EventModal() {
           </Radio.Group>
         </Form.Item>
 
-        <Form.Item
-          name="reminders"
-          label={t('calendar.reminder')}
-        >
-          <Select
-            mode="multiple"
-            placeholder={t('calendar.noReminder')}
-            options={reminderSelectOptions}
-            onChange={handleReminderChange}
-            allowClear
-          />
-        </Form.Item>
+        <Row gutter={16}>
+          <Col span={12}>
+            <Form.Item
+              name="reminderTime"
+              label="提醒时间"
+            >
+              <Select
+                placeholder="不提醒"
+                options={reminderTimeOptions}
+                allowClear
+              />
+            </Form.Item>
+          </Col>
+          <Col span={12}>
+            <Form.Item
+              name="reminderChannel"
+              label="推送渠道"
+            >
+              <Select
+                placeholder="选择渠道（可选）"
+                allowClear
+                options={channels.map((ch) => ({ label: ch.name, value: ch.id }))}
+              />
+            </Form.Item>
+          </Col>
+        </Row>
 
         <Form.Item
           name="description"
@@ -288,85 +291,14 @@ function EventModal() {
           />
         </Form.Item>
 
-        {/* Recurrence Section */}
+        {/* 简化后的重复规则 */}
         <Form.Item
           name="recurrence"
           label="重复"
         >
           <Select
             options={recurrenceOptions}
-            onChange={(value) => {
-              // Show/hide recurrence options based on selection
-              form.setFieldsValue({ recurrence: value })
-            }}
           />
-        </Form.Item>
-
-        <Form.Item noStyle shouldUpdate={(prev, curr) => prev.recurrence !== curr.recurrence}>
-          {() => {
-            const recurrence = form.getFieldValue('recurrence')
-            if (recurrence && recurrence !== 'none') {
-              return (
-                <>
-                  <Form.Item
-                    name="recurrenceInterval"
-                    label="重复间隔"
-                    style={{ marginBottom: 12 }}
-                  >
-                    <Select
-                      style={{ width: 100 }}
-                      options={[
-                        { label: '1', value: 1 },
-                        { label: '2', value: 2 },
-                        { label: '3', value: 3 },
-                        { label: '4', value: 4 },
-                        { label: '5', value: 5 },
-                      ]}
-                    />
-                  </Form.Item>
-
-                  <Form.Item
-                    name="recurrenceEndType"
-                    label="结束重复"
-                    style={{ marginBottom: 12 }}
-                  >
-                    <Select
-                      options={endTypeOptions}
-                    />
-                  </Form.Item>
-
-                  <Form.Item noStyle shouldUpdate={(prev, curr) => prev.recurrenceEndType !== curr.recurrenceEndType}>
-                    {() => {
-                      const endType = form.getFieldValue('recurrenceEndType')
-                      if (endType === 'count') {
-                        return (
-                          <Form.Item
-                            name="recurrenceEndCount"
-                            label="重复次数"
-                            style={{ marginBottom: 12 }}
-                          >
-                            <Input type="number" min={1} style={{ width: 100 }} />
-                          </Form.Item>
-                        )
-                      } else if (endType === 'until') {
-                        return (
-                          <Form.Item
-                            name="recurrenceEndDate"
-                            label="结束日期"
-                            style={{ marginBottom: 12 }}
-                          >
-                            <DatePicker />
-                          </Form.Item>
-                        )
-                      }
-                      return null
-                    }}
-                  </Form.Item>
-                </>
-              )
-            }
-            return null
-          }}
         </Form.Item>
       </Form>
     </Modal>
