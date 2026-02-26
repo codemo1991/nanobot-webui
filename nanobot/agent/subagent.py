@@ -66,7 +66,7 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.sessions = sessions
         self._claude_code_manager = claude_code_manager
-        self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._running_tasks: dict[str, tuple[str | None, Any]] = {}  # task_id -> (origin_key, task)
         self._status_service = status_service
 
         # 并发控制
@@ -119,6 +119,39 @@ class SubagentManager:
         if self._claude_code_manager and self._claude_code_manager.check_claude_available():
             return "claude_code"
         return "native"
+
+    def cancel_task(self, task_id: str) -> bool:
+        """取消指定的子代理任务"""
+        if task_id in self._running_tasks:
+            logger.info(f"[SubagentManager] Cancelling task: {task_id}")
+            # 从 _running_tasks 中移除
+            self._running_tasks.pop(task_id, None)
+            # 释放信号量
+            self._subagent_semaphore.release()
+            logger.info(f"[SubagentManager] Task {task_id} cancelled")
+            return True
+        return False
+
+    def cancel_by_session(self, channel: str, chat_id: str) -> int:
+        """取消指定 session 的所有子代理任务，返回取消的任务数量"""
+        origin_key = f"{channel}:{chat_id}"
+        cancelled = 0
+        for task_id, (orig_key, _) in list(self._running_tasks.items()):
+            if orig_key == origin_key:
+                logger.info(f"[SubagentManager] Cancelling task {task_id} for session {origin_key}")
+                self._running_tasks.pop(task_id, None)
+                self._subagent_semaphore.release()
+                cancelled += 1
+        if cancelled > 0:
+            logger.info(f"[SubagentManager] Cancelled {cancelled} tasks for session {origin_key}")
+        return cancelled
+
+    def cancel_all_tasks(self) -> int:
+        """取消所有子代理任务，返回取消的任务数量"""
+        count = len(self._running_tasks)
+        for task_id in list(self._running_tasks.keys()):
+            self.cancel_task(task_id)
+        return count
 
     async def spawn(
         self,
@@ -232,9 +265,9 @@ class SubagentManager:
         thread = threading.Thread(target=run_in_thread, daemon=True)
         thread.start()
 
-        # 由于任务在线程中运行，不需要 asyncio Task 追踪
-        # 直接添加到 _running_tasks 表示任务正在运行
-        self._running_tasks[task_id] = None  # 使用 None 表示线程任务
+        # 由于任务在线程中运行，存储 origin_key 以便后续按 session 取消
+        origin_key = f"{origin_channel}:{origin_chat_id}"
+        self._running_tasks[task_id] = (origin_key, None)  # 存储 (origin_key, 占位)
         logger.info(f"[SubagentProgress] SubagentManager id: {id(self)}, _running_tasks after (thread-based): {list(self._running_tasks.keys())}")
 
         # 记录子Agent spawn次数

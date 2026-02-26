@@ -79,9 +79,10 @@ export const api = {
       signal,
     }),
 
-  stopAgent: () =>
+  stopAgent: (sessionId?: string) =>
     request<{ stopped: boolean }>('/chat/stop', {
       method: 'POST',
+      body: sessionId ? JSON.stringify({ sessionId }) : undefined,
     }),
 
   /** Stream chat with SSE; calls onEvent for each progress event. Rejects on error. */

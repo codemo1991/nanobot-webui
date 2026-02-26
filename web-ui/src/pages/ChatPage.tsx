@@ -685,7 +685,8 @@ function ChatPage() {
       antMessage.info(t('chat.generationStopped'))
     }
     try {
-      await api.stopAgent()
+      // 传递当前 session ID 以只取消该 session 的子代理
+      await api.stopAgent(currentSession?.id)
     } catch (e) {
       console.warn('Stop agent request failed:', e)
     }
