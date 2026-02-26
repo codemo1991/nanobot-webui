@@ -34,6 +34,7 @@
 | **渠道** | Discord、QQ (qq-botpy)、钉钉，以及原有 Telegram、WhatsApp、飞书 |
 | **MCP** | Model Context Protocol 集成，通过 stdio/HTTP/SSE 接入外部工具 |
 | **Skills** | `claude-code`、`git-manager`、`xlsx`、`pdf`、`pptx`、`skill-creator`、`mirror-system`、`code-review-expert` |
+| **定时任务** | 定时提醒和循环任务 — 设置固定时间或间隔执行的任务 |
 | **模型提供商** | 智谱、通义千问、vLLM、OpenRouter、Anthropic、OpenAI、DeepSeek、Groq、Gemini、Minimax |
 | **启动脚本** | `nanobot-launcher.sh` (Linux/macOS) + `nanobot-launcher.ps1` (Windows) — 自动环境检查、依赖更新、前端构建、一键启动 |
 | **系统** | StatusRepository (SQLite)、SystemStatusService（运行时长、会话数）、集中日志 |
@@ -58,6 +59,34 @@ nanobot-webui 配备了强大的技能系统，可扩展 AI 的能力：
 ### 创建自定义技能
 
 技能系统是可扩展的。你可以通过实现技能函数来创建自定义技能，供 AI 调用。请参考 `skill-creator` 技能作为模板。
+
+---
+
+## ⏰ 定时任务 (Cron)
+
+nanobot-webui 支持通过内置的 Cron 系统设置定时任务，实现循环提醒和自动化操作：
+
+| 功能 | 描述 |
+|------|------|
+| **固定时间任务** | 在特定时间执行任务（如每天早上 9:00、每周一上午 10:00） |
+| **间隔任务** | 按固定间隔重复执行任务（如每 30 分钟、每 2 小时） |
+| **循环提醒** | 设置周期性提醒，如会议提醒、截止日期、健康检查等 |
+| **消息渠道** | 将定时消息发送到任何已配置的渠道（飞书、Telegram、Discord 等） |
+
+### 使用示例
+
+```
+# 设置每日提醒
+"每天早上 9 点提醒我喝水"
+
+# 设置每周会议提醒
+"每周一上午 10 点提醒我开周会"
+
+# 设置间隔检查
+"每半小时检查一下服务器状态"
+```
+
+Cron 系统在后台运行，会自动将定时消息投递到你配置的渠道。
 
 ---
 
