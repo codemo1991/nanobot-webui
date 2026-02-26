@@ -45,7 +45,34 @@ function EventModal() {
 
   // 加载渠道列表
   useEffect(() => {
-    api.getEnabledChannels().then(setChannels).catch(console.error)
+    api.getEnabledChannels().then((data) => {
+      // 防御性处理：确保 data 是数组
+      if (Array.isArray(data)) {
+        setChannels(data)
+      } else if (data && typeof data === 'object') {
+        // 如果返回的是对象（如 {feishu: {...}, telegram: {...}}），转换为数组
+        const channelList: { id: string; name: string }[] = []
+        for (const [key, value] of Object.entries(data)) {
+          if (value && typeof value === 'object' && (value as any).enabled) {
+            const nameMap: Record<string, string> = {
+              feishu: '飞书',
+              whatsapp: 'WhatsApp',
+              telegram: 'Telegram',
+              discord: 'Discord',
+              qq: 'QQ',
+              dingtalk: '钉钉',
+            }
+            channelList.push({ id: key, name: nameMap[key] || key })
+          }
+        }
+        setChannels(channelList)
+      } else {
+        setChannels([])
+      }
+    }).catch((err) => {
+      console.error('Failed to load channels:', err)
+      setChannels([])
+    })
   }, [])
 
   // Reset form when modal opens/closes or selectedEvent changes

@@ -92,15 +92,29 @@ class CronRepository:
     def _init_tables(self) -> None:
         """Initialize cron jobs table structure.
 
-        如果数据库文件损坏（file is not a database），自动备份并重建。
-        如果表已存在但缺少新列，自动迁移。
+        如果表不存在则创建，如果表已存在但缺少新列，自动迁移。
+        只有在数据库文件损坏无法连接时才备份重建。
         """
+        # 首先尝试连接数据库并检查表结构
         try:
+            conn = self._connect()
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cron_jobs'")
+            table_exists = cursor.fetchone() is not None
+            conn.close()
+
+            if table_exists:
+                # 表已存在，只迁移缺失的列
+                logger.debug("Cron jobs table already exists, checking for column migration")
+                self._migrate_columns()
+                return
+
+            # 表不存在，创建新表
             conn = self._connect()
             conn.executescript(self._CREATE_SCHEMA)
             conn.commit()
             conn.close()
-            logger.debug("Cron jobs table initialized")
+            logger.debug("Cron jobs table created")
+
         except sqlite3.DatabaseError as e:
             # 文件存在但不是合法的 SQLite 数据库（损坏或被覆盖）
             bak_path = self.db_path.with_suffix(".db.bak")
@@ -123,9 +137,6 @@ class CronRepository:
         except Exception:
             logger.exception("Failed to initialize cron jobs table")
             raise
-        finally:
-            # 确保迁移新列（如果表已存在但缺少 is_system 列）
-            self._migrate_columns()
 
     def _migrate_columns(self) -> None:
         """迁移表结构，添加缺失的列"""

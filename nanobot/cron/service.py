@@ -176,17 +176,11 @@ class CronService:
                 except Exception:
                     tz_obj = pytz.UTC
 
-                # 获取结束日期
-                end_date_str = trigger_config.get("endDate")
-                end_date = None
-                if end_date_str:
-                    from datetime import datetime
-                    try:
-                        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-                    except Exception:
-                        pass
+                # 获取结束日期 - apscheduler 3.x 的 from_crontab 不支持 end_date
+                # 如果需要 end_date 功能，需要升级到更高版本或使用其他方式
+                # 这里暂时忽略 end_date
 
-                return CronTrigger.from_crontab(expr, timezone=tz_obj, end_date=end_date)
+                return CronTrigger.from_crontab(expr, timezone=tz_obj)
 
         return None
 

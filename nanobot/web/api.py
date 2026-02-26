@@ -2147,8 +2147,9 @@ class NanobotWebAPI:
 
     def get_enabled_channels(self) -> list[dict[str, str]]:
         """获取已启用的渠道列表，供前端下拉选择"""
+        from nanobot.config.loader import load_config
         channels = []
-        config = self.config  # type: ignore
+        config = load_config()
         if config.channels.feishu.enabled:
             channels.append({"id": "feishu", "name": "飞书"})
         if config.channels.whatsapp.enabled:
@@ -2397,8 +2398,9 @@ class NanobotWebAPI:
 
     def get_enabled_channels(self) -> list[dict[str, str]]:
         """获取已启用的渠道列表，供前端下拉选择"""
+        from nanobot.config.loader import load_config
         channels = []
-        config = self.config  # type: ignore
+        config = load_config()
         if config.channels.feishu.enabled:
             channels.append({"id": "feishu", "name": "飞书"})
         if config.channels.whatsapp.enabled:
@@ -2840,7 +2842,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(app.get_metrics()))
                 return
 
-            if path == "/api/v1/channels":
+            if path == "/api/v1/config/channels":
                 config_data = app.get_config()
                 self._write_json(HTTPStatus.OK, _ok(config_data["channels"]))
                 return
@@ -4058,6 +4060,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             try:
                 data = app.update_memory_config(body)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except (ValueError, TypeError) as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
+
+        # PUT /api/v1/config/channels
+        if path == "/api/v1/config/channels":
+            body = self._read_json()
+            try:
+                data = app.update_channels(body)
                 self._write_json(HTTPStatus.OK, _ok(data))
             except (ValueError, TypeError) as e:
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))

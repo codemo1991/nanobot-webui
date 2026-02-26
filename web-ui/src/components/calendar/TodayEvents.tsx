@@ -49,8 +49,11 @@ function TodayEvents() {
   const { t } = useTranslation()
   const { events, setSelectedEvent, setEditingEventId, setEventModalOpen } = useCalendarStore()
 
+  // 确保 events 是数组
+  const safeEvents = Array.isArray(events) ? events : []
+
   // 筛选今日事件：开始时间是今天，或跨天事件的时间范围包含今天
-  const todayEvents = events.filter((event) => {
+  const todayEvents = safeEvents.filter((event) => {
     const now = new Date()
     const start = parseISO(event.start)
     const end = parseISO(event.end)
