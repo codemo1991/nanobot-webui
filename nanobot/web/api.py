@@ -498,7 +498,14 @@ class NanobotWebAPI:
         }
 
     def delete_session(self, session_id: str) -> bool:
-        return self.sessions.delete(self.to_session_key(session_id))
+        # 先删除会话，如果成功则清理缓冲区
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+        origin_key = f"web:{session_id}"
+        result = self.sessions.delete(self.to_session_key(session_id))
+        # 只有会话删除成功后才清理缓冲区，防止内存泄漏
+        if result:
+            SubagentProgressBus.get().clear_buffer(origin_key)
+        return result
 
     def get_messages(self, session_id: str, before: int | None, limit: int) -> list[dict[str, Any]]:
         key = self.to_session_key(session_id)
@@ -602,6 +609,21 @@ class NanobotWebAPI:
                 logger.exception("Mirror chat stream failed")
                 evt_queue.put({"type": "error", "message": str(e)})
             finally:
+                # 等待子代理后台任务完成（避免事件循环关闭导致任务被取消）
+                if hasattr(self.agent, 'subagents'):
+                    running_tasks = list(getattr(self.agent.subagents, '_running_tasks', {}).items())
+                    if running_tasks:
+                        logger.info(f"[MirrorChatStream] Waiting for {len(running_tasks)} subagent tasks to complete...")
+                        for task_id, task in running_tasks:
+                            if not task.done():
+                                try:
+                                    loop.run_until_complete(asyncio.wait_for(task, timeout=300))
+                                    logger.info(f"[MirrorChatStream] Subagent task {task_id} completed")
+                                except asyncio.TimeoutError:
+                                    logger.warning(f"[MirrorChatStream] Subagent task {task_id} timed out after 300s")
+                                except Exception as e:
+                                    logger.error(f"[MirrorChatStream] Subagent task {task_id} failed: {e}")
+                        logger.info("[MirrorChatStream] All subagent tasks completed or timed out")
                 try:
                     loop.close()
                 except Exception:
@@ -1117,6 +1139,16 @@ class NanobotWebAPI:
                 evt_queue.put({"type": "error", "message": str(e)})
             finally:
                 logger.debug("Chat stream thread ending")
+                # 等待子代理后台任务完成（避免事件循环关闭导致任务被取消）
+                logger.info(f"[ChatStream] Checking for subagent tasks, agent id: {id(self.agent)}, has subagents: {hasattr(self.agent, 'subagents')}")
+                if hasattr(self.agent, 'subagents'):
+                    subagents = self.agent.subagents
+                    running_tasks = getattr(subagents, '_running_tasks', {})
+                    logger.info(f"[ChatStream] SubagentManager id: {id(subagents)}, _running_tasks: {running_tasks}")
+                    # 子代理任务现在在独立线程中运行，不需要等待
+                    # 它们会在后台完成后通过 SubagentProgressBus 发送通知
+                    if running_tasks:
+                        logger.info(f"[ChatStream] {len(running_tasks)} subagent tasks running in background threads (will complete independently)")
                 if loop:
                     try:
                         loop.close()
@@ -2346,7 +2378,12 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             logger.warning("Chat stream write error: %s", e)
         finally:
             if thread.is_alive():
-                logger.debug("Chat stream thread still running after response end")
+                logger.warning("Chat stream thread still running after response end, attempting to cancel...")
+                # 尝试取消线程（通过设置取消标志）
+                # 注意：线程可能无法被强制终止，这是最后的警告
+                thread.join(timeout=0.5)
+                if thread.is_alive():
+                    logger.error("Chat stream thread failed to terminate, possible resource leak")
 
     def _handle_subagent_progress_stream(
         self, app: "NanobotWebAPI", session_id: str
@@ -2357,6 +2394,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         订阅 SubagentProgressBus 的 "web:{session_id}" origin_key，
         将事件实时流给前端；5 分钟无事件后自动关闭并发送 {"type": "timeout"}。
         """
+        origin_key = f"web:{session_id}"
+        logger.info(f"[SubagentProgress] SSE connection established for session: {session_id}, origin_key: {origin_key}")
         evt_queue = app.subagent_progress_stream(session_id)
 
         self.send_response(HTTPStatus.OK)
@@ -2396,16 +2435,22 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
                 try:
                     payload = json.dumps(evt, ensure_ascii=False)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError) as e:
+                    logger.warning(f"[SubagentProgress] Failed to serialize event: {e}, event: {evt}")
                     continue
 
                 try:
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
+                    logger.debug(f"[SubagentProgress] Sent event to frontend: {evt.get('type')}, task_id: {evt.get('task_id')}")
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     break
         finally:
             app.unsubscribe_subagent_progress(session_id, evt_queue)
+            # 清理缓冲区，防止内存泄漏
+            from nanobot.agent.subagent_progress import SubagentProgressBus
+            SubagentProgressBus.get().clear_buffer(f"web:{session_id}")
+            logger.info(f"[SubagentProgress] SSE connection closed and buffer cleared for session: {session_id}")
 
     def _handle_mirror_chat_stream(
         self, app: "NanobotWebAPI", session_type: str, session_id: str, content: str
@@ -2448,7 +2493,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     continue
                 try:
                     payload = json.dumps(evt, ensure_ascii=False)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError) as e:
+                    logger.warning(f"[ChatStream] Failed to serialize event: {e}")
                     continue
                 line = f"data: {payload}\n\n"
                 try:

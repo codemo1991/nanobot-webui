@@ -1115,7 +1115,9 @@ if __name__ == "__main__":
     
     def check_claude_available(self) -> bool:
         """Check if Claude Code CLI is available."""
-        return shutil.which("claude") is not None
+        available = shutil.which("claude") is not None
+        logger.info(f"[ClaudeCodeManager] Claude Code CLI available: {available}")
+        return available
     
     def _quote_args(self, args: list[str]) -> list[str]:
         """Quote command arguments for shell execution on Windows."""

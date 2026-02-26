@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,10 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from nanobot.claude_code.manager import ClaudeCodeManager
+    from nanobot.services.system_status_service import SystemStatusService
+
+# Forward declaration to avoid circular imports
+SystemStatusService = "SystemStatusService"
 
 from nanobot.agent.subagent_progress import SubagentProgressBus
 from nanobot.bus.events import InboundMessage
@@ -49,6 +54,7 @@ class SubagentManager:
         sessions: "SessionManager | None" = None,
         max_concurrent_subagents: int = 10,
         claude_code_manager: "ClaudeCodeManager | None" = None,
+        status_service: "SystemStatusService | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.session.manager import SessionManager
@@ -61,6 +67,7 @@ class SubagentManager:
         self.sessions = sessions
         self._claude_code_manager = claude_code_manager
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._status_service = status_service
 
         # 并发控制
         self._max_concurrent_subagents = max_concurrent_subagents
@@ -152,8 +159,8 @@ class SubagentManager:
             except asyncio.TimeoutError:
                 return f"Error: Too many concurrent subagents ({current_running}). Please wait and try again."
         else:
-            # 未达到上限，直接获取信号量（非阻塞）
-            self._subagent_semaphore.acquire()
+            # 未达到上限，直接等待获取信号量
+            await self._subagent_semaphore.acquire()
 
         template_obj = get_template(template)
 
@@ -178,18 +185,70 @@ class SubagentManager:
 
         resolved_backend = self._resolve_backend(template, backend)
         logger.info(f"Subagent [{task_id}] backend resolved: template={template}, requested={backend}, actual={resolved_backend}")
+        logger.info(f"[SubagentProgress] Creating background task for subagent, origin_channel={origin_channel}, origin_chat_id={origin_chat_id}")
 
-        bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, template, session_id, enable_memory, media, resolved_backend)
-        )
-        self._running_tasks[task_id] = bg_task
+        logger.info(f"[SubagentProgress] SubagentManager id: {id(self)}, _running_tasks before: {list(self._running_tasks.keys())}")
 
-        # 任务完成后释放信号量
-        def release_semaphore(t):
-            self._subagent_semaphore.release()
-            self._running_tasks.pop(task_id, None)
+        # 在独立线程中运行子代理任务，避免被主请求的事件循环关闭取消
+        import threading
 
-        bg_task.add_done_callback(release_semaphore)
+        # 保存信号量和任务引用，用于在线程完成后清理
+        semaphore = self._subagent_semaphore
+        running_tasks_ref = self._running_tasks
+
+        def run_in_thread():
+            """在独立线程的事件循环中运行子代理任务"""
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            bus = SubagentProgressBus.get()
+            origin_key = f"{origin['channel']}:{origin['chat_id']}"
+            try:
+                loop.run_until_complete(
+                    self._run_subagent(task_id, task, display_label, origin, template, session_id, enable_memory, media, resolved_backend)
+                )
+                logger.info(f"[SubagentProgress] Thread-based subagent task {task_id} completed successfully")
+            except Exception as e:
+                logger.error(f"[SubagentProgress] Thread-based subagent task {task_id} failed: {e}")
+                # 确保即使失败也发送 subagent_end 事件
+                try:
+                    bus.push(origin_key, {
+                        "type": "subagent_end",
+                        "task_id": task_id,
+                        "label": display_label,
+                        "status": "error",
+                        "summary": f"任务执行失败: {str(e)[:200]}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    logger.info(f"[SubagentProgress] Pushed subagent_end event for failed task {task_id}")
+                except Exception as push_err:
+                    logger.error(f"[SubagentProgress] Failed to push subagent_end for failed task: {push_err}")
+            finally:
+                # 释放信号量并清理
+                semaphore.release()
+                running_tasks_ref.pop(task_id, None)
+                logger.info(f"[SubagentProgress] Semaphore released and task {task_id} removed from _running_tasks")
+                loop.close()
+
+        thread = threading.Thread(target=run_in_thread, daemon=True)
+        thread.start()
+
+        # 由于任务在线程中运行，不需要 asyncio Task 追踪
+        # 直接添加到 _running_tasks 表示任务正在运行
+        self._running_tasks[task_id] = None  # 使用 None 表示线程任务
+        logger.info(f"[SubagentProgress] SubagentManager id: {id(self)}, _running_tasks after (thread-based): {list(self._running_tasks.keys())}")
+
+        # 记录子Agent spawn次数
+        if self._status_service:
+            try:
+                self._status_service.increment_subagent_spawn()
+            except Exception:
+                pass
+
+        # 对于线程方式运行的任务，不需要 asyncio task 回调
+        # 信号量释放和清理由线程内部处理
+
+        # 在返回前检查任务状态
+        logger.info(f"[SubagentProgress] Before return: thread-based task {task_id} started")
 
         if not session_id or not self.sessions or not self.sessions.get(session_id):
             logger.info(f"Spawned subagent [{task_id}]: {display_label}")
@@ -214,6 +273,7 @@ class SubagentManager:
         logger.info(f"Subagent [{task_id}] running via Claude Code Agent SDK backend (background)")
 
         origin_key = f"{origin['channel']}:{origin['chat_id']}"
+        logger.info(f"[SubagentProgress] Subscribing to origin_key: {origin_key}")
         bus = SubagentProgressBus.get()
 
         bus.push(origin_key, {
@@ -224,24 +284,44 @@ class SubagentManager:
             "task": task[:120],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+        logger.info(f"[SubagentProgress] Pushed subagent_start event for task_id: {task_id}")
+
+        # 简单的去重机制，避免相同内容反复发送
+        last_progress_content = None
+        last_progress_time = 0
 
         def _progress_callback(payload: dict) -> None:
             """将 SDK 流式事件通过 SubagentProgressBus 广播给所有订阅者。"""
-            subtype = payload.get("subtype", "")
-            content = payload.get("content", "")
-            if not subtype:
-                return
-            bus.push(origin_key, {
-                "type": "subagent_progress",
-                "task_id": task_id,
-                "label": label,
-                "subtype": subtype,
-                "content": content,
-                "tool_name": payload.get("tool_name"),
-                "subagent_type": payload.get("subagent_type"),
-            })
+            nonlocal last_progress_content, last_progress_time
+            try:
+                subtype = payload.get("subtype", "")
+                content = payload.get("content", "")
+                if not subtype:
+                    return
+
+                # 去重：如果内容和上次相同且时间间隔小于2秒，跳过
+                current_time = time.time()
+                if content == last_progress_content and (current_time - last_progress_time) < 2:
+                    return
+                last_progress_content = content
+                last_progress_time = current_time
+
+                bus.push(origin_key, {
+                    "type": "subagent_progress",
+                    "task_id": task_id,
+                    "label": label,
+                    "subtype": subtype,
+                    "content": content,
+                    "tool_name": payload.get("tool_name"),
+                    "subagent_type": payload.get("subagent_type"),
+                })
+                logger.debug(f"[SubagentProgress] Pushed subagent_progress event: subtype={subtype}, content={content[:80]}")
+            except Exception as e:
+                logger.error(f"[SubagentProgress] Error in progress callback: {e}")
 
         try:
+            logger.info(f"[SubagentProgress] Calling Claude Code Manager run_task for task_id: {task_id}, manager id: {id(self)}")
+            logger.info(f"[SubagentProgress] _running_tasks before run_task: {list(self._running_tasks.keys())}")
             result = await self._claude_code_manager.run_task(
                 prompt=task,
                 workdir=None,
@@ -250,6 +330,7 @@ class SubagentManager:
                 timeout=self._claude_code_manager.default_timeout,
                 progress_callback=_progress_callback,
             )
+            logger.info(f"[SubagentProgress] Claude Code Manager run_task completed for task_id: {task_id}")
             status = result.get("status", "unknown")
             output = result.get("output", "")
 
@@ -261,9 +342,25 @@ class SubagentManager:
                 "summary": (output or f"status={status}")[:300],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
+            logger.info(f"[SubagentProgress] Pushed subagent_end event: status={status}, task_id={task_id}")
 
             if status == "done":
                 await self._announce_result(task_id, label, task, output, origin, "ok")
+            elif status == "timeout":
+                # 超时不等于失败，任务可能仍在运行
+                bus.push(origin_key, {
+                    "type": "subagent_end",
+                    "task_id": task_id,
+                    "label": label,
+                    "status": "timeout",
+                    "summary": "任务执行超时，任务可能仍在后台运行，请稍后查询状态",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                await self._announce_result(
+                    task_id, label, task,
+                    f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。\n\n请稍后再查询任务状态或等待结果通知。",
+                    origin, "timeout"
+                )
             else:
                 await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error")
         except Exception as e:
@@ -291,11 +388,13 @@ class SubagentManager:
         backend: str = "native",
     ) -> None:
         """Execute the subagent task and announce the result."""
-        logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, backend: {backend}, memory: {enable_memory})")
+        logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, backend: {backend}, memory: {enable_memory}), manager id: {id(self)}")
 
         # 路由到 Claude Code CLI 后端
         if backend == "claude_code":
+            logger.info(f"[SubagentProgress] Routing to Claude Code backend for task_id: {task_id}")
             await self._run_via_claude_code(task_id, task, label, origin)
+            logger.info(f"[SubagentProgress] Claude Code backend completed for task_id: {task_id}")
             return
 
         origin_key = f"{origin['channel']}:{origin['chat_id']}"

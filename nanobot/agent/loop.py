@@ -183,12 +183,14 @@ class AgentLoop:
             sessions=self.sessions,
             max_concurrent_subagents=self._max_parallel_tool_calls,
             claude_code_manager=self.claude_code_manager,
+            status_service=status_service,
         )
-        
+        logger.info(f"[AgentLoop] AgentLoop id: {id(self)}, SubagentManager id: {id(self.subagents)}")
+
         # 如果传入了独立的 subagent_model，更新 SubagentManager 使用它
         if subagent_model:
             self.subagents.model = subagent_model
-        
+
         self._running = False
         self._mcp_loaded = False
         self._mcp_loop_id: int | None = None
@@ -417,13 +419,17 @@ class AgentLoop:
         """
         # 循环检测
         call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
+        logger.info(f"[ToolExecution] Starting tool: {tool_call.name}")
         logger.debug(f"Executing tool: {tool_call.name} with arguments: {json.dumps(tool_call.arguments)}")
 
         if progress:
             try:
                 progress({"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments})
+                logger.info(f"[ToolProgress] Sent tool_start event: {tool_call.name}")
             except Exception:
                 pass
+        else:
+            logger.warning(f"[ToolProgress] No progress callback, tool_start will not be sent for: {tool_call.name}")
 
         # 设置进度回调（用于 claude_code 工具）
         if tool_call.name == "claude_code":
@@ -452,6 +458,7 @@ class AgentLoop:
 
         # 记录工具执行指标
         execution_time = time.time() - tool_start_time
+        logger.info(f"[ToolExecution] Tool '{tool_call.name}' completed in {execution_time:.2f}s, error: {tool_execution_error is not None}")
         if self._status_service:
             try:
                 self._status_service.update_tool_execution_time(execution_time)
@@ -607,6 +614,7 @@ class AgentLoop:
         # Spawn tool (for subagents)
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
+        logger.info(f"[AgentLoop] SpawnTool registered with SubagentManager id: {id(self.subagents)}")
         
         # Cron tool (for scheduling)
         if self.cron_service:
@@ -916,6 +924,11 @@ class AgentLoop:
 
             # Handle tool calls
             if response.has_tool_calls:
+                logger.info(f"[AgentLoop] LLM returned {len(response.tool_calls)} tool calls: {[tc.name for tc in response.tool_calls]}")
+                if any(tc.name == 'spawn' for tc in response.tool_calls):
+                    logger.info(f"[AgentLoop] SPAWN tool detected in tool calls!")
+                if any(tc.name == 'claude_code' for tc in response.tool_calls):
+                    logger.info(f"[AgentLoop] CLAUDE_CODE tool detected in tool calls!")
                 # Add assistant message with tool calls
                 tool_call_dicts = [
                     {
