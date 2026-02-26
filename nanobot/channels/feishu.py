@@ -586,6 +586,9 @@ class FeishuChannel(BaseChannel):
                     if status == "ok":
                         body = f"**✅ 任务完成**\n\n{summary}"
                         color = "green"
+                    elif status == "timeout":
+                        body = f"**⏳ 任务超时**\n\n{summary}\n\n_任务可能仍在后台运行，请稍后查询状态_"
+                        color = "orange"
                     else:
                         body = f"**❌ 任务失败**\n\n{summary}"
                         color = "red"

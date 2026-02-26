@@ -214,7 +214,7 @@ function ChatPage() {
   const [bgAgents, setBgAgents] = useState<Array<{
     taskId: string
     label: string
-    status: 'running' | 'done' | 'error'
+    status: 'running' | 'done' | 'error' | 'timeout'
     progress: string
     backend: string
   }>>([])
@@ -260,20 +260,30 @@ function ChatPage() {
       bgAgentsAbortRef.current.abort()
       bgAgentsAbortRef.current = null
     }
+    // 清理旧会话的 bgAgents 状态，防止内存泄漏
+    setBgAgents([])
+    console.log('[BgAgent] Starting subagent progress stream for session:', sessionId)
     const ctrl = new AbortController()
     bgAgentsAbortRef.current = ctrl
     bgAgentsSessionRef.current = sessionId
 
     const handleEvt = (evt: SubagentProgressEvent) => {
-      if (evt.type === 'subagent_start') {
-        setBgAgents(prev => {
-          if (prev.find(a => a.taskId === evt.task_id)) return prev
-          return [...prev, {
-            taskId: evt.task_id,
-            label: evt.label,
+      try {
+        console.log('[BgAgent] Received event:', evt.type, 'task_id' in evt ? evt.task_id : undefined, 'label' in evt ? evt.label : undefined)
+        if (evt.type === 'subagent_start') {
+          // 提取需要的数据，避免在 setBgAgents 回调中访问联合类型的可能未定义属性
+          const currentTaskId = evt.task_id
+          const currentLabel = evt.label
+          const currentTask = evt.task
+          const currentBackend = evt.backend
+          setBgAgents(prev => {
+            if (prev.find(a => a.taskId === currentTaskId)) return prev
+            return [...prev, {
+            taskId: currentTaskId,
+            label: currentLabel,
             status: 'running',
-            progress: evt.task.slice(0, 80),
-            backend: evt.backend,
+            progress: currentTask.slice(0, 80),
+            backend: currentBackend,
           }]
         })
       } else if (evt.type === 'subagent_progress') {
@@ -288,26 +298,38 @@ function ChatPage() {
         } else {
           return
         }
+        // 提取需要的数据，避免在 setBgAgents 回调中访问联合类型的可能未定义属性
+        const currentTaskId = evt.task_id
         setBgAgents(prev => prev.map(a => {
-          if (a.taskId !== evt.task_id) return a
+          if (a.taskId !== currentTaskId) return a
           const lines = a.progress ? a.progress.split('\n') : []
           lines.push(line)
           const trimmed = lines.length > 20 ? lines.slice(-20) : lines
           return { ...a, progress: trimmed.join('\n') }
         }))
       } else if (evt.type === 'subagent_end') {
+        // 提取需要的数据，避免在 setBgAgents 回调中访问联合类型的可能未定义属性
+        const currentTaskId = evt.task_id
+        const currentStatus = evt.status
+        const currentSummary = evt.summary
         setBgAgents(prev => prev.map(a =>
-          a.taskId === evt.task_id
-            ? { ...a, status: evt.status === 'ok' ? 'done' : 'error', progress: evt.summary }
+          a.taskId === currentTaskId
+            ? { ...a, status: currentStatus === 'ok' ? 'done' : currentStatus === 'timeout' ? 'timeout' : 'error', progress: currentSummary }
             : a
         ))
       } else if (evt.type === 'timeout') {
         bgAgentsAbortRef.current = null
         bgAgentsSessionRef.current = null
       }
+    } catch (err) {
+      console.error('[BgAgent] Error handling event:', err)
     }
+  }
 
-    api.subagentProgressStream(sessionId, handleEvt, ctrl.signal).catch(() => {
+    api.subagentProgressStream(sessionId, handleEvt, ctrl.signal).catch((err) => {
+      console.error('[BgAgent] Failed to connect to subagent stream:', err)
+      // 清理状态，防止残留的旧任务显示在界面上
+      setBgAgents([])
       bgAgentsAbortRef.current = null
       bgAgentsSessionRef.current = null
     })
@@ -1215,6 +1237,7 @@ function ChatPage() {
                 <div className="bg-agent-title">
                   {agent.status === 'running' && <Spin size="small" style={{ marginRight: 6 }} />}
                   {agent.status === 'done' && <span style={{ marginRight: 6 }}>✅</span>}
+                  {agent.status === 'timeout' && <span style={{ marginRight: 6 }}>⏳</span>}
                   {agent.status === 'error' && <span style={{ marginRight: 6 }}>❌</span>}
                   <span className="bg-agent-label">{agent.label}</span>
                   <Tag className="bg-agent-backend" color={agent.backend === 'claude_code' ? 'orange' : 'blue'}>

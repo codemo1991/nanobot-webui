@@ -12,10 +12,13 @@
 origin_key 格式："{channel}:{chat_id}"，例如 "web:sess_abc123" 或 "feishu:oc_xxx"。
 """
 
+import logging
 import queue
 import threading
 from contextlib import contextmanager
 from typing import Any, Generator
+
+logger = logging.getLogger(__name__)
 
 
 class SubagentProgressBus:
@@ -57,11 +60,15 @@ class SubagentProgressBus:
                 del buf[: -self._MAX_BUFFER]
             queues = list(self._subscribers.get(origin_key, []))
 
+        dropped = 0
         for q in queues:
             try:
                 q.put_nowait(event)
             except queue.Full:
-                pass
+                dropped += 1
+        if dropped > 0:
+            # 使用 debug 级别避免日志泛滥，只有在调试时才显示
+            logger.debug(f"[SubagentProgressBus] Dropped {dropped} events for {origin_key} due to full queue")
 
     def subscribe(
         self,

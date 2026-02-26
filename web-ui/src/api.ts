@@ -587,14 +587,22 @@ export const api = {
     onEvent: (evt: SubagentProgressEvent) => void,
     signal?: AbortSignal,
   ): Promise<void> {
+    console.log('[SubagentProgress] Connecting to subagent-progress stream for session:', sessionId)
     const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/subagent-progress`, {
       method: 'GET',
       headers: { Accept: 'text/event-stream' },
       signal,
     })
-    if (!res.ok) return
+    if (!res.ok) {
+      console.error('[SubagentProgress] Failed to connect:', res.status, res.statusText)
+      return
+    }
+    console.log('[SubagentProgress] Connected to subagent-progress stream')
     const reader = res.body?.getReader()
-    if (!reader) return
+    if (!reader) {
+      console.error('[SubagentProgress] No reader available')
+      return
+    }
     const dec = new TextDecoder()
     let buf = ''
     try {

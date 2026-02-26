@@ -2,6 +2,8 @@
 
 from typing import Any, TYPE_CHECKING
 
+from loguru import logger
+
 from nanobot.agent.tools.base import Tool
 
 if TYPE_CHECKING:
@@ -103,6 +105,7 @@ class SpawnTool(Tool):
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
+        logger.info(f"[SpawnTool] Spawning subagent with manager id: {id(self._manager)}, origin: {self._origin_channel}:{self._origin_chat_id}")
         media = self._current_media if attach_media and self._current_media else None
         return await self._manager.spawn(
             task=task,
