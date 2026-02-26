@@ -35,11 +35,13 @@ class CronRepository:
             name TEXT NOT NULL,
             enabled INTEGER DEFAULT 1,
             is_system INTEGER DEFAULT 0,
+            source TEXT DEFAULT '',  -- 'system' | 'calendar' | ''
             trigger_type TEXT NOT NULL,
             trigger_date_ms INTEGER,
             trigger_interval_seconds INTEGER,
             trigger_cron_expr TEXT,
             trigger_tz TEXT,
+            trigger_end_date TEXT,  -- For cron trigger: YYYY-MM-DD
             payload_kind TEXT DEFAULT 'agent_turn',
             payload_message TEXT,
             payload_deliver INTEGER DEFAULT 0,
@@ -56,6 +58,7 @@ class CronRepository:
 
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_enabled ON cron_jobs(enabled);
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_cron_jobs_source ON cron_jobs(source);
     """
 
     # 系统任务 ID 常量
@@ -138,6 +141,16 @@ class CronRepository:
                 conn.commit()
                 logger.info("Migrated cron_jobs: added is_system column")
 
+            if "source" not in columns:
+                conn.execute("ALTER TABLE cron_jobs ADD COLUMN source TEXT DEFAULT ''")
+                conn.commit()
+                logger.info("Migrated cron_jobs: added source column")
+
+            if "trigger_end_date" not in columns:
+                conn.execute("ALTER TABLE cron_jobs ADD COLUMN trigger_end_date TEXT")
+                conn.commit()
+                logger.info("Migrated cron_jobs: added trigger_end_date column")
+
             conn.close()
         except Exception as e:
             logger.warning(f"Failed to migrate cron_jobs columns: {e}")
@@ -153,12 +166,14 @@ class CronRepository:
             "name": row["name"],
             "enabled": bool(row["enabled"]),
             "is_system": bool(row["is_system"]),
+            "source": row["source"] or "",
             "trigger": {
                 "type": row["trigger_type"],
                 "dateMs": row["trigger_date_ms"],
                 "intervalSeconds": row["trigger_interval_seconds"],
                 "cronExpr": row["trigger_cron_expr"],
                 "tz": row["trigger_tz"],
+                "endDate": row["trigger_end_date"],
             },
             "payload": {
                 "kind": row["payload_kind"],
@@ -233,6 +248,7 @@ class CronRepository:
         trigger_interval_seconds: int | None = None,
         trigger_cron_expr: str | None = None,
         trigger_tz: str | None = None,
+        trigger_end_date: str | None = None,
         payload_kind: str = "agent_turn",
         payload_message: str = "",
         payload_deliver: bool = False,
@@ -240,6 +256,7 @@ class CronRepository:
         payload_to: str | None = None,
         delete_after_run: bool = False,
         is_system: bool = False,
+        source: str = "",
     ) -> dict[str, Any]:
         """
         Create a new cron job.
@@ -252,6 +269,7 @@ class CronRepository:
             trigger_interval_seconds: For "every" trigger - interval in seconds
             trigger_cron_expr: For "cron" trigger - cron expression
             trigger_tz: Timezone for cron expression
+            trigger_end_date: For "cron" trigger - end date (YYYY-MM-DD)
             payload_kind: Payload kind ("agent_turn", "system_event")
             payload_message: Message to send
             payload_deliver: Whether to deliver response
@@ -259,6 +277,7 @@ class CronRepository:
             payload_to: Recipient for delivery
             delete_after_run: Delete job after execution
             is_system: Whether this is a system job (cannot be deleted)
+            source: Job source ("system" | "calendar" | "")
 
         Returns:
             Created job dict
@@ -269,16 +288,16 @@ class CronRepository:
                 conn.execute(
                     """
                     INSERT INTO cron_jobs (
-                        id, name, enabled, is_system, trigger_type, trigger_date_ms,
-                        trigger_interval_seconds, trigger_cron_expr, trigger_tz,
+                        id, name, enabled, is_system, source, trigger_type, trigger_date_ms,
+                        trigger_interval_seconds, trigger_cron_expr, trigger_tz, trigger_end_date,
                         payload_kind, payload_message, payload_deliver,
                         payload_channel, payload_to, delete_after_run,
                         created_at_ms, updated_at_ms
-                    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        job_id, name, int(is_system), trigger_type, trigger_date_ms,
-                        trigger_interval_seconds, trigger_cron_expr, trigger_tz,
+                        job_id, name, int(is_system), source, trigger_type, trigger_date_ms,
+                        trigger_interval_seconds, trigger_cron_expr, trigger_tz, trigger_end_date,
                         payload_kind, payload_message, int(payload_deliver),
                         payload_channel, payload_to, int(delete_after_run),
                         now_ms, now_ms
@@ -306,6 +325,7 @@ class CronRepository:
         payload_channel: str | None = None,
         payload_to: str | None = None,
         delete_after_run: bool | None = None,
+        source: str | None = None,
     ) -> dict[str, Any] | None:
         """
         Update an existing cron job.
@@ -325,6 +345,7 @@ class CronRepository:
             payload_channel: New channel (optional)
             payload_to: New recipient (optional)
             delete_after_run: New delete flag (optional)
+            source: New source (optional)
 
         Returns:
             Updated job dict or None if not found
@@ -376,6 +397,9 @@ class CronRepository:
         if delete_after_run is not None:
             updates.append("delete_after_run = ?")
             values.append(int(delete_after_run))
+        if source is not None:
+            updates.append("source = ?")
+            values.append(source)
 
         if not updates:
             return existing

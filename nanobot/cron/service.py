@@ -175,7 +175,18 @@ class CronService:
                     tz_obj = pytz.timezone(tz)
                 except Exception:
                     tz_obj = pytz.UTC
-                return CronTrigger.from_crontab(expr, timezone=tz_obj)
+
+                # 获取结束日期
+                end_date_str = trigger_config.get("endDate")
+                end_date = None
+                if end_date_str:
+                    from datetime import datetime
+                    try:
+                        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+                    except Exception:
+                        pass
+
+                return CronTrigger.from_crontab(expr, timezone=tz_obj, end_date=end_date)
 
         return None
 
@@ -273,14 +284,33 @@ class CronService:
         trigger_interval_seconds: int | None = None,
         trigger_cron_expr: str | None = None,
         trigger_tz: str | None = None,
+        trigger_end_date: str | None = None,
         payload_kind: str = "agent_turn",
         payload_message: str = "",
         payload_deliver: bool = False,
         payload_channel: str | None = None,
         payload_to: str | None = None,
         delete_after_run: bool = False,
+        source: str = "",
     ) -> dict[str, Any]:
-        """Add a new job."""
+        """Add a new job.
+
+        Args:
+            name: Job name
+            trigger_type: Trigger type ("at", "every", "cron")
+            trigger_date_ms: For "at" trigger - timestamp in ms
+            trigger_interval_seconds: For "every" trigger - interval in seconds
+            trigger_cron_expr: For "cron" trigger - cron expression
+            trigger_tz: Timezone for cron expression
+            trigger_end_date: For "cron" trigger - end date (YYYY-MM-DD)
+            payload_kind: Payload kind ("agent_turn", "system_event", "calendar_reminder")
+            payload_message: Message to send
+            payload_deliver: Whether to deliver response
+            payload_channel: Channel for delivery
+            payload_to: Recipient for delivery
+            delete_after_run: Delete job after execution
+            source: Job source ("system" | "calendar" | "")
+        """
         job_id = str(uuid.uuid4())[:8]
         next_run_ms = _compute_next_run_ms(
             trigger_type, trigger_date_ms, trigger_interval_seconds, trigger_cron_expr
@@ -294,12 +324,14 @@ class CronService:
             trigger_interval_seconds=trigger_interval_seconds,
             trigger_cron_expr=trigger_cron_expr,
             trigger_tz=trigger_tz,
+            trigger_end_date=trigger_end_date,
             payload_kind=payload_kind,
             payload_message=payload_message,
             payload_deliver=payload_deliver,
             payload_channel=payload_channel,
             payload_to=payload_to,
             delete_after_run=delete_after_run,
+            source=source,
         )
 
         # Update next run time in DB
@@ -314,6 +346,7 @@ class CronService:
                 "intervalSeconds": trigger_interval_seconds,
                 "cronExpr": trigger_cron_expr,
                 "tz": trigger_tz,
+                "endDate": trigger_end_date,
             }
             job["enabled"] = True
             try:

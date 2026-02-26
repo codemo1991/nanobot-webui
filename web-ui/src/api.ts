@@ -298,6 +298,14 @@ export const api = {
       body: JSON.stringify(settings),
     }),
 
+  // 获取已启用的渠道列表
+  getEnabledChannels: () =>
+    request<{ id: string; name: string }[]>('/channels'),
+
+  // 获取日历相关的定时任务
+  getCalendarJobs: () =>
+    request<any[]>('/calendar/jobs'),
+
   // Skills
   getInstalledSkills: () => request<import('./types').InstalledSkill[]>('/skills/installed'),
 

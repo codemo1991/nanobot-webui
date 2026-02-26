@@ -155,6 +155,31 @@ class NanobotWebAPI:
             if payload_kind == "system_event":
                 return await self._handle_system_event_job(job, message)
 
+            # 处理日历提醒任务
+            if payload_kind == "calendar_reminder":
+                event_id = payload.get("event_id")
+                logger.info(f"日历提醒触发: {job_name} (event_id: {event_id})")
+
+                if deliver and channel_name and to:
+                    sender = self._channel_senders.get(channel_name)
+                    if sender:
+                        try:
+                            await sender.send(OutboundMessage(
+                                channel=channel_name,
+                                chat_id=to,
+                                content=message,
+                            ))
+                            logger.info(f"日历提醒已推送至 {channel_name}:{to}")
+                        except Exception as _e:
+                            logger.error(f"日历提醒推送失败: {_e}")
+                    else:
+                        logger.warning(
+                            f"日历提醒: 渠道 '{channel_name}' 未配置或未启用，跳过推送"
+                        )
+                else:
+                    logger.info(f"日历提醒未配置推送渠道: {job_name}")
+                return message
+
             # 处理普通任务（调用 LLM）
             response = await self.agent.process_direct(
                 message,
@@ -189,6 +214,13 @@ class NanobotWebAPI:
         # 初始化日历仓库
         from nanobot.storage.calendar_repository import get_calendar_repository
         self.calendar_repo = get_calendar_repository(workspace_path)
+
+        # 初始化日历提醒服务
+        from nanobot.services.calendar_reminder import CalendarReminderService
+        self.calendar_reminder_service = CalendarReminderService(
+            calendar_repo=self.calendar_repo,
+            cron_service=self.cron_service,
+        )
 
         # 初始化自动记忆整合服务
         from nanobot.services.auto_memory_integration import AutoMemoryIntegrationService
@@ -2065,19 +2097,75 @@ class NanobotWebAPI:
 
     def create_calendar_event(self, data: dict[str, Any]) -> dict[str, Any]:
         """Create a new calendar event."""
-        return self.calendar_repo.create_event(data)
+        event = self.calendar_repo.create_event(data)
+
+        # 解析 reminders_json 为 reminders 数组
+        reminders_json = event.get("reminders_json")
+        if reminders_json:
+            import json
+            try:
+                event["reminders"] = json.loads(reminders_json)
+            except Exception:
+                event["reminders"] = []
+
+        # 创建日历提醒任务
+        if event.get("reminders"):
+            self.calendar_reminder_service.create_reminder_jobs(event)
+        return event
 
     def update_calendar_event(self, event_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
         """Update an existing calendar event."""
-        return self.calendar_repo.update_event(event_id, data)
+        event = self.calendar_repo.update_event(event_id, data)
+
+        # 解析 reminders_json 为 reminders 数组
+        if event:
+            reminders_json = event.get("reminders_json")
+            if reminders_json:
+                import json
+                try:
+                    event["reminders"] = json.loads(reminders_json)
+                except Exception:
+                    event["reminders"] = []
+
+            # 更新日历提醒任务
+            if event.get("reminders"):
+                self.calendar_reminder_service.update_reminder_jobs(event)
+            else:
+                # 如果事件没有提醒配置，删除旧的提醒任务
+                self.calendar_reminder_service.delete_reminder_jobs(event_id)
+        return event
 
     def delete_calendar_event(self, event_id: str) -> bool:
         """Delete a calendar event."""
+        # 先删除关联的提醒任务
+        self.calendar_reminder_service.delete_reminder_jobs(event_id)
         return self.calendar_repo.delete_event(event_id)
 
     def get_calendar_settings(self) -> dict[str, Any]:
         """Get calendar settings."""
         return self.calendar_repo.get_settings()
+
+    def get_enabled_channels(self) -> list[dict[str, str]]:
+        """获取已启用的渠道列表，供前端下拉选择"""
+        channels = []
+        config = self.config  # type: ignore
+        if config.channels.feishu.enabled:
+            channels.append({"id": "feishu", "name": "飞书"})
+        if config.channels.whatsapp.enabled:
+            channels.append({"id": "whatsapp", "name": "WhatsApp"})
+        if config.channels.telegram.enabled:
+            channels.append({"id": "telegram", "name": "Telegram"})
+        if config.channels.discord.enabled:
+            channels.append({"id": "discord", "name": "Discord"})
+        if config.channels.qq.enabled:
+            channels.append({"id": "qq", "name": "QQ"})
+        if config.channels.dingtalk.enabled:
+            channels.append({"id": "dingtalk", "name": "钉钉"})
+        return channels
+
+    def get_calendar_jobs(self) -> list[dict[str, Any]]:
+        """获取日历相关的 cron jobs"""
+        return self.calendar_reminder_service.get_calendar_jobs()
 
     def update_calendar_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         """Update calendar settings."""
@@ -2258,23 +2346,76 @@ class NanobotWebAPI:
     # Calendar
     # ------------------------------------------------------------------
 
-    def get_calendar_events(self) -> list[dict[str, Any]]:
-        return self.calendar_repo.get_events()
+    def get_calendar_events(self, start_time: str | None = None, end_time: str | None = None) -> list[dict[str, Any]]:
+        return self.calendar_repo.get_events(start_time=start_time, end_time=end_time)
 
     def create_calendar_event(self, data: dict[str, Any]) -> dict[str, Any]:
-        return self.calendar_repo.create_event(data)
+        event = self.calendar_repo.create_event(data)
+
+        # 解析 reminders_json 为 reminders 数组
+        reminders_json = event.get("reminders_json")
+        if reminders_json:
+            import json
+            try:
+                event["reminders"] = json.loads(reminders_json)
+            except Exception:
+                event["reminders"] = []
+
+        # 创建日历提醒任务
+        if event.get("reminders"):
+            self.calendar_reminder_service.create_reminder_jobs(event)
+        return event
 
     def update_calendar_event(self, event_id: str, data: dict[str, Any]) -> dict[str, Any]:
         result = self.calendar_repo.update_event(event_id, data)
         if result is None:
             raise KeyError(event_id)
+
+        # 解析 reminders_json 为 reminders 数组
+        reminders_json = result.get("reminders_json")
+        if reminders_json:
+            import json
+            try:
+                result["reminders"] = json.loads(reminders_json)
+            except Exception:
+                result["reminders"] = []
+
+        # 更新日历提醒任务
+        if result.get("reminders"):
+            self.calendar_reminder_service.update_reminder_jobs(result)
+        else:
+            self.calendar_reminder_service.delete_reminder_jobs(event_id)
         return result
 
     def delete_calendar_event(self, event_id: str) -> bool:
+        # 先删除关联的提醒任务
+        self.calendar_reminder_service.delete_reminder_jobs(event_id)
         return self.calendar_repo.delete_event(event_id)
 
     def get_calendar_settings(self) -> dict[str, Any]:
         return self.calendar_repo.get_settings()
+
+    def get_enabled_channels(self) -> list[dict[str, str]]:
+        """获取已启用的渠道列表，供前端下拉选择"""
+        channels = []
+        config = self.config  # type: ignore
+        if config.channels.feishu.enabled:
+            channels.append({"id": "feishu", "name": "飞书"})
+        if config.channels.whatsapp.enabled:
+            channels.append({"id": "whatsapp", "name": "WhatsApp"})
+        if config.channels.telegram.enabled:
+            channels.append({"id": "telegram", "name": "Telegram"})
+        if config.channels.discord.enabled:
+            channels.append({"id": "discord", "name": "Discord"})
+        if config.channels.qq.enabled:
+            channels.append({"id": "qq", "name": "QQ"})
+        if config.channels.dingtalk.enabled:
+            channels.append({"id": "dingtalk", "name": "钉钉"})
+        return channels
+
+    def get_calendar_jobs(self) -> list[dict[str, Any]]:
+        """获取日历相关的 cron jobs"""
+        return self.calendar_reminder_service.get_calendar_jobs()
 
     def update_calendar_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         return self.calendar_repo.update_settings(data)
@@ -2721,8 +2862,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
             # Calendar endpoints
             if path == "/api/v1/calendar/events":
-                start_time = self._get_query_param("start")
-                end_time = self._get_query_param("end")
+                start_time = query.get("start", [None])[0]
+                end_time = query.get("end", [None])[0]
                 events = app.get_calendar_events(start_time=start_time, end_time=end_time)
                 self._write_json(HTTPStatus.OK, _ok(events))
                 return
@@ -2730,6 +2871,18 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/calendar/settings":
                 settings = app.get_calendar_settings()
                 self._write_json(HTTPStatus.OK, _ok(settings))
+                return
+
+            # GET /api/v1/channels - 获取已启用的渠道列表
+            if path == "/api/v1/channels":
+                channels = app.get_enabled_channels()
+                self._write_json(HTTPStatus.OK, _ok(channels))
+                return
+
+            # GET /api/v1/calendar/jobs - 获取日历相关的 cron jobs
+            if path == "/api/v1/calendar/jobs":
+                jobs = app.get_calendar_jobs()
+                self._write_json(HTTPStatus.OK, _ok(jobs))
                 return
 
             if path == "/api/v1/system/status":
@@ -2855,6 +3008,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             # GET /api/v1/calendar/settings
             if path == "/api/v1/calendar/settings":
                 self._write_json(HTTPStatus.OK, _ok(app.get_calendar_settings()))
+                return
+
+            # GET /api/v1/channels - 获取已启用的渠道列表
+            if path == "/api/v1/channels":
+                self._write_json(HTTPStatus.OK, _ok(app.get_enabled_channels()))
+                return
+
+            # GET /api/v1/calendar/jobs - 获取日历相关的 cron jobs
+            if path == "/api/v1/calendar/jobs":
+                self._write_json(HTTPStatus.OK, _ok(app.get_calendar_jobs()))
                 return
 
             # ==================== Mirror Room GET ====================

@@ -681,6 +681,7 @@
     "triggerEveryMinutes": "每 {{minutes}} 分钟",
     "triggerEveryHours": "每 {{hours}} 小时",
     "systemJob": "系统任务",
+    "calendarJob": "日历任务",
     "systemJobTip": "系统任务不可编辑名称和触发类型",
     "cannotDeleteSystemJob": "系统任务无法删除",
     "status": {

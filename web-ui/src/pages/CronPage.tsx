@@ -13,6 +13,7 @@ export default function CronPage() {
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState<FilterType>('all')
   const [searchText, setSearchText] = useState('')
+  const [showCalendarJobs, setShowCalendarJobs] = useState(false)  // 是否显示日历任务
   const [modalVisible, setModalVisible] = useState(false)
   const [editingJob, setEditingJob] = useState<CronJob | null>(null)
   const [form] = Form.useForm()
@@ -39,6 +40,8 @@ export default function CronPage() {
   }
 
   const filteredJobs = jobs.filter(job => {
+    // Filter by calendar jobs (默认隐藏日历任务)
+    if (!showCalendarJobs && job.source === 'calendar') return false
     // Filter by status
     if (filter === 'enabled' && !job.enabled) return false
     if (filter === 'disabled' && job.enabled) return false
@@ -233,6 +236,12 @@ export default function CronPage() {
           <Radio.Button value="enabled">{t('cron.filterEnabled')}</Radio.Button>
           <Radio.Button value="disabled">{t('cron.filterDisabled')}</Radio.Button>
         </Radio.Group>
+        <Switch
+          checked={showCalendarJobs}
+          onChange={setShowCalendarJobs}
+          checkedChildren="显示日历任务"
+          unCheckedChildren="隐藏日历任务"
+        />
       </div>
 
       <div className="cron-content">
@@ -254,6 +263,7 @@ export default function CronPage() {
                     <Space>
                       <span className="job-name">{job.name}</span>
                       {job.is_system && <Tag color="purple">{t('cron.systemJob')}</Tag>}
+                      {job.source === 'calendar' && <Tag color="cyan">{t('cron.calendarJob')}</Tag>}
                       {getStatusTag(job)}
                     </Space>
                   }

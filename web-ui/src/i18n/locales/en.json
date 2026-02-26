@@ -681,6 +681,7 @@
     "triggerEveryMinutes": "Every {{minutes}} minutes",
     "triggerEveryHours": "Every {{hours}} hours",
     "systemJob": "System Job",
+    "calendarJob": "Calendar Job",
     "systemJobTip": "System jobs cannot edit name and trigger type",
     "cannotDeleteSystemJob": "System jobs cannot be deleted",
     "status": {
