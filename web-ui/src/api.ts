@@ -185,10 +185,10 @@ export const api = {
     }),
 
   // IM Channels (WhatsApp, Telegram, Feishu)
-  getChannels: () => request<import('./types').ChannelsConfig>('/channels'),
-  
+  getChannels: () => request<import('./types').ChannelsConfig>('/config/channels'),
+
   updateChannels: (channels: Partial<import('./types').ChannelsConfig>) =>
-    request<import('./types').ChannelsConfig>('/channels', {
+    request<import('./types').ChannelsConfig>('/config/channels', {
       method: 'PUT',
       body: JSON.stringify(channels),
     }),

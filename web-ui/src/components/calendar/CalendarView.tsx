@@ -41,6 +41,10 @@ function CalendarView() {
 
   // Convert events to FullCalendar format
   const calendarEvents: EventInput[] = useMemo(() => {
+    if (!Array.isArray(events)) {
+      console.warn('events is not an array:', events)
+      return []
+    }
     return events.map((event) => {
       const color = priorityColors[event.priority].css
       return {
