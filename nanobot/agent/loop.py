@@ -693,12 +693,25 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
-    def cancel_current_request(self) -> None:
+    def cancel_current_request(self, channel: str = "web", session_id: str | None = None) -> None:
         """Cancel the current running request by setting the cancel event."""
         # Always try to set the event (set() is idempotent and safe to call multiple times)
         # This ensures that multiple clicks on stop button will correctly propagate the cancellation
         self._cancel_event.set()
-        logger.info(f"Agent request cancellation requested, event is now set: {self._cancel_event.is_set()}")
+        logger.info(f"Agent request cancellation requested, channel={channel}, session_id={session_id}, event is now set: {self._cancel_event.is_set()}")
+
+        # 只取消指定 session 的子代理任务
+        if hasattr(self, 'subagents') and self.subagents:
+            if session_id:
+                # 取消指定 session 的任务
+                cancelled = self.subagents.cancel_by_session(channel, session_id)
+                if cancelled > 0:
+                    logger.info(f"Cancelled {cancelled} subagent tasks for session {channel}:{session_id}")
+            else:
+                # 没有 session_id，取消所有任务（向后兼容）
+                count = self.subagents.cancel_all_tasks()
+                if count > 0:
+                    logger.info(f"Cancelled {count} subagent tasks (all sessions)")
 
     async def _check_cancelled(self) -> None:
         """Check if cancellation was requested and raise if so."""

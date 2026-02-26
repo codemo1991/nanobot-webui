@@ -7,6 +7,7 @@ import cgi
 import io
 import json
 import mimetypes
+import os
 import queue
 import re
 import threading
@@ -1641,24 +1642,107 @@ class NanobotWebAPI:
         """Test MCP connection. Returns {connected: bool, message: str}."""
         import subprocess
         import urllib.request
+        import urllib.error
+        import json
 
         config = load_config()
         mcp = next((m for m in config.mcps if m.id == mcp_id), None)
         if not mcp:
             raise KeyError(f"MCP 不存在: {mcp_id}")
+
+        # 根据 transport 类型动态选择测试方式
+        transport = mcp.transport
+        url = mcp.url
+        command = mcp.command
+
+        # 通用 HTTP headers
+        headers = {}
+        if mcp.headers:
+            headers = dict(mcp.headers)
+        if "Authorization" not in headers and mcp.env and "ANTHROPIC_API_KEY" in mcp.env:
+            # 如果环境变量中有 API key，添加到 headers
+            headers["Authorization"] = f"Bearer {mcp.env['ANTHROPIC_API_KEY']}"
+
+        def try_http_request(req_method: str, req_data: bytes | None = None, timeout: int = 10) -> tuple[bool, str]:
+            """尝试 HTTP 请求"""
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=req_data,
+                    headers=headers,
+                    method=req_method
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    result = response.read().decode("utf-8")
+                    return True, f"连接成功: {result[:200]}"
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+                # 某些 MCP 服务器可能返回 405/406 但仍然可用
+                if e.code in (405, 406, 400):
+                    return True, f"服务器响应 {e.code}，但连接可达"
+                return False, f"HTTP {e.code}: {e.reason} - {body[:200]}"
+            except urllib.error.URLError as e:
+                return False, f"连接失败: {e.reason}"
+            except Exception as e:
+                return False, f"错误: {str(e)}"
+
         try:
-            if mcp.transport in ("http", "sse", "streamable_http"):
-                req = urllib.request.Request(mcp.url or "", method="GET")
-                with urllib.request.urlopen(req, timeout=5) as _:
-                    pass
-                return {"connected": True, "message": "连接成功"}
-            if mcp.transport == "stdio" and mcp.command:
-                cmd = [mcp.command] + (mcp.args or [])
+            if transport == "streamable_http":
+                # streamable_http 需要发送 JSON-RPC 初始化请求
+                init_request = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "nanobot",
+                            "version": "1.0.0"
+                        }
+                    }
+                }
+                req_data = json.dumps(init_request).encode("utf-8")
+                req_headers = dict(headers)
+                req_headers["Content-Type"] = "application/json"
+                req_headers["Accept"] = "application/json, text/event-stream"
+
+                try:
+                    req = urllib.request.Request(url, data=req_data, headers=req_headers, method="POST")
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        result = response.read().decode("utf-8")
+                        return {"connected": True, "message": f"连接成功: {result[:200]}"}
+                except urllib.error.HTTPError as e:
+                    if e.code in (405, 406):
+                        # 尝试 GET 请求看服务器是否可达
+                        connected, msg = try_http_request("GET", None, 5)
+                        if connected:
+                            return {"connected": True, "message": f"POST 返回 {e.code}，但 GET 成功: {msg}"}
+                    body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+                    return {"connected": False, "message": f"HTTP {e.code}: {body[:200]}"}
+                except Exception as e:
+                    return {"connected": False, "message": f"连接错误: {str(e)}"}
+
+            elif transport == "sse":
+                # SSE 使用 GET 请求，期望 event-stream 响应
+                connected, msg = try_http_request("GET", None, 5)
+                return {"connected": connected, "message": msg}
+
+            elif transport == "http":
+                # HTTP 使用 GET 请求
+                connected, msg = try_http_request("GET", None, 5)
+                return {"connected": connected, "message": msg}
+
+            elif transport == "stdio":
+                if not command:
+                    return {"connected": False, "message": "stdio transport 需要 command 参数"}
+                cmd = [command] + (mcp.args or [])
                 proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
+                    env={**os.environ, **mcp.env} if mcp.env else None,
                 )
                 import time
                 time.sleep(1.5)
@@ -1671,9 +1755,9 @@ class NanobotWebAPI:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 return {"connected": True, "message": "进程启动成功"}
+
         except Exception as e:
             return {"connected": False, "message": str(e)}
-        return {"connected": False, "message": "未知 transport 类型"}
 
     def update_agent_config(self, data: dict[str, Any]) -> dict[str, Any]:
         """Update agent system config (max_tool_iterations, max_execution_time). Hot-updates running agent."""
@@ -3080,7 +3164,17 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         # POST /api/v1/chat/stop - Stop the current running agent
         if path == "/api/v1/chat/stop":
             try:
-                app.agent.cancel_current_request()
+                # 从请求体获取 session 信息
+                channel = "web"  # 默认
+                session_id = None
+                if method == "POST" and body:
+                    try:
+                        body_data = json.loads(body) if isinstance(body, str) else body
+                        channel = body_data.get("channel", "web")
+                        session_id = body_data.get("sessionId")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                app.agent.cancel_current_request(channel=channel, session_id=session_id)
                 self._write_json(HTTPStatus.OK, _ok({"stopped": True}))
             except Exception as e:
                 logger.exception("Stop request failed")
