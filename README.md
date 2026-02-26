@@ -34,6 +34,7 @@ This fork extends nanobot with **Web UI**, **MCP support**, **additional channel
 | **Channels** | Discord, QQ (qq-botpy), DingTalk (钉钉), plus original Telegram, WhatsApp, Feishu |
 | **MCP** | Model Context Protocol integration — connect external tools via stdio/HTTP/SSE |
 | **Skills** | `claude-code`, `git-manager`, `xlsx`, `pdf`, `pptx`, `skill-creator`, `mirror-system`, `code-review-expert` |
+| **Cron** | Schedule reminders and recurring tasks — set fixed-time or interval-based jobs |
 | **Providers** | Zhipu (智谱), DashScope (通义千问), vLLM, OpenRouter, Anthropic, OpenAI, DeepSeek, Groq, Gemini, Minimax |
 | **Startup Scripts** | `nanobot-launcher.sh` (Linux/macOS) + `nanobot-launcher.ps1` (Windows) — Auto environment check, dependency update, frontend build, one-click launch |
 | **System** | StatusRepository (SQLite), SystemStatusService (uptime, session count), centralized logging |
@@ -58,6 +59,34 @@ nanobot-webui comes with a powerful skill system that extends the AI's capabilit
 ### Creating Custom Skills
 
 The skill system is extensible. You can create custom skills by implementing skill functions that the AI can invoke. See the `skill-creator` skill for a template.
+
+---
+
+## ⏰ Scheduled Tasks (Cron)
+
+nanobot-webui supports scheduled tasks through a built-in Cron system, allowing you to set up recurring reminders and automated actions:
+
+| Feature | Description |
+|---------|-------------|
+| **Fixed-Time Jobs** | Schedule tasks at specific times (e.g., daily 9:00 AM, weekly Monday 10:00 AM) |
+| **Interval Jobs** | Run tasks at regular intervals (e.g., every 30 minutes, every 2 hours) |
+| **Recurring Reminders** | Set up periodic reminders for meetings, deadlines, health checks, etc. |
+| **Message Channels** | Send scheduled messages to any configured channel (Feishu, Telegram, Discord, etc.) |
+
+### Usage Example
+
+```
+# Set a daily reminder
+"每天早上 9 点提醒我喝水"
+
+# Set a weekly meeting reminder
+"每周一上午 10 点提醒我开周会"
+
+# Set an interval check
+"每半小时检查一下服务器状态"
+```
+
+The Cron system runs in the background and automatically delivers scheduled messages to your configured channels.
 
 ---
 
