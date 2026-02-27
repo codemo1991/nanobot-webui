@@ -107,6 +107,8 @@ class AgentLoop:
         smart_parallel_model: str | None = None,
         # 状态服务（用于监控指标）
         status_service: "SystemStatusService | None" = None,
+        # Agent 模板管理器
+        agent_template_manager: "AgentTemplateManager | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig, ClaudeCodeConfig
         from nanobot.cron.service import CronService
@@ -184,6 +186,7 @@ class AgentLoop:
             max_concurrent_subagents=self._max_parallel_tool_calls,
             claude_code_manager=self.claude_code_manager,
             status_service=status_service,
+            agent_template_manager=agent_template_manager,
         )
         logger.info(f"[AgentLoop] AgentLoop id: {id(self)}, SubagentManager id: {id(self.subagents)}")
 
@@ -582,6 +585,14 @@ class AgentLoop:
         """Update subagent model at runtime (hot config). Empty string means use main model."""
         self.subagent_model = subagent_model
         self.subagents.model = subagent_model if subagent_model else self.model
+
+    def _is_vision_model(self, model: str) -> bool:
+        """Check if a model supports vision/images."""
+        if not model:
+            return False
+        model_lower = model.lower()
+        vision_keywords = ["vision", "vl", "qwen-vl", "gpt-4v", "gpt-4o", "claude-3-opus", "claude-3-sonnet", "claude-3-5", "claude-4"]
+        return any(kw in model_lower for kw in vision_keywords)
     
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -822,11 +833,23 @@ class AgentLoop:
             mirror_attack_level=mirror_attack_level,
         )
 
-        # Inline image recognition: 用视觉模型识别图片，将最后一条用户消息替换为纯文本
-        # 避免主模型（可能不支持视觉）收到图片时回复“无法查看图片”
+        # Inline image recognition: 处理用户发送的图片
+        # 逻辑调整：优先让主模型自己处理（或 spawn vision 子agent），只有当主模型不支持视觉时才做 inline recognition 作为兜底
         if msg.media:
-            img_desc = None
-            if self.subagent_model and self.subagent_model != self.model:
+            main_model_supports_vision = self._is_vision_model(self.model)
+
+            if main_model_supports_vision:
+                # 主模型支持视觉，直接发送图片给主模型（让模型自己决定是否需要处理）
+                # 不需要 inline recognition，主模型会自己分析图片
+                logger.info("[Image] Main model supports vision, letting model handle images directly")
+            elif self.subagent_model and self.subagent_model != self.model:
+                # 主模型不支持视觉，但配置了 subagent_model
+                # 让模型自己决定是否需要 spawn vision 子agent
+                # 暂时不做 inline recognition，让模型在 loop 中自己处理
+                # 如果模型没有 spawn 子agent，最后会在 loop 结束后做兜底
+                logger.info("[Image] Main model doesn't support vision, expecting model to spawn vision subagent or fallback to inline")
+            else:
+                # 没有配置 subagent_model，主模型也不支持视觉，直接 inline recognition
                 progress_cb = msg.metadata.get("progress_callback")
                 if progress_cb:
                     try:
@@ -840,20 +863,13 @@ class AgentLoop:
                     except Exception:
                         pass
 
-            last_user = messages[-1] if messages and messages[-1].get("role") == "user" else None
-            if last_user:
-                if img_desc:
-                    text_content = msg.content.strip() or "请描述这张图片。"
-                    last_user["content"] = f"{text_content}\n\n[图片识别结果]\n{img_desc}"
-                else:
-                    has_vision_config = bool(self.subagent_model and self.subagent_model != self.model)
-                    fallback = (
-                        "用户发送了图片。图片识别失败（请检查 DashScope API key 及子 Agent 模型配置），"
-                        "请用户用文字描述图片内容。"
-                        if has_vision_config
-                        else "用户发送了图片。系统未配置视觉模型，请用户用文字描述图片内容，或前往设置配置子 Agent 模型（如 dashscope/qwen-vl-plus）。"
-                    )
-                    last_user["content"] = f"{msg.content}\n\n[{fallback}]" if msg.content.strip() else fallback
+                last_user = messages[-1] if messages and messages[-1].get("role") == "user" else None
+                if last_user:
+                    if img_desc:
+                        text_content = msg.content.strip() or "请描述这张图片。"
+                        last_user["content"] = f"{text_content}\n\n[图片识别结果]\n{img_desc}"
+                    else:
+                        last_user["content"] = f"{msg.content}\n\n[图片识别失败，请用户用文字描述图片内容]"
         
         # Agent loop
         iteration = 0
@@ -1119,7 +1135,35 @@ class AgentLoop:
             completion_tokens=usage_acc["completion_tokens"],
             total_tokens=usage_acc["total_tokens"],
         )
-        
+
+        # 兜底逻辑：如果主模型不支持视觉且配置了 subagent_model，但模型没有 spawn vision 子agent
+        # 则使用 inline image recognition 作为兜底
+        if msg.media and not self._is_vision_model(self.model) and self.subagent_model and self.subagent_model != self.model:
+            # 检查是否已经 spawn 了 vision 子agent
+            spawned_vision = any(
+                step.get("name") == "spawn" and "vision" in str(step.get("arguments", {}))
+                for step in tool_steps
+            )
+            if not spawned_vision:
+                # 模型没有 spawn vision 子agent，做 inline recognition 兜底
+                logger.info("[Image] Model didn't spawn vision subagent, using inline recognition as fallback")
+                progress_cb = msg.metadata.get("progress_callback")
+                if progress_cb:
+                    try:
+                        progress_cb({"type": "tool_start", "name": "image_recognition_fallback", "arguments": {"images": len(msg.media)}})
+                    except Exception:
+                        pass
+
+                img_desc = await self._inline_image_recognition(msg.media, user_text=msg.content)
+                if img_desc:
+                    final_content = f"{final_content or ''}\n\n---\n\n[图片识别结果]\n{img_desc}"
+
+                if progress_cb:
+                    try:
+                        progress_cb({"type": "tool_end", "name": "image_recognition_fallback", "arguments": {}, "result": (img_desc or "")[:200]})
+                    except Exception:
+                        pass
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,

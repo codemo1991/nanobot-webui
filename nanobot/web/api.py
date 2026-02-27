@@ -97,6 +97,13 @@ class NanobotWebAPI:
             workspace=workspace_path
         )
 
+        # Initialize AgentTemplateManager
+        from nanobot.config.agent_templates import AgentTemplateManager
+        self.agent_template_manager = AgentTemplateManager(workspace_path)
+
+        # Pre-register API keys for custom models in templates
+        self._register_template_model_keys(provider, config)
+
         self.agent = AgentLoop(
             bus=MessageBus(),
             provider=provider,
@@ -113,6 +120,7 @@ class NanobotWebAPI:
             enable_parallel_tools=getattr(config.agents.defaults, "enable_parallel_tools", True),
             thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
             status_service=self.status_service,
+            agent_template_manager=self.agent_template_manager,
         )
         self.sessions = self.agent.sessions
 
@@ -344,6 +352,7 @@ class NanobotWebAPI:
             filesystem_config=config.tools.filesystem,
             claude_code_config=config.tools.claude_code,
             status_service=status_service,
+            agent_template_manager=self.agent_template_manager,
         )
         self.sessions = self.agent.sessions
 
@@ -439,6 +448,21 @@ class NanobotWebAPI:
             except self._subprocess.TimeoutExpired:
                 self.gateway_process.kill()
             self.gateway_process = None
+
+    def _register_template_model_keys(self, provider, config) -> None:
+        """Pre-register API keys for custom models configured in templates."""
+        try:
+            custom_models = self.agent_template_manager.get_all_custom_models()
+            for model in custom_models:
+                api_key = config.get_api_key(model)
+                api_base = config.get_api_base(model)
+                if api_key:
+                    provider.ensure_api_key_for_model(model, api_key, api_base)
+                    logger.info(f"Registered API key for template model: {model}")
+                else:
+                    logger.warning(f"No API key found for template model: {model}")
+        except Exception as e:
+            logger.warning(f"Failed to register template model keys: {e}")
 
     def _sync_gateway(self, restart: bool = False) -> None:
         """Start, stop, or restart gateway based on channel configuration."""
@@ -2168,6 +2192,121 @@ class NanobotWebAPI:
         """获取日历相关的 cron jobs"""
         return self.calendar_reminder_service.get_calendar_jobs()
 
+    # ========== Agent Template API ==========
+
+    def list_agent_templates(self) -> list[dict[str, Any]]:
+        """获取所有 Agent 模板列表"""
+        templates = self.agent_template_manager.list_templates()
+        return [
+            {
+                "name": t.name,
+                "description": t.description,
+                "tools": t.tools,
+                "rules": t.rules,
+                "system_prompt": t.system_prompt,
+                "model": t.model,
+                "source": t.source,
+                "is_builtin": t.is_builtin,
+                "is_editable": t.is_editable,
+                "is_deletable": t.is_deletable,
+                "enabled": t.enabled,
+                "created_at": t.created_at,
+                "updated_at": t.updated_at,
+            }
+            for t in templates
+        ]
+
+    def get_agent_template(self, name: str) -> dict[str, Any] | None:
+        """获取单个 Agent 模板详情"""
+        template = self.agent_template_manager.get_template(name)
+        if not template:
+            return None
+        return {
+            "name": template.name,
+            "description": template.description,
+            "tools": template.tools,
+            "rules": template.rules,
+            "system_prompt": template.system_prompt,
+            "model": template.model,
+            "source": template.source,
+            "is_builtin": template.is_builtin,
+            "is_editable": template.is_editable,
+            "is_deletable": template.is_deletable,
+            "enabled": template.enabled,
+            "created_at": template.created_at,
+            "updated_at": template.updated_at,
+        }
+
+    def create_agent_template(self, data: dict[str, Any]) -> dict[str, Any]:
+        """创建新的 Agent 模板"""
+        from nanobot.config.agent_templates import AgentTemplateConfig
+
+        config = AgentTemplateConfig(
+            name=data["name"],
+            description=data.get("description", ""),
+            tools=data.get("tools", []),
+            rules=data.get("rules", []),
+            system_prompt=data.get("system_prompt", ""),
+        )
+        created = self.agent_template_manager.create_template(config)
+        return {"name": created.name, "success": True}
+
+    def update_agent_template(self, name: str, data: dict[str, Any]) -> dict[str, Any]:
+        """更新 Agent 模板"""
+        updated = self.agent_template_manager.update_template(name, data)
+        if not updated:
+            raise KeyError(name)
+        return {"name": updated.name, "success": True}
+
+    def delete_agent_template(self, name: str) -> dict[str, Any]:
+        """删除 Agent 模板"""
+        success = self.agent_template_manager.delete_template(name)
+        if not success:
+            raise KeyError(name)
+        return {"name": name, "success": True}
+
+    def import_agent_templates(self, content: str, on_conflict: str = "skip") -> dict[str, Any]:
+        """从 YAML 导入 Agent 模板"""
+        result = self.agent_template_manager.import_from_yaml(content, on_conflict)
+        return result
+
+    def export_agent_templates(self, names: list[str] | None = None) -> str:
+        """导出 Agent 模板为 YAML"""
+        return self.agent_template_manager.export_to_yaml(names)
+
+    def get_valid_tools(self) -> list[dict[str, str]]:
+        """获取有效的工具列表（包含名称和描述）"""
+        from nanobot.config.agent_templates import VALID_TOOLS
+
+        # 工具描述映射
+        tool_descriptions = {
+            "read_file": "读取文件内容",
+            "write_file": "创建或写入文件",
+            "edit_file": "编辑现有文件",
+            "list_dir": "列出目录内容",
+            "exec": "执行shell命令",
+            "web_search": "搜索网页信息",
+            "web_fetch": "获取网页内容",
+            "claude_code": "使用 Claude Code CLI 执行代码任务",
+        }
+
+        return [
+            {"name": tool, "description": tool_descriptions.get(tool, "")}
+            for tool in VALID_TOOLS
+        ]
+
+    def reload_agent_templates(self) -> dict[str, Any]:
+        """热重载 Agent 模板"""
+        success = self.agent_template_manager.reload()
+        # Re-register API keys for custom models after reload
+        if success:
+            try:
+                config = load_config()
+                self._register_template_model_keys(self.agent.provider, config)
+            except Exception as e:
+                logger.warning(f"Failed to re-register template model keys on reload: {e}")
+        return {"success": success}
+
     def update_calendar_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         """Update calendar settings."""
         return self.calendar_repo.update_settings(data)
@@ -3020,6 +3159,28 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             # GET /api/v1/calendar/jobs - 获取日历相关的 cron jobs
             if path == "/api/v1/calendar/jobs":
                 self._write_json(HTTPStatus.OK, _ok(app.get_calendar_jobs()))
+                return
+
+            # ==================== Agent Template GET ====================
+
+            # GET /api/v1/agent-templates
+            if path == "/api/v1/agent-templates":
+                self._write_json(HTTPStatus.OK, _ok(app.list_agent_templates()))
+                return
+
+            # GET /api/v1/agent-templates/{name}
+            if len(parts) == 4 and parts[:3] == ["api", "v1", "agent-templates"]:
+                template_name = parts[3]
+                template = app.get_agent_template(template_name)
+                if template:
+                    self._write_json(HTTPStatus.OK, _ok(template))
+                else:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("AGENT_TEMPLATE_NOT_FOUND", "Agent模板不存在"))
+                return
+
+            # GET /api/v1/agent-templates/tools/valid
+            if path == "/api/v1/agent-templates/tools/valid":
+                self._write_json(HTTPStatus.OK, _ok(app.get_valid_tools()))
                 return
 
             # ==================== Mirror Room GET ====================
@@ -3916,6 +4077,61 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("CALENDAR_ERROR", str(e)))
             return
 
+        # ==================== Agent Template POST/PATCH ====================
+
+        # POST /api/v1/agent-templates - 创建新模板
+        if path == "/api/v1/agent-templates":
+            body = self._read_json()
+            try:
+                data = app.create_agent_template(body)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except ValueError as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("AGENT_TEMPLATE_ERROR", str(e)))
+            return
+
+        # POST /api/v1/agent-templates/import - 导入模板
+        if path == "/api/v1/agent-templates/import":
+            body = self._read_json()
+            try:
+                on_conflict = body.get("on_conflict", "skip")
+                result = app.import_agent_templates(body.get("content", ""), on_conflict)
+                self._write_json(HTTPStatus.OK, _ok(result))
+            except Exception as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("IMPORT_ERROR", str(e)))
+            return
+
+        # POST /api/v1/agent-templates/export - 导出模板
+        if path == "/api/v1/agent-templates/export":
+            body = self._read_json() or {}
+            try:
+                yaml_content = app.export_agent_templates(body.get("names"))
+                self._write_json(HTTPStatus.OK, _ok({"content": yaml_content}))
+            except Exception as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("EXPORT_ERROR", str(e)))
+            return
+
+        # POST /api/v1/agent-templates/reload - 热重载
+        if path == "/api/v1/agent-templates/reload":
+            try:
+                data = app.reload_agent_templates()
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except Exception as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("RELOAD_ERROR", str(e)))
+            return
+
+        # PATCH /api/v1/agent-templates/{name} - 更新模板
+        if len(parts) == 4 and parts[:3] == ["api", "v1", "agent-templates"]:
+            template_name = parts[3]
+            body = self._read_json()
+            try:
+                data = app.update_agent_template(template_name, body)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("AGENT_TEMPLATE_NOT_FOUND", "Agent模板不存在"))
+            except ValueError as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("AGENT_TEMPLATE_ERROR", str(e)))
+            return
+
         self._write_json(HTTPStatus.NOT_FOUND, _err("NOT_FOUND", f"Unknown path: {path}"))
 
     def do_DELETE(self) -> None:
@@ -3940,6 +4156,18 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("CALENDAR_EVENT_NOT_FOUND", "日历事件不存在"))
+            return
+
+        # DELETE /api/v1/agent-templates/{name}
+        if len(parts) == 4 and parts[:3] == ["api", "v1", "agent-templates"]:
+            template_name = parts[3]
+            try:
+                data = app.delete_agent_template(template_name)
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("AGENT_TEMPLATE_NOT_FOUND", "Agent模板不存在"))
+            except ValueError as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("AGENT_TEMPLATE_ERROR", str(e)))
             return
 
         # DELETE /api/v1/mcps/{mcpId}

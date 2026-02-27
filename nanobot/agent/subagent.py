@@ -55,6 +55,7 @@ class SubagentManager:
         max_concurrent_subagents: int = 10,
         claude_code_manager: "ClaudeCodeManager | None" = None,
         status_service: "SystemStatusService | None" = None,
+        agent_template_manager: "AgentTemplateManager | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.session.manager import SessionManager
@@ -68,6 +69,7 @@ class SubagentManager:
         self._claude_code_manager = claude_code_manager
         self._running_tasks: dict[str, tuple[str | None, Any]] = {}  # task_id -> (origin_key, task)
         self._status_service = status_service
+        self._agent_template_manager = agent_template_manager
 
         # 并发控制
         self._max_concurrent_subagents = max_concurrent_subagents
@@ -96,8 +98,8 @@ class SubagentManager:
         """
         决定实际使用的执行后端。
 
-        仅当 template=="coder" 时才有 claude_code 后端可选；
-        其他模板始终使用 native LLM。
+        当 template 包含 "coder" 或 "claude" 时（如 "coder", "claude-coder"），
+        可以使用 claude_code 后端；其他模板始终使用 native LLM。
 
         Args:
             template: 子 Agent 模板名称
@@ -106,7 +108,10 @@ class SubagentManager:
         Returns:
             "claude_code" 或 "native"
         """
-        if template != "coder":
+        # 判断模板是否支持 Claude Code 后端
+        supports_claude_code = "coder" in template.lower() or "claude" in template.lower()
+
+        if not supports_claude_code:
             return "native"
         if backend == "native":
             return "native"
@@ -423,6 +428,16 @@ class SubagentManager:
         """Execute the subagent task and announce the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, backend: {backend}, memory: {enable_memory}), manager id: {id(self)}")
 
+        # Determine the effective model: template's model or fallback to self.model
+        effective_model = self.model
+        if self._agent_template_manager and template:
+            template_model = self._agent_template_manager.get_model_for_template(template)
+            if template_model:
+                effective_model = template_model
+                logger.info(f"Subagent [{task_id}] using template '{template}' model: {effective_model}")
+            else:
+                logger.info(f"Subagent [{task_id}] using default model: {effective_model}")
+
         # 路由到 Claude Code CLI 后端
         if backend == "claude_code":
             logger.info(f"[SubagentProgress] Routing to Claude Code backend for task_id: {task_id}")
@@ -445,6 +460,11 @@ class SubagentManager:
         try:
             tools = self._create_tools_for_template(template)
 
+            # 设置 ClaudeCodeTool 的 context（如果有）
+            claude_code_tool = tools.get("claude_code")
+            if claude_code_tool:
+                claude_code_tool.set_context(origin["channel"], origin["chat_id"])
+
             from nanobot.agent.memory import MemoryStore
             if enable_memory:
                 agent_memory = MemoryStore.for_agent(self.workspace, task_id)
@@ -453,7 +473,17 @@ class SubagentManager:
 
             memory_context = agent_memory.get_memory_context() if enable_memory else ""
 
-            system_prompt = build_system_prompt(template, task, str(self.workspace))
+            # 优先使用 AgentTemplateManager（如果可用）
+            if self._agent_template_manager:
+                system_prompt = self._agent_template_manager.build_system_prompt(
+                    template, task, str(self.workspace)
+                )
+                # 如果模板不存在，回退到 prompts.py
+                if not system_prompt:
+                    system_prompt = build_system_prompt(template, task, str(self.workspace))
+            else:
+                system_prompt = build_system_prompt(template, task, str(self.workspace))
+
             if memory_context:
                 system_prompt += f"\n\n## Agent Memory\n\n{memory_context}"
 
@@ -479,9 +509,9 @@ class SubagentManager:
 
             # DashScope 模型有图片时绕过 LiteLLM (Bug #16007: LiteLLM 会丢弃 image_url)
             if media and use_tools is None:
-                model_lower = self.model.lower()
+                model_lower = effective_model.lower()
                 if any(k in model_lower for k in ("dashscope", "qwen")):
-                    direct_result = await self._dashscope_direct_call(messages, self.model)
+                    direct_result = await self._dashscope_direct_call(messages, effective_model)
                     if direct_result:
                         final_result = direct_result
                     else:
@@ -495,7 +525,7 @@ class SubagentManager:
                 response = await self.provider.chat(
                     messages=messages,
                     tools=use_tools,
-                    model=self.model,
+                    model=effective_model,
                 )
 
                 if response.has_tool_calls:
@@ -608,7 +638,15 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
     def _create_tools_for_template(self, template: str) -> ToolRegistry:
         """Create and register tools based on template."""
         tools = ToolRegistry()
-        tool_names = get_tools_for_template(template)
+
+        # 优先使用 AgentTemplateManager（如果可用）
+        if self._agent_template_manager:
+            tool_names = self._agent_template_manager.get_tools_for_template(template)
+            # 如果模板不存在，回退到 prompts.py
+            if not tool_names:
+                tool_names = get_tools_for_template(template)
+        else:
+            tool_names = get_tools_for_template(template)
 
         if "read_file" in tool_names:
             tools.register(ReadFileTool(workspace=str(self.workspace)))
@@ -628,6 +666,11 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             tools.register(WebSearchTool(api_key=self.brave_api_key))
         if "web_fetch" in tool_names:
             tools.register(WebFetchTool())
+
+        # Claude Code tool - 需要 ClaudeCodeManager
+        if "claude_code" in tool_names and self._claude_code_manager:
+            from nanobot.agent.tools.claude_code import ClaudeCodeTool
+            tools.register(ClaudeCodeTool(manager=self._claude_code_manager))
 
         return tools
 

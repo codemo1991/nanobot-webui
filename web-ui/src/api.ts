@@ -306,6 +306,50 @@ export const api = {
   getCalendarJobs: () =>
     request<any[]>('/calendar/jobs'),
 
+  // Agent Templates
+  getAgentTemplates: () =>
+    request<import('./types').AgentTemplate[]>('/agent-templates'),
+
+  getAgentTemplate: (name: string) =>
+    request<import('./types').AgentTemplate>(`/agent-templates/${name}`),
+
+  createAgentTemplate: (template: Partial<import('./types').AgentTemplate>) =>
+    request<{ name: string; success: boolean }>('/agent-templates', {
+      method: 'POST',
+      body: JSON.stringify(template),
+    }),
+
+  updateAgentTemplate: (name: string, template: Partial<import('./types').AgentTemplate>) =>
+    request<{ name: string; success: boolean }>(`/agent-templates/${name}`, {
+      method: 'PATCH',
+      body: JSON.stringify(template),
+    }),
+
+  deleteAgentTemplate: (name: string) =>
+    request<{ name: string; success: boolean }>(`/agent-templates/${name}`, {
+      method: 'DELETE',
+    }),
+
+  importAgentTemplates: (content: string, onConflict: 'skip' | 'replace' | 'rename' = 'skip') =>
+    request<{ imported: any[]; skipped: string[]; errors: string[] }>('/agent-templates/import', {
+      method: 'POST',
+      body: JSON.stringify({ content, on_conflict: onConflict }),
+    }),
+
+  exportAgentTemplates: (names?: string[]) =>
+    request<{ content: string }>('/agent-templates/export', {
+      method: 'POST',
+      body: JSON.stringify({ names }),
+    }),
+
+  getValidTools: () =>
+    request<{ name: string; description: string }[]>('/agent-templates/tools/valid'),
+
+  reloadAgentTemplates: () =>
+    request<{ success: boolean }>('/agent-templates/reload', {
+      method: 'POST',
+    }),
+
   // Skills
   getInstalledSkills: () => request<import('./types').InstalledSkill[]>('/skills/installed'),
 

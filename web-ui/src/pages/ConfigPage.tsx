@@ -4,6 +4,7 @@ import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, T
 import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined } from '@ant-design/icons'
 import { api } from '../api'
 import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig, WebConcurrencyConfig, WebMemoryConfig } from '../types'
+import AgentTemplatePage from './AgentTemplatePage'
 import './ConfigPage.css'
 
 const { Title, Text } = Typography
@@ -19,6 +20,7 @@ export default function ConfigPage() {
     { key: 'models', label: t('config.models'), children: <ModelsConfig /> },
     { key: 'mcps', label: t('config.mcps'), children: <McpConfig /> },
     { key: 'skills', label: t('config.skills'), children: <SkillsConfig /> },
+    { key: 'agent-templates', label: 'Agent 模板', children: <AgentTemplatePage /> },
     { key: 'system', label: t('config.system'), children: <SystemConfig /> },
   ]
 
