@@ -65,14 +65,14 @@ class SpawnTool(Tool):
                 },
                 "template": {
                     "type": "string",
-                    "enum": ["minimal", "coder", "researcher", "analyst"],
-                    "description": "The subagent template to use: minimal (simple tasks), coder (code writing - supports claude_code backend), researcher (information gathering), analyst (data analysis)",
+                    "enum": ["minimal", "coder", "researcher", "analyst", "claude-coder", "vision"],
+                    "description": "The subagent template: minimal (simple), coder (code), claude-coder (Claude Code), vision (image analysis), researcher (info), analyst (data)",
                     "default": "minimal",
                 },
                 "backend": {
                     "type": "string",
                     "enum": ["auto", "native", "claude_code"],
-                    "description": "Execution backend for coder template. 'auto' (default): prefer Claude Code CLI if available, else native LLM. 'claude_code': force Claude Code CLI. 'native': force native LLM with file/exec tools. Ignored for non-coder templates.",
+                    "description": "Execution backend. 'auto': auto-select. 'claude_code': Claude Code CLI. 'native': native LLM.",
                     "default": "auto",
                 },
                 "session_id": {
@@ -81,7 +81,7 @@ class SpawnTool(Tool):
                 },
                 "enable_memory": {
                     "type": "boolean",
-                    "description": "Enable agent-specific memory for this subagent (stores memory in agents/{session_id}/memory/)",
+                    "description": "Enable agent-specific memory for this subagent",
                     "default": False,
                 },
                 "attach_media": {

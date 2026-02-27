@@ -521,3 +521,21 @@ export interface TaskListResponse {
   pageSize: number
   total: number
 }
+
+// ==================== Agent Template Types ====================
+
+export interface AgentTemplate {
+  name: string
+  description: string
+  tools: string[]
+  rules: string[]
+  system_prompt: string
+  model?: string  // Optional: use specific model for this template
+  source: 'builtin' | 'user_yaml'
+  is_builtin: boolean
+  is_editable: boolean
+  is_deletable: boolean
+  enabled: boolean
+  created_at?: string
+  updated_at?: string
+}
