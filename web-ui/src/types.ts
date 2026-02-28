@@ -68,7 +68,8 @@ export type StreamEvent =
 export type SubagentProgressEvent =
   | { type: 'subagent_start'; task_id: string; label: string; backend: string; task: string }
   | { type: 'subagent_progress'; task_id: string; label: string; subtype: string; content: string; tool_name?: string; subagent_type?: string }
-  | { type: 'subagent_end'; task_id: string; label: string; status: 'ok' | 'error' | 'timeout'; summary: string }
+  | { type: 'subagent_end'; task_id: string; label: string; status: 'ok' | 'error' | 'timeout' | 'cancelled'; summary: string; result?: string }
+  | { type: 'subagent_summary'; task_id: string; task_ids?: string[]; label: string; llm_summary: string; message_id: string; timestamp?: string }
   | { type: 'heartbeat' }
   | { type: 'timeout' }
 

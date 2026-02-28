@@ -1,8 +1,11 @@
 """Agent loop: the core processing engine."""
 
 import asyncio
+import difflib
 import json
+import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +27,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.claude_code import ClaudeCodeTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
+from nanobot.agent.tools.get_subagent_results import GetSubagentResultsTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import parse_session_key
@@ -180,6 +184,7 @@ class AgentLoop:
             workspace=workspace,
             bus=bus,
             model=self.model,
+            main_model=self.model,
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             sessions=self.sessions,
@@ -199,6 +204,7 @@ class AgentLoop:
         self._mcp_loop_id: int | None = None
         self._mcp_fail_time: float = 0.0
         self._cancel_event = asyncio.Event()
+        self._cancelled_sessions: set[str] = set()  # 按 session 取消，支持多会话并发
         self._register_default_tools()
         self._init_mcp_loader()
 
@@ -297,6 +303,75 @@ class AgentLoop:
                 if not task.done():
                     task.cancel()
                     logger.info(f"Cancelled subagent task: {task_id}")
+
+    def _normalize_spawn_task(self, task: str) -> str:
+        """规范化 spawn 的 task 字符串，用于相似度比较。"""
+        if not task or not isinstance(task, str):
+            return ""
+        s = re.sub(r"\s+", " ", task.strip())
+        return s[:200] if len(s) > 200 else s
+
+    def _spawn_tasks_similar(self, task_a: str, task_b: str, threshold: float = 0.78) -> bool:
+        """判断两个 spawn task 是否语义相似。"""
+        na, nb = self._normalize_spawn_task(task_a), self._normalize_spawn_task(task_b)
+        if not na or not nb:
+            return na == nb
+        if na == nb:
+            return True
+        ratio = difflib.SequenceMatcher(None, na, nb).ratio()
+        return ratio >= threshold
+
+    def _is_duplicate_spawn(
+        self,
+        spawn_args: dict[str, Any],
+        tool_steps: list[dict[str, Any]],
+    ) -> bool:
+        """检查是否已执行过语义相似的 spawn。"""
+        new_task = spawn_args.get("task", "") or ""
+        new_template = str(spawn_args.get("template", "minimal")).lower()
+        for s in tool_steps:
+            if s.get("name") != "spawn":
+                continue
+            args = s.get("arguments") or {}
+            old_task = args.get("task", "") or ""
+            old_template = str(args.get("template", "minimal")).lower()
+            if new_template != old_template:
+                continue
+            if self._spawn_tasks_similar(new_task, old_task):
+                return True
+        return False
+
+    def _deduplicate_tool_calls(self, tool_calls: list) -> list:
+        """同一轮内去重。非 spawn 用精确匹配；spawn 用 task 相似度。"""
+        deduped = []
+        seen_exact: set[tuple[str, str]] = set()
+        for tc in tool_calls:
+            if tc.name == "spawn":
+                args = getattr(tc, "arguments", {}) or {}
+                if not isinstance(args, dict):
+                    args = {}
+                for prev in deduped:
+                    if prev.name != "spawn":
+                        continue
+                    prev_args = getattr(prev, "arguments", {}) or {}
+                    if not isinstance(prev_args, dict):
+                        continue
+                    if self._spawn_tasks_similar(
+                        args.get("task", ""),
+                        prev_args.get("task", ""),
+                    ) and str(args.get("template", "")).lower() == str(prev_args.get("template", "")).lower():
+                        logger.info(f"[AgentLoop] Deduplicated spawn: task similar to previous")
+                        break
+                else:
+                    deduped.append(tc)
+            else:
+                key = (tc.name, json.dumps(tc.arguments, sort_keys=True))
+                if key not in seen_exact:
+                    seen_exact.add(key)
+                    deduped.append(tc)
+        if len(deduped) < len(tool_calls):
+            logger.info(f"[AgentLoop] Deduplicated tool calls: {len(tool_calls)} -> {len(deduped)}")
+        return deduped
 
     async def _execute_tool_parallel(
         self,
@@ -593,7 +668,25 @@ class AgentLoop:
         model_lower = model.lower()
         vision_keywords = ["vision", "vl", "qwen-vl", "gpt-4v", "gpt-4o", "claude-3-opus", "claude-3-sonnet", "claude-3-5", "claude-4"]
         return any(kw in model_lower for kw in vision_keywords)
-    
+
+    def _is_image_file(self, path: str) -> bool:
+        """Check if a file is an image based on extension or mime type."""
+        import mimetypes
+        mime, _ = mimetypes.guess_type(path)
+        if mime and mime.startswith("image/"):
+            return True
+        # Fallback: check common image extensions
+        return str(path).lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'))
+
+    def _is_audio_file(self, path: str) -> bool:
+        """Check if a file is an audio file based on extension or mime type."""
+        import mimetypes
+        mime, _ = mimetypes.guess_type(path)
+        if mime and mime.startswith("audio/"):
+            return True
+        # Fallback: check common audio extensions
+        return str(path).lower().endswith(('.mp3', '.wav', '.ogg', '.m4a', '.opus', '.webm', '.aac'))
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         ws = str(self.workspace)
@@ -626,7 +719,10 @@ class AgentLoop:
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
         logger.info(f"[AgentLoop] SpawnTool registered with SubagentManager id: {id(self.subagents)}")
-        
+
+        # Get subagent results tool (查询子agent执行结果)
+        self.tools.register(GetSubagentResultsTool(sessions=self.sessions))
+
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -705,35 +801,48 @@ class AgentLoop:
         logger.info("Agent loop stopping")
 
     def cancel_current_request(self, channel: str = "web", session_id: str | None = None) -> None:
-        """Cancel the current running request by setting the cancel event."""
-        # Always try to set the event (set() is idempotent and safe to call multiple times)
-        # This ensures that multiple clicks on stop button will correctly propagate the cancellation
-        self._cancel_event.set()
-        logger.info(f"Agent request cancellation requested, channel={channel}, session_id={session_id}, event is now set: {self._cancel_event.is_set()}")
+        """Cancel the current running request for the given session."""
+        if session_id:
+            origin_key = f"{channel}:{session_id}"
+            self._cancelled_sessions.add(origin_key)
+            logger.info(f"Agent cancellation requested for session {origin_key}")
+        else:
+            self._cancel_event.set()
+            logger.info("Agent cancellation requested (all sessions, backward compat)")
 
-        # 只取消指定 session 的子代理任务
+        # 取消指定 session 的子代理任务
         if hasattr(self, 'subagents') and self.subagents:
             if session_id:
-                # 取消指定 session 的任务
                 cancelled = self.subagents.cancel_by_session(channel, session_id)
                 if cancelled > 0:
                     logger.info(f"Cancelled {cancelled} subagent tasks for session {channel}:{session_id}")
             else:
-                # 没有 session_id，取消所有任务（向后兼容）
                 count = self.subagents.cancel_all_tasks()
                 if count > 0:
                     logger.info(f"Cancelled {count} subagent tasks (all sessions)")
 
-    async def _check_cancelled(self) -> None:
-        """Check if cancellation was requested and raise if so."""
-        if self._cancel_event.is_set():
+        # 取消该 session 的 Claude Code 任务
+        if hasattr(self, 'claude_code_manager') and self.claude_code_manager and session_id:
+            cc_cancelled = self.claude_code_manager.cancel_by_session(channel, session_id)
+            if cc_cancelled > 0:
+                logger.info(f"Cancelled {cc_cancelled} Claude Code tasks for session {channel}:{session_id}")
+
+    async def _check_cancelled(self, session_key: str | None = None) -> None:
+        """Check if cancellation was requested for this session and raise if so."""
+        if session_key and session_key in self._cancelled_sessions:
+            self._cancelled_sessions.discard(session_key)
+            logger.info("Cancellation detected for session %s, raising CancelledError", session_key)
+            raise asyncio.CancelledError("Request cancelled by user")
+        if not session_key and self._cancel_event.is_set():
             self._cancel_event.clear()
-            logger.info("Cancellation detected, event cleared, raising CancelledError")
+            logger.info("Cancellation detected (global), raising CancelledError")
             raise asyncio.CancelledError("Request cancelled by user")
 
-    def _reset_cancel_event(self) -> None:
-        """Reset the cancel event for a new request."""
-        logger.debug(f"Resetting cancel event, current state: {self._cancel_event.is_set()}")
+    def _reset_cancel_event(self, session_key: str | None = None) -> None:
+        """Reset the cancel event for a new request; optionally clear session from cancelled set."""
+        if session_key:
+            self._cancelled_sessions.discard(session_key)
+        logger.debug(f"Resetting cancel state, session_key={session_key}, cancelled_sessions={self._cancelled_sessions}")
         self._cancel_event.clear()
     
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -746,6 +855,8 @@ class AgentLoop:
         Returns:
             The response message, or None if no response needed.
         """
+        # 新请求开始前重置取消状态，确保该 session 可正常执行
+        self._reset_cancel_event(msg.session_key)
         # Handle system messages (subagent announces)
         # The chat_id contains the original "channel:chat_id" to route back to
         if msg.channel == "system":
@@ -771,6 +882,12 @@ class AgentLoop:
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(msg.channel, msg.chat_id)
             spawn_tool.set_media(msg.media if msg.media else [])
+            spawn_tool.set_batch_id(str(uuid.uuid4())[:12])
+
+        # Get subagent results tool
+        get_subagent_results_tool = self.tools.get("get_subagent_results")
+        if get_subagent_results_tool:
+            get_subagent_results_tool.set_context(msg.channel, msg.chat_id)
 
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
@@ -833,9 +950,16 @@ class AgentLoop:
             mirror_attack_level=mirror_attack_level,
         )
 
-        # Inline image recognition: 处理用户发送的图片
+        # Inline image recognition: 处理用户发送的图片（不包括音频文件）
         # 逻辑调整：优先让主模型自己处理（或 spawn vision 子agent），只有当主模型不支持视觉时才做 inline recognition 作为兜底
-        if msg.media:
+        # 分离图片和音频文件
+        image_files = [m for m in (msg.media or []) if self._is_image_file(m)]
+        audio_files = [m for m in (msg.media or []) if self._is_audio_file(m)]
+
+        if audio_files:
+            logger.info(f"[Audio] Found {len(audio_files)} audio files, expecting model to spawn voice subagent")
+
+        if image_files:
             main_model_supports_vision = self._is_vision_model(self.model)
 
             if main_model_supports_vision:
@@ -853,10 +977,10 @@ class AgentLoop:
                 progress_cb = msg.metadata.get("progress_callback")
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_start", "name": "image_recognition", "arguments": {"images": len(msg.media)}})
+                        progress_cb({"type": "tool_start", "name": "image_recognition", "arguments": {"images": len(image_files)}})
                     except Exception:
                         pass
-                img_desc = await self._inline_image_recognition(msg.media, user_text=msg.content)
+                img_desc = await self._inline_image_recognition(image_files, user_text=msg.content)
                 if progress_cb:
                     try:
                         progress_cb({"type": "tool_end", "name": "image_recognition", "arguments": {}, "result": (img_desc or "")[:200]})
@@ -872,6 +996,7 @@ class AgentLoop:
                         last_user["content"] = f"{msg.content}\n\n[图片识别失败，请用户用文字描述图片内容]"
         
         # Agent loop
+        sk = msg.session_key
         iteration = 0
         final_content = None
         exit_reason: str | None = None  # "time" | "iterations" | "loop" | None=normal
@@ -905,7 +1030,7 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
             
-            await self._check_cancelled()
+            await self._check_cancelled(sk)
 
             # 时间限制: 防止 runaway，与 max_iterations 互补
             if self.max_execution_time > 0:
@@ -922,18 +1047,52 @@ class AgentLoop:
                     progress({"type": "thinking"})
                 except Exception:
                     pass
-            # Call LLM（单次调用最长 120 秒，防止 context 过大或网络问题导致请求永久挂住）
+            # Call LLM（单次最长 120 秒，等待期间每 2 秒检查一次取消）
             _LLM_CALL_TIMEOUT = 120
+            _CANCEL_CHECK_INTERVAL = 2.0
             selected_tools = self._select_tools_for_message(msg.content)
             try:
-                response = await asyncio.wait_for(
+                llm_task = asyncio.create_task(
                     self.provider.chat(
                         messages=messages,
                         tools=selected_tools,
                         model=self.model,
-                    ),
-                    timeout=_LLM_CALL_TIMEOUT,
+                    )
                 )
+                loop_start_llm = time.monotonic()
+                while not llm_task.done():
+                    elapsed_llm = time.monotonic() - loop_start_llm
+                    remaining = _LLM_CALL_TIMEOUT - elapsed_llm
+                    if remaining <= 0:
+                        llm_task.cancel()
+                        try:
+                            await llm_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise asyncio.TimeoutError()
+                    wait_time = min(_CANCEL_CHECK_INTERVAL, remaining)
+                    done, _ = await asyncio.wait(
+                        [llm_task],
+                        timeout=wait_time,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if llm_task in done:
+                        break
+                    cancelled = (sk in self._cancelled_sessions) or self._cancel_event.is_set()
+                    if cancelled:
+                        llm_task.cancel()
+                        try:
+                            await llm_task
+                        except asyncio.CancelledError:
+                            pass
+                        if sk in self._cancelled_sessions:
+                            self._cancelled_sessions.discard(sk)
+                        else:
+                            self._cancel_event.clear()
+                        raise asyncio.CancelledError("Request cancelled by user")
+                response = await llm_task
+            except asyncio.CancelledError:
+                raise
             except asyncio.TimeoutError:
                 logger.warning("LLM call timed out after %ds, breaking agent loop", _LLM_CALL_TIMEOUT)
                 exit_reason = "time"
@@ -958,7 +1117,9 @@ class AgentLoop:
                     logger.info(f"[AgentLoop] SPAWN tool detected in tool calls!")
                 if any(tc.name == 'claude_code' for tc in response.tool_calls):
                     logger.info(f"[AgentLoop] CLAUDE_CODE tool detected in tool calls!")
-                # Add assistant message with tool calls
+                # 批内去重：相同 (name, arguments) 只执行一次
+                tool_calls_deduped = self._deduplicate_tool_calls(response.tool_calls)
+                # Add assistant message with tool calls（使用去重后的列表以保持一致性）
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -968,7 +1129,7 @@ class AgentLoop:
                             "arguments": json.dumps(tc.arguments)  # Must be JSON string
                         }
                     }
-                    for tc in response.tool_calls
+                    for tc in tool_calls_deduped
                 ]
                 messages = self.context.add_assistant_message(
                     messages, response.content, tool_call_dicts
@@ -979,14 +1140,14 @@ class AgentLoop:
 
                 # 并行/串行执行工具
                 progress = msg.metadata.get("progress_callback")
-                tool_results = await self._execute_tool_parallel(response.tool_calls, progress)
+                tool_results = await self._execute_tool_parallel(tool_calls_deduped, progress)
 
                 for tool_call, result in tool_results:
                     # 跳过异常结果（tool_call 为 None）
                     if tool_call is None:
                         continue
 
-                    # 循环检测: 连续两次完全相同的调用视为 loop，提前终止
+                    # 循环检测: 连续两次完全相同的调用视为 loop；spawn 额外检查历史是否已有相同任务
                     call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
                     if len(tool_steps) >= 1:
                         last_key = (tool_steps[-1]["name"], json.dumps(tool_steps[-1]["arguments"], sort_keys=True))
@@ -994,6 +1155,20 @@ class AgentLoop:
                             logger.info("Loop detected: identical tool call %s, forcing synthesis", tool_call.name)
                             loop_detected = True
                             break
+                    # spawn 专项：语义相似重复 或 本轮 spawn 数量过多
+                    if tool_call.name == "spawn":
+                        spawn_count = sum(1 for s in tool_steps if s.get("name") == "spawn")
+                        if spawn_count >= 5:
+                            logger.info("Loop detected: too many spawns in this turn (%d), forcing synthesis", spawn_count)
+                            loop_detected = True
+                        else:
+                            args = getattr(tool_call, "arguments", {}) or {}
+                            if isinstance(args, dict) and self._is_duplicate_spawn(args, tool_steps):
+                                logger.info("Loop detected: spawn for similar task already executed, forcing synthesis")
+                                loop_detected = True
+
+                    if loop_detected:
+                        break
 
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
@@ -1031,17 +1206,42 @@ class AgentLoop:
                         progress({"type": "thinking"})
                     except Exception:
                         pass
-                # 综合调用限时 60 秒，避免大 context 下挂住整个请求
+                # 综合调用限时 60 秒，等待期间检查取消
                 _SYNTHESIS_TIMEOUT = 60
                 try:
-                    synth = await asyncio.wait_for(
+                    synth_task = asyncio.create_task(
                         self.provider.chat(
                             messages=messages,
                             tools=None,
                             model=self.model,
-                        ),
-                        timeout=_SYNTHESIS_TIMEOUT,
+                        )
                     )
+                    synth_start = time.monotonic()
+                    while not synth_task.done():
+                        remaining = _SYNTHESIS_TIMEOUT - (time.monotonic() - synth_start)
+                        if remaining <= 0:
+                            synth_task.cancel()
+                            try:
+                                await synth_task
+                            except asyncio.CancelledError:
+                                pass
+                            raise asyncio.TimeoutError()
+                        done, _ = await asyncio.wait(
+                            [synth_task],
+                            timeout=min(2.0, remaining),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if synth_task in done:
+                            break
+                        if self._cancel_event.is_set():
+                            synth_task.cancel()
+                            try:
+                                await synth_task
+                            except asyncio.CancelledError:
+                                pass
+                            self._cancel_event.clear()
+                            raise asyncio.CancelledError("Request cancelled by user")
+                    synth = await synth_task
                     _accumulate_usage(synth.usage)
                     # 记录 LLM 调用指标
                     if self._status_service and synth.usage:
@@ -1097,11 +1297,15 @@ class AgentLoop:
         }
         
         user_message_kwargs: dict[str, Any] = {"token_usage": user_token_usage}
-        
+
+        # 分离图片和音频文件，只处理图片
         if msg.media:
             import base64
             user_images: list[str] = []
             for media_path in msg.media:
+                # 只处理图片文件
+                if not self._is_image_file(media_path):
+                    continue
                 try:
                     with open(media_path, "rb") as f:
                         img_data = base64.b64encode(f.read()).decode("utf-8")
@@ -1137,8 +1341,8 @@ class AgentLoop:
         )
 
         # 兜底逻辑：如果主模型不支持视觉且配置了 subagent_model，但模型没有 spawn vision 子agent
-        # 则使用 inline image recognition 作为兜底
-        if msg.media and not self._is_vision_model(self.model) and self.subagent_model and self.subagent_model != self.model:
+        # 则使用 inline image recognition 作为兜底（只对图片）
+        if image_files and not self._is_vision_model(self.model) and self.subagent_model and self.subagent_model != self.model:
             # 检查是否已经 spawn 了 vision 子agent
             spawned_vision = any(
                 step.get("name") == "spawn" and "vision" in str(step.get("arguments", {}))
@@ -1150,17 +1354,17 @@ class AgentLoop:
                 progress_cb = msg.metadata.get("progress_callback")
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_start", "name": "image_recognition_fallback", "arguments": {"images": len(msg.media)}})
+                        progress_cb({"type": "tool_start", "name": "image_recognition_fallback", "arguments": {"images": len(image_files)}})
                     except Exception:
                         pass
 
-                img_desc = await self._inline_image_recognition(msg.media, user_text=msg.content)
+                img_desc = await self._inline_image_recognition(image_files, user_text=msg.content)
                 if img_desc:
                     final_content = f"{final_content or ''}\n\n---\n\n[图片识别结果]\n{img_desc}"
 
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_end", "name": "image_recognition_fallback", "arguments": {}, "result": (img_desc or "")[:200]})
+                        progress_cb({"type": "tool_end", "name": "image_reccognition_fallback", "arguments": {}, "result": (img_desc or "")[:200]})
                     except Exception:
                         pass
 
@@ -1326,6 +1530,7 @@ class AgentLoop:
         # Use the origin session for context
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
+        self._reset_cancel_event(session_key)
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -1335,7 +1540,12 @@ class AgentLoop:
         spawn_tool = self.tools.get("spawn")
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(origin_channel, origin_chat_id)
-        
+
+        # Get subagent results tool
+        get_subagent_results_tool = self.tools.get("get_subagent_results")
+        if get_subagent_results_tool:
+            get_subagent_results_tool.set_context(origin_channel, origin_chat_id)
+
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(origin_channel, origin_chat_id)
@@ -1396,7 +1606,7 @@ class AgentLoop:
         while iteration < self.max_iterations:
             iteration += 1
             
-            await self._check_cancelled()
+            await self._check_cancelled(session_key)
             
             if self.max_execution_time > 0:
                 elapsed = time.monotonic() - loop_start
@@ -1405,11 +1615,50 @@ class AgentLoop:
                     break
 
             selected_tools = self._select_tools_for_message(msg.content)
-            response = await self.provider.chat(
-                messages=messages,
-                tools=selected_tools,
-                model=self.model
-            )
+            # 与主流程一致：LLM 调用期间每 2 秒轮询取消
+            _LLM_CALL_TIMEOUT = 120
+            _CANCEL_CHECK_INTERVAL = 2.0
+            try:
+                llm_task = asyncio.create_task(
+                    self.provider.chat(
+                        messages=messages,
+                        tools=selected_tools,
+                        model=self.model
+                    )
+                )
+                loop_start_llm = time.monotonic()
+                while not llm_task.done():
+                    elapsed_llm = time.monotonic() - loop_start_llm
+                    remaining = _LLM_CALL_TIMEOUT - elapsed_llm
+                    if remaining <= 0:
+                        llm_task.cancel()
+                        try:
+                            await llm_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise asyncio.TimeoutError()
+                    wait_time = min(_CANCEL_CHECK_INTERVAL, remaining)
+                    done, _ = await asyncio.wait(
+                        [llm_task],
+                        timeout=wait_time,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if llm_task in done:
+                        break
+                    if session_key in self._cancelled_sessions:
+                        llm_task.cancel()
+                        try:
+                            await llm_task
+                        except asyncio.CancelledError:
+                            pass
+                        self._cancelled_sessions.discard(session_key)
+                        raise asyncio.CancelledError("Request cancelled by user")
+                response = await llm_task
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                logger.warning("System msg: LLM call timed out")
+                break
             _accumulate_usage(response.usage)
 
             # 记录 LLM 调用指标
@@ -1425,6 +1674,8 @@ class AgentLoop:
 
             if response.has_tool_calls:
                 loop_detected = False
+                # 批内去重（与 _process_message 一致）
+                tool_calls_deduped = self._deduplicate_tool_calls(response.tool_calls)
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -1434,18 +1685,25 @@ class AgentLoop:
                             "arguments": json.dumps(tc.arguments)
                         }
                     }
-                    for tc in response.tool_calls
+                    for tc in tool_calls_deduped
                 ]
                 messages = self.context.add_assistant_message(
                     messages, response.content, tool_call_dicts
                 )
 
-                for tool_call in response.tool_calls:
+                for tool_call in tool_calls_deduped:
                     call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
                     if len(tool_steps) >= 1:
                         last_key = (tool_steps[-1]["name"], json.dumps(tool_steps[-1]["arguments"], sort_keys=True))
                         if call_key == last_key:
                             logger.info("System msg: loop detected %s", tool_call.name)
+                            loop_detected = True
+                            break
+                    # spawn 专项：检查语义相似的重复
+                    if tool_call.name == "spawn":
+                        args = getattr(tool_call, "arguments", {}) or {}
+                        if isinstance(args, dict) and self._is_duplicate_spawn(args, tool_steps):
+                            logger.info("System msg: spawn for similar task already executed, skipping")
                             loop_detected = True
                             break
                     args_str = json.dumps(tool_call.arguments)
@@ -1545,8 +1803,8 @@ class AgentLoop:
         Returns:
             The agent's response.
         """
-        self._reset_cancel_event()
-        logger.info(f"Starting new request, cancel event reset, state: {self._cancel_event.is_set()}")
+        self._reset_cancel_event(session_key)
+        logger.info(f"Starting new request, cancel state reset for session {session_key}")
         
         if ":" in session_key:
             try:
@@ -1575,7 +1833,7 @@ class AgentLoop:
             return await self._handle_image_only(media, session_key, channel, chat_id)
 
         try:
-            await self._check_cancelled()
+            await self._check_cancelled(session_key)
             response = await self._process_message(msg)
             return response.content if response else ""
         except asyncio.CancelledError:

@@ -18,6 +18,27 @@ TOKEN_BUDGET_DEFAULTS = {
     "total": 5000,
 }
 
+# 主 Agent 默认身份内容（不含 runtime_suffix），用于启动时初始化 DB 及内置回退
+DEFAULT_IDENTITY_CONTENT = """# nanobot 🐈
+
+You are nanobot, a helpful AI assistant.
+
+## Behavior Guidelines
+
+- Be helpful, accurate, and concise
+- Use tools when needed, explain what you're doing
+- When user says "记住/remember", call the remember tool to persist the information
+- For normal conversation, respond with text directly. Only use the 'message' tool for cross-channel messaging.
+
+## Media Handling
+
+When receiving media content, choose the spawn template by media type:
+- **Images only** (photos, screenshots, [图片]): Use `template=vision` with `attach_media=true`. Vision is for image analysis/recognition, NOT for audio.
+- **Audio/voice only** ([语音], .mp3/.wav/.ogg): Use `template=voice` with `attach_media=true`. Voice is for speech-to-text transcription, NOT for images.
+
+**CRITICAL**: Never use `voice` template when the user sends images. Never use `vision` template when the user sends only audio. Match template to media type.
+**Important**: Always set `attach_media=true` when using spawn with vision or voice templates."""
+
 
 class ContextBuilder:
     """
@@ -29,7 +50,7 @@ class ContextBuilder:
     Supports agent-specific memory isolation when agent_id is provided.
     """
 
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
 
     def __init__(self, workspace: Path, agent_id: str | None = None, token_budget: dict[str, int] | None = None):
         self.workspace = workspace
@@ -134,30 +155,41 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
         return "\n\n---\n\n".join(parts)
     
     def _get_identity(self) -> str:
-        """Get the core identity section."""
+        """获取主 Agent 身份区块。优先级：DB 配置 > IDENTITY.md > 内置默认。"""
         from datetime import datetime
+
+        from nanobot.storage import memory_repository
+        from nanobot.storage.main_agent_prompt_repository import MainAgentPromptRepository
+
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         workspace_path = str(self.workspace.expanduser().resolve())
-        
-        return f"""# nanobot 🐈
-
-You are nanobot, a helpful AI assistant.
+        runtime_suffix = f"""
 
 ## Current Time
 {now}
 
 ## Workspace
 {workspace_path}
-- Memory: {workspace_path}/memory/MEMORY.md
-- Daily notes: {workspace_path}/memory/YYYY-MM-DD.md
+- 长期记忆与日程笔记：存储在 {workspace_path}/.nanobot/chat.db（SQLite），使用 remember 工具写入
 - User skills: {workspace_path}/skills/
 - Skill paths: see Skills section below (each entry shows the exact SKILL.md path)
-
-## Behavior Guidelines
-- Be helpful, accurate, and concise
-- Use tools when needed, explain what you're doing
-- When user says "记住/remember", call the remember tool to persist the information
-- For normal conversation, respond with text directly. Only use the 'message' tool for cross-channel messaging."""
+"""
+        # 1. 优先从 SQLite 读取用户可视化配置
+        db_path = memory_repository.MemoryRepository.get_workspace_db_path(self.workspace)
+        if not db_path.exists():
+            db_path = memory_repository.MemoryRepository.get_default_db_path()
+        repo = MainAgentPromptRepository(db_path)
+        row = repo.get(workspace_path)
+        if row and (row.get("identity_content") or "").strip():
+            return (row["identity_content"].rstrip() + runtime_suffix)
+        # 2. 其次从 workspace/IDENTITY.md
+        identity_file = self.workspace / "IDENTITY.md"
+        if identity_file.exists():
+            content = identity_file.read_text(encoding="utf-8").strip()
+            if content:
+                return content.rstrip() + runtime_suffix
+        # 3. 内置默认
+        return DEFAULT_IDENTITY_CONTENT.rstrip() + runtime_suffix
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""

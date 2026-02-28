@@ -38,7 +38,11 @@ except ImportError:
     Emoji = None
     CustomizedEvent = None  # type: ignore
 
-MEDIA_DIR = Path.home() / ".nanobot" / "media"
+def _media_dir(workspace: "Path | None") -> Path:
+    """返回 media 目录：workspace 优先，否则 ~/.nanobot/media"""
+    if workspace:
+        return Path(workspace).resolve() / ".nanobot" / "media"
+    return Path.home() / ".nanobot" / "media"
 
 
 def _markdown_to_feishu_post(text: str) -> dict[str, Any]:
@@ -231,9 +235,15 @@ class FeishuChannel(BaseChannel):
 
     name = "feishu"
 
-    def __init__(self, config: FeishuConfig, bus: MessageBus):
+    def __init__(
+        self,
+        config: FeishuConfig,
+        bus: MessageBus,
+        workspace: "Path | None" = None,
+    ):
         super().__init__(config, bus)
         self.config: FeishuConfig = config
+        self._workspace = workspace
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
@@ -276,7 +286,7 @@ class FeishuChannel(BaseChannel):
         self._running = True
         self._loop = asyncio.get_running_loop()
 
-        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        _media_dir(self._workspace).mkdir(parents=True, exist_ok=True)
 
         self._client = lark.Client.builder() \
             .app_id(self.config.app_id) \
@@ -701,7 +711,12 @@ class FeishuChannel(BaseChannel):
                 content_parts.append("[文件]")
 
             elif msg_type == "audio":
-                content_parts.append("[语音]")
+                audio_path = await self._download_audio_from_message(message_id, message.content)
+                if audio_path:
+                    media_paths.append(audio_path)
+                    content_parts.append("[语音]")
+                else:
+                    content_parts.append("[语音下载失败]")
 
             elif msg_type == "sticker":
                 content_parts.append("[表情]")
@@ -1014,8 +1029,9 @@ class FeishuChannel(BaseChannel):
             return None
 
         try:
-            MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-            save_path = MEDIA_DIR / f"feishu_{image_key[:20]}.png"
+            media_dir = _media_dir(self._workspace)
+            media_dir.mkdir(parents=True, exist_ok=True)
+            save_path = media_dir / f"feishu_{image_key[:20]}.png"
 
             if save_path.exists() and save_path.stat().st_size > 0:
                 logger.debug(f"Feishu image cache hit: {save_path}")
@@ -1056,6 +1072,85 @@ class FeishuChannel(BaseChannel):
 
         except Exception as e:
             logger.warning(f"Feishu image download error (key={image_key}): {e}")
+            return None
+
+    async def _download_audio_from_message(
+        self, message_id: str, message_content: str
+    ) -> str | None:
+        """
+        从飞书消息中下载语音资源。
+
+        语音消息 content 示例：{"file_key": "file_xxx", "duration": 12345}
+        """
+        try:
+            content = json.loads(message_content) if message_content else {}
+            logger.debug(f"Feishu audio message content: {content}")
+            file_key = content.get("file_key")
+            if not file_key:
+                logger.warning(f"Feishu audio message has no file_key, content: {content}")
+                return None
+            return await self._download_audio_by_key(message_id, file_key)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Feishu audio message JSON parse error: {e}, content: {message_content[:200]}")
+            return None
+
+    async def _download_audio_by_key(
+        self, message_id: str, file_key: str
+    ) -> str | None:
+        """
+        通过飞书 API 下载语音资源。
+
+        使用 im.v1.message_resource.get 接口：
+        GET /open-apis/im/v1/messages/:message_id/resources/:file_key?type=file
+        注：飞书语音消息以 file 类型存储，而非 audio 类型
+        """
+        if not self._client or not file_key:
+            return None
+
+        try:
+            media_dir = _media_dir(self._workspace)
+            media_dir.mkdir(parents=True, exist_ok=True)
+            # 飞书语音通常是 opus 格式，但保存为 .ogg 或 .mp3
+            save_path = media_dir / f"feishu_audio_{file_key[:20]}.ogg"
+
+            if save_path.exists() and save_path.stat().st_size > 0:
+                logger.debug(f"Feishu audio cache hit: {save_path}")
+                return str(save_path)
+
+            request = GetMessageResourceRequest.builder() \
+                .message_id(message_id) \
+                .file_key(file_key) \
+                .type("file") \
+                .build()
+
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None, self._client.im.v1.message_resource.get, request
+            )
+
+            if not response.success():
+                logger.warning(
+                    f"Feishu audio download failed: code={response.code} msg={response.msg} (key={file_key})"
+                )
+                return None
+
+            # lark-oapi 返回 response.file (file-like) 或 response.data
+            file_obj = getattr(response, "file", None)
+            if file_obj is not None:
+                if hasattr(file_obj, "read"):
+                    data = file_obj.read()
+                else:
+                    data = file_obj
+                with open(save_path, "wb") as f:
+                    f.write(data)
+                logger.info(f"Feishu audio downloaded: {save_path} ({len(data)} bytes)")
+                return str(save_path)
+
+            logger.warning("Feishu audio response has no file data (key=%s)", file_key)
+            return None
+
+        except Exception as e:
+            logger.warning(f"Feishu audio download error (key={file_key}): {e}")
             return None
 
     # ── Reaction ──────────────────────────────────────────────
