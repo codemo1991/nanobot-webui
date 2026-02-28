@@ -18,15 +18,17 @@ from nanobot.utils.helpers import ensure_dir
 class Session:
     """
     A conversation session.
-    
+
     Stores messages in SQLite for robust querying and persistence.
     """
-    
+
     key: str  # channel:chat_id
     messages: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # 存储子agent执行结果 {task_id: {label, result, timestamp}}
+    subagent_results: dict[str, dict[str, Any]] = field(default_factory=dict)
     
     DEFAULT_MAX_MESSAGE_LENGTH = 8000
 
@@ -186,15 +188,14 @@ class SessionManager:
             return session
 
     def _evict_if_needed(self) -> None:
-        """Evict oldest cache entries when over limit."""
+        """Evict oldest cache entries when over limit. Thread-safe via _locks_lock."""
         while len(self._cache) > self._max_cache_size:
-            evicted_key, _ = self._cache.popitem(last=False)
-            self._locks_lock.acquire()
-            try:
+            with self._locks_lock:
+                if len(self._cache) <= self._max_cache_size:
+                    break
+                evicted_key, _ = self._cache.popitem(last=False)
                 if evicted_key in self._locks:
                     del self._locks[evicted_key]
-            finally:
-                self._locks_lock.release()
     
     def set_max_cache_size(self, size: int) -> None:
         """Set max cache size at runtime. Triggers eviction if needed."""
@@ -212,15 +213,17 @@ class SessionManager:
         return self._max_cache_size
 
     def get(self, key: str) -> Session | None:
-        """Get an existing session without creating a new one."""
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
-        session = self._load(key)
-        if session is not None:
-            self._cache[key] = session
-            self._evict_if_needed()
-        return session
+        """Get an existing session without creating a new one. Thread-safe per key."""
+        lock = self._lock_for(key)
+        with lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            session = self._load(key)
+            if session is not None:
+                self._cache[key] = session
+                self._evict_if_needed()
+            return session
     
     def _load(self, key: str) -> Session | None:
         """Load a session from SQLite."""
@@ -263,12 +266,18 @@ class SessionManager:
             created_at = datetime.fromisoformat(session_row["created_at"])
             updated_at = datetime.fromisoformat(session_row["updated_at"])
 
+            # 恢复 subagent_results
+            subagent_results = metadata.pop("_subagent_results", {})
+            if subagent_results:
+                logger.info(f"[SessionManager] Loaded subagent_results: {list(subagent_results.keys())} for session {key}")
+
             return Session(
                 key=key,
                 messages=messages,
                 created_at=created_at,
                 updated_at=updated_at,
                 metadata=metadata,
+                subagent_results=subagent_results,
             )
         except Exception as e:
             logger.warning(f"Failed to load session {key}: {e}", exc_info=True)
@@ -283,6 +292,12 @@ class SessionManager:
 
     def _save_impl(self, session: Session) -> None:
         """Internal save implementation (caller must hold lock)."""
+        # 合并 metadata 和 subagent_results
+        save_metadata = dict(session.metadata)
+        if session.subagent_results:
+            save_metadata["_subagent_results"] = session.subagent_results
+            logger.info(f"[SessionManager] Saving subagent_results: {list(session.subagent_results.keys())}")
+
         with self._connect() as conn:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute(
@@ -297,7 +312,7 @@ class SessionManager:
                     session.key,
                     session.created_at.isoformat(),
                     session.updated_at.isoformat(),
-                    json.dumps(session.metadata),
+                    json.dumps(save_metadata),
                 ),
             )
 
@@ -321,6 +336,9 @@ class SessionManager:
                         json.dumps(extras),
                     ),
                 )
+
+            conn.commit()
+            logger.info(f"[SessionManager] Committed session {session.key} to database")
 
         self._cache[session.key] = session
     

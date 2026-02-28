@@ -350,6 +350,21 @@ export const api = {
       method: 'POST',
     }),
 
+  // 主 Agent 系统提示词 (Identity)
+  getMainAgentPrompt: () =>
+    request<{ identity_content: string; updated_at: string }>('/main-agent-prompt'),
+
+  updateMainAgentPrompt: (identity_content: string) =>
+    request<{ identity_content: string; updated_at: string }>('/main-agent-prompt', {
+      method: 'POST',
+      body: JSON.stringify({ identity_content }),
+    }),
+
+  resetMainAgentPrompt: () =>
+    request<{ success: boolean }>('/main-agent-prompt/reset', {
+      method: 'POST',
+    }),
+
   // Skills
   getInstalledSkills: () => request<import('./types').InstalledSkill[]>('/skills/installed'),
 

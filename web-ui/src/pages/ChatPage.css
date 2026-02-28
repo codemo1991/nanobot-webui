@@ -837,4 +837,19 @@
   line-height: 1.4;
 }
 
+.bg-agent-result {
+  margin: 0;
+  font-size: 12px;
+  color: #333;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 300px;
+  overflow-y: auto;
+  background: #fafafa;
+  border-radius: 4px;
+  padding: 8px;
+  line-height: 1.5;
+  border: 1px solid #e8e8e8;
+}
+
 

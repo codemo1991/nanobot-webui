@@ -5,6 +5,7 @@ import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpen
 import { api } from '../api'
 import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig, WebConcurrencyConfig, WebMemoryConfig } from '../types'
 import AgentTemplatePage from './AgentTemplatePage'
+import SystemPromptPage from './SystemPromptPage'
 import './ConfigPage.css'
 
 const { Title, Text } = Typography
@@ -21,6 +22,7 @@ export default function ConfigPage() {
     { key: 'mcps', label: t('config.mcps'), children: <McpConfig /> },
     { key: 'skills', label: t('config.skills'), children: <SkillsConfig /> },
     { key: 'agent-templates', label: 'Agent 模板', children: <AgentTemplatePage /> },
+    { key: 'system-prompt', label: '主 Agent 提示词', children: <SystemPromptPage /> },
     { key: 'system', label: t('config.system'), children: <SystemConfig /> },
   ]
 

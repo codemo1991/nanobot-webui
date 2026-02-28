@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -49,6 +50,7 @@ class SubagentManager:
         workspace: Path,
         bus: MessageBus,
         model: str | None = None,
+        main_model: str | None = None,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         sessions: "SessionManager | None" = None,
@@ -63,6 +65,8 @@ class SubagentManager:
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
+        # 主模型，用于 summary 等纯文本 LLM 调用（避免使用 vision 模型的 API key）
+        self._main_model = main_model or self.model
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.sessions = sessions
@@ -74,25 +78,64 @@ class SubagentManager:
         # 并发控制
         self._max_concurrent_subagents = max_concurrent_subagents
         self._subagent_semaphore = asyncio.Semaphore(max_concurrent_subagents)
+        # 按 session 取消标记（用于 _run_subagent 内检查，实现真正停止）
+        self._session_cancelled: set[str] = set()
+        # batch 聚合：batch_id -> set[task_id]，用于多子 agent 完成后统一汇总
+        self._batch_tasks: dict[str, set[str]] = {}
+        self._batch_lock = threading.Lock()
 
-    def _build_user_message_with_media(self, text: str, media: list[str] | None = None) -> dict[str, Any]:
-        """Build user message with optional base64-encoded images."""
-        if not media:
-            return {"role": "user", "content": text}
-        
-        images = []
+    def _media_has_images(self, media: list[str]) -> bool:
+        """检查 media 中是否包含图片（仅图片时需禁用 tools，语音子 agent 需保留 exec 等工具）。"""
         for path in media:
             p = Path(path)
             mime, _ = mimetypes.guess_type(path)
-            if not p.is_file() or not mime or not mime.startswith("image/"):
-                continue
-            b64 = base64.b64encode(p.read_bytes()).decode()
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-        
-        if not images:
+            if mime and mime.startswith("image/"):
+                return True
+            if not mime and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+                return True
+        return False
+
+    def _build_user_message_with_media(self, text: str, media: list[str] | None = None) -> dict[str, Any]:
+        """Build user message with optional media (images or audio files)."""
+        if not media:
             return {"role": "user", "content": text}
-        
-        return {"role": "user", "content": images + [{"type": "text", "text": text}]}
+
+        images = []
+        audio_files = []
+
+        for path in media:
+            p = Path(path)
+            mime, _ = mimetypes.guess_type(path)
+            if not p.is_file():
+                continue
+
+            # 检查文件类型（支持 mime 类型或扩展名）
+            is_image = mime and mime.startswith("image/")
+            is_audio = mime and mime.startswith("audio/")
+            # 如果 mime 无法识别，检查扩展名
+            if not mime:
+                ext = p.suffix.lower()
+                is_image = ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp')
+                is_audio = ext in ('.mp3', '.wav', '.ogg', '.m4a', '.opus', '.webm', '.aac')
+
+            if is_image:
+                # 图片：编码为 base64
+                b64 = base64.b64encode(p.read_bytes()).decode()
+                images.append({"type": "image_url", "image_url": {"url": f"data:{mime or 'image/jpeg'};base64,{b64}"}})
+            elif is_audio:
+                # 音频：记录文件路径供子 agent 读取
+                audio_files.append(str(p))
+
+        # 构建内容：如果有音频文件，在文本中附加路径信息
+        content_text = text
+        if audio_files:
+            audio_info = "\n\n[Attached Audio Files]\n" + "\n".join(f"- {f}" for f in audio_files)
+            content_text = text + audio_info
+
+        if not images:
+            return {"role": "user", "content": content_text}
+
+        return {"role": "user", "content": images + [{"type": "text", "text": content_text}]}
 
     def _resolve_backend(self, template: str, backend: str) -> str:
         """
@@ -126,26 +169,28 @@ class SubagentManager:
         return "native"
 
     def cancel_task(self, task_id: str) -> bool:
-        """取消指定的子代理任务"""
+        """取消指定的子代理任务。仅从追踪列表移除，不释放信号量（由任务线程在 finally 中释放，避免双重释放）。"""
         if task_id in self._running_tasks:
             logger.info(f"[SubagentManager] Cancelling task: {task_id}")
-            # 从 _running_tasks 中移除
+            orig_key, _ = self._running_tasks.get(task_id, (None, None))
             self._running_tasks.pop(task_id, None)
-            # 释放信号量
-            self._subagent_semaphore.release()
-            logger.info(f"[SubagentManager] Task {task_id} cancelled")
+            if orig_key and hasattr(self, "_session_cancelled"):
+                self._session_cancelled.add(orig_key)
+            logger.info(f"[SubagentManager] Task {task_id} cancelled (thread will release semaphore on exit)")
             return True
         return False
 
     def cancel_by_session(self, channel: str, chat_id: str) -> int:
-        """取消指定 session 的所有子代理任务，返回取消的任务数量"""
+        """取消指定 session 的所有子代理任务，返回取消的任务数量。仅移除追踪，不释放信号量。"""
         origin_key = f"{channel}:{chat_id}"
+        if hasattr(self, "_session_cancelled"):
+            self._session_cancelled.add(origin_key)
         cancelled = 0
         for task_id, (orig_key, _) in list(self._running_tasks.items()):
             if orig_key == origin_key:
                 logger.info(f"[SubagentManager] Cancelling task {task_id} for session {origin_key}")
                 self._running_tasks.pop(task_id, None)
-                self._subagent_semaphore.release()
+                # 不在此处 release，避免双重释放
                 cancelled += 1
         if cancelled > 0:
             logger.info(f"[SubagentManager] Cancelled {cancelled} tasks for session {origin_key}")
@@ -169,6 +214,7 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         media: list[str] | None = None,
         backend: str = "auto",
+        batch_id: str | None = None,
     ) -> str:
         """
         Spawn a subagent to execute a task in the background.
@@ -225,11 +271,14 @@ class SubagentManager:
         logger.info(f"Subagent [{task_id}] backend resolved: template={template}, requested={backend}, actual={resolved_backend}")
         logger.info(f"[SubagentProgress] Creating background task for subagent, origin_channel={origin_channel}, origin_chat_id={origin_chat_id}")
 
+        if batch_id:
+            with self._batch_lock:
+                self._batch_tasks.setdefault(batch_id, set()).add(task_id)
+            logger.info(f"[SubagentProgress] Added task {task_id} to batch {batch_id}")
+
         logger.info(f"[SubagentProgress] SubagentManager id: {id(self)}, _running_tasks before: {list(self._running_tasks.keys())}")
 
         # 在独立线程中运行子代理任务，避免被主请求的事件循环关闭取消
-        import threading
-
         # 保存信号量和任务引用，用于在线程完成后清理
         semaphore = self._subagent_semaphore
         running_tasks_ref = self._running_tasks
@@ -242,19 +291,26 @@ class SubagentManager:
             origin_key = f"{origin['channel']}:{origin['chat_id']}"
             try:
                 loop.run_until_complete(
-                    self._run_subagent(task_id, task, display_label, origin, template, session_id, enable_memory, media, resolved_backend)
+                    self._run_subagent(
+                        task_id, task, display_label, origin,
+                        template=template, session_id=session_id,
+                        enable_memory=enable_memory, media=media,
+                        backend=resolved_backend, batch_id=batch_id,
+                    )
                 )
                 logger.info(f"[SubagentProgress] Thread-based subagent task {task_id} completed successfully")
             except Exception as e:
                 logger.error(f"[SubagentProgress] Thread-based subagent task {task_id} failed: {e}")
                 # 确保即使失败也发送 subagent_end 事件
                 try:
+                    error_result = f"任务执行失败: {str(e)}"
                     bus.push(origin_key, {
                         "type": "subagent_end",
                         "task_id": task_id,
                         "label": display_label,
                         "status": "error",
-                        "summary": f"任务执行失败: {str(e)[:200]}",
+                        "summary": error_result[:300],
+                        "result": error_result,  # 完整错误信息供前端使用
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
                     logger.info(f"[SubagentProgress] Pushed subagent_end event for failed task {task_id}")
@@ -300,6 +356,8 @@ class SubagentManager:
         task: str,
         label: str,
         origin: dict[str, str],
+        template: str = "",
+        batch_id: str | None = None,
     ) -> None:
         """
         使用 Claude Code Agent SDK 后端在后台执行编码任务。
@@ -378,29 +436,82 @@ class SubagentManager:
                 "label": label,
                 "status": "ok" if status == "done" else "error",
                 "summary": (output or f"status={status}")[:300],
+                "result": output,  # 完整结果供前端使用
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
             logger.info(f"[SubagentProgress] Pushed subagent_end event: status={status}, task_id={task_id}")
 
-            if status == "done":
-                await self._announce_result(task_id, label, task, output, origin, "ok")
-            elif status == "timeout":
-                # 超时不等于失败，任务可能仍在运行
-                bus.push(origin_key, {
-                    "type": "subagent_end",
-                    "task_id": task_id,
-                    "label": label,
-                    "status": "timeout",
-                    "summary": "任务执行超时，任务可能仍在后台运行，请稍后查询状态",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                await self._announce_result(
-                    task_id, label, task,
-                    f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。\n\n请稍后再查询任务状态或等待结果通知。",
-                    origin, "timeout"
-                )
-            else:
-                await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error")
+            # 存储到 session（供 get_subagent_results 和 batch 汇总使用）
+            end_status = "ok" if status == "done" else "timeout" if status == "timeout" else "error"
+            if self.sessions:
+                main_session_key = f"{origin['channel']}:{origin['chat_id']}"
+                main_session = self.sessions.get_or_create(main_session_key)
+                if main_session:
+                    if status == "timeout":
+                        store_result = f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。"
+                    else:
+                        store_result = output or f"status={status}"
+                    main_session.subagent_results[task_id] = {
+                        "label": label,
+                        "task": task,
+                        "result": store_result,
+                        "status": end_status,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        **({"batch_id": batch_id} if batch_id else {}),
+                    }
+                    self.sessions.save(main_session)
+                    logger.info(f"[SubagentProgress] Stored Claude Code result for task {task_id}, status={end_status}")
+
+            # batch 聚合或单独交付
+            is_last = self._is_last_in_batch(batch_id, task_id) if batch_id else True
+            if is_last:
+                if batch_id:
+                    with self._batch_lock:
+                        batch_task_ids = self._batch_tasks.pop(batch_id, set())
+                    if len(batch_task_ids) > 1:
+                        await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
+                    else:
+                        if status == "done":
+                            if origin.get("channel") == "web":
+                                await self._generate_and_push_summary(task_id, label, task, output, origin)
+                            else:
+                                await self._announce_result(task_id, label, task, output, origin, "ok", template=template)
+                        elif status == "timeout" and origin.get("channel") != "web":
+                            bus.push(origin_key, {
+                                "type": "subagent_end",
+                                "task_id": task_id, "label": label, "status": "timeout",
+                                "summary": "任务执行超时，任务可能仍在后台运行，请稍后查询状态",
+                                "result": f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            })
+                            await self._announce_result(
+                                task_id, label, task,
+                                f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
+                                origin, "timeout", template=template
+                            )
+                        elif status != "done" and origin.get("channel") != "web":
+                            await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error", template=template)
+                else:
+                    if status == "done":
+                        if origin.get("channel") == "web":
+                            await self._generate_and_push_summary(task_id, label, task, output, origin)
+                        else:
+                            await self._announce_result(task_id, label, task, output, origin, "ok", template=template)
+                    elif status == "timeout" and origin.get("channel") != "web":
+                        bus.push(origin_key, {
+                            "type": "subagent_end",
+                            "task_id": task_id, "label": label, "status": "timeout",
+                            "summary": "任务执行超时，任务可能仍在后台运行，请稍后查询状态",
+                            "result": f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        await self._announce_result(
+                            task_id, label, task,
+                            f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
+                            origin, "timeout", template=template
+                        )
+                    elif status != "done" and origin.get("channel") != "web":
+                        await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error", template=template)
         except Exception as e:
             logger.error(f"Subagent [{task_id}] Claude Code backend failed: {e}")
             bus.push(origin_key, {
@@ -411,7 +522,7 @@ class SubagentManager:
                 "summary": str(e)[:300],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            await self._announce_result(task_id, label, task, f"Error: {str(e)}", origin, "error")
+            await self._announce_result(task_id, label, task, f"Error: {str(e)}", origin, "error", template=template)
 
     async def _run_subagent(
         self,
@@ -424,6 +535,7 @@ class SubagentManager:
         enable_memory: bool = False,
         media: list[str] | None = None,
         backend: str = "native",
+        batch_id: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, backend: {backend}, memory: {enable_memory}), manager id: {id(self)}")
@@ -441,13 +553,28 @@ class SubagentManager:
         # 路由到 Claude Code CLI 后端
         if backend == "claude_code":
             logger.info(f"[SubagentProgress] Routing to Claude Code backend for task_id: {task_id}")
-            await self._run_via_claude_code(task_id, task, label, origin)
+            await self._run_via_claude_code(task_id, task, label, origin, template=template, batch_id=batch_id)
             logger.info(f"[SubagentProgress] Claude Code backend completed for task_id: {task_id}")
             return
 
         origin_key = f"{origin['channel']}:{origin['chat_id']}"
-        bus = SubagentProgressBus.get()
+        # 启动前检查是否已被取消
+        if origin_key in self._session_cancelled:
+            self._session_cancelled.discard(origin_key)
+            logger.info(f"Subagent [{task_id}] cancelled before start (session {origin_key})")
+            bus = SubagentProgressBus.get()
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "cancelled",
+                "summary": "任务已被用户取消。",
+                "result": "任务已被用户取消。",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            return
 
+        bus = SubagentProgressBus.get()
         bus.push(origin_key, {
             "type": "subagent_start",
             "task_id": task_id,
@@ -504,11 +631,33 @@ class SubagentManager:
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
+            cancelled_by_user = False
+            # 子 agent 可能使用与主模型不同的模型，显式传入 api_key/api_base 避免 401（不依赖 env）
+            sa_key: str | None = None
+            sa_base: str | None = None
+            try:
+                from nanobot.config.loader import load_config
+                cfg = load_config()
+                sa_key = cfg.get_api_key(effective_model)
+                sa_base = cfg.get_api_base(effective_model)
+                if sa_key and hasattr(self.provider, "ensure_api_key_for_model"):
+                    self.provider.ensure_api_key_for_model(
+                        effective_model, sa_key, sa_base
+                    )
+                if not sa_key and any(k in effective_model.lower() for k in ("dashscope", "qwen")):
+                    logger.warning(
+                        f"子 agent 模型 {effective_model} 需要 DashScope API Key，"
+                        "请在配置页 Provider 中填写 Qwen（通义）的 apiKey"
+                    )
+            except Exception as e:
+                logger.debug(f"Subagent pre-register model key: {e}")
+
             # 视觉模型通常不支持 function calling，有图片时不传 tools
-            use_tools = None if media else tools.get_definitions()
+            # 语音子 agent 仅有音频时需保留 exec 等工具，故仅在有图片时禁用
+            use_tools = None if (media and self._media_has_images(media)) else tools.get_definitions()
 
             # DashScope 模型有图片时绕过 LiteLLM (Bug #16007: LiteLLM 会丢弃 image_url)
-            if media and use_tools is None:
+            if media and self._media_has_images(media) and use_tools is None:
                 model_lower = effective_model.lower()
                 if any(k in model_lower for k in ("dashscope", "qwen")):
                     direct_result = await self._dashscope_direct_call(messages, effective_model)
@@ -521,12 +670,66 @@ class SubagentManager:
 
             while iteration < max_iterations:
                 iteration += 1
+                # 检查是否被用户取消
+                if origin_key in self._session_cancelled:
+                    self._session_cancelled.discard(origin_key)
+                    logger.info(f"Subagent [{task_id}] cancelled by user (session {origin_key})")
+                    final_result = "任务已被用户取消。"
+                    cancelled_by_user = True
+                    break
 
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=use_tools,
-                    model=effective_model,
-                )
+                # LLM 调用期间每 2 秒轮询取消，与主 Agent 一致
+                _LLM_CALL_TIMEOUT = 120
+                _CANCEL_CHECK_INTERVAL = 2.0
+                cancelled_during_llm = False
+                try:
+                    chat_kwargs: dict[str, Any] = {
+                        "messages": messages,
+                        "tools": use_tools,
+                        "model": effective_model,
+                    }
+                    if sa_key:
+                        chat_kwargs["api_key"] = sa_key
+                        if sa_base:
+                            chat_kwargs["api_base"] = sa_base
+                    llm_task = asyncio.create_task(self.provider.chat(**chat_kwargs))
+                    loop_start_llm = time.monotonic()
+                    while not llm_task.done():
+                        elapsed_llm = time.monotonic() - loop_start_llm
+                        remaining = _LLM_CALL_TIMEOUT - elapsed_llm
+                        if remaining <= 0:
+                            llm_task.cancel()
+                            try:
+                                await llm_task
+                            except asyncio.CancelledError:
+                                pass
+                            raise asyncio.TimeoutError()
+                        wait_time = min(_CANCEL_CHECK_INTERVAL, remaining)
+                        done, _ = await asyncio.wait(
+                            [llm_task],
+                            timeout=wait_time,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if llm_task in done:
+                            break
+                        if origin_key in self._session_cancelled:
+                            self._session_cancelled.discard(origin_key)
+                            llm_task.cancel()
+                            try:
+                                await llm_task
+                            except asyncio.CancelledError:
+                                pass
+                            cancelled_during_llm = True
+                            break
+                    if cancelled_during_llm:
+                        final_result = "任务已被用户取消。"
+                        cancelled_by_user = True
+                        break
+                    response = await llm_task
+                except asyncio.TimeoutError:
+                    logger.warning(f"Subagent [{task_id}] LLM call timed out")
+                    final_result = "LLM 调用超时。"
+                    break
 
                 if response.has_tool_calls:
                     tool_call_dicts = [
@@ -580,29 +783,380 @@ class SubagentManager:
                 self.sessions.save(subagent_session)
 
             logger.info(f"Subagent [{task_id}] completed successfully")
+            end_status = "cancelled" if cancelled_by_user else "ok"
             bus.push(origin_key, {
                 "type": "subagent_end",
                 "task_id": task_id,
                 "label": label,
-                "status": "ok",
+                "status": end_status,
                 "summary": final_result[:300],
+                "result": final_result,  # 完整结果供前端使用
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
+
+            # 将子agent结果存入session，供主agent后续查询
+            if self.sessions:
+                main_session_key = f"{origin['channel']}:{origin['chat_id']}"
+                logger.info(f"[SubagentProgress] Trying to store result, session_key: {main_session_key}, origin: {origin}")
+                # 使用 get_or_create 而不是 get，确保session存在（即使主线程还没保存）
+                main_session = self.sessions.get_or_create(main_session_key)
+                logger.info(f"[SubagentProgress] Session obtained: {main_session is not None}, key: {main_session.key if main_session else 'N/A'}")
+                if main_session:
+                    main_session.subagent_results[task_id] = {
+                        "label": label,
+                        "task": task,
+                        "result": final_result,
+                        "status": end_status,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        **({"batch_id": batch_id} if batch_id else {}),
+                    }
+                    self.sessions.save(main_session)
+                    logger.info(f"[SubagentProgress] Stored result for task {task_id} in session {main_session_key}")
+                    logger.info(f"[SubagentProgress] Stored data: label={label}, status={end_status}, result_len={len(final_result)}")
+                    logger.info(f"[SubagentProgress] Session messages count: {len(main_session.messages)}")
+                    # 验证存储
+                    verify_session = self.sessions.get(main_session_key)
+                    if verify_session and task_id in verify_session.subagent_results:
+                        logger.info(f"[SubagentProgress] Verified: task {task_id} exists in session, result length: {len(verify_session.subagent_results[task_id].get('result', ''))}")
+                    else:
+                        logger.warning(f"[SubagentProgress] Verification failed: task {task_id} not found in session {main_session_key}")
+                else:
+                    logger.warning(f"[SubagentProgress] Failed to get session for key: {main_session_key}")
+            else:
+                logger.warning(f"[SubagentProgress] sessions is None, cannot store result")
+
+            # batch 聚合：最后一个完成时做汇总；否则不单独 push
+            logger.info(f"[SubagentProgress] origin channel: {origin.get('channel')}, task_id: {task_id}, batch_id: {batch_id}")
+            is_last = self._is_last_in_batch(batch_id, task_id) if batch_id else True
+            if is_last:
+                if batch_id:
+                    with self._batch_lock:
+                        batch_task_ids = self._batch_tasks.pop(batch_id, set())
+                    if len(batch_task_ids) > 1:
+                        await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
+                    else:
+                        if origin.get("channel") == "web":
+                            await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                        else:
+                            await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
+                else:
+                    if origin.get("channel") == "web":
+                        await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                    else:
+                        await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error(f"Subagent [{task_id}] failed: {e}")
+            end_status = "error"
             bus.push(origin_key, {
                 "type": "subagent_end",
                 "task_id": task_id,
                 "label": label,
                 "status": "error",
                 "summary": error_msg[:300],
+                "result": error_msg,  # 完整错误信息供前端使用
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            await self._announce_result(task_id, label, task, error_msg, origin, "error")
+
+            # 异常时也存储结果
+            if self.sessions:
+                main_session_key = f"{origin['channel']}:{origin['chat_id']}"
+                logger.info(f"[SubagentProgress] Exception: trying to store error result, session_key: {main_session_key}")
+                main_session = self.sessions.get_or_create(main_session_key)
+                if main_session:
+                    main_session.subagent_results[task_id] = {
+                        "label": label,
+                        "task": task,
+                        "result": error_msg,
+                        "status": end_status,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        **({"batch_id": batch_id} if batch_id else {}),
+                    }
+                    self.sessions.save(main_session)
+                    logger.info(f"[SubagentProgress] Stored error result for task {task_id}")
+
+            # batch 聚合：最后一个完成时做汇总
+            is_last = self._is_last_in_batch(batch_id, task_id) if batch_id else True
+            if is_last:
+                if batch_id:
+                    with self._batch_lock:
+                        batch_task_ids = self._batch_tasks.pop(batch_id, set())
+                    if len(batch_task_ids) > 1:
+                        await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
+                    else:
+                        if origin.get("channel") != "web":
+                            await self._announce_result(task_id, label, task, error_msg, origin, "error", template=template)
+                else:
+                    if origin.get("channel") != "web":
+                        await self._announce_result(task_id, label, task, error_msg, origin, "error", template=template)
     
+    def _is_last_in_batch(self, batch_id: str | None, task_id: str) -> bool:
+        """判断当前 task 是否为该 batch 中最后一个完成的（不含已移除的）。"""
+        if not batch_id:
+            return True
+        with self._batch_lock:
+            batch_task_ids = self._batch_tasks.get(batch_id, set())
+            still_running = {t for t in batch_task_ids if t in self._running_tasks}
+        return still_running == {task_id}
+
+    async def _deliver_batch_complete(
+        self,
+        batch_id: str,
+        batch_task_ids: set[str],
+        origin: dict[str, str],
+    ) -> None:
+        """batch 内所有任务完成，进行汇总并交付。"""
+        main_session_key = f"{origin['channel']}:{origin['chat_id']}"
+        if not self.sessions:
+            logger.warning("[SubagentBatch] No sessions, cannot deliver batch")
+            return
+        main_session = self.sessions.get_or_create(main_session_key)
+        batch_results = [
+            (tid, main_session.subagent_results[tid])
+            for tid in batch_task_ids
+            if tid in main_session.subagent_results and main_session.subagent_results[tid].get("batch_id") == batch_id
+        ]
+        if not batch_results:
+            logger.warning(f"[SubagentBatch] No results found for batch {batch_id}")
+            return
+        if origin.get("channel") == "web":
+            await self._generate_batch_summary(batch_id, batch_results, origin)
+        else:
+            await self._announce_batch_result(batch_results, origin)
+
+    async def _generate_batch_summary(
+        self,
+        batch_id: str,
+        batch_results: list[tuple[str, dict[str, Any]]],
+        origin: dict[str, str],
+    ) -> None:
+        """Web 渠道：对 batch 内多条结果做一次 LLM 综合汇总并推送。包含完整任务指令和结果，不截断。"""
+        origin_key = f"{origin['channel']}:{origin['chat_id']}"
+        bus = SubagentProgressBus.get()
+        message_id = f"msg_subagent_batch_{batch_id}"
+
+        # 完整内容：每条含任务指令 + 完整结果
+        full_parts = []
+        preview_parts = []
+        for tid, r in batch_results:
+            label = r.get("label", tid)
+            task = r.get("task", "")
+            result = r.get("result") or ""
+            status = r.get("status", "ok")
+            block = f"[{label}] ({status})\n任务指令：{task}\n\n结果：\n{result}"
+            full_parts.append(block)
+            # 用于 LLM 的预览（单条截断以防 token 溢出，但保留足够上下文）
+            preview_block = f"[{label}] ({status})\n任务：{task[:500]}{'...' if len(task) > 500 else ''}\n结果：{result[:2000]}{'...' if len(result) > 2000 else ''}"
+            preview_parts.append(preview_block)
+        combined_preview = "\n\n---\n\n".join(preview_parts)
+        full_detail = "\n\n---\n\n".join(full_parts)
+
+        try:
+            summary_prompt = (
+                "以下是多个子任务的执行结果（含任务指令与结果），请用 2-4 句话综合总结，自然回复用户。"
+                "不要逐条复述，要提炼关键结论。不要提 subagent、task_id 等技术细节。\n\n"
+                f"{combined_preview}"
+            )
+            messages = [
+                {"role": "system", "content": "你是协调子任务的主 agent，负责综合多子任务结果并向用户汇报。"},
+                {"role": "user", "content": summary_prompt},
+            ]
+            response = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=messages,
+                    tools=None,
+                    model=self._main_model,
+                    max_tokens=400,
+                    temperature=0.5,
+                ),
+                timeout=15.0,
+            )
+            brief = (response.content or "").strip()
+            if not brief:
+                raise ValueError("Empty summary from LLM")
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"[SubagentBatch] LLM summary failed for batch {batch_id}: {e}, using fallback")
+            brief = "各子任务执行完成，结果如下："
+
+        llm_summary = f"{brief}\n\n---\n\n**各任务详情**：\n\n{full_detail}"
+
+        if self.sessions:
+            main_session = self.sessions.get_or_create(origin_key)
+            if main_session:
+                main_session.add_message(
+                    role="assistant",
+                    content=llm_summary,
+                    source="subagent_batch_summary",
+                    batch_id=batch_id,
+                )
+                self.sessions.save(main_session)
+
+        batch_task_ids_list = [tid for tid, _ in batch_results]
+        bus.push(origin_key, {
+            "type": "subagent_summary",
+            "task_id": batch_id,
+            "task_ids": batch_task_ids_list,
+            "label": "batch",
+            "llm_summary": llm_summary,
+            "message_id": message_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info(f"[SubagentBatch] Pushed batch summary for {batch_id}")
+
+    async def _announce_batch_result(
+        self,
+        batch_results: list[tuple[str, dict[str, Any]]],
+        origin: dict[str, str],
+    ) -> None:
+        """非 Web 渠道：将 batch 内所有结果合并为一条 system 消息，触发主 agent 综合。包含完整任务指令和结果。"""
+        parts = []
+        for tid, r in batch_results:
+            label = r.get("label", tid)
+            task = r.get("task", "")
+            result = r.get("result") or ""
+            status = r.get("status", "ok")
+            status_text = "completed successfully" if status == "ok" else "failed"
+            parts.append(f"[Subagent '{label}' {status_text}]\nTask: {task}\nResult:\n{result}")
+        content = "\n\n---\n\n".join(parts)
+        content += "\n\nSummarize the above subagent results naturally for the user in 2-4 sentences. Do not mention technical details."
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id=f"{origin['channel']}:{origin['chat_id']}",
+            content=content,
+        )
+        await self.bus.publish_inbound(msg)
+        logger.debug(f"[SubagentBatch] Announced batch result to {origin['channel']}:{origin['chat_id']}")
+
+    def _build_full_summary_content(self, label: str, task: str, result: str, brief_summary: str) -> str:
+        """
+        构建完整 summary 内容：简要总结 + 任务指令 + 完整结果。
+        确保主 agent 和用户获得完整上下文，不截断。
+        """
+        return (
+            f"{brief_summary}\n\n---\n\n"
+            f"**任务指令**：\n{task}\n\n"
+            f"**完整结果**：\n{result}"
+        )
+
+    async def _generate_and_push_summary(
+        self,
+        task_id: str,
+        label: str,
+        task: str,
+        result: str,
+        origin: dict[str, str],
+    ) -> None:
+        """
+        Web 渠道专用：子 agent 成功完成后异步生成 LLM 总结并推送 subagent_summary 事件。
+        使用主模型（纯文本），失败时降级为结果预览。返回内容包含任务指令和完整结果，不截断。
+        """
+        origin_key = f"{origin['channel']}:{origin['chat_id']}"
+        bus = SubagentProgressBus.get()
+        message_id = f"msg_subagent_{task_id}"
+        fallback_brief = f"任务「{label}」已完成。"
+        fallback_full = self._build_full_summary_content(label, task, result, fallback_brief)
+
+        try:
+            # 传入完整任务指令和结果，供 LLM 准确总结（限制 result 长度以防 token 溢出，保留足够上下文）
+            result_for_prompt = result if len(result) <= 12000 else result[:12000] + "\n\n...(结果过长已截断，完整结果见下方)"
+            summary_prompt = (
+                f"任务名称：{label}\n\n"
+                f"任务描述（子 agent 收到的完整指令）：\n{task}\n\n"
+                f"执行结果：\n{result_for_prompt}"
+            )
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个助手，用 1–2 句话自然地向用户总结后台任务的执行结果。"
+                        "语言简洁口语化，不要提 subagent、task_id 等技术细节，不要使用 Markdown 标题。"
+                        "总结时要结合「任务描述」和「执行结果」两方面，确保准确。"
+                    ),
+                },
+                {"role": "user", "content": summary_prompt},
+            ]
+            # 使用主模型做纯文本 summary，避免 vision 模型 (如 qwen-vl-plus) 的 API key 要求
+            response = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=messages,
+                    tools=None,
+                    model=self._main_model,
+                    max_tokens=300,
+                    temperature=0.5,
+                ),
+                timeout=15.0,
+            )
+            brief = (response.content or "").strip()
+            if not brief:
+                brief = fallback_brief
+
+            full_content = self._build_full_summary_content(label, task, result, brief)
+
+            await self._push_summary_to_session_and_bus(
+                task_id, label, origin_key, message_id, full_content, origin, bus
+            )
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[SubagentSummary] LLM summary timed out for task {task_id}, using fallback")
+            await self._push_summary_to_session_and_bus(
+                task_id, label, origin_key, message_id, fallback_full, origin, bus
+            )
+        except Exception as e:
+            logger.warning(f"[SubagentSummary] Failed to generate summary for task {task_id}: {e}, using fallback")
+            await self._push_summary_to_session_and_bus(
+                task_id, label, origin_key, message_id, fallback_full, origin, bus
+            )
+
+    async def _push_summary_to_session_and_bus(
+        self,
+        task_id: str,
+        label: str,
+        origin_key: str,
+        message_id: str,
+        llm_summary: str,
+        origin: dict[str, str],
+        bus: SubagentProgressBus,
+    ) -> None:
+        """将 summary 写入 session 并推送到 bus。"""
+        if self.sessions:
+            main_session = self.sessions.get_or_create(origin_key)
+            if main_session:
+                main_session.add_message(
+                    role="assistant",
+                    content=llm_summary,
+                    source="subagent_summary",
+                    task_id=task_id,
+                )
+                self.sessions.save(main_session)
+                logger.info(f"[SubagentSummary] Saved summary to session for task {task_id}")
+
+        bus.push(origin_key, {
+            "type": "subagent_summary",
+            "task_id": task_id,
+            "task_ids": [task_id],
+            "label": label,
+            "llm_summary": llm_summary,
+            "message_id": message_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info(f"[SubagentSummary] Pushed subagent_summary for task {task_id}")
+
+    async def _inject_voice_as_user_message(self, origin: dict[str, str], transcribed_text: str) -> None:
+        """
+        将语音转写结果作为用户指令注入，让主 agent 直接执行。
+        用于飞书/Telegram 等渠道：语音触发 → 子 agent 转写 → 转写文本作为新用户消息，主 agent 自然回应。
+        """
+        msg = InboundMessage(
+            channel=origin["channel"],
+            sender_id="voice",
+            chat_id=origin["chat_id"],
+            content=transcribed_text.strip() or "[语音转写为空]",
+        )
+        await self.bus.publish_inbound(msg)
+        logger.info(f"[Voice] Injected transcription as user message to {origin['channel']}:{origin['chat_id']}")
+
     async def _announce_result(
         self,
         task_id: str,
@@ -611,8 +1165,14 @@ class SubagentManager:
         result: str,
         origin: dict[str, str],
         status: str,
+        template: str = "",
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
+        # voice 模板在非 web 渠道：转写结果作为用户指令注入，主 agent 直接执行，不走 summary
+        if template == "voice" and origin.get("channel") != "web" and status == "ok":
+            await self._inject_voice_as_user_message(origin, result)
+            return
+
         status_text = "completed successfully" if status == "ok" else "failed"
         
         announce_content = f"""[Subagent '{label}' {status_text}]
@@ -666,6 +1226,9 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             tools.register(WebSearchTool(api_key=self.brave_api_key))
         if "web_fetch" in tool_names:
             tools.register(WebFetchTool())
+        if "voice_transcribe" in tool_names:
+            from nanobot.agent.tools.voice_transcribe import VoiceTranscribeTool
+            tools.register(VoiceTranscribeTool())
 
         # Claude Code tool - 需要 ClaudeCodeManager
         if "claude_code" in tool_names and self._claude_code_manager:

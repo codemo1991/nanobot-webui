@@ -128,6 +128,9 @@ class NanobotWebAPI:
         self.status_service.session_manager = self.sessions
         self.status_service.initialize()
 
+        # 若主 Agent 提示词数据库无记录，则用默认内容初始化
+        self._init_main_agent_prompt_if_needed(workspace_path)
+
         # Mirror service
         self.mirror = MirrorService(
             workspace=workspace_path,
@@ -1112,14 +1115,19 @@ class NanobotWebAPI:
 
     def _save_images_to_temp(self, images: list[str]) -> list[str]:
         """
-        将 base64 data URL 图片保存为临时文件，返回文件路径列表。
+        将 base64 data URL 图片保存到当前 workspace 的 .nanobot/media 目录。
         调用方负责在处理完成后清理这些文件。
         """
         import base64
         import mimetypes
         import tempfile
 
-        media_dir = Path.home() / ".nanobot" / "media"
+        # 使用当前 workspace 的 media 目录，与 session/chat.db 同构
+        workspace = getattr(self.agent, "workspace", None)
+        if workspace:
+            media_dir = Path(workspace).resolve() / ".nanobot" / "media"
+        else:
+            media_dir = Path.home() / ".nanobot" / "media"
         media_dir.mkdir(parents=True, exist_ok=True)
 
         paths = []
@@ -2205,8 +2213,8 @@ class NanobotWebAPI:
                 "rules": t.rules,
                 "system_prompt": t.system_prompt,
                 "model": t.model,
-                "source": t.source,
-                "is_builtin": t.is_builtin,
+                "is_system": t.is_system,
+                "is_builtin": t.is_builtin,  # 兼容旧字段
                 "is_editable": t.is_editable,
                 "is_deletable": t.is_deletable,
                 "enabled": t.enabled,
@@ -2228,8 +2236,8 @@ class NanobotWebAPI:
             "rules": template.rules,
             "system_prompt": template.system_prompt,
             "model": template.model,
-            "source": template.source,
-            "is_builtin": template.is_builtin,
+            "is_system": template.is_system,
+            "is_builtin": template.is_builtin,  # 兼容旧字段
             "is_editable": template.is_editable,
             "is_deletable": template.is_deletable,
             "enabled": template.enabled,
@@ -2276,7 +2284,7 @@ class NanobotWebAPI:
 
     def get_valid_tools(self) -> list[dict[str, str]]:
         """获取有效的工具列表（包含名称和描述）"""
-        from nanobot.config.agent_templates import VALID_TOOLS
+        from nanobot.config.builtin_templates_data import VALID_TOOLS
 
         # 工具描述映射
         tool_descriptions = {
@@ -2306,6 +2314,64 @@ class NanobotWebAPI:
             except Exception as e:
                 logger.warning(f"Failed to re-register template model keys on reload: {e}")
         return {"success": success}
+
+    # ========== 主 Agent System Prompt API ==========
+
+    def get_main_agent_prompt(self) -> dict[str, Any]:
+        """获取主 Agent 系统提示词配置（Identity 部分）。"""
+        from nanobot.storage import memory_repository
+        from nanobot.storage.main_agent_prompt_repository import MainAgentPromptRepository
+
+        workspace_path = str(self.agent.workspace.expanduser().resolve())
+        db_path = memory_repository.MemoryRepository.get_workspace_db_path(self.agent.workspace)
+        if not db_path.exists():
+            db_path = memory_repository.MemoryRepository.get_default_db_path()
+        repo = MainAgentPromptRepository(db_path)
+        row = repo.get(workspace_path)
+        if row:
+            return {"identity_content": row.get("identity_content", ""), "updated_at": row.get("updated_at", "")}
+        return {"identity_content": "", "updated_at": ""}
+
+    def update_main_agent_prompt(self, identity_content: str) -> dict[str, Any]:
+        """更新主 Agent 系统提示词配置。"""
+        from nanobot.storage import memory_repository
+        from nanobot.storage.main_agent_prompt_repository import MainAgentPromptRepository
+
+        workspace_path = str(self.agent.workspace.expanduser().resolve())
+        db_path = memory_repository.MemoryRepository.get_workspace_db_path(self.agent.workspace)
+        if not db_path.exists():
+            db_path = memory_repository.MemoryRepository.get_default_db_path()
+        repo = MainAgentPromptRepository(db_path)
+        result = repo.upsert(workspace_path, identity_content or "")
+        return {"identity_content": result["identity_content"], "updated_at": result["updated_at"]}
+
+    def reset_main_agent_prompt(self) -> dict[str, Any]:
+        """恢复主 Agent 系统提示词为默认。"""
+        from nanobot.storage import memory_repository
+        from nanobot.storage.main_agent_prompt_repository import MainAgentPromptRepository
+
+        workspace_path = str(self.agent.workspace.expanduser().resolve())
+        db_path = memory_repository.MemoryRepository.get_workspace_db_path(self.agent.workspace)
+        if not db_path.exists():
+            db_path = memory_repository.MemoryRepository.get_default_db_path()
+        repo = MainAgentPromptRepository(db_path)
+        repo.reset(workspace_path)
+        return {"success": True}
+
+    def _init_main_agent_prompt_if_needed(self, workspace_path: Path) -> None:
+        """若主 Agent 提示词数据库无记录，则用默认内容初始化。"""
+        from nanobot.agent.context import DEFAULT_IDENTITY_CONTENT
+        from nanobot.storage.main_agent_prompt_repository import MainAgentPromptRepository
+
+        workspace_str = str(workspace_path.expanduser().resolve())
+        db_path = memory_repository.MemoryRepository.get_workspace_db_path(workspace_path)
+        if not db_path.exists():
+            db_path = memory_repository.MemoryRepository.get_default_db_path()
+        repo = MainAgentPromptRepository(db_path)
+        row = repo.get(workspace_str)
+        if row is None or not (row.get("identity_content") or "").strip():
+            repo.upsert(workspace_str, DEFAULT_IDENTITY_CONTENT)
+            logger.info(f"主 Agent 提示词已初始化默认内容: workspace={workspace_str}")
 
     def update_calendar_settings(self, data: dict[str, Any]) -> dict[str, Any]:
         """Update calendar settings."""
@@ -2813,10 +2879,9 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     break
         finally:
             app.unsubscribe_subagent_progress(session_id, evt_queue)
-            # 清理缓冲区，防止内存泄漏
-            from nanobot.agent.subagent_progress import SubagentProgressBus
-            SubagentProgressBus.get().clear_buffer(f"web:{session_id}")
-            logger.info(f"[SubagentProgress] SSE connection closed and buffer cleared for session: {session_id}")
+            # 注意：不再自动清除缓冲区，保留事件供后续重连时 replay
+            # 缓冲区会在会话真正结束时通过 clear_buffer API 手动清除
+            logger.info(f"[SubagentProgress] SSE connection closed for session: {session_id}, buffer preserved for replay")
 
     def _handle_mirror_chat_stream(
         self, app: "NanobotWebAPI", session_type: str, session_id: str, content: str
@@ -3183,6 +3248,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(app.get_valid_tools()))
                 return
 
+            # GET /api/v1/main-agent-prompt - 主 Agent 系统提示词
+            if path == "/api/v1/main-agent-prompt":
+                self._write_json(HTTPStatus.OK, _ok(app.get_main_agent_prompt()))
+                return
+
             # ==================== Mirror Room GET ====================
 
             # GET /api/v1/mirror/profile
@@ -3310,6 +3380,26 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.OK, _ok({"message": "Restarting..."}))
             import os
             threading.Timer(1.5, lambda: os._exit(RESTART_EXIT_CODE)).start()
+            return
+
+        # POST /api/v1/main-agent-prompt/reset - 恢复主 Agent 系统提示词为默认（先匹配更具体的路径）
+        if path == "/api/v1/main-agent-prompt/reset":
+            try:
+                data = app.reset_main_agent_prompt()
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except Exception as e:
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("RESET_FAILED", str(e)))
+            return
+
+        # POST /api/v1/main-agent-prompt - 更新主 Agent 系统提示词（保存）
+        if path == "/api/v1/main-agent-prompt":
+            body = self._read_json() or {}
+            try:
+                data = app.update_main_agent_prompt(body.get("identity_content", ""))
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except Exception as e:
+                logger.exception("Failed to update main agent prompt")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("UPDATE_FAILED", str(e)))
             return
 
         if path == "/api/v1/system/config/import":
@@ -4281,6 +4371,16 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok({"message": "Metrics reset successfully"}))
             except Exception as e:
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("RESET_FAILED", str(e)))
+            return
+
+        # PUT /api/v1/main-agent-prompt - 更新主 Agent 系统提示词
+        if path == "/api/v1/main-agent-prompt":
+            body = self._read_json() or {}
+            try:
+                data = app.update_main_agent_prompt(body.get("identity_content", ""))
+                self._write_json(HTTPStatus.OK, _ok(data))
+            except Exception as e:
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("UPDATE_FAILED", str(e)))
             return
 
         # PUT /api/v1/config/memory

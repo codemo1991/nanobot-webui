@@ -1,11 +1,89 @@
-"""Voice transcription provider using Groq."""
+"""Voice transcription providers: Groq Whisper and DashScope Qwen3-ASR-Flash."""
 
+import base64
+import mimetypes
 import os
 from pathlib import Path
 from typing import Any
 
 import httpx
+from litellm import acompletion
 from loguru import logger
+
+
+def _get_audio_mime(path: str | Path) -> str:
+    """根据扩展名返回 MIME 类型。"""
+    ext = Path(path).suffix.lower()
+    mime_map = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/opus",
+        ".webm": "audio/webm",
+        ".flac": "audio/flac",
+    }
+    return mime_map.get(ext) or mimetypes.guess_type(str(path))[0] or "audio/mpeg"
+
+
+class DashScopeASRTranscriptionProvider:
+    """
+    使用 DashScope Qwen3-ASR-Flash 的语音转录。
+    通过 LiteLLM 调用 dashscope/qwen3-asr-flash，复用主配置中的 qwen/dashscope Provider。
+    """
+
+    DEFAULT_MODEL = "dashscope/qwen3-asr-flash"
+
+    def __init__(self, api_key: str | None = None, api_base: str | None = None):
+        self.api_key = api_key or os.environ.get("DASHSCOPE_API_KEY")
+        self.api_base = api_base
+
+    async def transcribe(self, file_path: str | Path) -> str:
+        """将本地音频转为文字。"""
+        if not self.api_key:
+            logger.warning("DashScope API key 未配置，无法使用 Qwen3-ASR-Flash 转写")
+            return ""
+
+        path = Path(file_path)
+        if not path.exists():
+            logger.error(f"音频文件不存在: {file_path}")
+            return ""
+
+        # 10MB 限制，base64 后略大
+        if path.stat().st_size > 9 * 1024 * 1024:
+            logger.warning("音频文件超过 9MB，Qwen3-ASR-Flash 可能不支持")
+            return ""
+
+        mime = _get_audio_mime(path)
+        b64 = base64.b64encode(path.read_bytes()).decode()
+        data_uri = f"data:{mime};base64,{b64}"
+
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "input_audio", "input_audio": {"data": data_uri}}],
+            }
+        ]
+
+        kwargs: dict[str, Any] = {
+            "model": self.DEFAULT_MODEL,
+            "messages": messages,
+            "api_key": self.api_key,
+            "timeout": 60.0,
+            "extra_body": {"asr_options": {"enable_itn": False}},
+        }
+        if self.api_base:
+            kwargs["api_base"] = self.api_base.rstrip("/")
+
+        try:
+            response = await acompletion(**kwargs)
+            text = (response.choices[0].message.content or "").strip()
+            if text:
+                logger.info(f"DashScope ASR 转写完成: {len(text)} 字符")
+            return text
+        except Exception as e:
+            logger.error(f"DashScope ASR 转写失败: {e}")
+            return ""
 
 
 class GroqTranscriptionProvider:

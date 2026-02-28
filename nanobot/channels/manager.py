@@ -1,6 +1,7 @@
 """Channel manager for coordinating chat channels."""
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -9,6 +10,11 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
+
+
+def _media_dir(workspace: Path) -> Path:
+    """返回 workspace 下的 .nanobot/media 目录路径。"""
+    return Path(workspace).resolve() / ".nanobot" / "media"
 
 
 class ChannelManager:
@@ -32,6 +38,8 @@ class ChannelManager:
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
         
+        workspace_path = self.config.workspace_path
+
         # Telegram channel
         if self.config.channels.telegram.enabled:
             try:
@@ -39,6 +47,7 @@ class ChannelManager:
                 self.channels["telegram"] = TelegramChannel(
                     self.config.channels.telegram,
                     self.bus,
+                    workspace=workspace_path,
                     groq_api_key=self.config.providers.groq.api_key,
                 )
                 logger.info("Telegram channel enabled")
@@ -61,7 +70,7 @@ class ChannelManager:
             try:
                 from nanobot.channels.feishu import FeishuChannel
                 self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus
+                    self.config.channels.feishu, self.bus, workspace=workspace_path
                 )
                 logger.info("Feishu channel enabled")
             except ImportError as e:
@@ -72,7 +81,7 @@ class ChannelManager:
             try:
                 from nanobot.channels.discord import DiscordChannel
                 self.channels["discord"] = DiscordChannel(
-                    self.config.channels.discord, self.bus
+                    self.config.channels.discord, self.bus, workspace=workspace_path
                 )
                 logger.info("Discord channel enabled")
             except ImportError as e:

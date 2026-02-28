@@ -24,9 +24,15 @@ class DiscordChannel(BaseChannel):
 
     name = "discord"
 
-    def __init__(self, config: DiscordConfig, bus: MessageBus):
+    def __init__(
+        self,
+        config: DiscordConfig,
+        bus: MessageBus,
+        workspace: "Path | None" = None,
+    ):
         super().__init__(config, bus)
         self.config: DiscordConfig = config
+        self._workspace = workspace
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._seq: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
@@ -199,7 +205,10 @@ class DiscordChannel(BaseChannel):
 
         content_parts = [content] if content else []
         media_paths: list[str] = []
-        media_dir = Path.home() / ".nanobot" / "media"
+        if self._workspace:
+            media_dir = Path(self._workspace).resolve() / ".nanobot" / "media"
+        else:
+            media_dir = Path.home() / ".nanobot" / "media"
 
         for attachment in payload.get("attachments") or []:
             url = attachment.get("url")

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useLocation } from 'react-router-dom'
 import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Dropdown, Badge, Tag, Modal, Popconfirm, Pagination } from 'antd'
-import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, TagsOutlined } from '@ant-design/icons'
+import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, TagsOutlined, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -214,9 +214,11 @@ function ChatPage() {
   const [bgAgents, setBgAgents] = useState<Array<{
     taskId: string
     label: string
-    status: 'running' | 'done' | 'error' | 'timeout'
+    status: 'running' | 'done' | 'error' | 'timeout' | 'cancelled'
     progress: string
     backend: string
+    result?: string  // 完整结果
+    disconnected?: boolean  // SSE连接是否断开
   }>>([])
   const bgAgentsAbortRef = useRef<AbortController | null>(null)
   const bgAgentsSessionRef = useRef<string | null>(null)
@@ -270,6 +272,7 @@ function ChatPage() {
     const handleEvt = (evt: SubagentProgressEvent) => {
       try {
         console.log('[BgAgent] Received event:', evt.type, 'task_id' in evt ? evt.task_id : undefined, 'label' in evt ? evt.label : undefined)
+        console.log('[BgAgent] Current bgAgents before:', JSON.stringify(bgAgents))
         if (evt.type === 'subagent_start') {
           // 提取需要的数据，避免在 setBgAgents 回调中访问联合类型的可能未定义属性
           const currentTaskId = evt.task_id
@@ -312,12 +315,45 @@ function ChatPage() {
         const currentTaskId = evt.task_id
         const currentStatus = evt.status
         const currentSummary = evt.summary
+        const currentResult = 'result' in evt ? evt.result : undefined
         setBgAgents(prev => prev.map(a =>
           a.taskId === currentTaskId
-            ? { ...a, status: currentStatus === 'ok' ? 'done' : currentStatus === 'timeout' ? 'timeout' : 'error', progress: currentSummary }
+            ? {
+              ...a,
+              status: currentStatus === 'ok' ? 'done' : currentStatus === 'timeout' ? 'timeout' : currentStatus === 'cancelled' ? 'cancelled' : 'error',
+              progress: currentSummary,
+              result: currentResult  // 保存完整结果
+            }
             : a
         ))
+        // 发送浏览器通知提醒用户
+        if (currentStatus === 'ok' && currentResult) {
+          notifyTaskComplete(currentTaskId, currentResult)
+        }
+        console.log('[BgAgent] Current bgAgents after subagent_end:', JSON.stringify(bgAgents))
+      } else if (evt.type === 'subagent_summary') {
+        // 将 LLM 总结追加为主对话中的 assistant 消息
+        const summaryMsg: import('../types').Message = {
+          id: evt.message_id,
+          sessionId,
+          role: 'assistant',
+          content: evt.llm_summary,
+          createdAt: evt.timestamp || new Date().toISOString(),
+          sequence: Date.now(),
+        }
+        setMessages(prev => {
+          // 避免重复插入（SSE replay 场景）
+          if (prev.some(m => m.id === summaryMsg.id)) return prev
+          return [...prev, summaryMsg]
+        })
+        // 收到 summary 后自动关闭对应的后台 agent 卡片
+        const idsToRemove = evt.task_ids && evt.task_ids.length > 0
+          ? evt.task_ids
+          : [evt.task_id]
+        setBgAgents(prev => prev.filter(a => !idsToRemove.includes(a.taskId)))
+        console.log('[BgAgent] Appended subagent_summary, closed cards:', idsToRemove)
       } else if (evt.type === 'timeout') {
+        console.log('[BgAgent] Received timeout event')
         bgAgentsAbortRef.current = null
         bgAgentsSessionRef.current = null
       }
@@ -327,18 +363,39 @@ function ChatPage() {
   }
 
     api.subagentProgressStream(sessionId, handleEvt, ctrl.signal).catch((err) => {
-      console.error('[BgAgent] Failed to connect to subagent stream:', err)
-      // 清理状态，防止残留的旧任务显示在界面上
-      setBgAgents([])
+      console.error('[BgAgent] SSE connection lost:', err)
+      console.log('[BgAgent] Current bgAgents at disconnect:', JSON.stringify(bgAgents))
+      // SSE连接断开时，标记所有运行中的任务为断开状态，保留结果让用户手动获取
+      // 不要清除 bgAgents，因为子agent可能还在后台运行
+      setBgAgents(prev => {
+        const updated = prev.map(a => {
+          if (a.status === 'running') {
+            return { ...a, disconnected: true, progress: a.progress + '\n(连接已断开，点击刷新获取结果)' }
+          }
+          return a
+        })
+        console.log('[BgAgent] bgAgents after disconnect handling:', JSON.stringify(updated))
+        return updated
+      })
+      // 断开引用，避免重复处理
       bgAgentsAbortRef.current = null
       bgAgentsSessionRef.current = null
     })
   }, [])
 
   // 所有子 Agent 完成后，10 秒后自动清除面板
+  // 注意：如果连接已断开，保留面板让用户手动刷新
   useEffect(() => {
-    if (bgAgents.length > 0 && bgAgents.every(a => a.status !== 'running')) {
+    // 如果有正在运行的任务，或者连接已断开，不自动清除
+    const hasRunning = bgAgents.some(a => a.status === 'running')
+    const hasDisconnected = bgAgents.some(a => a.disconnected)
+
+    console.log('[BgAgent] Auto-clear check:', { hasRunning, hasDisconnected, length: bgAgents.length })
+
+    if (bgAgents.length > 0 && !hasRunning && !hasDisconnected) {
+      console.log('[BgAgent] Scheduling auto-clear in 12 seconds')
       const timer = setTimeout(() => {
+        console.log('[BgAgent] Auto-clear triggered, clearing bgAgents')
         setBgAgents([])
         if (bgAgentsAbortRef.current) {
           bgAgentsAbortRef.current.abort()
@@ -1232,6 +1289,20 @@ function ChatPage() {
             <div className="bg-agents-header">
               <SyncOutlined spin={bgAgents.some(a => a.status === 'running')} style={{ marginRight: 6 }} />
               <span>后台子 Agent ({bgAgents.filter(a => a.status === 'running').length} 运行中)</span>
+              {(bgAgents.some(a => a.disconnected) || bgAgents.every(a => a.status !== 'running')) && (
+                <Button
+                  type="link"
+                  size="small"
+                  onClick={() => {
+                    if (currentSession) {
+                      startBgAgentStream(currentSession.id)
+                    }
+                  }}
+                  style={{ marginLeft: 'auto', padding: '0 4px' }}
+                >
+                  刷新 <ReloadOutlined />
+                </Button>
+              )}
             </div>
             {bgAgents.map(agent => (
               <div key={agent.taskId} className={`bg-agent-item ${agent.status}`}>
@@ -1240,14 +1311,46 @@ function ChatPage() {
                   {agent.status === 'done' && <span style={{ marginRight: 6 }}>✅</span>}
                   {agent.status === 'timeout' && <span style={{ marginRight: 6 }}>⏳</span>}
                   {agent.status === 'error' && <span style={{ marginRight: 6 }}>❌</span>}
+                  {agent.status === 'cancelled' && <span style={{ marginRight: 6 }}>🛑</span>}
+                  {agent.disconnected && <span style={{ marginRight: 6 }}>🔌</span>}
                   <span className="bg-agent-label">{agent.label}</span>
                   <Tag className="bg-agent-backend" color={agent.backend === 'claude_code' ? 'orange' : 'blue'}>
                     {agent.backend === 'claude_code' ? 'Claude Code' : 'native'}
                   </Tag>
+                  {(agent.disconnected || agent.status === 'done') && agent.result && (
+                    <Tooltip title="自动发送消息询问执行结果">
+                      <Button
+                        type="link"
+                        size="small"
+                        onClick={async () => {
+                          // 直接发送消息询问子agent的执行结果
+                          // 主agent会自动通过 get_subagent_results 工具获取结果
+                          // 先清除该agent的状态，避免重复询问
+                          setBgAgents(prev => prev.filter(a => a.taskId !== agent.taskId))
+                          // 发送简短的消息
+                          setInput(`查看执行结果`)
+                          // 等待状态更新后触发发送
+                          setTimeout(() => {
+                            const btn = document.querySelector('.chat-send-button') as HTMLButtonElement
+                            if (btn) btn.click()
+                          }, 50)
+                        }}
+                        style={{ padding: '0 4px', marginLeft: 'auto' }}
+                      >
+                        继续对话 <MessageOutlined />
+                      </Button>
+                    </Tooltip>
+                  )}
                 </div>
-                {agent.progress && (
+                {agent.status === 'done' && agent.result ? (
+                  <Collapse ghost size="small">
+                    <Collapse.Panel key="result" header="查看完整结果">
+                      <pre className="bg-agent-result">{agent.result || ''}</pre>
+                    </Collapse.Panel>
+                  </Collapse>
+                ) : agent.progress ? (
                   <pre className="bg-agent-progress">{agent.progress}</pre>
-                )}
+                ) : null}
               </div>
             ))}
           </div>

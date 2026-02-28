@@ -280,6 +280,8 @@ class LiteLLMProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        api_key: str | None = None,
+        api_base: str | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -290,6 +292,8 @@ class LiteLLMProvider(LLMProvider):
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            api_key: Optional explicit API key (overrides env, for subagent multi-model).
+            api_base: Optional explicit API base (overrides instance default).
         
         Returns:
             LLMResponse with content and/or tool calls.
@@ -309,9 +313,11 @@ class LiteLLMProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        
-        # Pass api_base directly for custom endpoints (vLLM, etc.)
-        if self.api_base:
+        if api_key:
+            kwargs["api_key"] = api_key
+        if api_base is not None:
+            kwargs["api_base"] = api_base
+        elif self.api_base:
             kwargs["api_base"] = self.api_base
         
         if tools:

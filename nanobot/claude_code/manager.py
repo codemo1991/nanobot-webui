@@ -1112,7 +1112,20 @@ if __name__ == "__main__":
             logger.info(f"Claude Code task [{task_id}] cancelled")
             return True
         return False
-    
+
+    def cancel_by_session(self, channel: str, chat_id: str) -> int:
+        """Cancel all Claude Code tasks for the given session. Returns count of cancelled tasks."""
+        origin_key = f"{channel}:{chat_id}"
+        cancelled = 0
+        for task_id, origin in list(self._task_origins.items()):
+            task_origin_key = f"{origin.get('channel', '')}:{origin.get('chat_id', '')}"
+            if task_origin_key == origin_key:
+                if self.cancel_task(task_id):
+                    cancelled += 1
+        if cancelled > 0:
+            logger.info(f"Claude Code: cancelled {cancelled} tasks for session {origin_key}")
+        return cancelled
+
     def check_claude_available(self) -> bool:
         """Check if Claude Code CLI is available."""
         available = shutil.which("claude") is not None
