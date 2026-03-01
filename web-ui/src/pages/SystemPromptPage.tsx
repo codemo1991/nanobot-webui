@@ -138,7 +138,7 @@ export default function SystemPromptPage() {
                 <TextArea
                   rows={16}
                   placeholder={DEFAULT_IDENTITY_PLACEHOLDER}
-                  style={{ fontFamily: 'monospace' }}
+                  style={{ fontFamily: 'monospace', maxHeight: '500px', overflowY: 'auto' }}
                   value={identityContent}
                   onChange={(e) => setIdentityContent(e.target.value)}
                 />

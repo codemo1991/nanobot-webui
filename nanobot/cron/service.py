@@ -468,7 +468,9 @@ class CronService:
         enabled_jobs = [j for j in jobs if j["enabled"]]
         next_wake = None
         if enabled_jobs:
-            next_wake = min(j.get("nextRunAtMs") for j in enabled_jobs if j.get("nextRunAtMs"))
+            next_run_times = [j.get("nextRunAtMs") for j in enabled_jobs if j.get("nextRunAtMs")]
+            if next_run_times:
+                next_wake = min(next_run_times)
 
         return {
             "enabled": self._scheduler is not None,

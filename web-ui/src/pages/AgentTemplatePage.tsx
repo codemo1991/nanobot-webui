@@ -301,6 +301,7 @@ export default function AgentTemplatePage() {
         onOk={editingTemplate?.is_builtin ? undefined : handleSubmit}
         width={800}
         okButtonProps={{ style: { display: editingTemplate?.is_builtin ? 'none' : 'inline-block' } }}
+        className="agent-template-modal"
       >
         <Form
           form={form}
@@ -382,7 +383,7 @@ export default function AgentTemplatePage() {
                 <TextArea
                   rows={12}
                   placeholder="使用 {task}, {all_rules}, {workspace} 作为占位符"
-                  style={{ fontFamily: 'monospace' }}
+                  style={{ fontFamily: 'monospace', maxHeight: '400px', overflowY: 'auto' }}
                   value={systemPromptValue}
                   onChange={(e) => setSystemPromptValue(e.target.value)}
                 />
