@@ -15,15 +15,18 @@ export default function ConfigPage() {
   const [activeTab, setActiveTab] = useState('providers')
 
   const { t } = useTranslation()
+  const TabContentWrapper = ({ children }: { children: React.ReactNode }) => (
+    <div className="config-tab-content">{children}</div>
+  )
   const items = [
-    { key: 'channels', label: t('config.channels'), children: <ChannelsConfig /> },
-    { key: 'providers', label: t('config.providers'), children: <ProvidersConfig /> },
-    { key: 'models', label: t('config.models'), children: <ModelsConfig /> },
-    { key: 'mcps', label: t('config.mcps'), children: <McpConfig /> },
-    { key: 'skills', label: t('config.skills'), children: <SkillsConfig /> },
-    { key: 'agent-templates', label: 'Agent 模板', children: <AgentTemplatePage /> },
-    { key: 'system-prompt', label: '主 Agent 提示词', children: <SystemPromptPage /> },
-    { key: 'system', label: t('config.system'), children: <SystemConfig /> },
+    { key: 'channels', label: t('config.channels'), children: <TabContentWrapper><ChannelsConfig /></TabContentWrapper> },
+    { key: 'providers', label: t('config.providers'), children: <TabContentWrapper><ProvidersConfig /></TabContentWrapper> },
+    { key: 'models', label: t('config.models'), children: <TabContentWrapper><ModelsConfig /></TabContentWrapper> },
+    { key: 'mcps', label: t('config.mcps'), children: <TabContentWrapper><McpConfig /></TabContentWrapper> },
+    { key: 'skills', label: t('config.skills'), children: <TabContentWrapper><SkillsConfig /></TabContentWrapper> },
+    { key: 'agent-templates', label: 'Agent 模板', children: <TabContentWrapper><AgentTemplatePage /></TabContentWrapper> },
+    { key: 'system-prompt', label: '主 Agent 提示词', children: <TabContentWrapper><SystemPromptPage /></TabContentWrapper> },
+    { key: 'system', label: t('config.system'), children: <TabContentWrapper><SystemConfig /></TabContentWrapper> },
   ]
 
   return (

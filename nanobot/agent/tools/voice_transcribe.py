@@ -45,12 +45,14 @@ class VoiceTranscribeTool(Tool):
             return f"Error: 文件不存在: {file_path}"
 
         try:
+            import os
             from nanobot.config.loader import load_config
             cfg = load_config()
             model = "dashscope/qwen3-asr-flash"
-            dashscope_key = cfg.get_api_key(model) or (cfg.providers.dashscope.api_key or "").strip()
+            # 优先从 nanobot 配置获取，其次从环境变量获取
+            dashscope_key = cfg.get_api_key(model) or (cfg.providers.dashscope.api_key or "").strip() or os.environ.get("DASHSCOPE_API_KEY", "")
             dashscope_base = cfg.get_api_base(model)
-            groq_key = (cfg.providers.groq.api_key or "").strip() or __import__("os").environ.get("GROQ_API_KEY", "")
+            groq_key = (cfg.providers.groq.api_key or "").strip() or os.environ.get("GROQ_API_KEY", "")
 
             if dashscope_key:
                 from nanobot.providers.transcription import DashScopeASRTranscriptionProvider

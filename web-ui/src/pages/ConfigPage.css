@@ -44,7 +44,9 @@
 .config-tabs-container .ant-tabs-tabpane {
   height: 100%;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 24px;
+  box-sizing: border-box;
 }
 
 .config-tabs-container .ant-tabs-nav {
@@ -75,6 +77,18 @@
 
 .config-tabs-container .ant-tabs-content-holder {
   background: #f5f7fa;
+}
+
+/* 确保tab内容区域可以滚动 */
+.config-tabs-container .ant-tabs-content-container {
+  height: 100%;
+  overflow: hidden;
+}
+
+.config-tab-content {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .config-tabs-container .ant-tabs-tabpane::-webkit-scrollbar {
@@ -381,4 +395,99 @@
   text-align: center;
   padding: 40px;
   color: var(--color-text-secondary);
+}
+
+/* TextArea 滚动条样式 */
+.config-panel .ant-input-textarea textarea {
+  scrollbar-width: thin;
+  scrollbar-color: #d9d9d9 transparent;
+}
+
+.config-panel .ant-input-textarea textarea::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.config-panel .ant-input-textarea textarea::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.config-panel .ant-input-textarea textarea::-webkit-scrollbar-thumb {
+  background: #d9d9d9;
+  border-radius: 3px;
+}
+
+.config-panel .ant-input-textarea textarea::-webkit-scrollbar-thumb:hover {
+  background: #bfbfbf;
+}
+
+/* 小屏幕响应式 */
+@media (max-width: 768px) {
+  .config-panel {
+    max-height: calc(100vh - 140px);
+    padding-bottom: 16px;
+  }
+
+  .config-panel .ant-modal {
+    max-width: calc(100vw - 32px);
+    margin: 16px;
+  }
+
+  .config-panel .ant-modal-content {
+    max-height: calc(100vh - 100px);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .config-panel .ant-modal-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+  }
+
+  .config-panel .ant-input-textarea textarea {
+    max-height: calc(100vh - 280px) !important;
+  }
+
+  .channels-scroll-container {
+    max-height: calc(100vh - 180px);
+  }
+
+  .skills-list-scroll {
+    max-height: calc(100vh - 280px);
+    min-height: 150px;
+  }
+
+  .config-tabs-container .ant-tabs-tabpane {
+    padding: 16px;
+  }
+
+  .config-tabs-container .ant-tabs-tab {
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+}
+
+/* Modal 滚动条样式 */
+.agent-template-modal .ant-modal-body,
+.ant-modal.config-modal .ant-modal-body {
+  max-height: calc(100vh - 250px);
+  overflow-y: auto;
+  padding: 16px 24px;
+}
+
+.agent-template-modal .ant-modal-body::-webkit-scrollbar,
+.ant-modal.config-modal .ant-modal-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.agent-template-modal .ant-modal-body::-webkit-scrollbar-track,
+.ant-modal.config-modal .ant-modal-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.agent-template-modal .ant-modal-body::-webkit-scrollbar-thumb,
+.ant-modal.config-modal .ant-modal-body::-webkit-scrollbar-thumb {
+  background: #d9d9d9;
+  border-radius: 3px;
 }

@@ -132,10 +132,7 @@ echo ""
 kill_existing_nanobot
 
 # 构建前端（npm install + npm run build）
-# 参数: force=true 时强制重新安装/构建，不论目录是否存在
 ensure_frontend_built() {
-    local force="${1:-false}"
-
     if [ ! -d "$WEB_UI_DIR" ]; then
         echo "[launcher] 未找到 web-ui 目录，跳过前端构建。"
         return 0
@@ -145,19 +142,17 @@ ensure_frontend_built() {
         return 0
     fi
 
-    # npm install —— 仅在 node_modules 缺失时执行（依赖安装耗时，package.json 不常变）
-    if [ "$force" = "true" ] || [ ! -d "$WEB_UI_DIR/node_modules" ]; then
-        echo "[launcher] 正在安装前端依赖 (npm install)..."
-        set +e
-        (cd "$WEB_UI_DIR" && npm install 2>&1 | sed 's/^/  /')
-        npm_exit=$?
-        set -e
-        if [ "$npm_exit" -ne 0 ]; then
-            echo "[launcher] npm install 失败（exit $npm_exit），请检查 Node.js 是否已安装。"
-            exit 1
-        fi
-        echo "[launcher] npm install 完成。"
+    # npm install —— 每次构建前先执行，确保依赖完整（避免 node_modules 不完整导致 build 失败）
+    echo "[launcher] 正在安装前端依赖 (npm install)..."
+    set +e
+    (cd "$WEB_UI_DIR" && npm install 2>&1 | sed 's/^/  /')
+    npm_exit=$?
+    set -e
+    if [ "$npm_exit" -ne 0 ]; then
+        echo "[launcher] npm install 失败（exit $npm_exit），请检查 Node.js 是否已安装。"
+        exit 1
     fi
+    echo "[launcher] npm install 完成。"
 
     # npm run build —— 每次都执行，确保源码改动即时生效
     echo "[launcher] 正在构建前端 (npm run build)..."
@@ -325,7 +320,7 @@ while true; do
             fi
 
             echo "[launcher] Running: npm install + npm run build (in $WEB_UI_DIR)"
-            ensure_frontend_built "true"
+            ensure_frontend_built
 
             echo "[launcher] Running: pip install -e . (in $REPO_DIR, venv)"
             # 使用 --no-deps 加速，主要目的是让 Python 识别代码变更

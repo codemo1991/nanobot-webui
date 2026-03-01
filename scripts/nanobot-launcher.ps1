@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     nanobot 守护启动器 — 支持自更新后自动重启，并能自动修复损坏的安装。
@@ -38,12 +38,14 @@ param(
     [string[]]$Remaining
 )
 
+$LAUNCHER_TAG = '[launcher]'
+
 # 支持 --debug 传参（Linux 风格）
 if (-not $EnableDebug -and $Remaining -contains "--debug") { $EnableDebug = $true }
 
 # 防止 --debug 被误解析为 --host 的值（如 -ListenHost --debug）
 if ($ListenHost -match '^-') {
-    Write-Host "[launcher] Warning: ListenHost 不能以 - 开头，已恢复默认 127.0.0.1" -ForegroundColor Yellow
+    Write-Host "$LAUNCHER_TAG Warning: ListenHost 不能以 - 开头，已恢复默认 127.0.0.1" -ForegroundColor Yellow
     $ListenHost = "127.0.0.1"
     $EnableDebug = $true
 }
@@ -92,22 +94,22 @@ function Stop-ExistingNanobot {
     }
 
     if ($nanobotProcesses) {
-        Write-Host "[launcher] 检测到已有 nanobot 进程运行中，正在终止..." -ForegroundColor Yellow
+        Write-Host "$LAUNCHER_TAG 检测到已有 nanobot 进程运行中，正在终止..." -ForegroundColor Yellow
         if ($nanobotProcesses -is [System.Diagnostics.Process]) {
             $nanobotProcesses | ForEach-Object {
-                Write-Host "[launcher] 终止进程: $($_.Id) ($($_.ProcessName))" -ForegroundColor DarkGray
+                Write-Host "$LAUNCHER_TAG 终止进程: $($_.Id) ($($_.ProcessName))" -ForegroundColor DarkGray
                 Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
             }
         } else {
             # CIMInstance 返回的是进程对象
             $nanobotProcesses | ForEach-Object {
-                Write-Host "[launcher] 终止进程: $($_.ProcessId) ($($_.Name))" -ForegroundColor DarkGray
+                Write-Host "$LAUNCHER_TAG 终止进程: $($_.ProcessId) ($($_.Name))" -ForegroundColor DarkGray
                 Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
             }
         }
         # 等待进程终止
         Start-Sleep -Milliseconds 500
-        Write-Host "[launcher] 已终止旧进程" -ForegroundColor Green
+        Write-Host "$LAUNCHER_TAG 已终止旧进程" -ForegroundColor Green
     }
 }
 
@@ -126,7 +128,7 @@ function Test-NanobotHealth {
 
 # 修复损坏的 nanobot 安装：清除残留后重新安装
 function Repair-NanobotInstall {
-    Write-Host "[launcher] 正在修复 nanobot 安装..." -ForegroundColor Yellow
+    Write-Host "$LAUNCHER_TAG 正在修复 nanobot 安装..." -ForegroundColor Yellow
 
     # 1. 尝试卸载（可能因损坏而失败，忽略）
     & $VENV_PIP uninstall nanobot-ai -y 2>$null | Out-Null
@@ -138,7 +140,7 @@ function Repair-NanobotInstall {
             Where-Object { $_.Name -eq "nanobot" -or $_.Name -like "nanobot_ai*" -or $_.Name -like "~anobot*" } |
             ForEach-Object {
                 Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Host "[launcher] 已清除: $($_.Name)" -ForegroundColor DarkGray
+                Write-Host "$LAUNCHER_TAG 已清除: $($_.Name)" -ForegroundColor DarkGray
             }
     }
 
@@ -149,77 +151,72 @@ function Repair-NanobotInstall {
 
     # 4. 重新安装
     if (-not (Test-Path (Join-Path $REPO_DIR "pyproject.toml"))) {
-        Write-Host "[launcher] 未找到 pyproject.toml，无法修复。" -ForegroundColor Red
+        Write-Host "$LAUNCHER_TAG 未找到 pyproject.toml，无法修复。" -ForegroundColor Red
         exit 1
     }
-    Write-Host "[launcher] Running: pip install -e . (in $REPO_DIR)" -ForegroundColor DarkGray
+    Write-Host "$LAUNCHER_TAG Running: pip install -e . (in $REPO_DIR)" -ForegroundColor DarkGray
     Push-Location $REPO_DIR
     & $VENV_PIP install -e . 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     $pipExit = $LASTEXITCODE
     Pop-Location
     if ($pipExit -ne 0) {
-        Write-Host "[launcher] 修复失败（pip exit $pipExit）。" -ForegroundColor Red
+        Write-Host "$LAUNCHER_TAG 修复失败（pip exit $pipExit）。" -ForegroundColor Red
         exit 1
     }
     if (-not (Test-Path $NANOBOT_EXE)) {
-        Write-Host "[launcher] 修复完成但未找到可执行文件: $NANOBOT_EXE" -ForegroundColor Red
+        Write-Host "$LAUNCHER_TAG 修复完成但未找到可执行文件: $NANOBOT_EXE" -ForegroundColor Red
         exit 1
     }
-    Write-Host "[launcher] nanobot 安装已修复。" -ForegroundColor Green
+    Write-Host "$LAUNCHER_TAG nanobot 安装已修复。" -ForegroundColor Green
     Write-Host ""
 }
 
 function Ensure-FrontendBuilt {
-    param([switch]$Force)
-
     if (-not (Test-Path $WEB_UI_DIR)) {
-        Write-Host "[launcher] 未找到 web-ui 目录，跳过前端构建。" -ForegroundColor Yellow
+        Write-Host "$LAUNCHER_TAG 未找到 web-ui 目录，跳过前端构建。" -ForegroundColor Yellow
         return
     }
     if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-        Write-Host "[launcher] 未找到 npm，跳过前端构建（请安装 Node.js）。" -ForegroundColor Yellow
+        Write-Host "$LAUNCHER_TAG 未找到 npm，跳过前端构建（请安装 Node.js）。" -ForegroundColor Yellow
         return
     }
 
-    # npm install —— 仅在 node_modules 缺失时执行（依赖安装耗时，package.json 不常变）
-    $nodeModules = Join-Path $WEB_UI_DIR "node_modules"
-    if ($Force -or -not (Test-Path $nodeModules)) {
-        Write-Host "[launcher] 正在安装前端依赖 (npm install)..." -ForegroundColor Yellow
-        Push-Location $WEB_UI_DIR
-        & npm install 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
-        $npmExit = $LASTEXITCODE
-        Pop-Location
-        if ($npmExit -ne 0) {
-            Write-Host "[launcher] npm install 失败（exit $npmExit）。" -ForegroundColor Red
-            exit 1
-        }
-        Write-Host "[launcher] npm install 完成。" -ForegroundColor Green
+    # npm install —— 每次构建前先执行，确保依赖完整（避免 node_modules 不完整导致 build 失败）
+    Write-Host "$LAUNCHER_TAG 正在安装前端依赖 (npm install)..." -ForegroundColor Yellow
+    Push-Location $WEB_UI_DIR
+    & npm install 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    $npmExit = $LASTEXITCODE
+    Pop-Location
+    if ($npmExit -ne 0) {
+        Write-Host "$LAUNCHER_TAG npm install 失败（exit $npmExit）。" -ForegroundColor Red
+        exit 1
     }
+    Write-Host "$LAUNCHER_TAG npm install 完成。" -ForegroundColor Green
 
     # npm run build —— 每次都执行，确保源码改动即时生效
-    Write-Host "[launcher] 正在构建前端 (npm run build)..." -ForegroundColor Yellow
+    Write-Host "$LAUNCHER_TAG 正在构建前端 (npm run build)..." -ForegroundColor Yellow
     Push-Location $WEB_UI_DIR
     & npm run build 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     $buildExit = $LASTEXITCODE
     Pop-Location
     if ($buildExit -ne 0) {
-        Write-Host "[launcher] npm run build 失败（exit $buildExit）。" -ForegroundColor Red
+        Write-Host "$LAUNCHER_TAG npm run build 失败（exit $buildExit）。" -ForegroundColor Red
         exit 1
     }
-    Write-Host "[launcher] 前端构建完成。" -ForegroundColor Green
+    Write-Host "$LAUNCHER_TAG 前端构建完成。" -ForegroundColor Green
     Write-Host ""
 }
 
 function Ensure-VenvReady {
     # 1. 如果 venv 不存在则创建
     if (-not (Test-Path $VENV_DIR)) {
-        Write-Host "[launcher] 正在创建虚拟环境: $VENV_DIR" -ForegroundColor Yellow
+        Write-Host "$LAUNCHER_TAG 正在创建虚拟环境: $VENV_DIR" -ForegroundColor Yellow
         & python -m venv $VENV_DIR
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "[launcher] 虚拟环境创建失败，请确认 Python 已正确安装。" -ForegroundColor Red
+            Write-Host "$LAUNCHER_TAG 虚拟环境创建失败，请确认 Python 已正确安装。" -ForegroundColor Red
             exit 1
         }
-        Write-Host "[launcher] 虚拟环境创建成功。" -ForegroundColor Green
+        Write-Host "$LAUNCHER_TAG 虚拟环境创建成功。" -ForegroundColor Green
     }
 
     # 2. 构建前端（npm install + npm run build）
@@ -229,37 +226,37 @@ function Ensure-VenvReady {
     if (-not (Test-Path $NANOBOT_EXE)) {
         # 未安装 -> 执行安装
         if (-not (Test-Path (Join-Path $REPO_DIR "pyproject.toml"))) {
-            Write-Host "[launcher] 未找到 pyproject.toml（路径：$REPO_DIR），无法自动安装。" -ForegroundColor Red
+            Write-Host "$LAUNCHER_TAG 未找到 pyproject.toml（路径：$REPO_DIR），无法自动安装。" -ForegroundColor Red
             exit 1
         }
-        Write-Host "[launcher] 正在安装 nanobot 到虚拟环境..." -ForegroundColor Yellow
-        Write-Host "[launcher] Running: pip install -e . (in $REPO_DIR)" -ForegroundColor DarkGray
+        Write-Host "$LAUNCHER_TAG 正在安装 nanobot 到虚拟环境..." -ForegroundColor Yellow
+        Write-Host "$LAUNCHER_TAG Running: pip install -e . (in $REPO_DIR)" -ForegroundColor DarkGray
         Push-Location $REPO_DIR
         & $VENV_PIP install -e . 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
         $pipExit = $LASTEXITCODE
         Pop-Location
         if ($pipExit -ne 0) {
-            Write-Host "[launcher] 安装失败（exit $pipExit）。" -ForegroundColor Red
+            Write-Host "$LAUNCHER_TAG 安装失败（exit $pipExit）。" -ForegroundColor Red
             exit 1
         }
         if (-not (Test-Path $NANOBOT_EXE)) {
-            Write-Host "[launcher] 安装完成但未找到可执行文件: $NANOBOT_EXE" -ForegroundColor Red
+            Write-Host "$LAUNCHER_TAG 安装完成但未找到可执行文件: $NANOBOT_EXE" -ForegroundColor Red
             exit 1
         }
-        Write-Host "[launcher] nanobot 安装成功。" -ForegroundColor Green
+        Write-Host "$LAUNCHER_TAG nanobot 安装成功。" -ForegroundColor Green
         Write-Host ""
     }
     elseif (-not (Test-NanobotHealth)) {
         # 已安装但运行失败（如 ModuleNotFoundError）-> 执行修复
-        Write-Host "[launcher] 检测到 nanobot 安装损坏，正在修复..." -ForegroundColor Yellow
+        Write-Host "$LAUNCHER_TAG 检测到 nanobot 安装损坏，正在修复..." -ForegroundColor Yellow
         Repair-NanobotInstall
     }
 }
 
 Write-Banner
-Write-Host "[launcher] Repo:   $REPO_DIR" -ForegroundColor DarkGray
-Write-Host "[launcher] Venv:   $VENV_DIR" -ForegroundColor DarkGray
-Write-Host "[launcher] Debug:  $($EnableDebug.IsPresent)" -ForegroundColor DarkGray
+Write-Host "$LAUNCHER_TAG Repo:   $REPO_DIR" -ForegroundColor DarkGray
+Write-Host "$LAUNCHER_TAG Venv:   $VENV_DIR" -ForegroundColor DarkGray
+Write-Host "$LAUNCHER_TAG Debug:  $($EnableDebug.IsPresent)" -ForegroundColor DarkGray
 Write-Host ""
 
 # 终止已存在的 nanobot 进程
@@ -269,8 +266,8 @@ Ensure-VenvReady
 
 while ($true) {
     $nanobotArgs = Get-NanobotArgs
-    Write-Host "[launcher] Starting: $NANOBOT_EXE $($nanobotArgs -join ' ')" -ForegroundColor Green
-    Write-Host "[launcher] Restart exit code: $RESTART_EXIT_CODE | Ctrl+C to stop" -ForegroundColor DarkGray
+    Write-Host "$LAUNCHER_TAG Starting: $NANOBOT_EXE $($nanobotArgs -join ' ')" -ForegroundColor Green
+    Write-Host "$LAUNCHER_TAG Restart exit code: $RESTART_EXIT_CODE | Ctrl+C to stop" -ForegroundColor DarkGray
     Write-Host ""
 
     # 直接调用而非 Start-Process，$LASTEXITCODE 可可靠捕获 os._exit() 的退出码
@@ -278,7 +275,7 @@ while ($true) {
     $exitCode = $LASTEXITCODE
 
     Write-Host ""
-    Write-Host "[launcher] nanobot exited with code: $exitCode" -ForegroundColor Yellow
+    Write-Host "$LAUNCHER_TAG nanobot exited with code: $exitCode" -ForegroundColor Yellow
 
     if ($exitCode -eq $RESTART_EXIT_CODE) {
         # Rapid restart protection
@@ -287,40 +284,40 @@ while ($true) {
         $restartTimestamps += $now
 
         if ($restartTimestamps.Count -ge $MAX_RAPID_RESTARTS) {
-            Write-Host "[launcher] Too many rapid restarts ($MAX_RAPID_RESTARTS in ${RAPID_RESTART_WINDOW}s). Exiting." -ForegroundColor Red
+            Write-Host "$LAUNCHER_TAG Too many rapid restarts ($MAX_RAPID_RESTARTS in ${RAPID_RESTART_WINDOW}s). Exiting." -ForegroundColor Red
             exit 1
         }
 
-        Write-Host "[launcher] Self-update restart requested. Pulling & reinstalling..." -ForegroundColor Cyan
+        Write-Host "$LAUNCHER_TAG Self-update restart requested. Pulling & reinstalling..." -ForegroundColor Cyan
 
         if (Test-Path (Join-Path $REPO_DIR "pyproject.toml")) {
             Push-Location $REPO_DIR
 
             # 拉取远端最新代码（如已在 nanobot 内部 pull 则为 no-op，无害）
-            Write-Host "[launcher] Running: git pull (in $REPO_DIR)" -ForegroundColor DarkGray
+            Write-Host "$LAUNCHER_TAG Running: git pull (in $REPO_DIR)" -ForegroundColor DarkGray
             $gitOut = & git pull 2>&1
             $gitOut | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
             if ($LASTEXITCODE -ne 0) {
-                Write-Host "[launcher] Warning: git pull failed (exit $LASTEXITCODE), continuing anyway..." -ForegroundColor Yellow
+                Write-Host "$LAUNCHER_TAG Warning: git pull failed (exit $LASTEXITCODE), continuing anyway..." -ForegroundColor Yellow
             }
 
             # 重建前端
-            Write-Host "[launcher] Running: npm install + npm run build (in $WEB_UI_DIR)" -ForegroundColor DarkGray
-            Ensure-FrontendBuilt -Force
+            Write-Host "$LAUNCHER_TAG Running: npm install + npm run build (in $WEB_UI_DIR)" -ForegroundColor DarkGray
+            Ensure-FrontendBuilt
 
             # 重新安装依赖（使用 venv 的 pip）
-            Write-Host "[launcher] Running: pip install -e . (in $REPO_DIR, venv)" -ForegroundColor DarkGray
+            Write-Host "$LAUNCHER_TAG Running: pip install -e . (in $REPO_DIR, venv)" -ForegroundColor DarkGray
             & $VENV_PIP install -e . --quiet 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 
             Pop-Location
         }
 
-        Write-Host "[launcher] Restarting in 2 seconds..." -ForegroundColor Cyan
+        Write-Host "$LAUNCHER_TAG Restarting in 2 seconds..." -ForegroundColor Cyan
         Start-Sleep -Seconds 2
         continue
     }
     else {
-        Write-Host "[launcher] Normal exit. Goodbye." -ForegroundColor Green
+        Write-Host "$LAUNCHER_TAG Normal exit. Goodbye." -ForegroundColor Green
         exit $exitCode
     }
 }
