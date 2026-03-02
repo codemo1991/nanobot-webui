@@ -486,6 +486,10 @@ function ChatPage() {
             }
           }, 500) // 延迟检查，让 finally 块有机会先执行
         }
+
+        // 页面重新可见时，重新建立 subagent 进度流连接
+        // 这样可以从 buffer 中 replay 之前未接收的事件
+        startBgAgentStream(currentSession.id)
       }
     }
 

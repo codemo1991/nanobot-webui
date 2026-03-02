@@ -290,6 +290,7 @@ export default function AgentTemplatePage() {
           loading={loading}
           pagination={false}
           size="middle"
+          scroll={{ y: 'calc(100vh - 280px)' }}
         />
       </Card>
 
