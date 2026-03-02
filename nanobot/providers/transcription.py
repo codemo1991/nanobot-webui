@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from litellm import acompletion
 from loguru import logger
 
 
@@ -26,17 +25,24 @@ def _get_audio_mime(path: str | Path) -> str:
     return mime_map.get(ext) or mimetypes.guess_type(str(path))[0] or "audio/mpeg"
 
 
+# DashScope 兼容模式 API 默认端点（与主模型 litellm 配置解耦，避免 api_base 全局污染）
+DASHSCOPE_DEFAULT_BASE_CN = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DASHSCOPE_DEFAULT_BASE_INTL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+
 class DashScopeASRTranscriptionProvider:
     """
     使用 DashScope Qwen3-ASR-Flash 的语音转录。
-    通过 LiteLLM 调用 dashscope/qwen3-asr-flash，复用主配置中的 qwen/dashscope Provider。
+    通过 httpx 直连 DashScope 兼容模式 API，完全绕过 LiteLLM，避免与主模型（如 vLLM、OpenRouter）
+    共用 litellm.api_base 时导致的 endpoint 冲突。
     """
 
-    DEFAULT_MODEL = "dashscope/qwen3-asr-flash"
+    DEFAULT_MODEL = "qwen3-asr-flash"
 
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
         self.api_key = api_key or os.environ.get("DASHSCOPE_API_KEY")
-        self.api_base = api_base
+        # 未配置时使用中国区端点；用户可配置 dashscope.api_base 指定国际区等
+        self.api_base = (api_base or "").strip().rstrip("/") or DASHSCOPE_DEFAULT_BASE_CN
 
     async def transcribe(self, file_path: str | Path) -> str:
         """将本地音频转为文字。"""
@@ -58,41 +64,50 @@ class DashScopeASRTranscriptionProvider:
         b64 = base64.b64encode(path.read_bytes()).decode()
         data_uri = f"data:{mime};base64,{b64}"
 
-        messages = [
-            {
-                "role": "user",
-                "content": [{"type": "input_audio", "input_audio": {"data": data_uri}}],
-            }
-        ]
-
-        kwargs: dict[str, Any] = {
+        url = f"{self.api_base}/chat/completions"
+        payload: dict[str, Any] = {
             "model": self.DEFAULT_MODEL,
-            "messages": messages,
-            "api_key": self.api_key,
-            "timeout": 60.0,
-            "extra_body": {"asr_options": {"enable_itn": False}},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_audio", "input_audio": {"data": data_uri}}],
+                }
+            ],
+            "stream": False,
+            "asr_options": {"enable_itn": False},
         }
-        if self.api_base:
-            kwargs["api_base"] = self.api_base.rstrip("/")
 
         try:
-            response = await acompletion(**kwargs)
-            # 处理 content 为 None 的情况（DashScope ASR 可能返回 annotations 但 content 为 None）
-            message_content = response.choices[0].message.content
-            text = ""
-            if message_content:
-                text = message_content.strip()
-            elif hasattr(response.choices[0].message, 'annotations') and response.choices[0].message.annotations:
-                # 如果 content 为空但有 annotations，尝试从 annotations 中提取信息
-                logger.warning(f"DashScope ASR 返回 content 为空，但有 annotations: {response.choices[0].message.annotations}")
-                # annotations 包含音频元信息，实际转写内容可能在别处
-                # 这种情况下返回空字符串
-                text = ""
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"DashScope ASR HTTP 错误: {e.response.status_code} - {e.response.text[:500]}")
+            return ""
+        except Exception as e:
+            logger.error(f"DashScope ASR 转写失败: {e}")
+            return ""
+
+        try:
+            choices = data.get("choices", [])
+            if not choices:
+                logger.warning("DashScope ASR 返回无 choices")
+                return ""
+            msg = choices[0].get("message", {})
+            text = (msg.get("content") or "").strip()
             if text:
                 logger.info(f"DashScope ASR 转写完成: {len(text)} 字符")
             return text
         except Exception as e:
-            logger.error(f"DashScope ASR 转写失败: {e}")
+            logger.error(f"DashScope ASR 响应解析失败: {e}")
             return ""
 
 
