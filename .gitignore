@@ -17,3 +17,4 @@ docs/
 __pycache__/
 .cursor/
 .trae
+*.db

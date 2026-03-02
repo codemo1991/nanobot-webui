@@ -90,6 +90,8 @@ class NanobotWebAPI:
             status_db_path = memory_repository.get_default_db_path()
         data_dir = status_db_path.parent
         (data_dir / "media").mkdir(parents=True, exist_ok=True)
+        # 确保 workspace/.nanobot/media 存在（web-ui 图片等文件统一存放于此）
+        (workspace_path / ".nanobot" / "media").mkdir(parents=True, exist_ok=True)
         status_repo = StatusRepository(status_db_path)
         self.status_service = SystemStatusService(
             status_repo=status_repo,
@@ -104,6 +106,7 @@ class NanobotWebAPI:
         # Pre-register API keys for custom models in templates
         self._register_template_model_keys(provider, config)
 
+        self._workspace_path = workspace_path  # 用于 web-ui 图片等文件保存到 workspace/.nanobot/media
         self.agent = AgentLoop(
             bus=MessageBus(),
             provider=provider,
@@ -297,7 +300,34 @@ class NanobotWebAPI:
                     return None
 
             else:
-                logger.warning(f"未知的系统事件类型: {message}")
+                # 非预定义系统事件：当作 agent 任务执行（用户误选 system_event 时仍可工作）
+                if message and message.strip():
+                    logger.info(f"系统事件 '{message[:50]}...' 作为 agent 任务执行")
+                    payload = job.get("payload", {})
+                    channel_name = (payload.get("channel") or "feishu").strip()
+                    to = (payload.get("to") or "").strip()
+                    deliver = payload.get("deliver", False)
+                    response = await self.agent.process_direct(
+                        message,
+                        session_key=f"cron:{job_id}",
+                        channel=channel_name,
+                        chat_id=to or "direct",
+                    )
+                    if deliver and to:
+                        sender = self._channel_senders.get(channel_name)
+                        if sender:
+                            try:
+                                from nanobot.bus.events import OutboundMessage
+                                await sender.send(OutboundMessage(
+                                    channel=channel_name,
+                                    chat_id=to,
+                                    content=response or "",
+                                ))
+                                logger.info(f"系统任务 '{job_name}' 已推送至 {channel_name}:{to}")
+                            except Exception as _e:
+                                logger.error(f"系统任务推送失败: {_e}")
+                    return response
+                logger.warning(f"未知的系统事件类型且 message 为空: {message}")
 
             return None
 
@@ -365,6 +395,7 @@ class NanobotWebAPI:
         self.status_service.initialize()
         from nanobot.storage.calendar_repository import get_calendar_repository
         self.calendar_repo = get_calendar_repository(workspace_path)
+        self._workspace_path = workspace_path
         self.mirror = MirrorService(
             workspace=workspace_path,
             sessions_manager=self.sessions,
@@ -1116,16 +1147,17 @@ class NanobotWebAPI:
     def _save_images_to_temp(self, images: list[str]) -> list[str]:
         """
         将 base64 data URL 图片保存到当前 workspace 的 .nanobot/media 目录。
+        与飞书等渠道一致，统一使用 workspace/.nanobot/media。
         调用方负责在处理完成后清理这些文件。
         """
         import base64
         import mimetypes
         import tempfile
 
-        # 使用当前 workspace 的 media 目录，与 session/chat.db 同构
-        workspace = getattr(self.agent, "workspace", None)
+        # 使用 workspace/.nanobot/media，与飞书等渠道一致
+        workspace = getattr(self, "_workspace_path", None) or getattr(self.agent, "workspace", None)
         if workspace:
-            media_dir = Path(workspace).resolve() / ".nanobot" / "media"
+            media_dir = Path(workspace).expanduser().resolve() / ".nanobot" / "media"
         else:
             media_dir = Path.home() / ".nanobot" / "media"
         media_dir.mkdir(parents=True, exist_ok=True)
@@ -4462,13 +4494,48 @@ class NanobotHTTPServer(ThreadingHTTPServer):
         self.static_dir = static_dir
 
 
+def _run_cron_in_thread(app: "NanobotWebAPI") -> tuple["threading.Thread", asyncio.AbstractEventLoop | None]:
+    """在独立线程中运行 cron 服务，保持 event loop 常驻，避免 add_job 时 Event loop is closed。"""
+    import threading
+    import time
+
+    loop_ref: list[asyncio.AbstractEventLoop] = []
+
+    def _thread_target() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop_ref.append(loop)
+        try:
+            loop.run_until_complete(app.cron_service.start())
+            loop.run_forever()
+        except Exception as e:
+            logger.warning(f"Cron thread error: {e}")
+        finally:
+            try:
+                app.cron_service.stop()
+            except Exception:
+                pass
+            loop.close()
+
+    t = threading.Thread(target=_thread_target, daemon=True)
+    t.start()
+    for _ in range(50):
+        if loop_ref:
+            break
+        time.sleep(0.1)
+    return t, loop_ref[0] if loop_ref else None
+
+
 def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | None = None) -> None:
     """Run the web API server."""
+    import threading
     app = NanobotWebAPI()
 
-    # Start cron service
+    # 在独立线程中启动 cron 服务，保持 event loop 常驻
+    cron_thread: threading.Thread | None = None
+    cron_loop: asyncio.AbstractEventLoop | None = None
     try:
-        asyncio.run(app.cron_service.start())
+        cron_thread, cron_loop = _run_cron_in_thread(app)
     except Exception as e:
         logger.warning(f"Failed to start cron service: {e}")
 
@@ -4526,10 +4593,14 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
     except KeyboardInterrupt:
         logger.info("\nStopping web API server...")
     finally:
-        # Stop cron service
+        # Stop cron service（停止 loop 以结束 cron 线程）
+        if cron_loop and cron_loop.is_running():
+            cron_loop.call_soon_threadsafe(cron_loop.stop)
         try:
             app.cron_service.stop()
         except Exception as e:
             logger.warning(f"Error stopping cron service: {e}")
+        if cron_thread and cron_thread.is_alive():
+            cron_thread.join(timeout=3)
         app.shutdown()
         server.server_close()

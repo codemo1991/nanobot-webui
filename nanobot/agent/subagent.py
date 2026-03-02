@@ -346,9 +346,10 @@ class SubagentManager:
 
         if not session_id or not self.sessions or not self.sessions.get(session_id):
             logger.info(f"Spawned subagent [{task_id}]: {display_label}")
-            return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
+            # 返回消息告诉主 agent 立即返回给用户，不要等待
+            return f"✅ 后台任务已启动 (id: {task_id})：{display_label}。任务完成后将自动通知你，请稍候..."
         else:
-            return f"Continuing subagent session [{task_id}]. I'll notify you when it completes."
+            return f"继续子对话会话 {task_id}。任务完成后将自动通知你，请稍候..."
 
     async def _run_via_claude_code(
         self,
@@ -636,21 +637,77 @@ class SubagentManager:
             sa_key: str | None = None
             sa_base: str | None = None
             try:
-                from nanobot.config.loader import load_config
+                import os
+                from nanobot.config.loader import load_config, get_config_repository
                 cfg = load_config()
                 sa_key = cfg.get_api_key(effective_model)
                 sa_base = cfg.get_api_base(effective_model)
+                # DashScope/Qwen 模型：多级回退，确保能拿到 key（LiteLLM 401 常因 key 未传入）
+                if (not sa_key or not sa_key.strip()) and any(
+                    k in effective_model.lower() for k in ("dashscope", "qwen")
+                ):
+                    sa_key = (
+                        (cfg.providers.dashscope.api_key or "").strip()
+                        or os.environ.get("DASHSCOPE_API_KEY", "")
+                    ) or None
+                    # 仍为空时，直接从 config_providers 表读取（绕过 load_full_config 结构差异）
+                    if not sa_key:
+                        try:
+                            prov = get_config_repository().get_provider("dashscope")
+                            if prov and (prov.get("api_key") or "").strip():
+                                sa_key = prov["api_key"].strip()
+                                if not sa_base and prov.get("api_base"):
+                                    sa_base = prov["api_base"]
+                        except Exception:
+                            pass
+                # 中国区 DashScope：未指定 api_base 时使用国内端点，避免 401
+                if sa_key and any(k in effective_model.lower() for k in ("dashscope", "qwen")):
+                    if not sa_base or not sa_base.strip():
+                        sa_base = os.environ.get("DASHSCOPE_API_BASE") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
                 if sa_key and hasattr(self.provider, "ensure_api_key_for_model"):
                     self.provider.ensure_api_key_for_model(
                         effective_model, sa_key, sa_base
                     )
+                # 显式设置 env，LiteLLM DashScope 适配层优先读 env
+                if sa_key and any(k in effective_model.lower() for k in ("dashscope", "qwen")):
+                    os.environ["DASHSCOPE_API_KEY"] = sa_key
+                    if sa_base:
+                        os.environ["DASHSCOPE_API_BASE"] = sa_base
                 if not sa_key and any(k in effective_model.lower() for k in ("dashscope", "qwen")):
                     logger.warning(
                         f"子 agent 模型 {effective_model} 需要 DashScope API Key，"
-                        "请在配置页 Provider 中填写 Qwen（通义）的 apiKey"
+                        "请在配置页 Provider 中填写 Qwen（通义）的 apiKey，或设置环境变量 DASHSCOPE_API_KEY"
                     )
             except Exception as e:
                 logger.debug(f"Subagent pre-register model key: {e}")
+
+            # voice 模板：直接调用 voice_transcribe，完全绕过 LLM（避免 LLM 不调用工具或输出模板占位符）
+            if template == "voice" and media and not self._media_has_images(media):
+                if origin_key in self._session_cancelled:
+                    self._session_cancelled.discard(origin_key)
+                    logger.info(f"Subagent [{task_id}] cancelled before voice transcription (session {origin_key})")
+                    final_result = "任务已被用户取消。"
+                    cancelled_by_user = True
+                else:
+                    audio_paths = []
+                    for path in media:
+                        p = Path(path)
+                        if not p.is_file():
+                            continue
+                        mime, _ = mimetypes.guess_type(path)
+                        ext = p.suffix.lower()
+                        is_audio = (mime and mime.startswith("audio/")) or ext in (".mp3", ".wav", ".ogg", ".m4a", ".opus", ".webm", ".aac")
+                        if is_audio:
+                            audio_paths.append(str(p.resolve()))
+                    if audio_paths:
+                        audio_path = audio_paths[0]
+                        result = await tools.execute("voice_transcribe", {"file_path": audio_path})
+                        if result and not str(result).strip().startswith("Error:"):
+                            final_result = str(result).strip()
+                            logger.info(f"Subagent [{task_id}] voice direct transcription: {len(final_result)} chars")
+                        else:
+                            final_result = str(result).strip() if result else "语音转写失败，请检查 DashScope API 配置。"
+                        max_iterations = 0  # 跳过 LLM 循环
 
             # 视觉模型通常不支持 function calling，有图片时不传 tools
             # 语音子 agent 仅有音频时需保留 exec 等工具，故仅在有图片时禁用
@@ -660,11 +717,59 @@ class SubagentManager:
             if media and self._media_has_images(media) and use_tools is None:
                 model_lower = effective_model.lower()
                 if any(k in model_lower for k in ("dashscope", "qwen")):
-                    direct_result = await self._dashscope_direct_call(messages, effective_model)
-                    if direct_result:
-                        final_result = direct_result
+                    if origin_key in self._session_cancelled:
+                        self._session_cancelled.discard(origin_key)
+                        logger.info(f"Subagent [{task_id}] cancelled before vision API call (session {origin_key})")
+                        final_result = "任务已被用户取消。"
+                        cancelled_by_user = True
                     else:
-                        final_result = "DashScope 图片识别失败，请检查 API key 和模型配置。"
+                        # 调用期间每 2 秒轮询取消，与 LLM 调用一致
+                        ds_task = asyncio.create_task(
+                            self._dashscope_direct_call(messages, effective_model)
+                        )
+                        _DS_CALL_TIMEOUT = 60
+                        _CANCEL_CHECK_INTERVAL = 2.0
+                        cancelled_during_ds = False
+                        loop_start_ds = time.monotonic()
+                        while not ds_task.done():
+                            elapsed = time.monotonic() - loop_start_ds
+                            remaining = _DS_CALL_TIMEOUT - elapsed
+                            if remaining <= 0:
+                                ds_task.cancel()
+                                try:
+                                    await ds_task
+                                except asyncio.CancelledError:
+                                    pass
+                                break
+                            wait_time = min(_CANCEL_CHECK_INTERVAL, remaining)
+                            done, _ = await asyncio.wait(
+                                [ds_task],
+                                timeout=wait_time,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if ds_task in done:
+                                break
+                            if origin_key in self._session_cancelled:
+                                self._session_cancelled.discard(origin_key)
+                                ds_task.cancel()
+                                try:
+                                    await ds_task
+                                except asyncio.CancelledError:
+                                    pass
+                                cancelled_during_ds = True
+                                break
+                        if cancelled_during_ds:
+                            final_result = "任务已被用户取消。"
+                            cancelled_by_user = True
+                        else:
+                            try:
+                                direct_result = await ds_task
+                            except asyncio.CancelledError:
+                                direct_result = None  # 超时取消
+                            if direct_result:
+                                final_result = direct_result
+                            else:
+                                final_result = "DashScope 图片识别失败，请检查 API key 和模型配置。"
                     # 跳过正常 loop
                     max_iterations = 0
 
@@ -749,6 +854,7 @@ class SubagentManager:
                         "tool_calls": tool_call_dicts,
                     })
 
+                    voice_direct_result = None
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments)
                         logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
@@ -759,6 +865,13 @@ class SubagentManager:
                             "name": tool_call.name,
                             "content": result,
                         })
+                        # voice 模板：voice_transcribe 成功返回后直接使用工具结果，不再调用 LLM（避免 LLM 输出模板占位符而非实际转写文本）
+                        if template == "voice" and tool_call.name == "voice_transcribe" and result and not str(result).strip().startswith("Error:"):
+                            voice_direct_result = str(result).strip()
+                            break
+                    if voice_direct_result is not None:
+                        final_result = voice_direct_result
+                        break
                 else:
                     final_result = response.content
                     break
@@ -835,12 +948,14 @@ class SubagentManager:
                     if len(batch_task_ids) > 1:
                         await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
                     else:
-                        if origin.get("channel") == "web":
+                        # vision/voice 模板：web 渠道走 _generate_and_push_summary 推送到 SubagentProgressBus，前端才能刷新
+                        # 非 web 渠道用 _announce_result 触发主 agent 处理
+                        if template in ("vision", "voice") and origin.get("channel") == "web":
                             await self._generate_and_push_summary(task_id, label, task, final_result, origin)
                         else:
                             await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                 else:
-                    if origin.get("channel") == "web":
+                    if template in ("vision", "voice") and origin.get("channel") == "web":
                         await self._generate_and_push_summary(task_id, label, task, final_result, origin)
                     else:
                         await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
@@ -953,13 +1068,28 @@ class SubagentManager:
         full_detail = "\n\n---\n\n".join(full_parts)
 
         try:
-            summary_prompt = (
-                "以下是多个子任务的执行结果（含任务指令与结果），请用 2-4 句话综合总结，自然回复用户。"
-                "不要逐条复述，要提炼关键结论。不要提 subagent、task_id 等技术细节。\n\n"
-                f"{combined_preview}"
-            )
+            # 优化后的 prompt：强调保持用户原始意图和输出语言一致性
+            BATCH_SUMMARY_SYSTEM = """你是任务结果总结助手，负责将多个子任务的执行结果自然地呈现给用户。
+
+核心原则：
+1. **保持用户原始意图**：根据每个任务的「任务描述」来组织回复
+2. **结果导向**：用户要求做什么，就呈现什么（要代码给代码，要描述给描述）
+3. **简洁口语化**：不要提 subagent、task_id 等技术细节
+4. **语言一致性**：输出语言必须与「任务描述」的语言一致（任务描述是中文就输出中文，是英文就输出英文）
+
+输出结构：
+1. 总体结论：1-2 句概括所有任务完成情况
+2. 分任务要点：按任务逐一列出关键结论（每项 1-2 句）
+3. 建议下一步：如有未完成或需用户决策的内容，简要说明"""
+
+            summary_prompt = f"""以下是多个子任务的执行结果，请基于用户原始意图进行回复。
+
+每个任务的「任务描述」告诉用户想要什么，根据它来组织回复。
+
+任务结果：
+{combined_preview}"""
             messages = [
-                {"role": "system", "content": "你是协调子任务的主 agent，负责综合多子任务结果并向用户汇报。"},
+                {"role": "system", "content": BATCH_SUMMARY_SYSTEM},
                 {"role": "user", "content": summary_prompt},
             ]
             response = await asyncio.wait_for(
@@ -1019,7 +1149,18 @@ class SubagentManager:
             status_text = "completed successfully" if status == "ok" else "failed"
             parts.append(f"[Subagent '{label}' {status_text}]\nTask: {task}\nResult:\n{result}")
         content = "\n\n---\n\n".join(parts)
-        content += "\n\nSummarize the above subagent results naturally for the user in 2-4 sentences. Do not mention technical details."
+
+        # 优化后的 prompt：强调保持用户原始意图和输出语言一致性
+        content += """
+
+请基于用户原始意图，综合以上所有子任务结果进行回复：
+1. 根据每个任务的「任务描述」来理解用户想要什么
+2. 按「总体结论 → 各任务要点」结构，用 2-4 句话向用户汇报
+3. 如果用户要求 mermaid 代码，就输出代码；如果要求描述，就提供描述
+4. 不要逐条复述，要提炼关键结论
+5. 不要提及 subagent、task_id 等技术细节
+6. **语言一致性**：输出语言必须与「任务描述」的语言一致（任务描述是中文就输出中文，是英文就输出英文）"""
+
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",
@@ -1066,15 +1207,20 @@ class SubagentManager:
                 f"任务描述（子 agent 收到的完整指令）：\n{task}\n\n"
                 f"执行结果：\n{result_for_prompt}"
             )
+
+            # 优化后的 system prompt：强调保持用户原始意图和输出语言一致性
+            SUMMARY_SYSTEM_PROMPT = """你是任务结果总结助手，负责将子任务的执行结果自然地呈现给用户。
+
+核心原则：
+1. **保持用户原始意图**：根据「任务描述」中用户的具体要求来组织回复
+2. **结果导向**：用户要求做什么，就呈现什么（要代码给代码，要描述给描述）
+3. **隐匿系统执行过程**：不要提 subagent、task_id 等技术细节
+4. **语言一致性**：输出语言必须与「任务描述」的语言一致（任务描述是中文就输出中文，是英文就输出英文）
+
+请基于以下任务描述和执行结果，给出符合用户原始意图的回复："""
+
             messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一个助手，用 1–2 句话自然地向用户总结后台任务的执行结果。"
-                        "语言简洁口语化，不要提 subagent、task_id 等技术细节，不要使用 Markdown 标题。"
-                        "总结时要结合「任务描述」和「执行结果」两方面，确保准确。"
-                    ),
-                },
+                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
                 {"role": "user", "content": summary_prompt},
             ]
             # 使用主模型做纯文本 summary，避免 vision 模型 (如 qwen-vl-plus) 的 API key 要求
@@ -1174,26 +1320,37 @@ class SubagentManager:
             return
 
         status_text = "completed successfully" if status == "ok" else "failed"
-        
-        announce_content = f"""[Subagent '{label}' {status_text}]
 
-Task: {task}
+        # 优化后的 announce content：强调保持用户原始意图
+        result_preview = (result or "")[:800] + ("..." if len(result or "") > 800 else "")
 
-Result:
-{result}
+        announce_content = f"""[子 agent 完成] {label}
 
-Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
-        
+**任务描述（用户原始意图）**：{task[:300]}{'...' if len(task) > 300 else ''}
+
+**执行结果**：
+{result_preview}
+
+请基于用户原始意图进行回复：
+- 如果用户要求 mermaid 代码，就输出代码块
+- 如果用户要求描述内容，就提供描述
+- 保持简洁（1-3 句），不要提及 subagent、task_id 等技术细节"""
+
         # Inject as system message to trigger main agent
+        logger.info(f"[SubagentAnnounce] === ANNOUNCING RESULT ===")
+        logger.info(f"[SubagentAnnounce] task_id: {task_id}, label: {label}, status: {status}, template: {template}")
+        logger.info(f"[SubagentAnnounce] result_preview: {result[:100]}..." if len(result) > 100 else f"[SubagentAnnounce] result_preview: {result}")
+        logger.info(f"[SubagentAnnounce] publishing to channel={origin['channel']}, chat_id={origin['chat_id']}")
+
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=announce_content,
         )
-        
+
         await self.bus.publish_inbound(msg)
-        logger.debug(f"Subagent [{task_id}] announced result to {origin['channel']}:{origin['chat_id']}")
+        logger.info(f"[SubagentAnnounce] Published to bus, origin={origin['channel']}:{origin['chat_id']}")
 
     def _create_tools_for_template(self, template: str) -> ToolRegistry:
         """Create and register tools based on template."""

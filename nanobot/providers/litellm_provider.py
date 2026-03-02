@@ -354,9 +354,23 @@ class LiteLLMProvider(LLMProvider):
             return result
         except Exception as e:
             logger.exception("LLM API call failed")
-            # Return error as content for graceful handling
+            # 不返回详细错误信息给用户，避免技术细节泄露
+            # 返回通用错误，让上层处理
+            error_msg = str(e)
+            # 检查是否是常见的可处理错误
+            if "tool call and result not match" in error_msg:
+                user_message = "工具执行结果与请求不匹配，请重试"
+            elif "authentication" in error_msg.lower() or "401" in error_msg:
+                user_message = "认证失败，请检查 API 配置"
+            elif "rate_limit" in error_msg.lower() or "429" in error_msg:
+                user_message = "请求过于频繁，请稍后再试"
+            elif "timeout" in error_msg.lower():
+                user_message = "请求超时，请重试"
+            else:
+                user_message = "服务暂时不可用，请稍后再试"
+
             return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
+                content=user_message,
                 finish_reason="error",
             )
     
@@ -378,7 +392,7 @@ class LiteLLMProvider(LLMProvider):
                         args = {"raw": args}
                 
                 tool_calls.append(ToolCallRequest(
-                    id=tc.id,
+                    id=str(tc.id) if tc.id is not None else "",
                     name=tc.function.name,
                     arguments=args,
                 ))

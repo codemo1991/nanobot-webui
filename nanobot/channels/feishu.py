@@ -240,10 +240,12 @@ class FeishuChannel(BaseChannel):
         config: FeishuConfig,
         bus: MessageBus,
         workspace: "Path | None" = None,
+        agent: Any = None,
     ):
         super().__init__(config, bus)
         self.config: FeishuConfig = config
         self._workspace = workspace
+        self._agent = agent  # 用于 /stop 等命令
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
@@ -904,6 +906,14 @@ class FeishuChannel(BaseChannel):
             }
             if progress_callback is not None:
                 metadata["progress_callback"] = progress_callback
+
+            # /stop 命令：直接停止当前 session 的 agent/tool 调用，不入队
+            if content.strip().lower() == "/stop" and self._agent:
+                self._agent.cancel_current_request(channel="feishu", session_id=reply_to)
+                await self.bus.publish_outbound(
+                    OutboundMessage(channel="feishu", chat_id=reply_to, content="已发送停止指令。")
+                )
+                return
 
             await self._handle_message(
                 sender_id=sender_id,
