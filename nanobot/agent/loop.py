@@ -165,7 +165,12 @@ class AgentLoop:
             "total": system_prompt_max_tokens,
             "memory": memory_max_tokens,
         }
-        self.context = ContextBuilder(workspace, token_budget=token_budget)
+        # 子 agent 模板：未传入时自动创建 AgentTemplateManager
+        if agent_template_manager is None:
+            from nanobot.config.agent_templates import AgentTemplateManager
+            agent_template_manager = AgentTemplateManager(workspace)
+
+        self.context = ContextBuilder(workspace, token_budget=token_budget, agent_template_manager=agent_template_manager)
         self.sessions = SessionManager(workspace)
         # 初始化线程池
         self._thread_pool_executor = ThreadPoolExecutor(max_workers=self._thread_pool_size)
@@ -178,6 +183,11 @@ class AgentLoop:
             default_timeout=self.claude_code_config.default_timeout,
             max_concurrent_tasks=self.claude_code_config.max_concurrent_tasks,
         )
+
+        # 子 agent 模板：未传入时自动创建 AgentTemplateManager，其从 SQLite 数据库加载模板（workspace/.nanobot/chat.db 或 ~/.nanobot/chat.db），确保所有渠道（Web/飞书/CLI 等）行为一致
+        if agent_template_manager is None:
+            from nanobot.config.agent_templates import AgentTemplateManager
+            agent_template_manager = AgentTemplateManager(workspace)
 
         self.subagents = SubagentManager(
             provider=provider,
@@ -326,9 +336,17 @@ class AgentLoop:
         spawn_args: dict[str, Any],
         tool_steps: list[dict[str, Any]],
     ) -> bool:
-        """检查是否已执行过语义相似的 spawn。"""
-        new_task = spawn_args.get("task", "") or ""
+        """检查是否已执行过语义相似的 spawn。vision 模板：本回合已有 vision spawn 即视为重复。"""
         new_template = str(spawn_args.get("template", "minimal")).lower()
+        # vision：本回合已有任一 vision spawn 即视为重复（同一图片只需一次分析）
+        if new_template == "vision":
+            if any(
+                s.get("name") == "spawn"
+                and str((s.get("arguments") or {}).get("template", "")).lower() == "vision"
+                for s in tool_steps
+            ):
+                return True
+        new_task = spawn_args.get("task", "") or ""
         for s in tool_steps:
             if s.get("name") != "spawn":
                 continue
@@ -356,10 +374,10 @@ class AgentLoop:
                     prev_args = getattr(prev, "arguments", {}) or {}
                     if not isinstance(prev_args, dict):
                         continue
-                    if self._spawn_tasks_similar(
-                        args.get("task", ""),
-                        prev_args.get("task", ""),
-                    ) and str(args.get("template", "")).lower() == str(prev_args.get("template", "")).lower():
+                    template_match = str(args.get("template", "")).lower() == str(prev_args.get("template", "")).lower()
+                    # vision 模板使用更低阈值 0.55，减少重复 spawn
+                    thresh = 0.55 if "vision" in str(args.get("template", "")).lower() else 0.78
+                    if self._spawn_tasks_similar(args.get("task", ""), prev_args.get("task", ""), threshold=thresh) and template_match:
                         logger.info(f"[AgentLoop] Deduplicated spawn: task similar to previous")
                         break
                 else:
@@ -373,10 +391,60 @@ class AgentLoop:
             logger.info(f"[AgentLoop] Deduplicated tool calls: {len(tool_calls)} -> {len(deduped)}")
         return deduped
 
+    def _resolve_vision_exec_groups(
+        self,
+        tool_calls: list,
+        image_files: list[str],
+    ) -> list[list] | None:
+        """
+        检测 spawn(vision) + exec(图片相关) 冲突，返回串行分组（vision 先行）。
+        多个 spawn(vision) 按 task 相似度去重，只保留第一个。
+        """
+        if not image_files or len(tool_calls) < 2:
+            return None
+
+        spawn_vision: list = []
+        exec_image: list = []
+        others: list = []
+
+        for tc in tool_calls:
+            name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else None)
+            args = getattr(tc, "arguments", None) or (tc.get("arguments", {}) if isinstance(tc, dict) else {})
+            if not isinstance(args, dict):
+                args = {}
+
+            if name == "spawn" and str(args.get("template", "")).lower() == "vision":
+                spawn_vision.append(tc)
+            elif name == "exec":
+                cmd = args.get("command", "") or ""
+                if self._is_exec_image_related(cmd):
+                    exec_image.append(tc)
+                else:
+                    others.append(tc)
+            else:
+                others.append(tc)
+
+        if not spawn_vision or not exec_image:
+            return None
+
+        # 同一批多个 spawn(vision) 只保留第一个（同一图片只需一次视觉分析）
+        vision_deduped = spawn_vision[:1]
+        if len(spawn_vision) > 1:
+            logger.info("[AgentLoop] Vision spawn deduplicated in conflict group: keeping first only (%d -> 1)", len(spawn_vision))
+
+        # 串行组 1: vision 先行，再 exec；其余工具各成一组
+        group1 = vision_deduped + exec_image
+        groups = [group1]
+        for tc in others:
+            groups.append([tc])
+        return groups
+
     async def _execute_tool_parallel(
         self,
         tool_calls: list,
         progress: Callable | None = None,
+        image_files: list[str] | None = None,
+        session_key: str | None = None,
     ) -> list[tuple]:
         """
         并行执行多个工具调用。
@@ -384,6 +452,7 @@ class AgentLoop:
         Args:
             tool_calls: 工具调用列表
             progress: 进度回调函数
+            image_files: 当前消息的图片文件路径，用于 vision-exec 冲突检测
 
         Returns:
             按顺序排列的 (tool_call, result) 元组列表
@@ -399,9 +468,29 @@ class AgentLoop:
                     logger.debug(f"Failed to record serial tool metrics: {e}")
             results = []
             for tool_call in tool_calls:
+                await self._check_cancelled(session_key)
                 result = await self._execute_single_tool(tool_call, progress)
                 results.append((tool_call, result))
             return results
+
+        # vision-exec 冲突检测：有图片且同时存在 spawn(vision) 与 exec(图片相关) 时，串行分组（vision 先行）
+        if image_files and len(image_files) > 0:
+            groups = self._resolve_vision_exec_groups(tool_calls, image_files)
+            if groups:
+                logger.info("[AgentLoop] Vision-exec conflict detected, using serial groups (vision first)")
+                if self._status_service:
+                    try:
+                        for _ in tool_calls:
+                            self._status_service.increment_tool_call(is_parallel=False)
+                    except Exception as e:
+                        logger.debug(f"Failed to record serial tool metrics: {e}")
+                results = []
+                for group in groups:
+                    for tool_call in group:
+                        await self._check_cancelled(session_key)
+                        result = await self._execute_single_tool(tool_call, progress)
+                        results.append((tool_call, result))
+                return results
 
         # 智能并行判断
         should_parallel = True
@@ -421,6 +510,7 @@ class AgentLoop:
                     results = []
                     for group in groups:
                         for tool_call in group:
+                            await self._check_cancelled(session_key)
                             result = await self._execute_single_tool(tool_call, progress)
                             results.append((tool_call, result))
                     return results
@@ -439,6 +529,7 @@ class AgentLoop:
                     logger.debug(f"Failed to record serial tool metrics: {e}")
             results = []
             for tool_call in tool_calls:
+                await self._check_cancelled(session_key)
                 result = await self._execute_single_tool(tool_call, progress)
                 results.append((tool_call, result))
             return results
@@ -557,6 +648,12 @@ class AgentLoop:
                 progress({"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated})
             except Exception:
                 pass
+
+        # 详细日志：工具执行完成
+        result_preview = result[:200] + "..." if len(result) > 200 else result
+        logger.info(f"[ToolExecution] === TOOL COMPLETED ===")
+        logger.info(f"[ToolExecution] tool: {tool_call.name}, duration: {execution_time:.2f}s, has_error: {tool_execution_error is not None}")
+        logger.info(f"[ToolExecution] result_preview: {result_preview}")
 
         return result
 
@@ -686,6 +783,110 @@ class AgentLoop:
             return True
         # Fallback: check common audio extensions
         return str(path).lower().endswith(('.mp3', '.wav', '.ogg', '.m4a', '.opus', '.webm', '.aac'))
+
+    async def _wait_for_subagents(self, task_ids: list[str], timeout: float = 120.0) -> None:
+        """等待指定的所有子 Agent 任务完成。"""
+        if not task_ids or not self.subagents:
+            return
+
+        start_time = time.monotonic()
+        check_interval = 2.0  # 每 2 秒检查一次
+
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= timeout:
+                raise asyncio.TimeoutError(f"Timeout waiting for subagents after {timeout}s")
+
+            # 检查哪些任务还在运行
+            running = []
+            for task_id in task_ids:
+                if task_id in self.subagents._running_tasks:
+                    running.append(task_id)
+
+            if not running:
+                # 所有任务都完成了
+                logger.info(f"[BatchMode] All subagent tasks completed: {task_ids}")
+                break
+
+            # 等待一段时间再检查
+            await asyncio.sleep(check_interval)
+
+    async def _synthesize_batch_results(
+        self,
+        tool_steps: list[dict[str, Any]],
+        subagent_results: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+    ) -> str | None:
+        """综合工具执行结果和子 Agent 结果，调用 LLM 生成最终回复。"""
+        if not subagent_results:
+            return None
+
+        # 构建综合 prompt
+        parts = []
+
+        # 添加工具执行结果
+        if tool_steps:
+            parts.append("## 工具执行结果\n")
+            for step in tool_steps:
+                name = step.get("name", "unknown")
+                args = step.get("arguments", {})
+                result = step.get("result", "")
+                parts.append(f"### {name}\n- 参数: {json.dumps(args, ensure_ascii=False)[:200]}\n- 结果: {result[:500]}")
+
+        # 添加子 Agent 结果
+        if subagent_results:
+            parts.append("\n## 子 Agent 执行结果\n")
+            for sa in subagent_results:
+                label = sa.get("label", "unknown")
+                task = sa.get("task", "")
+                result = sa.get("result", "")
+                parts.append(f"### {label}\n- 任务: {task[:200]}\n- 结果: {result[:500]}")
+
+        combined = "\n\n".join(parts)
+
+        synthesis_prompt = f"""你是一个协调多任务执行的助手。请综合以下所有执行结果，给用户一个统一的回复。
+
+{combined}
+
+要求：
+1. 简洁明了地告诉用户完成了哪些任务
+2. 每个任务的关键结果要提到
+3. 如果有失败的任务，要说明
+4. 不要提及技术细节（如 task_id、subagent 等）"""
+
+        try:
+            response = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=[{"role": "user", "content": synthesis_prompt}],
+                    tools=None,
+                    model=self.model,
+                    max_tokens=1000,
+                    temperature=0.5,
+                ),
+                timeout=30.0,
+            )
+            return response.content
+        except asyncio.TimeoutError:
+            logger.warning("[BatchMode] Synthesis LLM call timed out")
+            # 超时时返回原始结果拼接
+            fallback = "我完成了以下任务：\n"
+            for sa in subagent_results:
+                fallback += f"- {sa.get('label', '任务')}: {sa.get('result', '')[:200]}...\n"
+            return fallback
+        except Exception as e:
+            logger.warning(f"[BatchMode] Synthesis failed: {e}")
+            return None
+
+    def _is_exec_image_related(self, command: str) -> bool:
+        """判断 exec 的 command 是否疑似图片识别/分析相关。"""
+        if not command or not isinstance(command, str):
+            return False
+        lower = command.lower()
+        keywords = [
+            "识别", "ocr", "图片", "图像", "分析图", "识别图",
+            "image", "tesseract", "pytesseract", "opencv", "cv2", "pil", "pillow",
+        ]
+        return any(kw in lower for kw in keywords)
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -870,6 +1071,20 @@ class AgentLoop:
 
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
 
+        # /clear 命令：清除聊天记录，清空上下文（飞书等渠道通用）
+        _cmd = (msg.content or "").strip().lower()
+        if _cmd in ("/clear", "/清空"):
+            session = self.sessions.get_or_create(msg.session_key)
+            session.clear()
+            session.subagent_results.clear()
+            self.sessions.save(session)
+            logger.info(f"Session {msg.session_key} cleared by /clear command")
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="已清除所有聊天记录，上下文已清空。",
+            )
+
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
 
@@ -883,6 +1098,7 @@ class AgentLoop:
             spawn_tool.set_context(msg.channel, msg.chat_id)
             spawn_tool.set_media(msg.media if msg.media else [])
             spawn_tool.set_batch_id(str(uuid.uuid4())[:12])
+            spawn_tool.set_user_message(msg.content)  # 传递用户的原始消息
 
         # Get subagent results tool
         get_subagent_results_tool = self.tools.get("get_subagent_results")
@@ -957,7 +1173,7 @@ class AgentLoop:
         audio_files = [m for m in (msg.media or []) if self._is_audio_file(m)]
 
         if audio_files:
-            logger.info(f"[Audio] Found {len(audio_files)} audio files, expecting model to spawn voice subagent")
+            logger.info(f"[Audio] Found {len(audio_files)} audio files, expecting model to choose appropriate subagent template")
 
         if image_files:
             main_model_supports_vision = self._is_vision_model(self.model)
@@ -974,6 +1190,7 @@ class AgentLoop:
                 logger.info("[Image] Main model doesn't support vision, expecting model to spawn vision subagent or fallback to inline")
             else:
                 # 没有配置 subagent_model，主模型也不支持视觉，直接 inline recognition
+                await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
                 progress_cb = msg.metadata.get("progress_callback")
                 if progress_cb:
                     try:
@@ -1004,6 +1221,9 @@ class AgentLoop:
         usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         loop_start = time.monotonic()
         tool_result_max_len = self.tool_result_max_length
+
+        # Batch 模式：记录本轮 spawn 的 task_id，等待完成后聚合返回
+        spawned_task_ids: list[str] = []
 
         def _truncate(val: str, max_len: int | None = None) -> str:
             if not isinstance(val, str):
@@ -1119,10 +1339,19 @@ class AgentLoop:
                     logger.info(f"[AgentLoop] CLAUDE_CODE tool detected in tool calls!")
                 # 批内去重：相同 (name, arguments) 只执行一次
                 tool_calls_deduped = self._deduplicate_tool_calls(response.tool_calls)
+
+                # 详细日志：工具调用信息
+                tool_calls_info = []
+                for tc in tool_calls_deduped:
+                    args_str = json.dumps(tc.arguments, ensure_ascii=False)[:200]
+                    tool_calls_info.append(f"{tc.name}({args_str})")
+                logger.info(f"[AgentLoop] Tool calls prepared: {tool_calls_info}")
+
                 # Add assistant message with tool calls（使用去重后的列表以保持一致性）
+                # 确保 id 为字符串（MiniMax 等 API 对 tool call/result 匹配有严格要求）
                 tool_call_dicts = [
                     {
-                        "id": tc.id,
+                        "id": str(tc.id) if tc.id is not None else "",
                         "type": "function",
                         "function": {
                             "name": tc.name,
@@ -1138,13 +1367,151 @@ class AgentLoop:
                 # Execute tools and collect steps for UI display
                 loop_detected = False
 
-                # 并行/串行执行工具
+                # 执行前过滤：与本回合已执行的 spawn 语义重复的，不执行（避免重复 spawn vision）
+                to_execute: list = []
+                skipped_spawns: set = set()
+                for tc in tool_calls_deduped:
+                    if tc.name == "spawn":
+                        args = getattr(tc, "arguments", {}) or {}
+                        if isinstance(args, dict) and self._is_duplicate_spawn(args, tool_steps):
+                            logger.info("[AgentLoop] Skipping duplicate spawn before execution (similar task already done this turn)")
+                            skipped_spawns.add(id(tc))
+                            continue
+                    to_execute.append(tc)
+
+                if not to_execute:
+                    logger.info("[AgentLoop] All tool calls were duplicate spawns, forcing synthesis")
+                    # 必须为被跳过的 tool_calls 注入占位 result，否则 messages 中 assistant 有 tool_calls 却无对应 result，MiniMax 等 API 会报 2013
+                    for tc in tool_calls_deduped:
+                        if id(tc) in skipped_spawns:
+                            messages = self.context.add_tool_result(
+                                messages, tc.id, tc.name,
+                                "已跳过：本回合已执行过类似的视觉分析任务，请使用之前的识别结果。",
+                            )
+                            tool_steps.append({
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                                "result": "已跳过：本回合已执行过类似的视觉分析任务，请使用之前的识别结果。",
+                            })
+                    loop_detected = True
+                    exit_reason = "loop"
+                    break
+
+                # 执行前检查取消，避免工具执行期间无法响应停止
+                await self._check_cancelled(sk)
+
+                # Batch 模式：spawn 优先级高于 exec
+                # 实现：spawn 和 exec 同时启动，谁先完成用谁
+                # - 如果 spawn 先完成且有正确结果，取消 exec
+                # - 否则执行完所有工具
+                has_spawn = any(tc.name == "spawn" for tc in to_execute)
+                has_exec = any(tc.name == "exec" for tc in to_execute)
+
                 progress = msg.metadata.get("progress_callback")
-                tool_results = await self._execute_tool_parallel(tool_calls_deduped, progress)
+
+                # 如果有 spawn，需要等待子 Agent 完成后再继续（避免再次 LLM 调用时子 Agent 还在运行）
+                if spawned_task_ids and self.subagents:
+                    running_spawns = [
+                        tid for tid in spawned_task_ids
+                        if tid in self.subagents._running_tasks
+                    ]
+                    if running_spawns:
+                        logger.info(f"[BatchMode] Waiting for spawn tasks before next LLM call: {running_spawns}")
+                        try:
+                            await self._wait_for_subagents(running_spawns, timeout=120.0)
+                            logger.info(f"[BatchMode] Spawn tasks completed before next LLM call")
+                        except asyncio.TimeoutError:
+                            logger.warning(f"[BatchMode] Timeout waiting for spawn tasks")
+
+                if has_spawn and has_exec and spawned_task_ids is not None:
+                    # Batch 模式：spawn 优先执行
+                    logger.info("[BatchMode] Spawn priority mode: spawn first, exec follows if needed")
+
+                    # 分离 spawn 和 exec
+                    spawn_calls = [tc for tc in to_execute if tc.name == "spawn"]
+                    exec_calls = [tc for tc in to_execute if tc.name == "exec"]
+
+                    # 先执行所有 spawn
+                    spawn_results = []
+                    for tc in spawn_calls:
+                        result = await self._execute_single_tool(tc, progress)
+                        spawn_results.append((tc, result))
+                        # 提取 task_id
+                        import re
+                        task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
+                        if task_id_match:
+                            task_id = task_id_match.group(1) or task_id_match.group(2)
+                            spawned_task_ids.append(task_id)
+                            logger.info(f"[BatchMode] Spawn completed first, recorded task_id: {task_id}")
+
+                    # 检查 spawn 是否有正确结果，如果有就跳过 exec
+                    spawn_has_result = any(
+                        "started" in r[1] or "id:" in r[1]
+                        for r in spawn_results
+                    )
+
+                    if spawn_has_result:
+                        # spawn 有结果，跳过 exec
+                        logger.info("[BatchMode] Spawn has result, skipping exec")
+                        exec_results = []
+                    else:
+                        # spawn 没有结果，执行 exec
+                        logger.info("[BatchMode] Spawn has no result, executing exec")
+                        exec_results = []
+                        for tc in exec_calls:
+                            result = await self._execute_single_tool(tc, progress)
+                            exec_results.append((tc, result))
+
+                    # 合并结果
+                    exec_results = spawn_results + exec_results
+                else:
+                    # 正常模式：并行/串行执行
+                    exec_results = await self._execute_tool_parallel(
+                        to_execute, progress, image_files=image_files, session_key=sk
+                    )
+
+                # 合并结果：保持 tool_calls_deduped 顺序，被跳过的 spawn 注入占位结果
+                exec_iter = iter(exec_results)
+                tool_results: list = []
+                for tc in tool_calls_deduped:
+                    if id(tc) in skipped_spawns:
+                        tool_results.append((tc, "已跳过：本回合已执行过类似的视觉分析任务，请使用之前的识别结果。"))
+                    else:
+                        tool_results.append(next(exec_iter))
 
                 for tool_call, result in tool_results:
                     # 跳过异常结果（tool_call 为 None）
                     if tool_call is None:
+                        continue
+
+                    # Batch 模式特殊处理：spawn 仍然要放入 messages，但最终回复基于综合结果
+                    # 原因：否则 LLM 会报 "tool call and result not match" 错误
+                    is_spawn = tool_call.name == "spawn"
+
+                    if is_spawn:
+                        # 放入 messages 避免 tool call 不匹配错误
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result
+                        )
+                        # 记录到 tool_steps（用于后续综合）
+                        tool_steps.append({
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            "result": _truncate(result),
+                        })
+                        logger.info(f"[BatchMode] Spawn result added to messages (final result will be synthesized later)")
+                        continue
+
+                    # 我们主动跳过的重复 spawn：加入 messages 但不触发 loop 检测
+                    if id(tool_call) in skipped_spawns:
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result
+                        )
+                        tool_steps.append({
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            "result": _truncate(result),
+                        })
                         continue
 
                     # 循环检测: 连续两次完全相同的调用视为 loop；spawn 额外检查历史是否已有相同任务
@@ -1170,6 +1537,18 @@ class AgentLoop:
                     if loop_detected:
                         break
 
+                    # Batch 模式：记录 spawn 产生的 task_id
+                    if tool_call.name == "spawn":
+                        # 从返回结果中提取 task_id
+                        # 格式1: "Subagent [label] started (id: {task_id})."
+                        # 格式2: "Continuing subagent session [{task_id}]."
+                        import re
+                        task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
+                        if task_id_match:
+                            task_id = task_id_match.group(1) or task_id_match.group(2)
+                            spawned_task_ids.append(task_id)
+                            logger.info(f"[BatchMode] Recorded spawn task_id: {task_id}")
+
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
@@ -1187,6 +1566,16 @@ class AgentLoop:
                 # No tool calls, we're done
                 final_content = response.content
                 break
+
+        # 非阻塞 Batch 模式：spawn 后立即返回，不等待子 Agent 完成
+        # 子 Agent 完成后会触发综合并通过 SSE 推送结果
+        if spawned_task_ids:
+            logger.info(f"[BatchMode] Non-blocking mode: spawn {len(spawned_task_ids)} tasks, returning immediately")
+            # 直接返回 spawn 的结果，不再继续 LLM 调用
+            # 使用 spawn 返回的消息（已经在 response.content 中）
+            final_content = response.content if response.content else f"任务已启动，正在后台处理中 (id: {spawned_task_ids[0]})..."
+            # 强制设置 exit_reason 避免后续继续循环
+            exit_reason = "spawn_nonblocking"
 
         if final_content is None and exit_reason is None:
             exit_reason = "iterations"
@@ -1351,6 +1740,7 @@ class AgentLoop:
             if not spawned_vision:
                 # 模型没有 spawn vision 子agent，做 inline recognition 兜底
                 logger.info("[Image] Model didn't spawn vision subagent, using inline recognition as fallback")
+                await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
                 progress_cb = msg.metadata.get("progress_callback")
                 if progress_cb:
                     try:
@@ -1511,12 +1901,12 @@ class AgentLoop:
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
-        
+
         The chat_id field contains "original_channel:original_chat_id" to route
         the response back to the correct destination.
         """
-        logger.info(f"Processing system message from {msg.sender_id}")
-        
+        logger.info(f"[SystemMessage] Processing system message from sender={msg.sender_id}, chat_id={msg.chat_id}")
+
         # Parse origin from chat_id (format: "channel:chat_id")
         if ":" in msg.chat_id:
             parts = msg.chat_id.split(":", 1)
@@ -1526,11 +1916,14 @@ class AgentLoop:
             # Fallback
             origin_channel = "cli"
             origin_chat_id = msg.chat_id
-        
+
+        logger.info(f"[SystemMessage] Parsed origin: channel={origin_channel}, chat_id={origin_chat_id}")
+
         # Use the origin session for context
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
         self._reset_cancel_event(session_key)
+        logger.info(f"[SystemMessage] Using session: {session_key}, message_preview={msg.content[:100]}...")
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -1678,7 +2071,7 @@ class AgentLoop:
                 tool_calls_deduped = self._deduplicate_tool_calls(response.tool_calls)
                 tool_call_dicts = [
                     {
-                        "id": tc.id,
+                        "id": str(tc.id) if tc.id is not None else "",
                         "type": "function",
                         "function": {
                             "name": tc.name,

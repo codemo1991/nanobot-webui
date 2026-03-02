@@ -256,7 +256,7 @@ Analyze the provided image(s) and provide a detailed description.
 When complete, provide a comprehensive description of the image.""",
     },
     "voice": {
-        "description": "语音转文字（DashScope Qwen3-ASR-Flash / Groq Whisper）",
+        "description": "语音转文字（DashScope Qwen3-ASR-Flash）",
         "tools": ["voice_transcribe", "read_file"],
         "rules": [
             "Accept audio files in various formats (mp3, wav, m4a, ogg, etc.)",
@@ -266,7 +266,7 @@ When complete, provide a comprehensive description of the image.""",
         "system_prompt": """# Voice Transcription Subagent
 
 You are a voice transcription subagent specialized in converting speech to text.
-Uses DashScope Qwen3-ASR-Flash (preferred) or Groq Whisper via the voice_transcribe tool.
+Uses DashScope Qwen3-ASR-Flash via the voice_transcribe tool.
 
 ## Your Task
 {task}
@@ -302,5 +302,5 @@ VALID_TOOLS = {
     "web_search",
     "web_fetch",
     "claude_code",  # Claude Code CLI tool
-    "voice_transcribe",  # 语音转写（DashScope Qwen3-ASR-Flash / Groq Whisper）
+    "voice_transcribe",  # 语音转写（DashScope Qwen3-ASR-Flash）
 }

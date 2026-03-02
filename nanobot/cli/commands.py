@@ -209,7 +209,7 @@ def gateway(
     # Create cron service first (callback set after agent creation)
     cron = CronService(get_db_path())
 
-    # Create agent with cron service
+    # Create agent with cron service（子 agent 模板由 AgentLoop 内部从 SQLite 加载，所有渠道一致）
     agent = AgentLoop(
         bus=bus,
         provider=provider,
@@ -278,8 +278,8 @@ def gateway(
         model=model,
     )
 
-    # Create channel manager
-    channels = ChannelManager(config, bus)
+    # Create channel manager（传入 agent 供 /stop 等命令使用）
+    channels = ChannelManager(config, bus, agent=agent)
     
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")

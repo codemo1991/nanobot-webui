@@ -77,7 +77,17 @@ class DashScopeASRTranscriptionProvider:
 
         try:
             response = await acompletion(**kwargs)
-            text = (response.choices[0].message.content or "").strip()
+            # 处理 content 为 None 的情况（DashScope ASR 可能返回 annotations 但 content 为 None）
+            message_content = response.choices[0].message.content
+            text = ""
+            if message_content:
+                text = message_content.strip()
+            elif hasattr(response.choices[0].message, 'annotations') and response.choices[0].message.annotations:
+                # 如果 content 为空但有 annotations，尝试从 annotations 中提取信息
+                logger.warning(f"DashScope ASR 返回 content 为空，但有 annotations: {response.choices[0].message.annotations}")
+                # annotations 包含音频元信息，实际转写内容可能在别处
+                # 这种情况下返回空字符串
+                text = ""
             if text:
                 logger.info(f"DashScope ASR 转写完成: {len(text)} 字符")
             return text

@@ -19,6 +19,7 @@ TOKEN_BUDGET_DEFAULTS = {
 }
 
 # 主 Agent 默认身份内容（不含 runtime_suffix），用于启动时初始化 DB 及内置回退
+# Media Handling 部分由 ContextBuilder 动态构建模板描述
 DEFAULT_IDENTITY_CONTENT = """# nanobot 🐈
 
 You are nanobot, a helpful AI assistant.
@@ -30,14 +31,18 @@ You are nanobot, a helpful AI assistant.
 - When user says "记住/remember", call the remember tool to persist the information
 - For normal conversation, respond with text directly. Only use the 'message' tool for cross-channel messaging.
 
-## Media Handling
+## When to Use spawn (Subagent)
 
-When receiving media content, choose the spawn template by media type:
-- **Images only** (photos, screenshots, [图片]): Use `template=vision` with `attach_media=true`. Vision is for image analysis/recognition, NOT for audio.
-- **Audio/voice only** ([语音], .mp3/.wav/.ogg): Use `template=voice` with `attach_media=true`. Voice is for speech-to-text transcription, NOT for images.
+- **Use spawn** for tasks that need dedicated capability or longer processing: image/voice analysis (vision, voice template), deep research (researcher), code implementation (coder), data analysis (analyst)
+- **Do NOT spawn** for simple one-off operations: reading a file, running a command, web search — do these yourself
+- **Avoid duplicate spawn**: only spawn once per logical task; do not create similar subagents for the same request
+- **Task description**: When spawning with images, keep the task description brief and aligned with user's original intent. Do NOT re-describe the image; simply pass the user's request as-is (e.g., if user says "describe this image in mermaid", use exactly that as the task)
+- **Non-blocking**: After spawning, immediately return the result to the user. Do NOT wait or poll - the subagent will notify you when complete via a system message.
+- **Handle subagent results**: When you receive a system message with subagent results, synthesize them into your reply to the user.
 
-**CRITICAL**: Never use `voice` template when the user sends images. Never use `vision` template when the user sends only audio. Match template to media type.
-**Important**: Always set `attach_media=true` when using spawn with vision or voice templates."""
+## Subagent Templates
+
+Use spawn tool to delegate tasks to subagents. Available templates are listed in the tool description."""
 
 
 class ContextBuilder:
@@ -52,12 +57,13 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md"]
 
-    def __init__(self, workspace: Path, agent_id: str | None = None, token_budget: dict[str, int] | None = None):
+    def __init__(self, workspace: Path, agent_id: str | None = None, token_budget: dict[str, int] | None = None, agent_template_manager: Any = None):
         self.workspace = workspace
         self.agent_id = agent_id
         self.memory = MemoryStore(workspace, agent_id=agent_id)
         self.skills = SkillsLoader(workspace)
         self.token_budget = {**TOKEN_BUDGET_DEFAULTS, **(token_budget or {})}
+        self._agent_template_manager = agent_template_manager
     
     def update_token_budget(self, **kwargs: int) -> None:
         """Update token budget settings at runtime."""
@@ -163,6 +169,23 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         workspace_path = str(self.workspace.expanduser().resolve())
+
+        # 动态构建模板描述
+        template_info = ""
+        if self._agent_template_manager:
+            try:
+                templates = self._agent_template_manager.list_templates()
+                if templates:
+                    template_lines = []
+                    for t in templates:
+                        if t.enabled:
+                            desc = t.description or "无描述"
+                            template_lines.append(f"- **{t.name}**: {desc}")
+                    if template_lines:
+                        template_info = "\n\n## Available Subagent Templates\n\n" + "\n".join(template_lines)
+            except Exception:
+                pass
+
         runtime_suffix = f"""
 
 ## Current Time
@@ -173,6 +196,7 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
 - 长期记忆与日程笔记：存储在 {workspace_path}/.nanobot/chat.db（SQLite），使用 remember 工具写入
 - User skills: {workspace_path}/skills/
 - Skill paths: see Skills section below (each entry shows the exact SKILL.md path)
+{template_info}
 """
         # 1. 优先从 SQLite 读取用户可视化配置
         db_path = memory_repository.MemoryRepository.get_workspace_db_path(self.workspace)
@@ -264,22 +288,42 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
         return messages
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+        """Build user message content with optional base64-encoded images and audio files."""
         if not media:
             return text
-        
+
         images = []
+        audio_files = []
         for path in media:
             p = Path(path)
             mime, _ = mimetypes.guess_type(path)
-            if not p.is_file() or not mime or not mime.startswith("image/"):
+            if not p.is_file():
                 continue
-            b64 = base64.b64encode(p.read_bytes()).decode()
-            images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-        
-        if not images:
+            ext = p.suffix.lower()
+            is_image = (mime and mime.startswith("image/")) or ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+            is_audio = (mime and mime.startswith("audio/")) or ext in (".mp3", ".wav", ".ogg", ".m4a", ".opus", ".webm", ".aac")
+            # 处理图片
+            if is_image:
+                mime_type = mime or "image/jpeg"
+                b64 = base64.b64encode(p.read_bytes()).decode()
+                images.append({"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}})
+            # 处理音频（飞书 .ogg 等可能无 mime，用扩展名兜底）
+            elif is_audio:
+                audio_files.append({"type": "audio_file", "audio_url": {"url": p.as_posix()}})
+
+        # 如果有图片或音频，构造多模态消息
+        content_parts = []
+        if images:
+            content_parts.extend(images)
+        if audio_files:
+            # 音频文件路径作为文本提示，告诉模型有音频待处理
+            audio_paths = "\n".join([f"[Attached Audio: {a['audio_url']['url']}]" for a in audio_files])
+            content_parts.append({"type": "text", "text": f"{audio_paths}\n\n{text}" if text else audio_paths})
+
+        if not content_parts:
             return text
-        return images + [{"type": "text", "text": text}]
+        # 只有图片时返回多模态内容，有音频时返回混合内容
+        return content_parts
     
     def add_tool_result(
         self,
@@ -300,11 +344,12 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
         Returns:
             Updated message list.
         """
+        # 确保 tool_call_id 为字符串（部分 API 如 MiniMax 对类型敏感）
         messages.append({
             "role": "tool",
-            "tool_call_id": tool_call_id,
+            "tool_call_id": str(tool_call_id) if tool_call_id is not None else "",
             "name": tool_name,
-            "content": result
+            "content": result if result is not None else ""
         })
         return messages
     

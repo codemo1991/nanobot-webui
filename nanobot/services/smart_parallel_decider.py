@@ -110,7 +110,17 @@ class SmartParallelDecider:
                 "reason": "单个工具无需并行",
             }
 
-        # 快速检查：是否有必须串行的工具
+        # 规则优先：使用并行依赖分析器
+        from nanobot.services.parallel_dependency_analyzer import analyze as analyze_dependencies
+        rule_result = analyze_dependencies(tool_calls)
+        if not rule_result.get("need_llm", True):
+            return {
+                "parallel": rule_result["can_parallel"],
+                "groups": rule_result["groups"],
+                "reason": rule_result["reason"],
+            }
+
+        # 原有 message 检查
         tool_names = [tc.name if hasattr(tc, 'name') else tc.get('name', '') for tc in tool_calls]
 
         # message 工具必须串行

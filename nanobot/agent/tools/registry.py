@@ -105,11 +105,19 @@ class ToolRegistry:
                 return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors)
 
             # 将异步工具包装为在线程池中同步执行
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
-                effective_executor,
-                lambda: asyncio.run(tool.execute(**params))
-            )
+            # 注意：不能在已有 event loop 的线程中用 asyncio.run()，需创建新 loop
+            loop = asyncio.get_running_loop()
+            params_copy = dict(params)
+
+            def _run_async_in_thread() -> str:
+                thread_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(thread_loop)
+                try:
+                    return thread_loop.run_until_complete(tool.execute(**params_copy))
+                finally:
+                    thread_loop.close()
+
+            return await loop.run_in_executor(effective_executor, _run_async_in_thread)
         except Exception as e:
             logger.exception(f"Tool execution failed in thread pool: {name}")
             return f"Error executing {name}: {str(e)}"

@@ -27,9 +27,10 @@ class ChannelManager:
     - Route outbound messages
     """
     
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(self, config: Config, bus: MessageBus, agent: Any = None):
         self.config = config
         self.bus = bus
+        self.agent = agent  # 用于 /stop 等命令，停止 session 的 agent/tool 调用
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
         
@@ -70,7 +71,8 @@ class ChannelManager:
             try:
                 from nanobot.channels.feishu import FeishuChannel
                 self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus, workspace=workspace_path
+                    self.config.channels.feishu, self.bus, workspace=workspace_path,
+                    agent=self.agent,
                 )
                 logger.info("Feishu channel enabled")
             except ImportError as e:
