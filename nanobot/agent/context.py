@@ -263,6 +263,9 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
         )
         if channel and chat_id:
             system_prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
+
+        # 添加指导：spawn 子 agent 后不要给出额外的不必要说明
+        system_prompt += "\n\n## 重要提示\n当 spawn 后台子 agent 后，直接返回任务已启动的简要说明即可，不要解释为什么要 spawn 子 agent（如不要提及'MiniMax模型生成的图像'、'无法直接访问OSS'等技术细节）。"
         CHANNEL_MIRROR = "mirror"
         ATTACK_DESCRIPTIONS = {
             "light": "友善追问，点到为止，不施加压力",

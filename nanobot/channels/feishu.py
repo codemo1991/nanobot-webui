@@ -672,10 +672,12 @@ class FeishuChannel(BaseChannel):
 
             message_id = message.message_id
             if message_id in self._processed_message_ids:
+                logger.debug(f"[Feishu] Skipping duplicate message: {message_id}")
                 return
             self._processed_message_ids[message_id] = None
             while len(self._processed_message_ids) > 1000:
                 self._processed_message_ids.popitem(last=False)
+            logger.info(f"[Feishu] Processing message: {message_id}, type: {msg_type}")
 
             if sender.sender_type == "bot":
                 return
