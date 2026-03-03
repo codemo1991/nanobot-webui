@@ -2907,7 +2907,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
                     logger.debug(f"[SubagentProgress] Sent event to frontend: {evt.get('type')}, task_id: {evt.get('task_id')}")
-                except (BrokenPipeError, ConnectionResetError, OSError):
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    logger.warning(f"[SubagentProgress] Connection lost for session {session_id}, event not sent: {evt.get('type')}, task_id: {evt.get('task_id')}, error: {e}")
                     break
         finally:
             app.unsubscribe_subagent_progress(session_id, evt_queue)
