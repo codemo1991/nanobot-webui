@@ -30,20 +30,17 @@ class Session:
     # 存储子agent执行结果 {task_id: {label, result, timestamp}}
     subagent_results: dict[str, dict[str, Any]] = field(default_factory=dict)
     
-    DEFAULT_MAX_MESSAGE_LENGTH = 8000
-
     def add_message(self, role: str, content: str, max_length: int | None = None, **kwargs: Any) -> None:
         """Add a message to the session.
         
         Args:
             role: Message role (user/assistant/system).
             content: Message content.
-            max_length: Maximum content length. Defaults to DEFAULT_MAX_MESSAGE_LENGTH.
+            max_length: Maximum content length. If None, store full content without truncation.
             **kwargs: Additional metadata.
         """
-        max_len = max_length or self.DEFAULT_MAX_MESSAGE_LENGTH
-        if len(content) > max_len:
-            content = content[:max_len] + f"\n... [截断，原长度 {len(content)} 字符]"
+        if max_length is not None and len(content) > max_length:
+            content = content[:max_length] + f"\n... [截断，原长度 {len(content)} 字符]"
         
         msg = {
             "role": role,

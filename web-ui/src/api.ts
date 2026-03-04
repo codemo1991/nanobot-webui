@@ -146,6 +146,55 @@ export const api = {
     throw new Error('Stream ended without done event')
   },
 
+  /** 重连 Chat SSE 流（刷新/切换 tab 后继续接收推送） */
+  async subscribeToChatStream(
+    sessionId: string,
+    onEvent: (evt: StreamEvent) => void,
+    signal?: AbortSignal
+  ): Promise<ChatResponse | null> {
+    const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/stream`, { signal })
+    if (!res.ok) throw new Error('Stream reconnect failed')
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('Stream not supported')
+    const dec = new TextDecoder()
+    let buf = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n\n')
+        buf = lines.pop() ?? ''
+        for (const block of lines) {
+          const dataParts = block.split('\n')
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trimStart())
+          const dataStr = dataParts.join('\n')
+          if (!dataStr || dataStr === ': heartbeat') continue
+          try {
+            const evt = JSON.parse(dataStr) as StreamEvent
+            onEvent(evt)
+            if (evt.type === 'done') {
+              return {
+                content: 'content' in evt ? evt.content ?? '' : '',
+                assistantMessage: 'assistantMessage' in evt ? evt.assistantMessage ?? null : null,
+              }
+            }
+            if (evt.type === 'error') {
+              throw new Error('message' in evt ? evt.message : 'Stream error')
+            }
+            if (evt.type === 'timeout') return null
+          } catch (e) {
+            if (e instanceof Error && e.message === 'Stream error') throw e
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    return null
+  },
+
   // Configuration
   getConfig: () => request<import('./types').ConfigData>('/config'),
 

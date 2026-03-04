@@ -112,6 +112,7 @@
     "sessionRenamed": "Session renamed",
     "sendFailed": "Failed to send message",
     "generationStopped": "Generation stopped",
+    "streamReconnected": "Reconnected, continuing to receive response",
     "defaultTitle": "New Chat",
     "thinkingOrTool": "Thinking or calling tools…",
     "thinking": "Thinking…",

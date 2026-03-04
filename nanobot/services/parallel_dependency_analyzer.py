@@ -2,10 +2,10 @@
 
 from typing import Any
 
-WRITE_TOOLS = {"write_file", "edit_file", "exec", "spawn", "claude_code", "cron", "remember"}
+WRITE_TOOLS = {"write_file", "edit_file", "exec", "spawn", "cron", "remember"}
 READ_TOOLS = {"read_file", "list_dir", "web_search", "web_fetch"}
 MUST_SERIAL_TOOLS = {"message"}
-BACKGROUND_TOOLS = {"exec", "spawn", "claude_code", "web_search", "web_fetch", "read_file", "list_dir"}
+BACKGROUND_TOOLS = {"exec", "spawn", "web_search", "web_fetch", "read_file", "list_dir"}
 
 
 def _extract_paths(args: dict) -> set[str]:

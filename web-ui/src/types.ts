@@ -57,12 +57,14 @@ export interface ChatResponse {
 }
 
 export type StreamEvent =
+  | { type: 'start'; session_id: string }
   | { type: 'thinking' }
   | { type: 'tool_start'; name: string; arguments: Record<string, unknown> }
   | { type: 'tool_end'; name: string; arguments: Record<string, unknown>; result: string }
   | { type: 'claude_code_progress'; task_id: string; subtype: string; content: string; tool_name?: string; timestamp?: string }
   | { type: 'done'; content: string; assistantMessage: Message | null }
   | { type: 'error'; message: string }
+  | { type: 'timeout' }
 
 /** 子 Agent 后台进度 SSE 事件（来自 /subagent-progress 端点） */
 export type SubagentProgressEvent =
@@ -531,6 +533,7 @@ export interface AgentTemplate {
   tools: string[]
   rules: string[]
   system_prompt: string
+  skills?: string[]  // Skill names to load into subagent context
   model?: string  // Optional: use specific model for this template
   source: 'builtin' | 'user_yaml'
   is_builtin: boolean

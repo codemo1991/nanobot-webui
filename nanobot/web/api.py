@@ -1204,16 +1204,36 @@ class NanobotWebAPI:
         evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         media_paths = self._save_images_to_temp(images or [])
 
-        def on_progress(evt: dict[str, Any]) -> None:
+        # 立即保存用户消息到数据库，确保刷新界面时能看到提问（即使 nanobot 仍在回答中）
+        key = self.to_session_key(session_id)
+        session = self.sessions.get_or_create(key)
+        user_kwargs: dict[str, Any] = {}
+        if images:
+            user_kwargs["images"] = images
+        session.add_message("user", content or "[图片]", **user_kwargs)
+        self.sessions.save(session)
+        logger.info(f"[ChatStream] User message saved immediately for session {session_id}")
+
+        from nanobot.web.chat_stream_bus import ChatStreamBus
+        bus = ChatStreamBus.get()
+        origin_key = f"web:{session_id}"
+
+        def _put_evt(evt: dict[str, Any]) -> None:
             try:
                 evt_queue.put(evt)
+                bus.push(origin_key, evt)
             except Exception:
                 pass
 
+        def on_progress(evt: dict[str, Any]) -> None:
+            _put_evt(evt)
+
         def run_agent() -> None:
+            # 新对话开始，清空该 session 的缓冲，避免与旧事件混淆
+            bus.clear_buffer(origin_key)
             # 首先发送一个开始事件，确认线程已启动
             try:
-                evt_queue.put({"type": "start", "session_id": session_id})
+                _put_evt({"type": "start", "session_id": session_id})
             except Exception:
                 pass
 
@@ -1224,16 +1244,19 @@ class NanobotWebAPI:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 result = loop.run_until_complete(
-                    self._chat_with_progress(session_id, content, on_progress, media_paths)
+                    self._chat_with_progress(
+                        session_id, content, on_progress, media_paths,
+                        extra_metadata={"user_message_saved": True},
+                    )
                 )
                 logger.debug(f"Chat stream completed with result: {result}")
-                evt_queue.put({"type": "done", **result})
+                _put_evt({"type": "done", **result})
             except asyncio.CancelledError:
                 logger.debug("Chat stream cancelled")
-                evt_queue.put({"type": "error", "message": "cancelled"})
+                _put_evt({"type": "error", "message": "cancelled"})
             except Exception as e:
                 logger.exception(f"Chat stream failed: {e}")
-                evt_queue.put({"type": "error", "message": str(e)})
+                _put_evt({"type": "error", "message": str(e)})
             finally:
                 logger.debug("Chat stream thread ending")
                 # 等待子代理后台任务完成（避免事件循环关闭导致任务被取消）
@@ -1266,6 +1289,7 @@ class NanobotWebAPI:
         content: str,
         progress_callback: Any,
         media: list[str] | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Internal: run chat with optional progress callback. Used by chat() and chat_stream."""
         key = self.to_session_key(session_id)
@@ -1278,6 +1302,7 @@ class NanobotWebAPI:
                 chat_id=session_id,
                 progress_callback=progress_callback,
                 media=media or [],
+                extra_metadata=extra_metadata,
             )
         finally:
             if getattr(self.agent, "mcp_loader", None):
@@ -1314,6 +1339,16 @@ class NanobotWebAPI:
                 else None
             ),
         }
+
+    def chat_stream_resume(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
+        """
+        订阅指定 session 的 Chat 流式事件（用于刷新/切换 tab 后重连 SSE）。
+        返回的 Queue 会接收 start / tool_start / tool_end / done / error 等事件，
+        支持 replay 已发生的事件。
+        """
+        from nanobot.web.chat_stream_bus import ChatStreamBus
+        origin_key = f"web:{session_id}"
+        return ChatStreamBus.get().subscribe(origin_key, replay=True)
 
     def subagent_progress_stream(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
         """
@@ -2244,6 +2279,7 @@ class NanobotWebAPI:
                 "tools": t.tools,
                 "rules": t.rules,
                 "system_prompt": t.system_prompt,
+                "skills": getattr(t, "skills", []) or [],
                 "model": t.model,
                 "is_system": t.is_system,
                 "is_builtin": t.is_builtin,  # 兼容旧字段
@@ -2267,6 +2303,7 @@ class NanobotWebAPI:
             "tools": template.tools,
             "rules": template.rules,
             "system_prompt": template.system_prompt,
+            "skills": getattr(template, "skills", []) or [],
             "model": template.model,
             "is_system": template.is_system,
             "is_builtin": template.is_builtin,  # 兼容旧字段
@@ -2287,6 +2324,7 @@ class NanobotWebAPI:
             tools=data.get("tools", []),
             rules=data.get("rules", []),
             system_prompt=data.get("system_prompt", ""),
+            skills=data.get("skills", []),
         )
         created = self.agent_template_manager.create_template(config)
         return {"name": created.name, "success": True}
@@ -2327,7 +2365,6 @@ class NanobotWebAPI:
             "exec": "执行shell命令",
             "web_search": "搜索网页信息",
             "web_fetch": "获取网页内容",
-            "claude_code": "使用 Claude Code CLI 执行代码任务",
         }
 
         return [
@@ -2780,6 +2817,63 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _handle_chat_stream_resume(
+        self, app: "NanobotWebAPI", session_id: str
+    ) -> None:
+        """
+        重连 Chat SSE 流。当用户刷新或切换 tab 后，可由此端点继续接收推送结果。
+        """
+        logger.info(f"[ChatStream] SSE resume connection for session: {session_id}")
+        evt_queue = app.chat_stream_resume(session_id)
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        idle_timeout = 60  # 60 秒无事件则关闭（replay 后若流已结束会很快收到 done）
+        heartbeat_interval = 30
+        last_event = time.time()
+        last_heartbeat = time.time()
+
+        try:
+            while True:
+                try:
+                    evt = evt_queue.get(timeout=0.5)
+                    last_event = time.time()
+                except queue.Empty:
+                    now = time.time()
+                    if now - last_event >= idle_timeout:
+                        try:
+                            self.wfile.write(b'data: {"type":"timeout"}\n\n')
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        break
+                    if now - last_heartbeat >= heartbeat_interval:
+                        try:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                            last_heartbeat = now
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            break
+                    continue
+                try:
+                    payload = json.dumps(evt, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+                if evt.get("type") in ("done", "error"):
+                    break
+        except Exception as e:
+            logger.warning("Chat stream resume error: %s", e)
+
     def _handle_chat_stream(
         self, app: "NanobotWebAPI", session_id: str, content: str, images: list[str] | None = None
     ) -> None:
@@ -2856,7 +2950,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         以 SSE 形式持续推送子 Agent 进度事件。
 
         订阅 SubagentProgressBus 的 "web:{session_id}" origin_key，
-        将事件实时流给前端；5 分钟无事件后自动关闭并发送 {"type": "timeout"}。
+        将事件实时流给前端；20 分钟无事件后自动关闭并发送 {"type": "timeout"}。
+        late result 场景下 SDK 可能超时后继续运行，延长空闲超时以便用户能收到最终结果。
         """
         origin_key = f"web:{session_id}"
         logger.info(f"[SubagentProgress] SSE connection established for session: {session_id}, origin_key: {origin_key}")
@@ -2869,7 +2964,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-        idle_timeout = 300  # 5 分钟无事件自动关闭
+        idle_timeout = 1200  # 20 分钟无事件自动关闭（覆盖 Claude Code SDK 超时后 late result 的等待期）
         heartbeat_interval = 30
         last_event = time.time()
         last_heartbeat = time.time()
@@ -3037,6 +3132,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.OK, _ok(app.get_messages(session_id, before, limit)))
                 except KeyError:
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
+                return
+
+            # GET /api/v1/chat/sessions/{sessionId}/stream  (SSE 重连)
+            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "stream":
+                session_id = parts[4]
+                try:
+                    self._handle_chat_stream_resume(app, session_id)
+                except Exception as exc:
+                    logger.exception("Chat stream resume failed")
+                    self._write_json(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        _err("CHAT_STREAM_RESUME_FAILED", "Chat 流重连失败", str(exc)),
+                    )
                 return
 
             # GET /api/v1/chat/sessions/{sessionId}/subagent-progress  (SSE)
@@ -3516,17 +3624,23 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
         # ==================== Claude Code Tasks POST ====================
 
-        # POST /api/v1/tasks/{taskId}/cancel - Cancel a running task
+        # POST /api/v1/tasks/{taskId}/cancel - Cancel a running task (native subagent or Claude Code)
         if len(parts) == 5 and parts[:2] == ["api", "v1"] and parts[2] == "tasks" and parts[4] == "cancel":
             task_id = parts[3]
             try:
-                success = app.agent.claude_code_manager.cancel_task(task_id)
+                success = False
+                # 优先尝试 native subagent（spawn 工具派发的任务）
+                if hasattr(app.agent, "subagents") and app.agent.subagents:
+                    success = app.agent.subagents.cancel_task(task_id)
+                # 若未命中，再尝试 Claude Code 任务
+                if not success and hasattr(app.agent, "claude_code_manager") and app.agent.claude_code_manager:
+                    success = app.agent.claude_code_manager.cancel_task(task_id)
                 if success:
                     self._write_json(HTTPStatus.OK, _ok({"cancelled": True}))
                 else:
                     self._write_json(HTTPStatus.NOT_FOUND, _err("TASK_NOT_FOUND", "任务不存在或已完成"))
             except Exception as e:
-                logger.error(f"Error cancelling Claude Code task {task_id}: {e}")
+                logger.error(f"Error cancelling task {task_id}: {e}")
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TASK_CANCEL_FAILED", "取消任务失败", str(e)))
             return
 

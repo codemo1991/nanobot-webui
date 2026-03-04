@@ -25,7 +25,6 @@ from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.claude_code import ClaudeCodeTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.tools.get_subagent_results import GetSubagentResultsTool
 from nanobot.agent.subagent import SubagentManager
@@ -139,7 +138,7 @@ class AgentLoop:
         self._max_parallel_tool_calls = max_parallel_tool_calls
         self._enable_parallel_tools = enable_parallel_tools
         self._thread_pool_size = thread_pool_size
-        self._thread_pool_tools = thread_pool_tools or ["exec", "spawn", "claude_code"]
+        self._thread_pool_tools = thread_pool_tools or ["exec", "spawn"]
         self._enable_smart_parallel = enable_smart_parallel
         self._smart_parallel_model = smart_parallel_model
         self._status_service = status_service
@@ -600,12 +599,6 @@ class AgentLoop:
         else:
             logger.warning(f"[ToolProgress] No progress callback, tool_start will not be sent for: {tool_call.name}")
 
-        # 设置进度回调（用于 claude_code 工具）
-        if tool_call.name == "claude_code":
-            claude_code_tool = self.tools.get("claude_code")
-            if claude_code_tool and hasattr(claude_code_tool, "set_progress_callback"):
-                claude_code_tool.set_progress_callback(progress)
-
         # 记录工具执行开始时间
         tool_start_time = time.time()
         tool_execution_error = None
@@ -635,12 +628,6 @@ class AgentLoop:
                     self._status_service.increment_failed_tool_call()
             except Exception as e:
                 logger.debug(f"Failed to record tool metrics: {e}")
-
-        # 清除进度回调
-        if tool_call.name == "claude_code":
-            claude_code_tool = self.tools.get("claude_code")
-            if claude_code_tool and hasattr(claude_code_tool, "set_progress_callback"):
-                claude_code_tool.set_progress_callback(None)
 
         if progress:
             try:
@@ -927,13 +914,6 @@ class AgentLoop:
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
-        
-        # Claude Code tool（直接调用，支持实时流式进度输出）
-        # 与 spawn(template="coder", backend="claude_code") 的后台执行路径互补：
-        #   - 此工具：主 Agent 当前轮次同步调用，progress_callback 可注入，SDK 输出实时流至 UI
-        #   - spawn：后台异步执行，适合长任务，完成后通过消息总线通知
-        self.tools.register(ClaudeCodeTool(manager=self.claude_code_manager))
-
         # Self-update tool (for self-evolution: git push + restart)
         self.tools.register(SelfUpdateTool(workspace=ws))
     
@@ -960,7 +940,16 @@ class AgentLoop:
                         timeout=self.message_timeout,
                     )
                     if response:
+                        logger.info(
+                            "[AgentLoop] Publishing reply to %s:%s (content_len=%d)",
+                            response.channel, response.chat_id, len(response.content or ""),
+                        )
                         await self.bus.publish_outbound(response)
+                    else:
+                        logger.warning(
+                            "[AgentLoop] _process_message returned None, no reply for %s:%s",
+                            msg.channel, msg.chat_id,
+                        )
                 except asyncio.CancelledError:
                     raise  # Propagate for clean shutdown
                 except asyncio.TimeoutError:
@@ -1096,6 +1085,8 @@ class AgentLoop:
         spawn_tool = self.tools.get("spawn")
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(msg.channel, msg.chat_id)
+        if hasattr(self, "claude_code_manager") and self.claude_code_manager:
+            self.claude_code_manager.set_context(msg.channel, msg.chat_id)
             spawn_tool.set_media(msg.media if msg.media else [])
             spawn_tool.set_batch_id(str(uuid.uuid4())[:12])
             spawn_tool.set_user_message(msg.content)  # 传递用户的原始消息
@@ -1108,10 +1099,6 @@ class AgentLoop:
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
-
-        claude_code_tool = self.tools.get("claude_code")
-        if isinstance(claude_code_tool, ClaudeCodeTool):
-            claude_code_tool.set_context(msg.channel, msg.chat_id)
 
         # MCP tools are tied to the event loop that created them. Web uses asyncio.run() per request,
         # so each request gets a new loop; prior MCP sessions become stale (ClosedResourceError).
@@ -1335,8 +1322,6 @@ class AgentLoop:
                 logger.info(f"[AgentLoop] LLM returned {len(response.tool_calls)} tool calls: {[tc.name for tc in response.tool_calls]}")
                 if any(tc.name == 'spawn' for tc in response.tool_calls):
                     logger.info(f"[AgentLoop] SPAWN tool detected in tool calls!")
-                if any(tc.name == 'claude_code' for tc in response.tool_calls):
-                    logger.info(f"[AgentLoop] CLAUDE_CODE tool detected in tool calls!")
                 # 批内去重：相同 (name, arguments) 只执行一次
                 tool_calls_deduped = self._deduplicate_tool_calls(response.tool_calls)
 
@@ -1424,45 +1409,89 @@ class AgentLoop:
                             logger.warning(f"[BatchMode] Timeout waiting for spawn tasks")
 
                 if has_spawn and has_exec and spawned_task_ids is not None:
-                    # Batch 模式：spawn 优先执行
-                    logger.info("[BatchMode] Spawn priority mode: spawn first, exec follows if needed")
+                    # Batch 模式：按类型区分执行
+                    # - spawn(vision) 优先执行（图片分析）
+                    # - exec(图片相关) 需要在 spawn(vision) 完成后执行
+                    # - exec(非图片) 和 spawn(非 vision) 可以并行执行
+                    logger.info("[BatchMode] Type-aware execution mode")
 
-                    # 分离 spawn 和 exec
+                    # 分离不同类型的 spawn
                     spawn_calls = [tc for tc in to_execute if tc.name == "spawn"]
                     exec_calls = [tc for tc in to_execute if tc.name == "exec"]
 
-                    # 先执行所有 spawn
-                    spawn_results = []
+                    spawn_vision = []
+                    spawn_other = []
                     for tc in spawn_calls:
+                        template = (tc.arguments.get("template") or "").lower() if tc.arguments else ""
+                        if template == "vision":
+                            spawn_vision.append(tc)
+                        else:
+                            spawn_other.append(tc)
+
+                    # 分离不同类型的 exec
+                    exec_image = []
+                    exec_other = []
+                    for tc in exec_calls:
+                        cmd = tc.arguments.get("command", "") or "" if tc.arguments else ""
+                        if self._is_exec_image_related(cmd):
+                            exec_image.append(tc)
+                        else:
+                            exec_other.append(tc)
+
+                    logger.info(f"[BatchMode] spawn_vision={len(spawn_vision)}, spawn_other={len(spawn_other)}, exec_image={len(exec_image)}, exec_other={len(exec_other)}")
+
+                    spawn_results = []
+                    exec_results = []
+
+                    # 阶段 1: 先执行 spawn(vision)
+                    for tc in spawn_vision:
                         result = await self._execute_single_tool(tc, progress)
                         spawn_results.append((tc, result))
-                        # 提取 task_id
-                        import re
                         task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
                         if task_id_match:
                             task_id = task_id_match.group(1) or task_id_match.group(2)
                             spawned_task_ids.append(task_id)
-                            logger.info(f"[BatchMode] Spawn completed first, recorded task_id: {task_id}")
+                            logger.info(f"[BatchMode] Spawn vision completed: {task_id}")
 
-                    # 检查 spawn 是否有正确结果，如果有就跳过 exec
-                    spawn_has_result = any(
-                        "started" in r[1] or "id:" in r[1]
-                        for r in spawn_results
+                    # 阶段 2: spawn(vision) 有结果后，exec(图片相关) 才能执行
+                    spawn_vision_has_result = any(
+                        "started" in r[1] or "id:" in r[1] for r in spawn_results
                     )
 
-                    if spawn_has_result:
-                        # spawn 有结果，跳过 exec
-                        logger.info("[BatchMode] Spawn has result, skipping exec")
-                        exec_results = []
-                    else:
-                        # spawn 没有结果，执行 exec
-                        logger.info("[BatchMode] Spawn has no result, executing exec")
-                        exec_results = []
-                        for tc in exec_calls:
-                            result = await self._execute_single_tool(tc, progress)
-                            exec_results.append((tc, result))
+                    if exec_image:
+                        if spawn_vision and not spawn_vision_has_result:
+                            # 如果有 spawn(vision) 但还没完成，跳过 exec_image（避免重复分析）
+                            # 添加占位结果以保持与 tool_calls_deduped 的顺序对应
+                            logger.info("[BatchMode] Skipping exec_image due to pending spawn_vision")
+                            for tc in exec_image:
+                                exec_results.append((tc, "已跳过：spawn vision 任务正在执行中"))
+                        else:
+                            # spawn(vision) 已完成或没有 spawn(vision)，执行 exec_image
+                            for tc in exec_image:
+                                result = await self._execute_single_tool(tc, progress)
+                                exec_results.append((tc, result))
+                                logger.info(f"[BatchMode] Exec image completed")
 
-                    # 合并结果
+                    # 阶段 3: exec(非图片) 和 spawn(非 vision) 并行执行
+                    parallel_tasks = []
+                    for tc in spawn_other + exec_other:
+                        parallel_tasks.append(self._execute_single_tool(tc, progress))
+
+                    if parallel_tasks:
+                        parallel_results = await asyncio.gather(*parallel_tasks)
+                        for tc, result in zip(spawn_other + exec_other, parallel_results):
+                            if tc.name == "spawn":
+                                spawn_results.append((tc, result))
+                                task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
+                                if task_id_match:
+                                    task_id = task_id_match.group(1) or task_id_match.group(2)
+                                    spawned_task_ids.append(task_id)
+                                    logger.info(f"[BatchMode] Spawn other completed: {task_id}")
+                            else:
+                                exec_results.append((tc, result))
+                                logger.info(f"[BatchMode] Exec other completed")
+
+                    # 合并所有结果
                     exec_results = spawn_results + exec_results
                 else:
                     # 正常模式：并行/串行执行
@@ -1687,6 +1716,9 @@ class AgentLoop:
         
         user_message_kwargs: dict[str, Any] = {"token_usage": user_token_usage}
 
+        # Web 渠道在请求开始时已保存用户消息，此处跳过避免重复
+        user_message_saved = msg.metadata.get("user_message_saved") if msg.metadata else False
+
         # 分离图片和音频文件，只处理图片
         if msg.media:
             import base64
@@ -1712,9 +1744,9 @@ class AgentLoop:
             if user_images:
                 user_message_kwargs["images"] = user_images
         
-        session.add_message("user", msg.content, **user_message_kwargs)
-        # 立即保存用户消息，确保即使后续处理失败也不丢失
-        self.sessions.save(session)
+        if not user_message_saved:
+            session.add_message("user", msg.content, **user_message_kwargs)
+            self.sessions.save(session)
         session.add_message(
             "assistant",
             final_content,
@@ -1933,6 +1965,8 @@ class AgentLoop:
         spawn_tool = self.tools.get("spawn")
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(origin_channel, origin_chat_id)
+        if hasattr(self, "claude_code_manager") and self.claude_code_manager:
+            self.claude_code_manager.set_context(origin_channel, origin_chat_id)
 
         # Get subagent results tool
         get_subagent_results_tool = self.tools.get("get_subagent_results")
@@ -1942,10 +1976,6 @@ class AgentLoop:
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(origin_channel, origin_chat_id)
-
-        claude_code_tool = self.tools.get("claude_code")
-        if isinstance(claude_code_tool, ClaudeCodeTool):
-            claude_code_tool.set_context(origin_channel, origin_chat_id)
 
         # Same loop check as _process_message (MCP sessions tied to event loop)
         try:

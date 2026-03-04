@@ -112,6 +112,7 @@
     "sessionRenamed": "会话已重命名",
     "sendFailed": "发送消息失败",
     "generationStopped": "生成已中断",
+    "streamReconnected": "已重新连接，继续接收回复",
     "defaultTitle": "新对话",
     "thinkingOrTool": "正在思考或调用工具…",
     "thinking": "正在思考…",
