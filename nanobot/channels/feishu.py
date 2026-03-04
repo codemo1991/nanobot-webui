@@ -677,6 +677,8 @@ class FeishuChannel(BaseChannel):
             self._processed_message_ids[message_id] = None
             while len(self._processed_message_ids) > 1000:
                 self._processed_message_ids.popitem(last=False)
+
+            msg_type = message.message_type
             logger.info(f"[Feishu] Processing message: {message_id}, type: {msg_type}")
 
             if sender.sender_type == "bot":
@@ -685,7 +687,6 @@ class FeishuChannel(BaseChannel):
             sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
             chat_id = message.chat_id
             chat_type = message.chat_type
-            msg_type = message.message_type
 
             await self._add_reaction(message_id, "OnIt")
 
