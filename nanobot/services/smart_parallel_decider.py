@@ -38,7 +38,7 @@ SIMPLE_PARALLEL_PROMPT = """判断这些工具能否并行执行。
 - 读文件(read_file)之间可以并行
 - 写文件(write_file)与读文件可并行
 - 相同文件的写操作必须串行
-- exec/spawn/claude_code 建议并行
+- exec/spawn 建议并行
 - message 必须串行
 
 JSON: {{"parallel": bool, "reason": "..."}}"""
@@ -169,7 +169,7 @@ class SmartParallelDecider:
             tools_info.append((name, args))
 
         # 检查是否有写操作
-        write_tools = {'write_file', 'edit_file', 'exec', 'spawn', 'claude_code', 'cron'}
+        write_tools = {'write_file', 'edit_file', 'exec', 'spawn', 'cron'}
         read_tools = {'read_file', 'list_dir', 'web_search', 'web_fetch'}
 
         has_write = any(name in write_tools for name, _ in tools_info)
@@ -179,9 +179,9 @@ class SmartParallelDecider:
         if has_read and not has_write:
             return True
 
-        # 如果都是 exec/spawn/claude_code，可以并行
+        # 如果都是 exec/spawn，可以并行
         all_background = all(
-            name in {'exec', 'spawn', 'claude_code', 'web_search', 'web_fetch', 'read_file', 'list_dir'}
+            name in {'exec', 'spawn', 'web_search', 'web_fetch', 'read_file', 'list_dir'}
             for name, _ in tools_info
         )
         if all_background:

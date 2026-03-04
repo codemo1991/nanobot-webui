@@ -7,7 +7,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { api } from '../api'
-import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, SubagentProgressEvent } from '../types'
+import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, SubagentProgressEvent, StreamEvent } from '../types'
 import './ChatPage.css'
 import 'highlight.js/styles/github-dark.css'
 import { useTaskPolling } from '../hooks/useTaskPolling'
@@ -383,6 +383,91 @@ function ChatPage() {
     })
   }, [])
 
+  // 流式事件处理（供 handleSend 和 SSE 重连共用）
+  const handleStreamEvent = useCallback((evt: StreamEvent) => {
+    if (evt.type === 'thinking') {
+      setStreamingThinking(true)
+    } else if (evt.type === 'tool_start' && evt.name) {
+      setStreamingThinking(false)
+      if (evt.name === 'claude_code') {
+        setClaudeCodeProgress('')
+      }
+      if (evt.name === 'spawn' && currentSession) {
+        startBgAgentStream(currentSession.id)
+      }
+      setStreamingToolSteps(prev => [...prev, { name: evt.name!, arguments: evt.arguments ?? {}, result: '' }])
+    } else if (evt.type === 'tool_end' && evt.name) {
+      setStreamingToolSteps(prev => {
+        const next = [...prev]
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].name === evt.name && !next[i].result) {
+            next[i] = { ...next[i], result: evt.result ?? '' }
+            break
+          }
+        }
+        return next
+      })
+      if (evt.name === 'claude_code') {
+        setClaudeCodeProgress('')
+      }
+    } else if (evt.type === 'claude_code_progress') {
+      const subtype = evt.subtype || 'text'
+      const content = evt.content || ''
+      if (evt.task_id && !currentTaskIdRef.current) {
+        currentTaskIdRef.current = evt.task_id
+        if (document.visibilityState === 'hidden') {
+          setPollingTaskId(evt.task_id)
+        }
+      }
+      let line = ''
+      if (subtype === 'tool_use') {
+        line = `[${evt.tool_name || 'Tool'}] ${content}`
+      } else if (subtype === 'tool_result') {
+        line = `  -> ${content}`
+      } else if (subtype === 'assistant_text') {
+        line = content.length > 120 ? content.slice(0, 120) + '...' : content
+      } else {
+        line = content
+      }
+      setClaudeCodeProgress(prev => {
+        const newText = prev ? prev + '\n' + line : line
+        const lines = newText.split('\n')
+        return lines.length > 30 ? lines.slice(-30).join('\n') : newText
+      })
+    }
+  }, [currentSession, startBgAgentStream])
+
+  // 尝试重连 Chat SSE（刷新/切换 tab 后继续接收推送）
+  const tryReconnectChatStream = useCallback(async (sessionId: string) => {
+    const ctrl = new AbortController()
+    abortControllerRef.current = ctrl
+    isStreamingRef.current = true
+    setLoading(true)
+    try {
+      const result = await api.subscribeToChatStream(sessionId, handleStreamEvent, ctrl.signal)
+      await loadMessages(sessionId)
+      await loadSessionTokenUsage(sessionId)
+      void loadSessions()
+      if (result) {
+        antMessage.success(t('chat.streamReconnected'))
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return
+      console.warn('Chat stream reconnect failed:', err)
+    } finally {
+      isStreamingRef.current = false
+      setLoading(false)
+      setStreamingToolSteps([])
+      setStreamingThinking(false)
+      setClaudeCodeProgress('')
+      currentTaskIdRef.current = null
+      setPollingTaskId(null)
+      abortControllerRef.current = null
+      clearStreamingState(sessionId)
+      isRestoringRef.current = false
+    }
+  }, [handleStreamEvent, t])
+
   // 所有子 Agent 完成后，10 秒后自动清除面板
   // 注意：如果连接已断开，保留面板让用户手动刷新
   useEffect(() => {
@@ -467,22 +552,20 @@ function ChatPage() {
             }, 1000)
           }
 
-          // 重要：检查 SSE 连接是否已断开
-          // 如果 isStreamingRef.current 为 false，说明连接已断开，需要清理状态
+          // 重要：检查 SSE 连接是否已断开，尝试重连 Chat 流
           setTimeout(() => {
             if (!isStreamingRef.current) {
-              console.log('SSE connection lost during tab switch, clearing loading state')
-              // 如果有 taskId，则启用后台轮询（由 useTaskPolling 处理）
-              // 否则直接清理状态
-              if (!savedState.taskId) {
+              console.log('SSE connection lost during tab switch, attempting reconnect')
+              // 尝试重连 Chat SSE 以继续接收推送
+              if (savedState.loading && savedState.sessionId === currentSession.id) {
+                void tryReconnectChatStream(currentSession.id)
+              } else if (!savedState.taskId) {
                 setLoading(false)
                 setStreamingThinking(false)
                 isRestoringRef.current = false
                 clearStreamingState(currentSession.id)
-                // 刷新消息列表，获取最新结果
                 void loadMessages(currentSession.id)
               }
-              // 如果有 taskId，保持 loading 状态，让 useTaskPolling 来处理
             }
           }, 500) // 延迟检查，让 finally 块有机会先执行
         }
@@ -497,7 +580,7 @@ function ChatPage() {
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [currentSession])
+  }, [currentSession, tryReconnectChatStream])
 
   // 当流式状态变化时，自动保存到 sessionStorage
   useEffect(() => {
@@ -538,25 +621,34 @@ function ChatPage() {
       loadMessages(currentSession.id)
       loadSessionTokenUsage(currentSession.id)
 
-      // 从 sessionStorage 恢复之前保存的状态
-      const savedState = loadStreamingState(currentSession.id)
+      // 从 sessionStorage 恢复之前保存的状态，尝试重连 SSE
+      const sessionId = currentSession.id
+      const savedState = loadStreamingState(sessionId)
       if (savedState) {
-        // 检查 SSE 连接是否还在（通过 isStreamingRef）
-        // 如果流式请求已经结束但状态显示 loading，需要清理
+        isRestoringRef.current = true
+        setStreamingToolSteps(savedState.toolSteps || [])
+        setStreamingThinking(savedState.thinking || false)
+        setClaudeCodeProgress(savedState.progress || '')
+        if (savedState.loading) setLoading(true)
+        if (savedState.taskId) {
+          currentTaskIdRef.current = savedState.taskId
+          setPollingTaskId(savedState.taskId)
+        }
+        // 尝试重连 Chat SSE（刷新后恢复）
         setTimeout(() => {
-          if (!isStreamingRef.current && loading) {
-            console.log('Session switch: SSE disconnected, clearing loading')
+          if (savedState.loading && savedState.sessionId === sessionId) {
+            void tryReconnectChatStream(sessionId)
+          } else if (!savedState.taskId) {
             setLoading(false)
-            clearStreamingState(currentSession.id)
-            // 刷新消息获取最新状态
-            void loadMessages(currentSession.id)
+            clearStreamingState(sessionId)
+            void loadMessages(sessionId)
           }
-        }, 500)
+        }, 300)
       }
     } else {
       setSessionTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 })
     }
-  }, [currentSession])
+  }, [currentSession, tryReconnectChatStream])
 
   // 监听路由变化，当从其他页面切回聊天页面时恢复状态
   useEffect(() => {
@@ -676,6 +768,7 @@ function ChatPage() {
 
   // 获取运行中的任务数量
   const runningTasksCount = tasks.filter(task => task.status === 'running').length
+  const runningBgAgentsCount = bgAgents.filter(a => a.status === 'running').length
 
   const loadMessages = async (sessionId: string) => {
     try {
@@ -812,63 +905,6 @@ function ChatPage() {
       setImageSendStatus(status)
     }
 
-    const handleStreamEvent = (evt: { type: string; name?: string; arguments?: Record<string, unknown>; result?: string; subtype?: string; content?: string; tool_name?: string; task_id?: string }) => {
-      if (evt.type === 'thinking') {
-        setStreamingThinking(true)
-      } else if (evt.type === 'tool_start' && evt.name) {
-        setStreamingThinking(false)
-        if (evt.name === 'claude_code') {
-          setClaudeCodeProgress('')
-        }
-        // spawn 工具调用时启动子 Agent 进度订阅
-        if (evt.name === 'spawn' && currentSession) {
-          startBgAgentStream(currentSession.id)
-        }
-        setStreamingToolSteps(prev => [...prev, { name: evt.name!, arguments: evt.arguments ?? {}, result: '' }])
-      } else if (evt.type === 'tool_end' && evt.name) {
-        setStreamingToolSteps(prev => {
-          const next = [...prev]
-          for (let i = next.length - 1; i >= 0; i--) {
-            if (next[i].name === evt.name && !next[i].result) {
-              next[i] = { ...next[i], result: evt.result ?? '' }
-              break
-            }
-          }
-          return next
-        })
-        if (evt.name === 'claude_code') {
-          setClaudeCodeProgress('')
-        }
-      } else if (evt.type === 'claude_code_progress') {
-        const subtype = evt.subtype || 'text'
-        const content = evt.content || ''
-        // 捕获任务 ID 用于后台轮询
-        if (evt.task_id && !currentTaskIdRef.current) {
-          currentTaskIdRef.current = evt.task_id
-          console.log('Captured Claude Code task ID:', evt.task_id)
-          // 如果页面当前不可见，立即启动轮询
-          if (document.visibilityState === 'hidden') {
-            setPollingTaskId(evt.task_id)
-          }
-        }
-        let line = ''
-        if (subtype === 'tool_use') {
-          line = `[${evt.tool_name || 'Tool'}] ${content}`
-        } else if (subtype === 'tool_result') {
-          line = `  -> ${content}`
-        } else if (subtype === 'assistant_text') {
-          line = content.length > 120 ? content.slice(0, 120) + '...' : content
-        } else {
-          line = content
-        }
-        setClaudeCodeProgress(prev => {
-          const newText = prev ? prev + '\n' + line : line
-          const lines = newText.split('\n')
-          return lines.length > 30 ? lines.slice(-30).join('\n') : newText
-        })
-      }
-    }
-
     try {
       await api.sendMessageStream(
         currentSession.id,
@@ -948,7 +984,7 @@ function ChatPage() {
         abortControllerRef.current = null
       }
     }
-  }, [input, loading, messages, currentSession, pendingImages.length, t])
+  }, [input, loading, messages, currentSession, pendingImages.length, t, handleStreamEvent])
 
   const handleImageSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
@@ -1321,6 +1357,29 @@ function ChatPage() {
                   <Tag className="bg-agent-backend" color={agent.backend === 'claude_code' ? 'orange' : 'blue'}>
                     {agent.backend === 'claude_code' ? 'Claude Code' : 'native'}
                   </Tag>
+                  {agent.status === 'running' && (
+                    <Popconfirm
+                      title={t('chat.tasks.cancelConfirm')}
+                      onConfirm={async () => {
+                        try {
+                          await api.cancelTask(agent.taskId)
+                          antMessage.success(t('chat.tasks.cancelSuccess'))
+                          setBgAgents(prev => prev.map(a =>
+                            a.taskId === agent.taskId ? { ...a, status: 'cancelled' as const } : a
+                          ))
+                        } catch (e) {
+                          antMessage.error(t('chat.tasks.cancelFailed'))
+                          console.error(e)
+                        }
+                      }}
+                      okText={t('chat.tasks.cancel')}
+                      cancelText={t('common.cancel')}
+                    >
+                      <Button type="link" size="small" danger style={{ padding: '0 4px', marginLeft: 'auto' }}>
+                        <CloseCircleOutlined /> {t('chat.tasks.cancel')}
+                      </Button>
+                    </Popconfirm>
+                  )}
                   {(agent.disconnected || agent.status === 'done') && agent.result && (
                     <Tooltip title="自动发送消息询问执行结果">
                       <Button
@@ -1425,13 +1484,13 @@ function ChatPage() {
             />
             <Button
               type="primary"
-              icon={loading ? <StopOutlined /> : <SendOutlined />}
-              onClick={loading ? handleStop : handleSend}
-              danger={loading}
-              disabled={(!currentSession || (!input.trim() && pendingImages.length === 0)) && !loading}
+              icon={(loading || runningBgAgentsCount > 0) ? <StopOutlined /> : <SendOutlined />}
+              onClick={(loading || runningBgAgentsCount > 0) ? handleStop : handleSend}
+              danger={loading || runningBgAgentsCount > 0}
+              disabled={(!currentSession || (!input.trim() && pendingImages.length === 0)) && !loading && runningBgAgentsCount === 0}
               className="send-button"
             >
-              {loading ? t('chat.stop') : t('chat.send')}
+              {(loading || runningBgAgentsCount > 0) ? t('chat.stop') : t('chat.send')}
             </Button>
           </div>
           <div className="chat-token-summary">

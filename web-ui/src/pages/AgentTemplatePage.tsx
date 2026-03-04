@@ -17,6 +17,7 @@ const { Text } = Typography
 export default function AgentTemplatePage() {
   const [templates, setTemplates] = useState<AgentTemplate[]>([])
   const [validTools, setValidTools] = useState<{ name: string; description: string }[]>([])
+  const [installedSkills, setInstalledSkills] = useState<{ id: string; name: string; description: string }[]>([])
   const [loading, setLoading] = useState(false)
   const [modalVisible, setModalVisible] = useState(false)
   const [editingTemplate, setEditingTemplate] = useState<AgentTemplate | null>(null)
@@ -31,6 +32,7 @@ export default function AgentTemplatePage() {
   useEffect(() => {
     loadTemplates()
     loadValidTools()
+    loadInstalledSkills()
   }, [])
 
   const loadTemplates = async () => {
@@ -54,6 +56,15 @@ export default function AgentTemplatePage() {
     }
   }
 
+  const loadInstalledSkills = async () => {
+    try {
+      const skills = await api.getInstalledSkills()
+      setInstalledSkills(skills.map(s => ({ id: s.id, name: s.name, description: s.description || '' })))
+    } catch (error) {
+      console.error('Failed to load installed skills:', error)
+    }
+  }
+
   const handleCreate = () => {
     setEditingTemplate(null)
     form.resetFields()
@@ -62,6 +73,7 @@ export default function AgentTemplatePage() {
     form.setFieldsValue({
       tools: ['read_file', 'write_file'],
       rules: ['遵循项目规范'],
+      skills: [],
       enabled: true
     })
     setMarkdownPreview('edit')
@@ -77,6 +89,7 @@ export default function AgentTemplatePage() {
       description: record.description,
       tools: record.tools,
       rules: record.rules,
+      skills: record.skills || [],
       enabled: record.enabled
     })
     setMarkdownPreview('edit')
@@ -227,6 +240,18 @@ export default function AgentTemplatePage() {
       )
     },
     {
+      title: 'Skills',
+      dataIndex: 'skills',
+      key: 'skills',
+      render: (skills: string[]) => (
+        <Space size={4} wrap>
+          {(skills || []).slice(0, 2).map(s => <Tag key={s} color="cyan">{s}</Tag>)}
+          {(skills || []).length > 2 && <Tag color="cyan">+{(skills || []).length - 2}</Tag>}
+          {(skills || []).length === 0 && <Text type="secondary">-</Text>}
+        </Space>
+      )
+    },
+    {
       title: '操作',
       key: 'action',
       width: 200,
@@ -350,6 +375,18 @@ export default function AgentTemplatePage() {
               mode="multiple"
               placeholder="选择工具"
               options={validTools.map(t => ({ label: `${t.name} - ${t.description}`, value: t.name }))}
+            />
+          </Form.Item>
+
+          <Form.Item
+            name="skills"
+            label="Skills"
+            tooltip="子 agent 执行时可参考的 Skills，用于项目规范、编码约定等，支持自行决策"
+          >
+            <Select
+              mode="multiple"
+              placeholder="选择 Skills（可选）"
+              options={installedSkills.map(s => ({ label: `${s.name} - ${s.description}`, value: s.name }))}
             />
           </Form.Item>
 

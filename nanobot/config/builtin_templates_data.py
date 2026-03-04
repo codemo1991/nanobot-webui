@@ -301,6 +301,5 @@ VALID_TOOLS = {
     "exec",
     "web_search",
     "web_fetch",
-    "claude_code",  # Claude Code CLI tool
     "voice_transcribe",  # 语音转写（DashScope Qwen3-ASR-Flash）
 }

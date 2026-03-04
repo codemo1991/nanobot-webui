@@ -6,7 +6,7 @@ import json
 import re
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Any
 
@@ -251,8 +251,8 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
-        # chat_id -> 进度卡片 message_id（处理中的会话）
-        self._active_progress_cards: dict[str, str] = {}
+        # chat_id -> 进度卡片 message_id 队列（FIFO，同一会话并发请求时按顺序匹配）
+        self._active_progress_cards: dict[str, deque[str]] = {}
         # chat_id -> 上次 patch 时间戳（用于节流控制）
         self._last_card_update: dict[str, float] = {}
         # chat_id -> 子 Agent 独立进度卡片 message_id
@@ -356,8 +356,17 @@ class FeishuChannel(BaseChannel):
             logger.warning("Feishu client not initialized")
             return
 
-        # 尝试将进度卡片更新为最终回复
-        card_message_id = self._active_progress_cards.pop(msg.chat_id, None)
+        # 去除消息前导/尾随换行，避免飞书显示多余空行
+        body_text = (msg.content or "").strip()
+
+        # 尝试将进度卡片更新为最终回复（FIFO：取最早创建的卡片，避免并发时回复错配）
+        card_message_id = None
+        if msg.chat_id in self._active_progress_cards:
+            q = self._active_progress_cards[msg.chat_id]
+            if q:
+                card_message_id = q.popleft()
+                if not q:
+                    del self._active_progress_cards[msg.chat_id]
         self._last_card_update.pop(msg.chat_id, None)
 
         if card_message_id:
@@ -365,7 +374,7 @@ class FeishuChannel(BaseChannel):
             fn = functools.partial(
                 self._patch_card_sync,
                 card_message_id,
-                msg.content,
+                body_text,
                 "AI 助手",
                 "green",
             )
@@ -383,7 +392,7 @@ class FeishuChannel(BaseChannel):
                 receive_id_type = "open_id"
 
             # 将 markdown 转为飞书 post 格式
-            post_body = _markdown_to_feishu_post(msg.content)
+            post_body = _markdown_to_feishu_post(body_text)
             content = json.dumps(post_body, ensure_ascii=False)
 
             request = CreateMessageRequest.builder() \
@@ -406,30 +415,30 @@ class FeishuChannel(BaseChannel):
                     "Feishu post message failed (code=%s msg=%s), falling back to text",
                     response.code, response.msg,
                 )
-                await self._send_text_fallback(msg)
+                await self._send_text_fallback(msg.chat_id, body_text)
             else:
                 logger.debug(f"Feishu post message sent to {msg.chat_id}")
 
         except Exception as e:
             logger.warning(f"Feishu post send error: {e}, falling back to text")
-            await self._send_text_fallback(msg)
+            await self._send_text_fallback(msg.chat_id, body_text)
 
-    async def _send_text_fallback(self, msg: OutboundMessage) -> None:
+    async def _send_text_fallback(self, chat_id: str, content: str) -> None:
         """纯文本发送回退。"""
         try:
-            if msg.chat_id.startswith("oc_"):
+            if chat_id.startswith("oc_"):
                 receive_id_type = "chat_id"
             else:
                 receive_id_type = "open_id"
 
-            content = json.dumps({"text": msg.content})
+            payload = json.dumps({"text": content})
             request = CreateMessageRequest.builder() \
                 .receive_id_type(receive_id_type) \
                 .request_body(
                     CreateMessageRequestBody.builder()
-                    .receive_id(msg.chat_id)
+                    .receive_id(chat_id)
                     .msg_type("text")
-                    .content(content)
+                    .content(payload)
                     .build()
                 ).build()
 
@@ -739,7 +748,9 @@ class FeishuChannel(BaseChannel):
             # 发送初始进度卡片
             card_message_id = await self._send_initial_progress_card(reply_to, receive_id_type)
             if card_message_id:
-                self._active_progress_cards[reply_to] = card_message_id
+                if reply_to not in self._active_progress_cards:
+                    self._active_progress_cards[reply_to] = deque()
+                self._active_progress_cards[reply_to].append(card_message_id)
                 self._last_card_update[reply_to] = 0.0
 
             # 构建进度回调闭包，负责实时更新进度卡片
@@ -926,13 +937,8 @@ class FeishuChannel(BaseChannel):
                 metadata=metadata,
             )
 
-            # 启动子 Agent 进度监听（如果已有同 chat_id 的 watcher 则跳过）
-            if reply_to not in self._subagent_watcher_tasks or self._subagent_watcher_tasks[reply_to].done():
-                receive_id_type_for_watcher = receive_id_type
-                task = asyncio.ensure_future(
-                    self._watch_subagent_progress(reply_to, receive_id_type_for_watcher)
-                )
-                self._subagent_watcher_tasks[reply_to] = task
+            # 飞书不单独监听子 Agent 进度，避免消息分裂。
+            # 子 agent 完成后通过 _announce_result 通知主 agent，主 agent 统一 publish_outbound 推送结果。
 
         except Exception:
             logger.exception("Error processing Feishu message")

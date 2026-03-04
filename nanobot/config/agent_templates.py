@@ -3,7 +3,7 @@
 import json
 import threading
 import yaml
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -26,6 +26,7 @@ class AgentTemplateConfig:
     tools: list[str]
     rules: list[str]
     system_prompt: str
+    skills: list[str] = field(default_factory=list)  # Skill names to load into subagent context
     is_system: bool = False  # True = system built-in, False = user created
     model: Optional[str] = None  # Optional: use specific model for this template
     created_at: Optional[str] = None
@@ -57,6 +58,8 @@ class AgentTemplateConfig:
             "rules": self.rules,
             "system_prompt": self.system_prompt,
         }
+        if self.skills:
+            result["skills"] = self.skills
         if self.model:
             result["model"] = self.model
         return result
@@ -69,6 +72,7 @@ class AgentTemplateConfig:
             "tools": self.tools,
             "rules": self.rules,
             "system_prompt": self.system_prompt,
+            "skills": self.skills,
             "model": self.model,
             "enabled": self.enabled,
             "created_at": self.created_at,
@@ -85,6 +89,7 @@ class AgentTemplateConfig:
             tools=data.get("tools", []),
             rules=data.get("rules", []),
             system_prompt=data.get("system_prompt", ""),
+            skills=data.get("skills", []),
             model=data.get("model"),
             is_system=is_system,
             enabled=data.get("enabled", True),
@@ -157,6 +162,7 @@ class AgentTemplateManager:
                     "tools": data["tools"],
                     "rules": data["rules"],
                     "system_prompt": data["system_prompt"],
+                    "skills": data.get("skills", []),
                     "model": None,
                     "enabled": True,
                     "created_at": datetime.now().isoformat(),
@@ -331,6 +337,8 @@ class AgentTemplateManager:
                 existing.enabled = updates["enabled"]
             if "model" in updates:
                 existing.model = updates["model"] or None
+            if "skills" in updates:
+                existing.skills = updates["skills"] or []
 
             existing.updated_at = datetime.now().isoformat()
 
@@ -422,6 +430,7 @@ class AgentTemplateManager:
                     tools=agent_data["tools"],
                     rules=agent_data["rules"],
                     system_prompt=agent_data["system_prompt"],
+                    skills=agent_data.get("skills", []),
                     model=agent_data.get("model"),
                     is_system=False,
                     workspace_path=self.workspace_path,
@@ -470,18 +479,27 @@ class AgentTemplateManager:
         return yaml.dump(data, allow_unicode=True, sort_keys=False)
 
     def build_system_prompt(self, name: str, task: str, workspace: str) -> Optional[str]:
-        """Build the system prompt for a subagent."""
+        """Build the system prompt for a subagent, including template skills if configured."""
         template = self.get_template(name)
         if not template:
             return None
 
         rules_text = "\n".join(f"{i+1}. {rule}" for i, rule in enumerate(template.rules))
 
-        return template.system_prompt.format(
+        base_prompt = template.system_prompt.format(
             task=task,
             all_rules=rules_text,
             workspace=workspace,
         )
+
+        if template.skills:
+            from nanobot.agent.skills import SkillsLoader
+            skills_loader = SkillsLoader(Path(workspace))
+            skills_content = skills_loader.load_skills_for_context(template.skills)
+            if skills_content:
+                base_prompt += f"\n\n## 参考 Skills\n\n{skills_content}"
+
+        return base_prompt
 
     def get_tools_for_template(self, name: str) -> list[str]:
         """Get list of tools for a template."""

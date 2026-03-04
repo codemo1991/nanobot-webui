@@ -86,7 +86,7 @@ class AgentDefaults(BaseModel):
     max_concurrent_subagents: int = 10  # 最大并发子Agent数
     enable_parallel_tools: bool = True  # 是否启用并行工具调用
     thread_pool_size: int = 4  # 线程池大小（用于CPU密集型任务）
-    thread_pool_tools: list[str] = Field(default_factory=lambda: ["exec", "spawn", "claude_code"])  # 线程池执行的工具列表
+    thread_pool_tools: list[str] = Field(default_factory=lambda: ["exec", "spawn"])  # 线程池执行的工具列表
     # 智能并行配置
     enable_smart_parallel: bool = True  # 是否启用智能并行判断
     smart_parallel_model: str = ""  # 智能并行判断使用的模型（留空使用默认轻量模型）

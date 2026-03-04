@@ -47,7 +47,7 @@ class ClaudeCodeManager:
         self._started = False
         # 用户决策中继：session_key -> (Future, questions)
         self._pending_decisions: dict[str, tuple[asyncio.Future, list]] = {}
-        # 当前消息的来源渠道（由 ClaudeCodeTool.set_context 更新）
+        # 当前消息的来源渠道（由 AgentLoop 在处理消息时调用 set_context 更新）
         self._channel: str = ""
         self._chat_id: str = ""
 
@@ -377,9 +377,16 @@ class ClaudeCodeManager:
             await asyncio.wait_for(_run_query(), timeout=effective_timeout)
         except asyncio.TimeoutError:
             logger.warning(f"Claude Code [{task_id}] timed out after {effective_timeout}s")
+            # 保留已产生的部分执行结果，避免超时时完全丢失
+            timeout_msg = f"任务执行超时（{effective_timeout}秒），以下为超时前的部分输出："
+            output = (
+                f"{timeout_msg}\n\n{final_result}"
+                if (final_result and final_result.strip())
+                else f"Task timed out after {effective_timeout} seconds"
+            )
             return {
                 "task_id": task_id,
-                "output": f"Task timed out after {effective_timeout} seconds",
+                "output": output,
                 "status": "timeout",
             }
         except Exception as e:

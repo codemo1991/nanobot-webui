@@ -83,6 +83,8 @@ class SubagentManager:
         # batch 聚合：batch_id -> set[task_id]，用于多子 agent 完成后统一汇总
         self._batch_tasks: dict[str, set[str]] = {}
         self._batch_lock = threading.Lock()
+        # 工具缓存：按模板缓存，避免每次 spawn 都重新创建工具实例
+        self._tools_cache: dict[str, Any] = {}
 
     def _media_has_images(self, media: list[str]) -> bool:
         """检查 media 中是否包含图片（仅图片时需禁用 tools，语音子 agent 需保留 exec 等工具）。"""
@@ -321,6 +323,11 @@ class SubagentManager:
                 semaphore.release()
                 running_tasks_ref.pop(task_id, None)
                 logger.info(f"[SubagentProgress] Semaphore released and task {task_id} removed from _running_tasks")
+                # 给 LiteLLM LoggingWorker 时间处理待处理日志，避免 Event loop is closed 等错误
+                try:
+                    loop.run_until_complete(asyncio.sleep(0.5))
+                except Exception:
+                    pass
                 loop.close()
 
         thread = threading.Thread(target=run_in_thread, daemon=True)
@@ -416,28 +423,117 @@ class SubagentManager:
             except Exception as e:
                 logger.error(f"[SubagentProgress] Error in progress callback: {e}")
 
-        try:
-            logger.info(f"[SubagentProgress] Calling Claude Code Manager run_task for task_id: {task_id}, manager id: {id(self)}")
-            logger.info(f"[SubagentProgress] _running_tasks before run_task: {list(self._running_tasks.keys())}")
-            result = await self._claude_code_manager.run_task(
+        timeout_sec = self._claude_code_manager.default_timeout
+
+        async def _run_and_maybe_wait_late() -> dict[str, Any]:
+            """运行 run_task；超时后用 shield 保护，后台完成后可再通知。"""
+            return await self._claude_code_manager.run_task(
                 prompt=task,
                 workdir=None,
                 permission_mode="auto",
                 enable_subagents=True,
-                timeout=self._claude_code_manager.default_timeout,
+                timeout=timeout_sec * 2,  # 内部超时设大，由外层 wait_for 控制
                 progress_callback=_progress_callback,
             )
-            logger.info(f"[SubagentProgress] Claude Code Manager run_task completed for task_id: {task_id}")
+
+        async def _deliver_late_result(inner: asyncio.Task) -> None:
+            """等待 shielded 任务完成，将最终结果推送到 bus，并处理 batch 聚合与非 web 渠道的 announce。"""
+            try:
+                result = await inner
+                status = result.get("status", "unknown")
+                output = result.get("output", "")
+                logger.info(f"[SubagentProgress] Late result for task_id: {task_id}, status={status}")
+                bus.push(origin_key, {
+                    "type": "subagent_end",
+                    "task_id": task_id,
+                    "label": label,
+                    "status": "ok" if status == "done" else "timeout" if status == "timeout" else "error",
+                    "summary": (output or f"status={status}")[:300],
+                    "result": output,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                if self.sessions:
+                    main_session = self.sessions.get_or_create(f"{origin['channel']}:{origin['chat_id']}")
+                    if main_session:
+                        main_session.subagent_results[task_id] = {
+                            "label": label,
+                            "task": task,
+                            "result": output or f"status={status}",
+                            "status": "ok" if status == "done" else "timeout" if status == "timeout" else "error",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            **({"batch_id": batch_id} if batch_id else {}),
+                        }
+                        self.sessions.save(main_session)
+                # Web 渠道：推送 summary；非 web：announce 给主 agent
+                if origin.get("channel") == "web":
+                    if status == "done":
+                        await self._generate_and_push_summary(task_id, label, task, output, origin, from_late_result=True)
+                else:
+                    await self._announce_result(
+                        task_id, label, task,
+                        output or f"status={status}",
+                        origin,
+                        "ok" if status == "done" else "timeout" if status == "timeout" else "error",
+                        template=template,
+                    )
+                # batch 聚合：若为 batch 中最后一个完成，执行汇总
+                is_last = self._is_last_in_batch(batch_id, task_id) if batch_id else True
+                if is_last and batch_id:
+                    with self._batch_lock:
+                        batch_task_ids = self._batch_tasks.pop(batch_id, set())
+                    if len(batch_task_ids) > 1:
+                        await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
+            except asyncio.CancelledError:
+                logger.debug(f"[SubagentProgress] Late result delivery cancelled for task_id: {task_id}")
+            except Exception as e:
+                logger.warning(f"[SubagentProgress] Late result delivery failed: {e}")
+
+        try:
+            try:
+                logger.info(f"[SubagentProgress] Calling Claude Code Manager run_task for task_id: {task_id}")
+                inner_task = asyncio.ensure_future(_run_and_maybe_wait_late())
+                result = await asyncio.wait_for(asyncio.shield(inner_task), timeout=float(timeout_sec))
+                logger.info(f"[SubagentProgress] Claude Code Manager run_task completed for task_id: {task_id}")
+            except asyncio.TimeoutError:
+                # 超时后任务受 shield 保护继续运行，等待完成后推送最终结果
+                logger.info(f"[SubagentProgress] Task {task_id} timed out, waiting for late result...")
+                partial = "⏳ 任务执行超时，正在后台继续运行，完成后将自动通知。"
+                bus.push(origin_key, {
+                    "type": "subagent_end",
+                    "task_id": task_id,
+                    "label": label,
+                    "status": "timeout",
+                    "summary": partial[:300],
+                    "result": partial,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                if self.sessions:
+                    main_session = self.sessions.get_or_create(f"{origin['channel']}:{origin['chat_id']}")
+                    if main_session:
+                        main_session.subagent_results[task_id] = {
+                            "label": label,
+                            "task": task,
+                            "result": partial,
+                            "status": "timeout",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            **({"batch_id": batch_id} if batch_id else {}),
+                        }
+                        self.sessions.save(main_session)
+                # 超时分支不生成 summary，由 _deliver_late_result 在任务完成后统一处理
+                await _deliver_late_result(inner_task)
+                return
+
             status = result.get("status", "unknown")
             output = result.get("output", "")
 
+            end_status_bus = "ok" if status == "done" else "timeout" if status == "timeout" else "error"
             bus.push(origin_key, {
                 "type": "subagent_end",
                 "task_id": task_id,
                 "label": label,
-                "status": "ok" if status == "done" else "error",
+                "status": end_status_bus,
                 "summary": (output or f"status={status}")[:300],
-                "result": output,  # 完整结果供前端使用
+                "result": output,  # 完整结果供前端使用（含超时时的部分输出）
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
             logger.info(f"[SubagentProgress] Pushed subagent_end event: status={status}, task_id={task_id}")
@@ -449,7 +545,11 @@ class SubagentManager:
                 main_session = self.sessions.get_or_create(main_session_key)
                 if main_session:
                     if status == "timeout":
-                        store_result = f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。"
+                        store_result = (
+                            output
+                            if (output and output.strip())
+                            else f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。"
+                        )
                     else:
                         store_result = output or f"status={status}"
                     main_session.subagent_results[task_id] = {
@@ -477,19 +577,19 @@ class SubagentManager:
                                 await self._generate_and_push_summary(task_id, label, task, output, origin)
                             else:
                                 await self._announce_result(task_id, label, task, output, origin, "ok", template=template)
-                        elif status == "timeout" and origin.get("channel") != "web":
-                            bus.push(origin_key, {
-                                "type": "subagent_end",
-                                "task_id": task_id, "label": label, "status": "timeout",
-                                "summary": "任务执行超时，任务可能仍在后台运行，请稍后查询状态",
-                                "result": f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                            })
-                            await self._announce_result(
-                                task_id, label, task,
-                                f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
-                                origin, "timeout", template=template
-                            )
+                        elif status == "timeout":
+                            if origin.get("channel") == "web":
+                                await self._generate_and_push_summary(
+                                    task_id, label, task,
+                                    output or f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒）",
+                                    origin,
+                                )
+                            else:
+                                await self._announce_result(
+                                    task_id, label, task,
+                                    output or f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
+                                    origin, "timeout", template=template
+                                )
                         elif status != "done" and origin.get("channel") != "web":
                             await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error", template=template)
                 else:
@@ -498,32 +598,32 @@ class SubagentManager:
                             await self._generate_and_push_summary(task_id, label, task, output, origin)
                         else:
                             await self._announce_result(task_id, label, task, output, origin, "ok", template=template)
-                    elif status == "timeout" and origin.get("channel") != "web":
-                        bus.push(origin_key, {
-                            "type": "subagent_end",
-                            "task_id": task_id, "label": label, "status": "timeout",
-                            "summary": "任务执行超时，任务可能仍在后台运行，请稍后查询状态",
-                            "result": f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        })
-                        await self._announce_result(
-                            task_id, label, task,
-                            f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
-                            origin, "timeout", template=template
-                        )
+                    elif status == "timeout":
+                        if origin.get("channel") == "web":
+                            await self._generate_and_push_summary(
+                                task_id, label, task,
+                                output or f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒）",
+                                origin,
+                            )
+                        else:
+                            await self._announce_result(
+                                task_id, label, task,
+                                output or f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
+                                origin, "timeout", template=template
+                            )
                     elif status != "done" and origin.get("channel") != "web":
                         await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error", template=template)
-        except Exception as e:
-            logger.error(f"Subagent [{task_id}] Claude Code backend failed: {e}")
+        except Exception as exc:
+            logger.error(f"Subagent [{task_id}] Claude Code backend failed: {exc}")
             bus.push(origin_key, {
                 "type": "subagent_end",
                 "task_id": task_id,
                 "label": label,
                 "status": "error",
-                "summary": str(e)[:300],
+                "summary": str(exc)[:300],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            await self._announce_result(task_id, label, task, f"Error: {str(e)}", origin, "error", template=template)
+            await self._announce_result(task_id, label, task, f"Error: {str(exc)}", origin, "error", template=template)
 
     async def _run_subagent(
         self,
@@ -587,11 +687,6 @@ class SubagentManager:
 
         try:
             tools = self._create_tools_for_template(template)
-
-            # 设置 ClaudeCodeTool 的 context（如果有）
-            claude_code_tool = tools.get("claude_code")
-            if claude_code_tool:
-                claude_code_tool.set_context(origin["channel"], origin["chat_id"])
 
             from nanobot.agent.memory import MemoryStore
             if enable_memory:
@@ -1188,6 +1283,7 @@ class SubagentManager:
         task: str,
         result: str,
         origin: dict[str, str],
+        from_late_result: bool = False,
     ) -> None:
         """
         Web 渠道专用：子 agent 成功完成后异步生成 LLM 总结并推送 subagent_summary 事件。
@@ -1241,18 +1337,21 @@ class SubagentManager:
             full_content = self._build_full_summary_content(label, task, result, brief)
 
             await self._push_summary_to_session_and_bus(
-                task_id, label, origin_key, message_id, full_content, origin, bus
+                task_id, label, origin_key, message_id, full_content, origin, bus,
+                clear_buffer=not from_late_result,
             )
 
         except asyncio.TimeoutError:
             logger.warning(f"[SubagentSummary] LLM summary timed out for task {task_id}, using fallback")
             await self._push_summary_to_session_and_bus(
-                task_id, label, origin_key, message_id, fallback_full, origin, bus
+                task_id, label, origin_key, message_id, fallback_full, origin, bus,
+                clear_buffer=not from_late_result,
             )
         except Exception as e:
             logger.warning(f"[SubagentSummary] Failed to generate summary for task {task_id}: {e}, using fallback")
             await self._push_summary_to_session_and_bus(
-                task_id, label, origin_key, message_id, fallback_full, origin, bus
+                task_id, label, origin_key, message_id, fallback_full, origin, bus,
+                clear_buffer=not from_late_result,
             )
 
     async def _push_summary_to_session_and_bus(
@@ -1264,8 +1363,9 @@ class SubagentManager:
         llm_summary: str,
         origin: dict[str, str],
         bus: SubagentProgressBus,
+        clear_buffer: bool = True,
     ) -> None:
-        """将 summary 写入 session 并推送到 bus。"""
+        """将 summary 写入 session 并推送到 bus。clear_buffer=False 时保留缓冲供重连 replay（late result 场景）。"""
         if self.sessions:
             main_session = self.sessions.get_or_create(origin_key)
             if main_session:
@@ -1288,6 +1388,8 @@ class SubagentManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         logger.info(f"[SubagentSummary] Pushed subagent_summary for task {task_id}")
+        if clear_buffer:
+            bus.clear_buffer(origin_key)
 
     async def _inject_voice_as_user_message(self, origin: dict[str, str], transcribed_text: str) -> None:
         """
@@ -1300,8 +1402,11 @@ class SubagentManager:
             chat_id=origin["chat_id"],
             content=transcribed_text.strip() or "[语音转写为空]",
         )
-        await self.bus.publish_inbound(msg)
-        logger.info(f"[Voice] Injected transcription as user message to {origin['channel']}:{origin['chat_id']}")
+        try:
+            await self.bus.publish_inbound(msg)
+            logger.info(f"[Voice] Injected transcription as user message to {origin['channel']}:{origin['chat_id']}")
+        except Exception as e:
+            logger.error(f"[Voice] publish_inbound failed (possible cross-loop issue): {e}")
 
     async def _announce_result(
         self,
@@ -1314,7 +1419,7 @@ class SubagentManager:
         template: str = "",
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
-        # voice 模板在非 web 渠道：转写结果作为用户指令注入，主 agent 直接执行，不走 summary
+        # voice 模板在非 web 渠道：转写结果作为用户指令注入，主 agent 直接执行
         if template == "voice" and origin.get("channel") != "web" and status == "ok":
             await self._inject_voice_as_user_message(origin, result)
             return
@@ -1353,7 +1458,11 @@ class SubagentManager:
         logger.info(f"[SubagentAnnounce] Published to bus, origin={origin['channel']}:{origin['chat_id']}")
 
     def _create_tools_for_template(self, template: str) -> ToolRegistry:
-        """Create and register tools based on template."""
+        """Create and register tools based on template. Uses caching to avoid recreating tools for each spawn."""
+        # 检查缓存
+        if template in self._tools_cache:
+            return self._tools_cache[template]
+
         tools = ToolRegistry()
 
         # 优先使用 AgentTemplateManager（如果可用）
@@ -1387,11 +1496,8 @@ class SubagentManager:
             from nanobot.agent.tools.voice_transcribe import VoiceTranscribeTool
             tools.register(VoiceTranscribeTool())
 
-        # Claude Code tool - 需要 ClaudeCodeManager
-        if "claude_code" in tool_names and self._claude_code_manager:
-            from nanobot.agent.tools.claude_code import ClaudeCodeTool
-            tools.register(ClaudeCodeTool(manager=self._claude_code_manager))
-
+        # 缓存工具实例
+        self._tools_cache[template] = tools
         return tools
 
     async def _dashscope_direct_call(
