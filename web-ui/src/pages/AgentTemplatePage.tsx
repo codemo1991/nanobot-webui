@@ -315,7 +315,7 @@ export default function AgentTemplatePage() {
           loading={loading}
           pagination={false}
           size="middle"
-          scroll={{ y: 'calc(100vh - 280px)' }}
+          scroll={{ y: 'min(400px, calc(100vh - 340px))' }}
         />
       </Card>
 
