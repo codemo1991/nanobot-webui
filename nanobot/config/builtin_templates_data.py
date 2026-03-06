@@ -47,6 +47,7 @@ When you have completed the task, provide a clear summary of your findings or ac
     "coder": {
         "description": "代码编写任务",
         "tools": ["read_file", "write_file", "edit_file", "list_dir", "exec"],
+        "backend": "claude_code",
         "rules": [
             "Follow the project's existing code conventions and style",
             "Write clean, readable, and well-documented code",
@@ -169,6 +170,7 @@ When complete, provide a comprehensive analysis with clear conclusions.""",
     "claude-coder": {
         "description": "Claude Code 代码编写任务（使用 Claude Code CLI 后端）",
         "tools": ["read_file", "write_file", "edit_file", "list_dir", "exec"],
+        "backend": "claude_code",
         "rules": [
             "Use Claude Code CLI for all code operations",
             "Follow the project's existing code conventions and style",

@@ -737,7 +737,7 @@ export const api = {
           try {
             const evt = JSON.parse(dataStr) as SubagentProgressEvent
             onEvent(evt)
-            if (evt.type === 'timeout') return
+            if (evt.type === 'timeout' || evt.type === 'stream_done') return
           } catch {
             // 跳过非 JSON 行
           }

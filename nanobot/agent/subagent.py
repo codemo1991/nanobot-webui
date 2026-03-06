@@ -29,6 +29,11 @@ from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirT
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.prompts import get_template, build_system_prompt, get_tools_for_template
+from nanobot.config.subagent_summary_prompts_loader import (
+    get_batch_system_prompt,
+    get_batch_user_intro,
+    get_single_task_system_prompt,
+)
 
 
 class SubagentManager:
@@ -58,6 +63,8 @@ class SubagentManager:
         claude_code_manager: "ClaudeCodeManager | None" = None,
         status_service: "SystemStatusService | None" = None,
         agent_template_manager: "AgentTemplateManager | None" = None,
+        backend_registry: "BackendRegistry | None" = None,
+        backend_resolver: "BackendResolver | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.session.manager import SessionManager
@@ -85,6 +92,35 @@ class SubagentManager:
         self._batch_lock = threading.Lock()
         # 工具缓存：按模板缓存，避免每次 spawn 都重新创建工具实例
         self._tools_cache: dict[str, Any] = {}
+
+        # Backend registry and resolver
+        from nanobot.agent.backend_registry import BackendRegistry as BR
+        from nanobot.agent.backend_resolver import BackendResolver as BRes
+        self._backend_registry = backend_registry if backend_registry is not None else BR()
+        # 确保 voice、dashscope_vision 等自注册 backends 已加载
+        import nanobot.agent.backends  # noqa: F401
+        self._backend_resolver = backend_resolver if backend_resolver is not None else BRes(
+            agent_template_manager, self._backend_registry
+        )
+
+        # 执行链路监控
+        from nanobot.monitoring.execution_chain import ExecutionChainMonitor
+        self._chain_monitor = ExecutionChainMonitor.get_instance()
+        self._subagent_nodes: dict[str, str] = {}  # task_id -> node_id
+
+    def _complete_subagent_node(self, task_id: str, status: str, result: str = None, error: str = None):
+        """完成子 Agent 执行节点"""
+        node_id = self._subagent_nodes.pop(task_id, None)
+        if node_id and self._chain_monitor.get_current_chain():
+            try:
+                self._chain_monitor.get_current_chain().complete_node(
+                    node_id,
+                    result=result,
+                    error=error
+                )
+                logger.info(f"[ExecutionChain] Completed subagent node: {node_id}, status: {status}")
+            except Exception as e:
+                logger.warning(f"[ExecutionChain] Failed to complete subagent node: {e}")
 
     def _media_has_images(self, media: list[str]) -> bool:
         """检查 media 中是否包含图片（仅图片时需禁用 tools，语音子 agent 需保留 exec 等工具）。"""
@@ -139,36 +175,6 @@ class SubagentManager:
 
         return {"role": "user", "content": images + [{"type": "text", "text": content_text}]}
 
-    def _resolve_backend(self, template: str, backend: str) -> str:
-        """
-        决定实际使用的执行后端。
-
-        当 template 包含 "coder" 或 "claude" 时（如 "coder", "claude-coder"），
-        可以使用 claude_code 后端；其他模板始终使用 native LLM。
-
-        Args:
-            template: 子 Agent 模板名称
-            backend: 用户指定的后端偏好（"auto" / "native" / "claude_code"）
-
-        Returns:
-            "claude_code" 或 "native"
-        """
-        # 判断模板是否支持 Claude Code 后端
-        supports_claude_code = "coder" in template.lower() or "claude" in template.lower()
-
-        if not supports_claude_code:
-            return "native"
-        if backend == "native":
-            return "native"
-        if backend == "claude_code":
-            if self._claude_code_manager and self._claude_code_manager.check_claude_available():
-                return "claude_code"
-            logger.warning("Claude Code CLI 不可用，回退到 native LLM 后端")
-            return "native"
-        # auto：优先 Claude Code CLI，不可用时降级
-        if self._claude_code_manager and self._claude_code_manager.check_claude_available():
-            return "claude_code"
-        return "native"
 
     def cancel_task(self, task_id: str) -> bool:
         """取消指定的子代理任务。仅从追踪列表移除，不释放信号量（由任务线程在 finally 中释放，避免双重释放）。"""
@@ -269,8 +275,24 @@ class SubagentManager:
             "chat_id": origin_chat_id,
         }
 
-        resolved_backend = self._resolve_backend(template, backend)
+        resolved_backend = self._backend_resolver.resolve(template, backend, media=media)
         logger.info(f"Subagent [{task_id}] backend resolved: template={template}, requested={backend}, actual={resolved_backend}")
+
+        # 创建子 Agent 执行节点
+        subagent_node_id = None
+        if self._chain_monitor.get_current_chain():
+            try:
+                subagent_node = self._chain_monitor.get_current_chain().create_node(
+                    node_type='subagent',
+                    name=template,
+                    parent_node_id=None,  # 可以从调用栈获取父节点
+                    arguments={'task': task, 'label': label, 'backend': resolved_backend}
+                )
+                subagent_node_id = subagent_node.node_id
+                self._subagent_nodes[task_id] = subagent_node_id
+                logger.info(f"[ExecutionChain] Created subagent node: {subagent_node_id}, template: {template}")
+            except Exception as e:
+                logger.warning(f"[ExecutionChain] Failed to create subagent node: {e}")
         logger.info(f"[SubagentProgress] Creating background task for subagent, origin_channel={origin_channel}, origin_chat_id={origin_chat_id}")
 
         if batch_id:
@@ -301,8 +323,12 @@ class SubagentManager:
                     )
                 )
                 logger.info(f"[SubagentProgress] Thread-based subagent task {task_id} completed successfully")
+                # 完成子 Agent 执行节点
+                self._complete_subagent_node(task_id, status="completed", result="Task completed")
             except Exception as e:
                 logger.error(f"[SubagentProgress] Thread-based subagent task {task_id} failed: {e}")
+                # 完成子 Agent 执行节点（失败状态）
+                self._complete_subagent_node(task_id, status="failed", result=str(e))
                 # 确保即使失败也发送 subagent_end 事件
                 try:
                     error_result = f"任务执行失败: {str(e)}"
@@ -323,6 +349,14 @@ class SubagentManager:
                 semaphore.release()
                 running_tasks_ref.pop(task_id, None)
                 logger.info(f"[SubagentProgress] Semaphore released and task {task_id} removed from _running_tasks")
+                # 若该 session 已无运行中的子 agent，推送 stream_done 以便 SSE 自动断开
+                remaining = sum(1 for ok, _ in running_tasks_ref.values() if ok == origin_key)
+                if remaining == 0:
+                    try:
+                        bus.push(origin_key, {"type": "stream_done"})
+                        logger.info(f"[SubagentProgress] Pushed stream_done for origin_key: {origin_key}")
+                    except Exception as e:
+                        logger.warning(f"[SubagentProgress] Failed to push stream_done: {e}")
                 # 给 LiteLLM LoggingWorker 时间处理待处理日志，避免 Event loop is closed 等错误
                 try:
                     loop.run_until_complete(asyncio.sleep(0.5))
@@ -625,6 +659,250 @@ class SubagentManager:
             })
             await self._announce_result(task_id, label, task, f"Error: {str(exc)}", origin, "error", template=template)
 
+    async def _run_via_voice(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        template: str = "voice",
+        batch_id: str | None = None,
+        media: list[str] | None = None,
+    ) -> None:
+        """Voice backend: 直接调用 voice_transcribe 工具，绕过 LLM。"""
+        origin_key = f"{origin['channel']}:{origin['chat_id']}"
+        bus = SubagentProgressBus.get()
+
+        bus.push(origin_key, {
+            "type": "subagent_start",
+            "task_id": task_id,
+            "label": label,
+            "backend": "voice",
+            "task": task[:120],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        try:
+            if origin_key in self._session_cancelled:
+                self._session_cancelled.discard(origin_key)
+                final_result = "任务已被用户取消。"
+                end_status = "cancelled"
+            else:
+                audio_paths = []
+                for path in media or []:
+                    p = Path(path)
+                    if not p.is_file():
+                        continue
+                    mime, _ = mimetypes.guess_type(path)
+                    ext = p.suffix.lower()
+                    is_audio = (mime and mime.startswith("audio/")) or ext in (".mp3", ".wav", ".ogg", ".m4a", ".opus", ".webm", ".aac")
+                    if is_audio:
+                        audio_paths.append(str(p.resolve()))
+                if audio_paths:
+                    tools = self._create_tools_for_template(template)
+                    result = await tools.execute("voice_transcribe", {"file_path": audio_paths[0]})
+                    if result and not str(result).strip().startswith("Error:"):
+                        final_result = str(result).strip()
+                    else:
+                        final_result = str(result).strip() if result else "语音转写失败，请检查 DashScope API 配置。"
+                else:
+                    final_result = "未找到有效的音频文件。"
+                end_status = "ok"
+
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": end_status,
+                "summary": final_result[:300],
+                "result": final_result,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            if self.sessions:
+                main_session = self.sessions.get_or_create(origin_key)
+                if main_session:
+                    main_session.subagent_results[task_id] = {
+                        "label": label,
+                        "task": task,
+                        "result": final_result,
+                        "status": end_status,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        **({"batch_id": batch_id} if batch_id else {}),
+                    }
+                    self.sessions.save(main_session)
+            is_last = self._is_last_in_batch(batch_id, task_id) if batch_id else True
+            if is_last:
+                if batch_id:
+                    with self._batch_lock:
+                        batch_task_ids = self._batch_tasks.pop(batch_id, set())
+                    if len(batch_task_ids) > 1:
+                        await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
+                    else:
+                        if origin.get("channel") == "web":
+                            await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                        else:
+                            await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
+                else:
+                    if origin.get("channel") == "web":
+                        await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                    else:
+                        await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            logger.error(f"Subagent [{task_id}] Voice backend failed: {e}")
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "error",
+                "summary": error_msg[:300],
+                "result": error_msg,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            if origin.get("channel") != "web":
+                await self._announce_result(task_id, label, task, error_msg, origin, "error", template=template)
+
+    async def _run_via_dashscope_vision(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        template: str = "",
+        batch_id: str | None = None,
+        media: list[str] | None = None,
+        model: str = "",
+    ) -> None:
+        """DashScope vision backend: 直接调用 DashScope API，绕过 LiteLLM。"""
+        origin_key = f"{origin['channel']}:{origin['chat_id']}"
+        bus = SubagentProgressBus.get()
+
+        bus.push(origin_key, {
+            "type": "subagent_start",
+            "task_id": task_id,
+            "label": label,
+            "backend": "dashscope_vision",
+            "task": task[:120],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        try:
+            if origin_key in self._session_cancelled:
+                self._session_cancelled.discard(origin_key)
+                final_result = "任务已被用户取消。"
+                end_status = "cancelled"
+            else:
+                from nanobot.agent.prompts import build_system_prompt
+                if self._agent_template_manager:
+                    system_prompt = self._agent_template_manager.build_system_prompt(template, task, str(self.workspace))
+                    if not system_prompt:
+                        system_prompt = build_system_prompt(template, task, str(self.workspace))
+                else:
+                    system_prompt = build_system_prompt(template, task, str(self.workspace))
+                messages: list[dict[str, Any]] = [
+                    {"role": "system", "content": system_prompt},
+                    self._build_user_message_with_media(task, media),
+                ]
+                ds_task = asyncio.create_task(self._dashscope_direct_call(messages, model))
+                _DS_CALL_TIMEOUT = 60
+                _CANCEL_CHECK_INTERVAL = 2.0
+                cancelled_during_ds = False
+                loop_start_ds = time.monotonic()
+                while not ds_task.done():
+                    elapsed = time.monotonic() - loop_start_ds
+                    remaining = _DS_CALL_TIMEOUT - elapsed
+                    if remaining <= 0:
+                        ds_task.cancel()
+                        try:
+                            await ds_task
+                        except asyncio.CancelledError:
+                            pass
+                        break
+                    wait_time = min(_CANCEL_CHECK_INTERVAL, remaining)
+                    done, _ = await asyncio.wait(
+                        [ds_task],
+                        timeout=wait_time,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if ds_task in done:
+                        break
+                    if origin_key in self._session_cancelled:
+                        self._session_cancelled.discard(origin_key)
+                        ds_task.cancel()
+                        try:
+                            await ds_task
+                        except asyncio.CancelledError:
+                            pass
+                        cancelled_during_ds = True
+                        break
+                if cancelled_during_ds:
+                    final_result = "任务已被用户取消。"
+                    end_status = "cancelled"
+                else:
+                    try:
+                        direct_result = await ds_task
+                    except asyncio.CancelledError:
+                        direct_result = None
+                    if direct_result:
+                        final_result = direct_result
+                        end_status = "ok"
+                    else:
+                        final_result = "DashScope 图片识别失败，请检查 API key 和模型配置。"
+                        end_status = "error"
+
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": end_status,
+                "summary": final_result[:300],
+                "result": final_result,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            if self.sessions:
+                main_session = self.sessions.get_or_create(origin_key)
+                if main_session:
+                    main_session.subagent_results[task_id] = {
+                        "label": label,
+                        "task": task,
+                        "result": final_result,
+                        "status": end_status,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        **({"batch_id": batch_id} if batch_id else {}),
+                    }
+                    self.sessions.save(main_session)
+            is_last = self._is_last_in_batch(batch_id, task_id) if batch_id else True
+            if is_last:
+                if batch_id:
+                    with self._batch_lock:
+                        batch_task_ids = self._batch_tasks.pop(batch_id, set())
+                    if len(batch_task_ids) > 1:
+                        await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
+                    else:
+                        if origin.get("channel") == "web":
+                            await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                        else:
+                            await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
+                else:
+                    if origin.get("channel") == "web":
+                        await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                    else:
+                        await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            logger.error(f"Subagent [{task_id}] DashScope vision backend failed: {e}")
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "error",
+                "summary": error_msg[:300],
+                "result": error_msg,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            if origin.get("channel") != "web":
+                await self._announce_result(task_id, label, task, error_msg, origin, "error", template=template)
+
     async def _run_subagent(
         self,
         task_id: str,
@@ -651,13 +929,26 @@ class SubagentManager:
             else:
                 logger.info(f"Subagent [{task_id}] using default model: {effective_model}")
 
-        # 路由到 Claude Code CLI 后端
-        if backend == "claude_code":
-            logger.info(f"[SubagentProgress] Routing to Claude Code backend for task_id: {task_id}")
-            await self._run_via_claude_code(task_id, task, label, origin, template=template, batch_id=batch_id)
-            logger.info(f"[SubagentProgress] Claude Code backend completed for task_id: {task_id}")
+        # 二次解析：native 时根据 media+model 可能路由到 dashscope_vision
+        effective_backend = backend
+        if backend == "native":
+            effective_backend = self._backend_resolver.resolve(
+                template, backend, media=media, model=effective_model
+            )
+
+        # 使用 BackendRegistry 路由到对应的 backend
+        runner = self._backend_registry.get(effective_backend)
+        if runner is not None and effective_backend != "native":
+            logger.info(f"[SubagentProgress] Routing to {effective_backend} backend for task_id: {task_id}")
+            await runner(
+                task_id, task, label, origin,
+                template=template, batch_id=batch_id, subagent_manager=self,
+                media=media, model=effective_model,
+            )
+            logger.info(f"[SubagentProgress] {effective_backend} backend completed for task_id: {task_id}")
             return
 
+        # effective_backend == "native" 或 runner 为 None 时，使用内置 native 路径
         origin_key = f"{origin['channel']}:{origin['chat_id']}"
         # 启动前检查是否已被取消
         if origin_key in self._session_cancelled:
@@ -728,145 +1019,13 @@ class SubagentManager:
             iteration = 0
             final_result: str | None = None
             cancelled_by_user = False
-            # 子 agent 可能使用与主模型不同的模型，显式传入 api_key/api_base 避免 401（不依赖 env）
-            sa_key: str | None = None
-            sa_base: str | None = None
-            try:
-                import os
-                from nanobot.config.loader import load_config, get_config_repository
-                cfg = load_config()
-                sa_key = cfg.get_api_key(effective_model)
-                sa_base = cfg.get_api_base(effective_model)
-                # DashScope/Qwen 模型：多级回退，确保能拿到 key（LiteLLM 401 常因 key 未传入）
-                if (not sa_key or not sa_key.strip()) and any(
-                    k in effective_model.lower() for k in ("dashscope", "qwen")
-                ):
-                    sa_key = (
-                        (cfg.providers.dashscope.api_key or "").strip()
-                        or os.environ.get("DASHSCOPE_API_KEY", "")
-                    ) or None
-                    # 仍为空时，直接从 config_providers 表读取（绕过 load_full_config 结构差异）
-                    if not sa_key:
-                        try:
-                            prov = get_config_repository().get_provider("dashscope")
-                            if prov and (prov.get("api_key") or "").strip():
-                                sa_key = prov["api_key"].strip()
-                                if not sa_base and prov.get("api_base"):
-                                    sa_base = prov["api_base"]
-                        except Exception:
-                            pass
-                # 中国区 DashScope：未指定 api_base 时使用国内端点，避免 401
-                if sa_key and any(k in effective_model.lower() for k in ("dashscope", "qwen")):
-                    if not sa_base or not sa_base.strip():
-                        sa_base = os.environ.get("DASHSCOPE_API_BASE") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-                if sa_key and hasattr(self.provider, "ensure_api_key_for_model"):
-                    self.provider.ensure_api_key_for_model(
-                        effective_model, sa_key, sa_base
-                    )
-                # 显式设置 env，LiteLLM DashScope 适配层优先读 env
-                if sa_key and any(k in effective_model.lower() for k in ("dashscope", "qwen")):
-                    os.environ["DASHSCOPE_API_KEY"] = sa_key
-                    if sa_base:
-                        os.environ["DASHSCOPE_API_BASE"] = sa_base
-                if not sa_key and any(k in effective_model.lower() for k in ("dashscope", "qwen")):
-                    logger.warning(
-                        f"子 agent 模型 {effective_model} 需要 DashScope API Key，"
-                        "请在配置页 Provider 中填写 Qwen（通义）的 apiKey，或设置环境变量 DASHSCOPE_API_KEY"
-                    )
-            except Exception as e:
-                logger.debug(f"Subagent pre-register model key: {e}")
-
-            # voice 模板：直接调用 voice_transcribe，完全绕过 LLM（避免 LLM 不调用工具或输出模板占位符）
-            if template == "voice" and media and not self._media_has_images(media):
-                if origin_key in self._session_cancelled:
-                    self._session_cancelled.discard(origin_key)
-                    logger.info(f"Subagent [{task_id}] cancelled before voice transcription (session {origin_key})")
-                    final_result = "任务已被用户取消。"
-                    cancelled_by_user = True
-                else:
-                    audio_paths = []
-                    for path in media:
-                        p = Path(path)
-                        if not p.is_file():
-                            continue
-                        mime, _ = mimetypes.guess_type(path)
-                        ext = p.suffix.lower()
-                        is_audio = (mime and mime.startswith("audio/")) or ext in (".mp3", ".wav", ".ogg", ".m4a", ".opus", ".webm", ".aac")
-                        if is_audio:
-                            audio_paths.append(str(p.resolve()))
-                    if audio_paths:
-                        audio_path = audio_paths[0]
-                        result = await tools.execute("voice_transcribe", {"file_path": audio_path})
-                        if result and not str(result).strip().startswith("Error:"):
-                            final_result = str(result).strip()
-                            logger.info(f"Subagent [{task_id}] voice direct transcription: {len(final_result)} chars")
-                        else:
-                            final_result = str(result).strip() if result else "语音转写失败，请检查 DashScope API 配置。"
-                        max_iterations = 0  # 跳过 LLM 循环
+            # 使用 config 工具统一加载并注入模型 API Key（DashScope 等多级回退）
+            from nanobot.config.model_api_key import ensure_model_api_key
+            sa_key, sa_base = ensure_model_api_key(effective_model, provider=self.provider)
 
             # 视觉模型通常不支持 function calling，有图片时不传 tools
             # 语音子 agent 仅有音频时需保留 exec 等工具，故仅在有图片时禁用
             use_tools = None if (media and self._media_has_images(media)) else tools.get_definitions()
-
-            # DashScope 模型有图片时绕过 LiteLLM (Bug #16007: LiteLLM 会丢弃 image_url)
-            if media and self._media_has_images(media) and use_tools is None:
-                model_lower = effective_model.lower()
-                if any(k in model_lower for k in ("dashscope", "qwen")):
-                    if origin_key in self._session_cancelled:
-                        self._session_cancelled.discard(origin_key)
-                        logger.info(f"Subagent [{task_id}] cancelled before vision API call (session {origin_key})")
-                        final_result = "任务已被用户取消。"
-                        cancelled_by_user = True
-                    else:
-                        # 调用期间每 2 秒轮询取消，与 LLM 调用一致
-                        ds_task = asyncio.create_task(
-                            self._dashscope_direct_call(messages, effective_model)
-                        )
-                        _DS_CALL_TIMEOUT = 60
-                        _CANCEL_CHECK_INTERVAL = 2.0
-                        cancelled_during_ds = False
-                        loop_start_ds = time.monotonic()
-                        while not ds_task.done():
-                            elapsed = time.monotonic() - loop_start_ds
-                            remaining = _DS_CALL_TIMEOUT - elapsed
-                            if remaining <= 0:
-                                ds_task.cancel()
-                                try:
-                                    await ds_task
-                                except asyncio.CancelledError:
-                                    pass
-                                break
-                            wait_time = min(_CANCEL_CHECK_INTERVAL, remaining)
-                            done, _ = await asyncio.wait(
-                                [ds_task],
-                                timeout=wait_time,
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                            if ds_task in done:
-                                break
-                            if origin_key in self._session_cancelled:
-                                self._session_cancelled.discard(origin_key)
-                                ds_task.cancel()
-                                try:
-                                    await ds_task
-                                except asyncio.CancelledError:
-                                    pass
-                                cancelled_during_ds = True
-                                break
-                        if cancelled_during_ds:
-                            final_result = "任务已被用户取消。"
-                            cancelled_by_user = True
-                        else:
-                            try:
-                                direct_result = await ds_task
-                            except asyncio.CancelledError:
-                                direct_result = None  # 超时取消
-                            if direct_result:
-                                final_result = direct_result
-                            else:
-                                final_result = "DashScope 图片识别失败，请检查 API key 和模型配置。"
-                    # 跳过正常 loop
-                    max_iterations = 0
 
             while iteration < max_iterations:
                 iteration += 1
@@ -1162,29 +1321,25 @@ class SubagentManager:
         combined_preview = "\n\n---\n\n".join(preview_parts)
         full_detail = "\n\n---\n\n".join(full_parts)
 
+        # 获取用户原始提问用于判断输出语言
+        user_question = ""
+        if self.sessions:
+            main_session = self.sessions.get_or_create(origin_key)
+            if main_session and main_session.messages:
+                for m in reversed(main_session.messages):
+                    if m.get("role") == "user":
+                        user_question = (m.get("content") or "").strip()
+                        if user_question and user_question not in ("[图片]", "[语音]", "[文件]", "[空消息]", ""):
+                            break
+                        user_question = ""
+
         try:
-            # 优化后的 prompt：强调保持用户原始意图和输出语言一致性
-            BATCH_SUMMARY_SYSTEM = """你是任务结果总结助手，负责将多个子任务的执行结果自然地呈现给用户。
-
-核心原则：
-1. **保持用户原始意图**：根据每个任务的「任务描述」来组织回复
-2. **结果导向**：用户要求做什么，就呈现什么（要代码给代码，要描述给描述）
-3. **简洁口语化**：不要提 subagent、task_id 等技术细节
-4. **语言一致性**：输出语言必须与「任务描述」的语言一致（任务描述是中文就输出中文，是英文就输出英文）
-
-输出结构：
-1. 总体结论：1-2 句概括所有任务完成情况
-2. 分任务要点：按任务逐一列出关键结论（每项 1-2 句）
-3. 建议下一步：如有未完成或需用户决策的内容，简要说明"""
-
-            summary_prompt = f"""以下是多个子任务的执行结果，请基于用户原始意图进行回复。
-
-每个任务的「任务描述」告诉用户想要什么，根据它来组织回复。
-
-任务结果：
-{combined_preview}"""
+            summary_prompt = get_batch_user_intro()
+            if user_question:
+                summary_prompt += f"用户原始提问：\n{user_question[:500]}\n\n---\n\n"
+            summary_prompt += f"任务结果：\n{combined_preview}"
             messages = [
-                {"role": "system", "content": BATCH_SUMMARY_SYSTEM},
+                {"role": "system", "content": get_batch_system_prompt()},
                 {"role": "user", "content": summary_prompt},
             ]
             response = await asyncio.wait_for(
@@ -1295,6 +1450,18 @@ class SubagentManager:
         fallback_brief = f"任务「{label}」已完成。"
         fallback_full = self._build_full_summary_content(label, task, result, fallback_brief)
 
+        # 获取用户原始提问用于判断输出语言
+        user_question = ""
+        if self.sessions:
+            main_session = self.sessions.get_or_create(origin_key)
+            if main_session and main_session.messages:
+                for m in reversed(main_session.messages):
+                    if m.get("role") == "user":
+                        user_question = (m.get("content") or "").strip()
+                        if user_question and user_question not in ("[图片]", "[语音]", "[文件]", "[空消息]", ""):
+                            break
+                        user_question = ""
+
         try:
             # 传入完整任务指令和结果，供 LLM 准确总结（限制 result 长度以防 token 溢出，保留足够上下文）
             result_for_prompt = result if len(result) <= 12000 else result[:12000] + "\n\n...(结果过长已截断，完整结果见下方)"
@@ -1303,20 +1470,11 @@ class SubagentManager:
                 f"任务描述（子 agent 收到的完整指令）：\n{task}\n\n"
                 f"执行结果：\n{result_for_prompt}"
             )
-
-            # 优化后的 system prompt：强调保持用户原始意图和输出语言一致性
-            SUMMARY_SYSTEM_PROMPT = """你是任务结果总结助手，负责将子任务的执行结果自然地呈现给用户。
-
-核心原则：
-1. **保持用户原始意图**：根据「任务描述」中用户的具体要求来组织回复
-2. **结果导向**：用户要求做什么，就呈现什么（要代码给代码，要描述给描述）
-3. **隐匿系统执行过程**：不要提 subagent、task_id 等技术细节
-4. **语言一致性**：输出语言必须与「任务描述」的语言一致（任务描述是中文就输出中文，是英文就输出英文）
-
-请基于以下任务描述和执行结果，给出符合用户原始意图的回复："""
+            if user_question:
+                summary_prompt = f"用户原始提问：\n{user_question[:500]}\n\n---\n\n" + summary_prompt
 
             messages = [
-                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                {"role": "system", "content": get_single_task_system_prompt()},
                 {"role": "user", "content": summary_prompt},
             ]
             # 使用主模型做纯文本 summary，避免 vision 模型 (如 qwen-vl-plus) 的 API key 要求
@@ -1389,7 +1547,9 @@ class SubagentManager:
         })
         logger.info(f"[SubagentSummary] Pushed subagent_summary for task {task_id}")
         if clear_buffer:
-            bus.clear_buffer(origin_key)
+            # 裁剪为仅保留最后 5 个事件（subagent_end/summary/stream_done 等），
+            # 供重连 replay，同时避免大量 progress 事件导致页面卡顿
+            bus.trim_buffer(origin_key, keep_last=5)
 
     async def _inject_voice_as_user_message(self, origin: dict[str, str], transcribed_text: str) -> None:
         """

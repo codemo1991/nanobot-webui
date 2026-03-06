@@ -74,6 +74,7 @@ export type SubagentProgressEvent =
   | { type: 'subagent_summary'; task_id: string; task_ids?: string[]; label: string; llm_summary: string; message_id: string; timestamp?: string }
   | { type: 'heartbeat' }
   | { type: 'timeout' }
+  | { type: 'stream_done' }
 
 // Configuration Types
 

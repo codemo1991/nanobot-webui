@@ -3005,6 +3005,9 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, OSError) as e:
                     logger.warning(f"[SubagentProgress] Connection lost for session {session_id}, event not sent: {evt.get('type')}, task_id: {evt.get('task_id')}, error: {e}")
                     break
+                if evt.get("type") == "stream_done":
+                    logger.info(f"[SubagentProgress] All subagents finished for session {session_id}, closing SSE")
+                    break
         finally:
             app.unsubscribe_subagent_progress(session_id, evt_queue)
             # 注意：不再自动清除缓冲区，保留事件供后续重连时 replay
@@ -3111,6 +3114,43 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
             if path == "/api/v1/health":
                 self._write_json(HTTPStatus.OK, _ok({"status": "ok"}))
+                return
+
+            # 执行链路监控 API
+            if path == "/api/v1/monitoring/chains":
+                # 查询链路列表
+                session_key = query.get("sessionKey", [None])[0]
+                status = query.get("status", [None])[0]
+                limit = int(query.get("limit", ["100"])[0])
+                limit = max(1, min(limit, 500))
+                try:
+                    from nanobot.monitoring.execution_chain import ExecutionChainMonitor
+                    monitor = ExecutionChainMonitor.get_instance()
+                    chains = monitor.query_chains(
+                        session_key=session_key,
+                        status=status,
+                        limit=limit
+                    )
+                    self._write_json(HTTPStatus.OK, _ok(chains))
+                except Exception as e:
+                    logger.exception("Failed to query execution chains")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("CHAIN_QUERY_FAILED", str(e)))
+                return
+
+            # 获取链路详情
+            if len(parts) == 5 and parts[:4] == ["api", "v1", "monitoring", "chains"]:
+                chain_id = parts[4]
+                try:
+                    from nanobot.monitoring.execution_chain import ExecutionChainMonitor
+                    monitor = ExecutionChainMonitor.get_instance()
+                    detail = monitor.get_chain_detail(chain_id)
+                    if detail:
+                        self._write_json(HTTPStatus.OK, _ok(detail))
+                    else:
+                        self._write_json(HTTPStatus.NOT_FOUND, _err("CHAIN_NOT_FOUND", "链路不存在"))
+                except Exception as e:
+                    logger.exception("Failed to get chain detail")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("CHAIN_DETAIL_FAILED", str(e)))
                 return
 
             if path == "/api/v1/chat/sessions":

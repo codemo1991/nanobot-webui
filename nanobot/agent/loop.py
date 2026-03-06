@@ -188,6 +188,16 @@ class AgentLoop:
             from nanobot.config.agent_templates import AgentTemplateManager
             agent_template_manager = AgentTemplateManager(workspace)
 
+        # Backend registry and resolver for subagent execution (after agent_template_manager is ready)
+        from nanobot.agent.backend_registry import BackendRegistry
+        from nanobot.agent.backend_resolver import BackendResolver
+        self._backend_registry = BackendRegistry()
+        self._backend_resolver = BackendResolver(agent_template_manager, self._backend_registry)
+
+        # Register Claude Code backend
+        from nanobot.agent.backends import claude_code as cc_backend
+        cc_backend.register(self.claude_code_manager)
+
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -201,6 +211,8 @@ class AgentLoop:
             claude_code_manager=self.claude_code_manager,
             status_service=status_service,
             agent_template_manager=agent_template_manager,
+            backend_registry=self._backend_registry,
+            backend_resolver=self._backend_resolver,
         )
         logger.info(f"[AgentLoop] AgentLoop id: {id(self)}, SubagentManager id: {id(self.subagents)}")
 
@@ -214,6 +226,15 @@ class AgentLoop:
         self._mcp_fail_time: float = 0.0
         self._cancel_event = asyncio.Event()
         self._cancelled_sessions: set[str] = set()  # 按 session 取消，支持多会话并发
+        # 初始化执行链路监控
+        from nanobot.monitoring.execution_chain import ExecutionChainMonitor
+        from nanobot.storage.execution_chain_repository import ExecutionChainRepository
+        db_path = workspace / '.nanobot' / 'chat.db'
+        repo = ExecutionChainRepository.get_instance(db_path)
+        self._chain_monitor = ExecutionChainMonitor.get_instance(db_path)
+        self._chain_monitor.set_repository(repo)
+        logger.info(f'[ExecutionChain] Monitor initialized with db: {db_path}')
+
         self._register_default_tools()
         self._init_mcp_loader()
 
@@ -574,6 +595,7 @@ class AgentLoop:
         self,
         tool_call,
         progress: Callable | None = None,
+        parent_node_id: str = None,
     ) -> str:
         """
         执行单个工具调用。
@@ -581,10 +603,25 @@ class AgentLoop:
         Args:
             tool_call: 工具调用对象
             progress: 进度回调函数
+            parent_node_id: 父节点ID，用于构建调用树
 
         Returns:
             工具执行结果
         """
+        # 创建工具执行节点
+        node = None
+        if hasattr(self, '_chain_monitor') and self._chain_monitor.get_current_chain():
+            try:
+                node = self._chain_monitor.get_current_chain().create_node(
+                    node_type='tool',
+                    name=tool_call.name,
+                    parent_node_id=parent_node_id,
+                    arguments=tool_call.arguments
+                )
+                logger.info(f"[ExecutionChain] Created tool node: {node.node_id}, tool: {tool_call.name}")
+            except Exception as e:
+                logger.warning(f"[ExecutionChain] Failed to create tool node: {e}")
+
         # 循环检测
         call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
         logger.info(f"[ToolExecution] Starting tool: {tool_call.name}")
@@ -641,6 +678,19 @@ class AgentLoop:
         logger.info(f"[ToolExecution] === TOOL COMPLETED ===")
         logger.info(f"[ToolExecution] tool: {tool_call.name}, duration: {execution_time:.2f}s, has_error: {tool_execution_error is not None}")
         logger.info(f"[ToolExecution] result_preview: {result_preview}")
+
+        # 完成工具执行节点
+        if node:
+            try:
+                error_msg = str(tool_execution_error) if tool_execution_error else None
+                self._chain_monitor.get_current_chain().complete_node(
+                    node.node_id,
+                    result=result,
+                    error=error_msg
+                )
+                logger.info(f"[ExecutionChain] Completed tool node: {node.node_id}, status: {node.status}")
+            except Exception as e:
+                logger.warning(f"[ExecutionChain] Failed to complete tool node: {e}")
 
         return result
 
@@ -953,6 +1003,10 @@ class AgentLoop:
                 except asyncio.CancelledError:
                     raise  # Propagate for clean shutdown
                 except asyncio.TimeoutError:
+                    try:
+                        self._chain_monitor.end_chain(status="timeout")
+                    except Exception as _e:
+                        logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
                     logger.warning(f"Message processing timed out after {self.message_timeout}s")
                     timeout_text = (
                         "⏳ 当前任务处理时间较长。"
@@ -975,6 +1029,10 @@ class AgentLoop:
                         content=timeout_text,
                     ))
                 except Exception as e:
+                    try:
+                        self._chain_monitor.end_chain(status="failed")
+                    except Exception as _e:
+                        logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
                     logger.exception("Error processing message")
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
@@ -1045,6 +1103,15 @@ class AgentLoop:
         Returns:
             The response message, or None if no response needed.
         """
+        # 开始执行链路监控
+        chain = self._chain_monitor.start_chain(
+            session_key=msg.session_key,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            root_prompt=msg.content or ''
+        )
+        current_node_id = None  # 当前节点ID，用于追踪父子关系
+
         # 新请求开始前重置取消状态，确保该 session 可正常执行
         self._reset_cancel_event(msg.session_key)
         # Handle system messages (subagent announces)
@@ -1056,6 +1123,10 @@ class AgentLoop:
         # 当 manager 有挂起的决策时，该消息直接路由给对应的 Future，不走 LLM
         if self.claude_code_manager.resolve_decision(msg.session_key, msg.content):
             logger.info(f"Message routed as Claude Code decision reply for {msg.session_key}")
+            try:
+                self._chain_monitor.end_chain(status="completed")
+            except Exception as e:
+                logger.error(f"[ExecutionChain] Failed to end chain: {e}")
             return None
 
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
@@ -1068,6 +1139,10 @@ class AgentLoop:
             session.subagent_results.clear()
             self.sessions.save(session)
             logger.info(f"Session {msg.session_key} cleared by /clear command")
+            try:
+                self._chain_monitor.end_chain(status="completed")
+            except Exception as e:
+                logger.error(f"[ExecutionChain] Failed to end chain: {e}")
             return OutboundMessage(
                 channel=msg.channel,
                 chat_id=msg.chat_id,
@@ -1790,6 +1865,12 @@ class AgentLoop:
                     except Exception:
                         pass
 
+        # 结束执行链路监控（主流程正常完成），确保节点持久化
+        try:
+            self._chain_monitor.end_chain(status="completed")
+        except Exception as e:
+            logger.error(f"[ExecutionChain] Failed to end chain: {e}")
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -2195,6 +2276,12 @@ class AgentLoop:
             total_tokens=usage_acc["total_tokens"],
         )
         
+        # 结束执行链路监控
+        try:
+            self._chain_monitor.end_chain(status="completed")
+        except Exception as e:
+            logger.error(f"[ExecutionChain] Failed to end chain: {e}")
+
         return OutboundMessage(
             channel=origin_channel,
             chat_id=origin_chat_id,
@@ -2262,6 +2349,12 @@ class AgentLoop:
         except asyncio.CancelledError:
             logger.info("Agent request was cancelled")
             return ""
+        finally:
+            # 异常/取消时确保结束执行链路并持久化节点（正常返回时 _process_message 已调用）
+            try:
+                self._chain_monitor.end_chain(status="completed")
+            except Exception as e:
+                logger.error(f"[ExecutionChain] Failed to end chain: {e}")
     
     async def _handle_image_only(
         self,

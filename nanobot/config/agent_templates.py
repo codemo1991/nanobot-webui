@@ -29,6 +29,7 @@ class AgentTemplateConfig:
     skills: list[str] = field(default_factory=list)  # Skill names to load into subagent context
     is_system: bool = False  # True = system built-in, False = user created
     model: Optional[str] = None  # Optional: use specific model for this template
+    backend: Optional[str] = None  # Backend preference: "native" | "claude_code" | None (auto)
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     enabled: bool = True
@@ -62,6 +63,8 @@ class AgentTemplateConfig:
             result["skills"] = self.skills
         if self.model:
             result["model"] = self.model
+        if self.backend:
+            result["backend"] = self.backend
         return result
 
     def to_json(self) -> str:
@@ -74,6 +77,7 @@ class AgentTemplateConfig:
             "system_prompt": self.system_prompt,
             "skills": self.skills,
             "model": self.model,
+            "backend": self.backend,
             "enabled": self.enabled,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -91,6 +95,7 @@ class AgentTemplateConfig:
             system_prompt=data.get("system_prompt", ""),
             skills=data.get("skills", []),
             model=data.get("model"),
+            backend=data.get("backend"),
             is_system=is_system,
             enabled=data.get("enabled", True),
             created_at=data.get("created_at"),
@@ -164,6 +169,7 @@ class AgentTemplateManager:
                     "system_prompt": data["system_prompt"],
                     "skills": data.get("skills", []),
                     "model": None,
+                    "backend": data.get("backend"),  # 支持 backend 配置
                     "enabled": True,
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
@@ -247,7 +253,9 @@ class AgentTemplateManager:
                         "tools": data["tools"],
                         "rules": data["rules"],
                         "system_prompt": data["system_prompt"],
+                        "skills": data.get("skills", []),
                         "model": None,
+                        "backend": data.get("backend"),  # 支持 backend 配置
                         "enabled": True,
                         "created_at": datetime.now().isoformat(),
                         "updated_at": datetime.now().isoformat(),
