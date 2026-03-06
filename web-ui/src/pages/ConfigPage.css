@@ -2,16 +2,14 @@
   height: 100%;
   display: flex;
   flex-direction: column;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
   background: #f5f7fa;
 }
 
 .config-content-wrapper {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
@@ -45,6 +43,7 @@
 
 .config-tabs-container .ant-tabs-tabpane {
   height: 100%;
+  max-height: calc(100vh - 200px);
   overflow-y: auto;
   overflow-x: hidden;
   padding: 24px;
@@ -93,19 +92,23 @@
   overflow-x: hidden;
 }
 
+.config-tab-content::-webkit-scrollbar,
 .config-tabs-container .ant-tabs-tabpane::-webkit-scrollbar {
   width: 6px;
 }
 
+.config-tab-content::-webkit-scrollbar-track,
 .config-tabs-container .ant-tabs-tabpane::-webkit-scrollbar-track {
   background: transparent;
 }
 
+.config-tab-content::-webkit-scrollbar-thumb,
 .config-tabs-container .ant-tabs-tabpane::-webkit-scrollbar-thumb {
   background: #d9d9d9;
   border-radius: 3px;
 }
 
+.config-tab-content::-webkit-scrollbar-thumb:hover,
 .config-tabs-container .ant-tabs-tabpane::-webkit-scrollbar-thumb:hover {
   background: #bfbfbf;
 }
