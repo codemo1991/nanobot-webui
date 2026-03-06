@@ -8,6 +8,7 @@
                        "subtype": str, "content": str, "tool_name": str | None}
 - subagent_end   : {"type": "subagent_end", "task_id": str, "label": str,
                     "status": "ok" | "error", "summary": str}
+- stream_done    : {"type": "stream_done"}  # 该 origin_key 下所有子 agent 已结束，SSE 可断开
 
 origin_key 格式："{channel}:{chat_id}"，例如 "web:sess_abc123" 或 "feishu:oc_xxx"。
 """
@@ -107,6 +108,17 @@ class SubagentProgressBus:
         """清除指定 origin_key 的回放缓冲（会话结束后可调用释放内存）。"""
         with self._lock:
             self._buffers.pop(origin_key, None)
+
+    def trim_buffer(self, origin_key: str, keep_last: int = 5) -> None:
+        """
+        将缓冲裁剪为仅保留最后 keep_last 个事件。
+        用于任务完成后：新订阅者能 replay 到 subagent_end/summary/stream_done 等关键事件，
+        同时避免保留大量 subagent_progress 导致重连时一次性 replay 过多造成页面卡顿。
+        """
+        with self._lock:
+            buf = self._buffers.get(origin_key)
+            if buf and len(buf) > keep_last:
+                self._buffers[origin_key] = buf[-keep_last:]
 
     @contextmanager
     def subscription(

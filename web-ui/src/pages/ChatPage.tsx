@@ -313,19 +313,35 @@ function ChatPage() {
       } else if (evt.type === 'subagent_end') {
         // 提取需要的数据，避免在 setBgAgents 回调中访问联合类型的可能未定义属性
         const currentTaskId = evt.task_id
+        const currentLabel = evt.label
         const currentStatus = evt.status
         const currentSummary = evt.summary
         const currentResult = 'result' in evt ? evt.result : undefined
-        setBgAgents(prev => prev.map(a =>
-          a.taskId === currentTaskId
-            ? {
-              ...a,
-              status: currentStatus === 'ok' ? 'done' : currentStatus === 'timeout' ? 'timeout' : currentStatus === 'cancelled' ? 'cancelled' : 'error',
-              progress: currentSummary,
-              result: currentResult  // 保存完整结果
-            }
-            : a
-        ))
+        const currentBackend = ('backend' in evt && typeof evt.backend === 'string') ? evt.backend : 'unknown'
+        setBgAgents(prev => {
+          const existing = prev.find(a => a.taskId === currentTaskId)
+          if (existing) {
+            return prev.map(a =>
+              a.taskId === currentTaskId
+                ? {
+                    ...a,
+                    status: currentStatus === 'ok' ? 'done' : currentStatus === 'timeout' ? 'timeout' : currentStatus === 'cancelled' ? 'cancelled' : 'error',
+                    progress: currentSummary,
+                    result: currentResult,
+                  }
+                : a
+            )
+          }
+          // 未收到 subagent_start 时（如 trim_buffer 或连接时机导致），subagent_end 仍创建卡片以展示结果
+          return [...prev, {
+            taskId: currentTaskId,
+            label: currentLabel,
+            status: currentStatus === 'ok' ? 'done' : currentStatus === 'timeout' ? 'timeout' : currentStatus === 'cancelled' ? 'cancelled' : 'error',
+            progress: currentSummary,
+            backend: currentBackend,
+            result: currentResult,
+          }]
+        })
         // 发送浏览器通知提醒用户
         if (currentStatus === 'ok' && currentResult) {
           notifyTaskComplete(currentTaskId, currentResult)
@@ -354,6 +370,10 @@ function ChatPage() {
         console.log('[BgAgent] Appended subagent_summary, closed cards:', idsToRemove)
       } else if (evt.type === 'timeout') {
         console.log('[BgAgent] Received timeout event')
+        bgAgentsAbortRef.current = null
+        bgAgentsSessionRef.current = null
+      } else if (evt.type === 'stream_done') {
+        console.log('[BgAgent] All subagents finished, stream closed')
         bgAgentsAbortRef.current = null
         bgAgentsSessionRef.current = null
       }
