@@ -64,10 +64,15 @@ MEMORY_SUMMARIZE_PROMPT = """你是一个记忆整理助手。将以下长期记
 3. 精简表述，去除冗余；内容中避免使用 # 开头的行，以免被误解析
 4. 输出直接可写入长期记忆的 Markdown 列表格式，不要额外说明"""
 
-DAILY_EXTRACT_PROMPT = """你是一个记忆提取助手。从以下当日笔记中提取值得长期记住的信息。
+def _get_daily_extract_prompt(note_date_ymd: str) -> str:
+    """生成带日期的每日提取 prompt，确保 LLM 使用正确日期（通常为昨日，因处理的是昨日笔记）。"""
+    return f"""你是一个记忆提取助手。从以下笔记中提取值得长期记住的信息。
+
+**重要：笔记日期为 {note_date_ymd}**。输出中的日期必须使用此日期 {note_date_ymd}，不要从笔记内容推断其他日期。
+
 提取：用户偏好、重要决定、项目信息、习惯设定等跨天仍有价值的内容。
 忽略：临时待办、当天会议安排、一次性任务等。
-每条输出格式：- [YYYY-MM-DD HH:MM] 内容（使用当前时间，如果笔记没有明确时间则用 00:00）
+每条输出格式：- [{note_date_ymd} HH:MM] 内容（时间若笔记无明确说明则用 00:00）
 内容中避免使用 # 开头的行。
 若无值得长期记忆的内容，输出空。输出直接可追加到长期记忆的 Markdown 列表格式，不要额外说明"""
 
@@ -229,8 +234,9 @@ class MemoryMaintenanceService:
         logger.info("Daily merge: extracting from {} (scope={})", yesterday, self.scope)
 
         try:
+            prompt = _get_daily_extract_prompt(yesterday)
             extracted = await _call_llm_with_retry(
-                self.provider, self.model, content, DAILY_EXTRACT_PROMPT
+                self.provider, self.model, content, prompt
             )
             if not extracted or not extracted.strip():
                 return
