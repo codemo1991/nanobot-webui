@@ -168,6 +168,7 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
         from nanobot.storage.main_agent_prompt_repository import MainAgentPromptRepository
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        today_ymd = datetime.now().strftime("%Y-%m-%d")
         workspace_path = str(self.workspace.expanduser().resolve())
 
         # 动态构建模板描述
@@ -188,8 +189,11 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
 
         runtime_suffix = f"""
 
-## Current Time
-{now}
+## 今日日期（重要）
+**Today's Date**: {today_ymd}
+当前时间: {now}
+
+进行记录、日记、笔记、记忆等操作时，必须使用上述今日日期 {today_ymd}，不要基于对话历史或上下文推断日期。
 
 ## Workspace
 {workspace_path}
