@@ -323,7 +323,7 @@ function ProvidersConfig() {
     form.setFieldsValue({
       type: provider.type,
       name: provider.name,
-      apiKey: '', // Don't show existing key
+      apiKey: provider.apiKey || '',
       apiBase: provider.apiBase
     })
     setModalVisible(true)
@@ -378,6 +378,7 @@ function ProvidersConfig() {
     { value: 'dashscope', label: 'Qwen (通义 / DashScope)' },
     { value: 'gemini', label: 'Gemini' },
     { value: 'vllm', label: 'vLLM' },
+    { value: 'moonshot', label: 'Moonshot (Kimi)' },
   ]
 
   return (

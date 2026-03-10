@@ -3770,13 +3770,13 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 # 从请求体获取 session 信息
                 channel = "web"  # 默认
                 session_id = None
-                if method == "POST" and body:
-                    try:
-                        body_data = json.loads(body) if isinstance(body, str) else body
+                try:
+                    body_data = self._read_json()
+                    if body_data:
                         channel = body_data.get("channel", "web")
                         session_id = body_data.get("sessionId")
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                except (json.JSONDecodeError, TypeError):
+                    pass
                 app.agent.cancel_current_request(channel=channel, session_id=session_id)
                 self._write_json(HTTPStatus.OK, _ok({"stopped": True}))
             except Exception as e:

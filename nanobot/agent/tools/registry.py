@@ -6,6 +6,11 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.tool_errors import (
+    format_invalid_params,
+    format_tool_error,
+    format_tool_not_found,
+)
 from nanobot.agent.tools.base import Tool
 
 
@@ -56,23 +61,21 @@ class ToolRegistry:
             params: Tool parameters.
 
         Returns:
-            Tool execution result as string.
-
-        Raises:
-            KeyError: If tool not found.
+            Tool execution result as string. 错误时返回标准化格式：
+            [RETRYABLE] 可重试 / [ERROR] 永久性错误，便于 LLM 区分。
         """
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found"
+            return format_tool_not_found(name)
 
         try:
             errors = tool.validate_params(params)
             if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors)
+                return format_invalid_params(name, errors)
             return await tool.execute(**params)
         except Exception as e:
             logger.exception(f"Tool execution failed: {name}")
-            return f"Error executing {name}: {str(e)}"
+            return format_tool_error(name, e)
 
     def set_thread_pool(self, executor: ThreadPoolExecutor) -> None:
         """设置线程池执行器（用于CPU密集型任务）"""
@@ -97,12 +100,12 @@ class ToolRegistry:
 
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found"
+            return format_tool_not_found(name)
 
         try:
             errors = tool.validate_params(params)
             if errors:
-                return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors)
+                return format_invalid_params(name, errors)
 
             # 将异步工具包装为在线程池中同步执行
             # 注意：不能在已有 event loop 的线程中用 asyncio.run()，需创建新 loop
@@ -120,7 +123,7 @@ class ToolRegistry:
             return await loop.run_in_executor(effective_executor, _run_async_in_thread)
         except Exception as e:
             logger.exception(f"Tool execution failed in thread pool: {name}")
-            return f"Error executing {name}: {str(e)}"
+            return format_tool_error(name, e)
     
     @property
     def tool_names(self) -> list[str]:

@@ -27,6 +27,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.tools.get_subagent_results import GetSubagentResultsTool
+from nanobot.agent.tool_errors import format_tool_error
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.utils.helpers import parse_session_key
@@ -571,7 +572,7 @@ class AgentLoop:
                 return (tc, result)
             except Exception as e:
                 logger.exception(f"Tool execution failed in parallel: {tc.name}")
-                return (tc, f"Error executing {tc.name}: {str(e)}")
+                return (tc, format_tool_error(tc.name, e))
 
         # 使用 asyncio.gather 并行执行，捕获异常避免整体失败
         results = await asyncio.gather(
@@ -579,12 +580,12 @@ class AgentLoop:
             return_exceptions=True
         )
 
-        # 处理异常结果
+        # 处理异常结果（gather return_exceptions=True 时，协程未捕获的异常会作为 Exception 返回）
         processed_results = []
         for r in results:
             if isinstance(r, Exception):
                 logger.error(f"Parallel tool execution exception: {r}")
-                processed_results.append((None, f"Error: {str(r)}"))
+                processed_results.append((None, format_tool_error("parallel_tool", r)))
             else:
                 processed_results.append(r)
 
@@ -629,7 +630,9 @@ class AgentLoop:
 
         if progress:
             try:
-                progress({"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments})
+                evt = {"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments}
+                progress(evt)
+                progress({**evt, "type": "tool_execution_start"})  # 细粒度事件流
                 logger.info(f"[ToolProgress] Sent tool_start event: {tool_call.name}")
             except Exception:
                 pass
@@ -669,7 +672,9 @@ class AgentLoop:
         if progress:
             try:
                 truncated = _truncate(result)
-                progress({"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated})
+                evt = {"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated}
+                progress(evt)
+                progress({**evt, "type": "tool_execution_end"})  # 细粒度事件流
             except Exception:
                 pass
 
@@ -1286,6 +1291,8 @@ class AgentLoop:
 
         # Batch 模式：记录本轮 spawn 的 task_id，等待完成后聚合返回
         spawned_task_ids: list[str] = []
+        # 已注入 messages 的 subagent task_id，避免重复注入
+        _injected_subagent_task_ids: set[str] = set()
 
         def _truncate(val: str, max_len: int | None = None) -> str:
             if not isinstance(val, str):
@@ -1309,8 +1316,27 @@ class AgentLoop:
             usage_acc["completion_tokens"] += max(0, int(usage.get("completion_tokens", 0) or 0))
             usage_acc["total_tokens"] += max(0, int(usage.get("total_tokens", 0) or 0))
 
+        def _emit(evt: dict[str, Any]) -> None:
+            """安全发送进度事件（细粒度事件流，兼容 pi-agent 风格）。"""
+            progress = msg.metadata.get("progress_callback")
+            if progress:
+                try:
+                    progress(evt)
+                except Exception:
+                    pass
+
+        # 细粒度事件流：agent_start
+        _emit({"type": "agent_start", "iteration": 0})
+
+        # 细粒度事件流：message_start/end (user) - 用户消息已纳入 context
+        _emit({"type": "message_start", "role": "user", "content": (current_message or "")[:200]})
+        _emit({"type": "message_end", "role": "user"})
+
         while iteration < self.max_iterations:
             iteration += 1
+
+            # 细粒度事件流：turn_start
+            _emit({"type": "turn_start", "iteration": iteration})
             
             await self._check_cancelled(sk)
 
@@ -1320,15 +1346,44 @@ class AgentLoop:
                 if elapsed >= self.max_execution_time:
                     logger.info("Max execution time %ds reached (elapsed %.0fs)", self.max_execution_time, elapsed)
                     exit_reason = "time"
+                    _emit({"type": "turn_end", "iteration": iteration})
                     break
 
-            # Notify progress: thinking / about to call LLM
-            progress = msg.metadata.get("progress_callback")
-            if progress:
-                try:
-                    progress({"type": "thinking"})
-                except Exception:
-                    pass
+            # 方案 A：有上一轮 spawn 时，先等待完成，再将子 Agent 结果注入 messages（便于 vision -> claude_code 等链式调用）
+            if iteration > 1 and spawned_task_ids and self.subagents:
+                running_spawns = [
+                    tid for tid in spawned_task_ids
+                    if tid in self.subagents._running_tasks
+                ]
+                if running_spawns:
+                    logger.info(f"[SubagentInject] Waiting for spawn tasks before LLM call: {running_spawns}")
+                    try:
+                        await self._wait_for_subagents(running_spawns, timeout=120.0)
+                        logger.info("[SubagentInject] Spawn tasks completed")
+                    except asyncio.TimeoutError:
+                        logger.warning("[SubagentInject] Timeout waiting for spawn tasks")
+
+                # 注入已完成且尚未注入的子 Agent 结果
+                to_inject = [
+                    tid for tid in spawned_task_ids
+                    if tid not in _injected_subagent_task_ids
+                    and tid in session.subagent_results
+                ]
+                if to_inject:
+                    parts = ["[子 Agent 已完成] 以下是已完成的子 Agent 执行结果，请基于这些结果继续处理用户请求：\n"]
+                    for tid in to_inject:
+                        sa = session.subagent_results[tid]
+                        label = sa.get("label", "任务")
+                        task = sa.get("task", "")[:200]
+                        result = (sa.get("result") or "")[:1500]
+                        parts.append(f"\n### {label}\n- 任务: {task}\n- 结果:\n{result}")
+                        _injected_subagent_task_ids.add(tid)
+                    inject_content = "\n".join(parts)
+                    messages.append({"role": "user", "content": inject_content})
+                    logger.info(f"[SubagentInject] Injected {len(to_inject)} subagent results into messages: {to_inject}")
+
+            # 细粒度事件流：thinking
+            _emit({"type": "thinking"})
             # Call LLM（单次最长 120 秒，等待期间每 2 秒检查一次取消）
             _LLM_CALL_TIMEOUT = 120
             _CANCEL_CHECK_INTERVAL = 2.0
@@ -1378,8 +1433,13 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 logger.warning("LLM call timed out after %ds, breaking agent loop", _LLM_CALL_TIMEOUT)
                 exit_reason = "time"
+                _emit({"type": "turn_end", "iteration": iteration})
                 break
             _accumulate_usage(response.usage)
+
+            # 细粒度事件流：message_start/end (assistant)
+            _emit({"type": "message_start", "role": "assistant", "content": (response.content or "")[:200]})
+            _emit({"type": "message_end", "role": "assistant", "has_tool_calls": response.has_tool_calls})
 
             # 记录 LLM 调用指标
             if self._status_service:
@@ -1455,6 +1515,7 @@ class AgentLoop:
                             })
                     loop_detected = True
                     exit_reason = "loop"
+                    _emit({"type": "turn_end", "iteration": iteration})
                     break
 
                 # 执行前检查取消，避免工具执行期间无法响应停止
@@ -1603,6 +1664,12 @@ class AgentLoop:
                             "arguments": tool_call.arguments,
                             "result": _truncate(result),
                         })
+                        # 非 Batch 路径也需记录 task_id，否则 Round 2 无法等待/注入（vision -> claude_code 链式调用）
+                        task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
+                        if task_id_match:
+                            task_id = task_id_match.group(1) or task_id_match.group(2)
+                            spawned_task_ids.append(task_id)
+                            logger.info(f"[Spawn] Recorded task_id for inject: {task_id}")
                         logger.info(f"[BatchMode] Spawn result added to messages (final result will be synthesized later)")
                         continue
 
@@ -1646,7 +1713,6 @@ class AgentLoop:
                         # 从返回结果中提取 task_id
                         # 格式1: "Subagent [label] started (id: {task_id})."
                         # 格式2: "Continuing subagent session [{task_id}]."
-                        import re
                         task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
                         if task_id_match:
                             task_id = task_id_match.group(1) or task_id_match.group(2)
@@ -1665,15 +1731,24 @@ class AgentLoop:
 
                 if loop_detected:
                     exit_reason = "loop"
+                    _emit({"type": "turn_end", "iteration": iteration})
                     break
+
+                # 有 tool calls 且未 break：本轮结束，继续下一轮
+                _emit({"type": "turn_end", "iteration": iteration})
             else:
                 # No tool calls, we're done
                 final_content = response.content
+                _emit({"type": "turn_end", "iteration": iteration})
                 break
+
+        # 细粒度事件流：agent_end
+        _emit({"type": "agent_end", "exit_reason": exit_reason, "final_content_preview": (final_content or "")[:100]})
 
         # 非阻塞 Batch 模式：spawn 后立即返回，不等待子 Agent 完成
         # 子 Agent 完成后会触发综合并通过 SSE 推送结果
-        if spawned_task_ids:
+        # 若已注入过子 Agent 结果（方案 A：vision -> claude_code 链式调用），则返回 LLM 合成结果，不覆盖
+        if spawned_task_ids and not _injected_subagent_task_ids:
             logger.info(f"[BatchMode] Non-blocking mode: spawn {len(spawned_task_ids)} tasks, returning immediately")
             # 直接返回 spawn 的结果，不再继续 LLM 调用
             # 使用 spawn 返回的消息（已经在 response.content 中）
@@ -1693,12 +1768,7 @@ class AgentLoop:
                 # Hit max_iterations with only tool calls - force one final LLM call without tools
                 # to get a proper summary/response instead of generic fallback
                 logger.info("Max iterations reached with no text response; requesting final synthesis (no tools)")
-                progress = msg.metadata.get("progress_callback")
-                if progress:
-                    try:
-                        progress({"type": "thinking"})
-                    except Exception:
-                        pass
+                _emit({"type": "thinking"})
                 # 综合调用限时 60 秒，等待期间检查取消
                 _SYNTHESIS_TIMEOUT = 60
                 try:
@@ -2036,7 +2106,8 @@ class AgentLoop:
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
         self._reset_cancel_event(session_key)
-        logger.info(f"[SystemMessage] Using session: {session_key}, message_preview={msg.content[:100]}...")
+        _preview = msg.content[:5000] + (f"... (共 {len(msg.content)} 字)" if len(msg.content) > 5000 else "")
+        logger.info(f"[SystemMessage] Using session: {session_key}, message_preview=\n{_preview}")
         
         # Update tool contexts
         message_tool = self.tools.get("message")
