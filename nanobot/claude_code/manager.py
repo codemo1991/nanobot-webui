@@ -289,6 +289,8 @@ class ClaudeCodeManager:
         final_result = ""
         logger.info(f"Claude Code task [{task_id}] started (SDK): {prompt[:200]}")
 
+        _first_message_logged = False
+
         def _fire_progress(payload: dict) -> None:
             if progress_callback:
                 try:
@@ -303,9 +305,16 @@ class ClaudeCodeManager:
             yield {"type": "user", "message": {"role": "user", "content": prompt}}
 
         async def _run_query() -> None:
-            nonlocal final_result, _not_logged_in
+            nonlocal final_result, _not_logged_in, _first_message_logged
+            logger.info(f"Claude Code [{task_id}] entering query() async iterator...")
             async for message in query(prompt=_prompt_stream(), options=options):
+                if not _first_message_logged:
+                    _first_message_logged = True
+                    logger.info(f"Claude Code [{task_id}] first message received: {type(message).__name__}")
                 msg_type = type(message).__name__
+                # 关键进度：AssistantMessage=Claude 开始输出，ResultMessage=最终结果
+                if msg_type in ("AssistantMessage", "ResultMessage"):
+                    logger.info(f"Claude Code [{task_id}] received {msg_type}")
                 if msg_type == "AssistantMessage":
                     for block in message.content:
                         block_type = type(block).__name__

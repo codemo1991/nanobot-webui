@@ -215,7 +215,7 @@ class SpawnTool(Tool):
         # 但是要排除占位符如 "[图片]" 等
         if self._user_original_message and self._user_original_message.strip() not in ("[图片]", "[语音]", "[文件]", "[空消息]", ""):
             task = self._user_original_message
-            logger.info(f"[SpawnTool] Using user original message as task (forced): {task[:100]}...")
+            logger.info(f"[SpawnTool] Using user original message as task (forced):\n{task}")
         else:
             # 用户只发送了媒体文件（图片/语音）而没有文字，使用传入的 task 参数
             # 这是正常情况，比如用户只发了张图片然后说"分析一下"
@@ -223,7 +223,7 @@ class SpawnTool(Tool):
 
         # 详细日志：spawn 参数
         logger.info(f"[SpawnTool] === SPAWN CALLED ===")
-        logger.info(f"[SpawnTool] task: {task[:100]}..." if len(task) > 100 else f"[SpawnTool] task: {task}")
+        logger.info(f"[SpawnTool] task:\n{task}")
         logger.info(f"[SpawnTool] label: {label}, template: {template}, backend: {backend}")
         logger.info(f"[SpawnTool] enable_memory: {enable_memory}, attach_media: {bool(media)}, media_count: {len(media) if media else 0}")
         logger.info(f"[SpawnTool] origin: {self._origin_channel}:{self._origin_chat_id}, batch_id: {self._batch_id}")
