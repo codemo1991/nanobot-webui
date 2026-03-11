@@ -53,6 +53,9 @@ def load_config() -> Config:
     try:
         config_data = repo.load_full_config()
         data = convert_keys(config_data)
+        # 移除 Config  schema 中不存在的扩展字段，避免 Pydantic extra_forbidden 校验失败
+        for key in ("models", "model_profiles"):
+            data.pop(key, None)
         return Config.model_validate(data)
     except Exception as e:
         logger.warning(f"Failed to load config from SQLite: {e}, using defaults")

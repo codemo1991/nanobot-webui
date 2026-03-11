@@ -929,6 +929,13 @@ class FeishuChannel(BaseChannel):
                 )
                 return
 
+            # 启动子 Agent 进度监听，用于 spawn/claude_code 等后台任务的实时进度展示
+            if reply_to not in self._subagent_watcher_tasks:
+                watcher = asyncio.create_task(
+                    self._watch_subagent_progress(reply_to, receive_id_type)
+                )
+                self._subagent_watcher_tasks[reply_to] = watcher
+
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -937,8 +944,7 @@ class FeishuChannel(BaseChannel):
                 metadata=metadata,
             )
 
-            # 飞书不单独监听子 Agent 进度，避免消息分裂。
-            # 子 agent 完成后通过 _announce_result 通知主 agent，主 agent 统一 publish_outbound 推送结果。
+            # 子 agent 完成后通过 _announce_result 通知主 agent，主 agent 统一 publish_outbound 推送结果
 
         except Exception:
             logger.exception("Error processing Feishu message")

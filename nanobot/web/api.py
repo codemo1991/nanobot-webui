@@ -24,9 +24,11 @@ from loguru import logger
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.bus.queue import MessageBus
+from nanobot.config.defaults import init_default_profiles, init_default_agent_config
 from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.providers.router import ModelRouter
 from nanobot.services.mirror_service import MirrorService
 from nanobot.services.system_status_service import SystemStatusService
 from nanobot.session.manager import SessionManager
@@ -56,29 +58,37 @@ class NanobotWebAPI:
         # Logging configured by setup_logging() in CLI main callback
         config = ensure_initial_config()
 
+        # Initialize config repository and ensure default profiles exist
+        repo = get_config_repository()
+        init_default_profiles(repo)
+        init_default_agent_config(repo)
+
+        # Initialize ModelRouter - the new unified model resolution
+        self.router = ModelRouter(repo)
+
+        # Check if we have any usable models
+        try:
+            self.default_profile = repo.get_config_value("agent", "default_profile", "smart")
+            handle = self.router.get(self.default_profile)
+            logger.info(f"ModelRouter initialized with default profile: {self.default_profile}")
+        except Exception as e:
+            logger.warning(
+                f"No usable model configuration found: {e}. "
+                "Please configure providers and models via the Config page."
+            )
+            # Create a dummy router that will fail gracefully
+            handle = None
+
+        # Keep provider for backward compatibility during migration
+        # TODO: Remove after full migration to ModelRouter
         model = config.agents.defaults.model
         api_key = config.get_api_key(model)
         api_base = config.get_api_base(model)
-        is_bedrock = model.startswith("bedrock/")
-        if not api_key and not is_bedrock:
-            logger.warning(
-                "No API key configured. Web UI will start; configure providers.*.apiKey "
-                "via the Config page to use chat."
-            )
-
         provider = LiteLLMProvider(
             api_key=api_key,
             api_base=api_base,
-            default_model=config.agents.defaults.model,
+            default_model=model,
         )
-
-        subagent_model_cfg = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
-        if subagent_model_cfg:
-            sa_key = config.get_api_key(subagent_model_cfg)
-            if sa_key:
-                provider.ensure_api_key_for_model(
-                    subagent_model_cfg, sa_key, config.get_api_base(subagent_model_cfg)
-                )
 
         # Initialize system status service first (needed by AgentLoop)
         # 优先使用 workspace 特定的数据库，否则使用默认数据库
@@ -124,6 +134,9 @@ class NanobotWebAPI:
             thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
             status_service=self.status_service,
             agent_template_manager=self.agent_template_manager,
+            # 新架构：传入 ModelRouter
+            router=self.router,
+            default_profile=self.default_profile,
         )
         self.sessions = self.agent.sessions
 
@@ -1439,19 +1452,24 @@ class NanobotWebAPI:
             "dashscope": "Qwen (通义)",
             "gemini": "Gemini",
             "vllm": "vLLM",
+            "ollama": "Ollama",
             "minimax": "Minimax",
         }
         providers = []
-        for provider_name in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'minimax']:
+        for provider_name in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
             provider_config = getattr(config.providers, provider_name)
             if provider_config.api_key or provider_config.api_base:
+                # Ollama 仅需 api_base 即可启用
+                enabled = bool(provider_config.api_key) or (
+                    provider_name == "ollama" and provider_config.api_base
+                )
                 providers.append({
                     "id": provider_name,
                     "name": provider_display_names.get(provider_name, provider_name.capitalize()),
                     "type": provider_name,
                     "apiKey": "***" if provider_config.api_key else None,
                     "apiBase": provider_config.api_base,
-                    "enabled": bool(provider_config.api_key),
+                    "enabled": enabled,
                 })
         
         # Create default model entry
@@ -1530,7 +1548,7 @@ class NanobotWebAPI:
         config = load_config()
         provider_type = data.get("type", "").lower()
         
-        if not provider_type or provider_type not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'minimax']:
+        if not provider_type or provider_type not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
             raise ValueError("Invalid provider type")
         
         provider_config = getattr(config.providers, provider_type)
@@ -1540,20 +1558,23 @@ class NanobotWebAPI:
         from nanobot.config.loader import save_config
         save_config(config)
         
+        enabled = bool(provider_config.api_key) or (
+            provider_type == "ollama" and provider_config.api_base
+        )
         return {
             "id": provider_type,
             "name": data.get("name", provider_type.capitalize()),
             "type": provider_type,
             "apiBase": provider_config.api_base,
             "apiKey": "***" if provider_config.api_key else None,
-            "enabled": bool(provider_config.api_key),
+            "enabled": enabled,
         }
 
     def update_provider(self, provider_id: str, data: dict[str, Any]) -> dict[str, Any]:
         """Update AI provider configuration."""
         config = load_config()
         
-        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'minimax']:
+        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
             raise KeyError("Provider not found")
         
         provider_config = getattr(config.providers, provider_id)
@@ -1565,20 +1586,31 @@ class NanobotWebAPI:
         from nanobot.config.loader import save_config
         save_config(config)
         
+        # 若当前默认模型使用此 provider，热更新 agent 的 provider 配置
+        model_name = config.agents.defaults.model
+        if model_name and model_name.split("/")[0] == provider_id:
+            if hasattr(self.agent.provider, "update_config"):
+                api_key = config.get_api_key(model_name)
+                api_base = config.get_api_base(model_name)
+                self.agent.provider.update_config(model_name, api_key, api_base)
+        
+        enabled = bool(provider_config.api_key) or (
+            provider_id == "ollama" and provider_config.api_base
+        )
         return {
             "id": provider_id,
             "name": data.get("name", provider_id.capitalize()),
             "type": provider_id,
             "apiBase": provider_config.api_base,
             "apiKey": "***" if provider_config.api_key else None,
-            "enabled": bool(provider_config.api_key),
+            "enabled": enabled,
         }
 
     def delete_provider(self, provider_id: str) -> bool:
         """Disable AI provider configuration."""
         config = load_config()
         
-        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'minimax']:
+        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
             return False
         
         provider_config = getattr(config.providers, provider_id)
@@ -3238,8 +3270,56 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/v1/models":
-                config_data = app.get_config()
-                self._write_json(HTTPStatus.OK, _ok(config_data["models"]))
+                # New model router API - return detailed model info
+                from nanobot.config.loader import get_config_repository
+                repo = get_config_repository()
+                models = repo.get_all_models()
+                # Convert snake_case to camelCase for frontend compatibility
+                models_camel = [{
+                    "id": m["id"],
+                    "providerId": m["provider_id"],
+                    "name": m["name"],
+                    "litellmId": m["litellm_id"],
+                    "aliases": m["aliases"],
+                    "capabilities": m["capabilities"],
+                    "contextWindow": m["context_window"],
+                    "costRank": m["cost_rank"],
+                    "qualityRank": m["quality_rank"],
+                    "enabled": m["enabled"],
+                    "isDefault": m["is_default"],
+                } for m in models]
+                self._write_json(HTTPStatus.OK, _ok(models_camel))
+                return
+
+            # GET /api/v1/model-profiles - Get model profiles
+            if path == "/api/v1/model-profiles":
+                from nanobot.config.loader import get_config_repository
+                repo = get_config_repository()
+                profiles = repo.get_all_model_profiles()
+                self._write_json(HTTPStatus.OK, _ok(profiles))
+                return
+
+            # GET /api/v1/providers/{providerId}/discover - Discover models from provider
+            if len(parts) == 5 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "providers" and parts[4] == "discover":
+                provider_id = parts[3]
+                from nanobot.providers.discovery import ModelDiscoveryService
+                from nanobot.config.loader import get_config_repository
+                repo = get_config_repository()
+                discovery = ModelDiscoveryService(repo)
+                import asyncio
+                try:
+                    models = asyncio.run(discovery.discover_and_save(provider_id))
+                    self._write_json(HTTPStatus.OK, _ok([{
+                        "id": m.id,
+                        "name": m.name,
+                        "litellmId": m.litellm_id,
+                        "aliases": m.aliases,
+                        "capabilities": m.capabilities,
+                        "contextWindow": m.context_window,
+                    } for m in models]))
+                except Exception as e:
+                    logger.exception(f"Failed to discover models for {provider_id}")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("DISCOVERY_FAILED", str(e)))
                 return
 
             if path == "/api/v1/mcps":
@@ -3846,20 +3926,90 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MCP_NOT_FOUND", "MCP 不存在"))
             return
 
-        # POST /api/v1/models - Create model
+        # POST /api/v1/models - Create model manually
         if path == "/api/v1/models":
             body = self._read_json()
             try:
-                data = app.create_model(body)
-                self._write_json(HTTPStatus.CREATED, _ok(data))
-            except ValueError as e:
+                from nanobot.config.loader import get_config_repository
+                repo = get_config_repository()
+                repo.set_model(
+                    model_id=body["id"],
+                    provider_id=body["providerId"],
+                    name=body["name"],
+                    litellm_id=body["litellmId"],
+                    aliases=body.get("aliases", ""),
+                    capabilities=body.get("capabilities", ""),
+                    context_window=body.get("contextWindow", 128000),
+                    cost_rank=body.get("costRank"),
+                    quality_rank=body.get("qualityRank"),
+                    enabled=body.get("enabled", True),
+                    is_default=body.get("isDefault", False),
+                )
+                self._write_json(HTTPStatus.CREATED, _ok({"success": True}))
+            except Exception as e:
+                logger.exception("Failed to create model")
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
+
+        # POST /api/v1/model-profiles - Create profile
+        if path == "/api/v1/model-profiles":
+            body = self._read_json()
+            try:
+                from nanobot.config.loader import get_config_repository
+                repo = get_config_repository()
+                repo.set_model_profile(
+                    profile_id=body["id"],
+                    name=body["name"],
+                    description=body.get("description", ""),
+                    model_chain=body["modelChain"],
+                    rules=body.get("rules", ""),
+                    enabled=body.get("enabled", True),
+                )
+                # Clear router cache
+                if hasattr(app, 'router'):
+                    app.router.clear_cache()
+                self._write_json(HTTPStatus.CREATED, _ok({"success": True}))
+            except Exception as e:
+                logger.exception("Failed to create profile")
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
             return
 
         # POST /api/v1/models/{modelId}/set-default
         if len(parts) == 5 and parts[:3] == ["api", "v1", "models"] and parts[4] == "set-default":
             model_id = parts[3]
-            app.update_model(model_id, {"isDefault": True})
+            from nanobot.config.loader import get_config_repository
+            repo = get_config_repository()
+            model = repo.get_model(model_id)
+            if model:
+                repo.set_model(
+                    model_id=model_id,
+                    provider_id=model["provider_id"],
+                    name=model["name"],
+                    litellm_id=model["litellm_id"],
+                    aliases=model.get("aliases", ""),
+                    capabilities=model.get("capabilities", ""),
+                    context_window=model.get("context_window", 128000),
+                    cost_rank=model.get("cost_rank"),
+                    quality_rank=model.get("quality_rank"),
+                    enabled=model.get("enabled", True),
+                    is_default=True,
+                )
+                # Clear other models' default status for this provider
+                for m in repo.get_all_models(model["provider_id"]):
+                    if m["id"] != model_id:
+                        repo.set_model(
+                            model_id=m["id"],
+                            provider_id=m["provider_id"],
+                            name=m["name"],
+                            litellm_id=m["litellm_id"],
+                            aliases=m.get("aliases", ""),
+                            capabilities=m.get("capabilities", ""),
+                            context_window=m.get("context_window", 128000),
+                            cost_rank=m.get("cost_rank"),
+                            quality_rank=m.get("quality_rank"),
+                            enabled=m.get("enabled", True),
+                            is_default=False,
+                        )
             self._write_json(HTTPStatus.OK, _ok({"success": True}))
             return
 
@@ -4468,6 +4618,36 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.NOT_FOUND, _err("PROVIDER_NOT_FOUND", "Provider 不存在"))
             return
 
+        # DELETE /api/v1/models/{modelId}
+        if len(parts) == 4 and parts[:3] == ["api", "v1", "models"]:
+            model_id = parts[3]
+            from nanobot.config.loader import get_config_repository
+            repo = get_config_repository()
+            deleted = repo.delete_model(model_id)
+            if deleted:
+                self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
+            else:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MODEL_NOT_FOUND", "模型不存在"))
+            return
+
+        # DELETE /api/v1/model-profiles/{profileId}
+        if len(parts) == 4 and parts[:3] == ["api", "v1", "model-profiles"]:
+            profile_id = parts[3]
+            from nanobot.config.loader import get_config_repository
+            repo = get_config_repository()
+            # Prevent deletion of system profiles
+            if profile_id in ["smart", "fast", "coding", "summarize"]:
+                self._write_json(HTTPStatus.FORBIDDEN, _err("CANNOT_DELETE_SYSTEM_PROFILE", "不能删除系统预设场景"))
+                return
+            deleted = repo.delete_model_profile(profile_id)
+            if deleted:
+                if hasattr(app, 'router'):
+                    app.router.clear_cache()
+                self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
+            else:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("PROFILE_NOT_FOUND", "场景配置不存在"))
+            return
+
         # ==================== Cron DELETE ====================
 
         # DELETE /api/v1/cron/jobs/{jobId}
@@ -4632,9 +4812,56 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             model_id = parts[3]
             body = self._read_json()
             try:
-                data = app.update_model(model_id, body)
-                self._write_json(HTTPStatus.OK, _ok(data))
-            except ValueError as e:
+                from nanobot.config.loader import get_config_repository
+                repo = get_config_repository()
+                existing = repo.get_model(model_id)
+                if not existing:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("MODEL_NOT_FOUND", "模型不存在"))
+                    return
+                repo.set_model(
+                    model_id=model_id,
+                    provider_id=body.get("providerId", existing["provider_id"]),
+                    name=body.get("name", existing["name"]),
+                    litellm_id=body.get("litellmId", existing["litellm_id"]),
+                    aliases=body.get("aliases", existing.get("aliases", "")),
+                    capabilities=body.get("capabilities", existing.get("capabilities", "")),
+                    context_window=body.get("contextWindow", existing.get("context_window", 128000)),
+                    cost_rank=body.get("costRank", existing.get("cost_rank")),
+                    quality_rank=body.get("qualityRank", existing.get("quality_rank")),
+                    enabled=body.get("enabled", existing.get("enabled", True)),
+                    is_default=body.get("isDefault", existing.get("is_default", False)),
+                )
+                self._write_json(HTTPStatus.OK, _ok({"success": True}))
+            except Exception as e:
+                logger.exception("Failed to update model")
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
+
+        # PUT /api/v1/model-profiles/{profileId}
+        if len(parts) == 4 and parts[:3] == ["api", "v1", "model-profiles"]:
+            profile_id = parts[3]
+            body = self._read_json()
+            try:
+                from nanobot.config.loader import get_config_repository
+                repo = get_config_repository()
+                existing = repo.get_model_profile(profile_id)
+                if not existing:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("PROFILE_NOT_FOUND", "场景配置不存在"))
+                    return
+                repo.set_model_profile(
+                    profile_id=profile_id,
+                    name=body.get("name", existing["name"]),
+                    description=body.get("description", existing.get("description", "")),
+                    model_chain=body.get("modelChain", existing["model_chain"]),
+                    rules=body.get("rules", existing.get("rules", "")),
+                    enabled=body.get("enabled", existing.get("enabled", True)),
+                )
+                # Clear router cache
+                if hasattr(app, 'router'):
+                    app.router.clear_cache()
+                self._write_json(HTTPStatus.OK, _ok({"success": True}))
+            except Exception as e:
+                logger.exception("Failed to update profile")
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
             return
 

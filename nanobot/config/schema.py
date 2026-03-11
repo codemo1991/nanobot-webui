@@ -113,6 +113,7 @@ class ProvidersConfig(BaseModel):
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # Qwen via Aliyun DashScope
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # 本地 Ollama，OpenAI 兼容 API
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
 
@@ -223,12 +224,13 @@ class Config(BaseSettings):
         ("gemini/", "gemini"): "gemini",
         ("groq/", "groq"): "groq",
         ("vllm/", "vllm"): "vllm",
+        ("ollama/", "ollama"): "ollama",
         ("minimax/", "minimax"): "minimax",
     }
     
     _FALLBACK_PROVIDER_ORDER: list[str] = [
         "openrouter", "deepseek", "anthropic", "openai",
-        "gemini", "zhipu", "dashscope", "groq", "vllm", "minimax"
+        "gemini", "zhipu", "dashscope", "groq", "vllm", "ollama", "minimax"
     ]
     
     _MODEL_API_BASE_MAP: dict[str, str | None] = {
@@ -241,6 +243,7 @@ class Config(BaseSettings):
         "gemini": None,
         "groq": None,
         "vllm": None,
+        "ollama": "http://localhost:11434/v1",  # Ollama 默认 OpenAI 兼容端点
         "minimax": "https://api.minimax.chat/v1",
     }
 
@@ -257,17 +260,27 @@ class Config(BaseSettings):
         """
         Get API key for the given model, or first available in priority order.
         When model is specified, returns the key for the matching provider.
+        Ollama 本地服务不需要真实 key，用占位符 "ollama"。
         """
         provider = self._get_provider_for_model(model)
         if provider:
             key = getattr(self.providers, provider).api_key
             if key:
                 return key
+            # Ollama 仅需 api_base，key 可为空
+            if provider == "ollama":
+                return "ollama"
         
         for fallback_provider in self._FALLBACK_PROVIDER_ORDER:
             key = getattr(self.providers, fallback_provider).api_key
             if key:
                 return key
+            # Ollama 仅需 api_base，无 key 时用占位符
+            if fallback_provider == "ollama" and (
+                getattr(self.providers.ollama, "api_base", None)
+                or self._MODEL_API_BASE_MAP.get("ollama")
+            ):
+                return "ollama"
         return None
 
     def get_api_base(self, model: str | None = None) -> str | None:

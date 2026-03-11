@@ -29,6 +29,7 @@ PROVIDER_PREFIX_MAP = {
     "groq": "groq",
     "deepseek": "deepseek",
     "minimax": "minimax",
+    "ollama": "ollama",
     "01ai": "01ai",
     "moonshot": "moonshot",
     "kimi": "moonshot",
@@ -50,6 +51,7 @@ PROVIDER_ENV_KEYS = {
     "groq": "GROQ_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "minimax": "MINIMAX_API_KEY",
+    "ollama": "OPENAI_API_KEY",  # Ollama OpenAI 兼容 API 用占位 key
     "01ai": "01AI_API_KEY",
     "moonshot": "MOONSHOT_API_KEY",
     "kimi": "MOONSHOT_API_KEY",
@@ -151,6 +153,8 @@ class LiteLLMProvider(LLMProvider):
         "deepseek": "deepseek",
         "zhipu": "zhipuai",
         "zhipuai": "zhipuai",
+        "ollama": "ollama",
+        "11434": "ollama",  # Ollama 默认端口
     }
     
     def __init__(
@@ -181,9 +185,12 @@ class LiteLLMProvider(LLMProvider):
         )
         
         # Configure LiteLLM environment based on provider
+        # Ollama 等本地端点不设置真实 key，避免 LiteLLM 使用 OPENAI_API_KEY 路由到官方 API
         if api_key:
             if self.is_openrouter:
                 os.environ["OPENROUTER_API_KEY"] = api_key
+            elif self._detected_provider == "ollama":
+                os.environ["OPENAI_API_KEY"] = "ollama"
             elif self.is_vllm:
                 os.environ["OPENAI_API_KEY"] = api_key
             else:
@@ -244,6 +251,8 @@ class LiteLLMProvider(LLMProvider):
         if self.api_key:
             if self.is_openrouter:
                 os.environ["OPENROUTER_API_KEY"] = self.api_key
+            elif self._detected_provider == "ollama":
+                os.environ["OPENAI_API_KEY"] = "ollama"
             elif self.is_vllm:
                 os.environ["OPENAI_API_KEY"] = self.api_key
             else:
@@ -307,6 +316,31 @@ class LiteLLMProvider(LLMProvider):
             is_vllm=self.is_vllm
         )
         
+        # 解析 effective_base：优先参数，其次实例属性，最后从 config 动态加载（处理热更新滞后）
+        effective_base = api_base if api_base is not None else self.api_base
+        if not effective_base and model:
+            try:
+                from nanobot.config.loader import load_config
+                effective_base = load_config().get_api_base(model)
+            except Exception:
+                pass
+        
+        # 自定义 OpenAI 兼容端点（Ollama、vLLM 等）：openai/ 前缀会导致 LiteLLM 路由到官方 API，
+        # 需去掉前缀，仅传模型名，确保请求发往 api_base
+        is_custom_base = bool(effective_base and "api.openai.com" not in (effective_base or ""))
+        is_ollama_base = bool(
+            effective_base
+            and (
+                "localhost" in effective_base
+                or "11434" in effective_base
+                or "127.0.0.1" in effective_base
+                or "ollama" in effective_base.lower()
+            )
+        ) or self._detected_provider == "ollama"
+        if is_custom_base and model.startswith("openai/"):
+            model = model[7:]  # 去掉 "openai/" 前缀
+            logger.debug("Custom OpenAI endpoint: using model=%s with api_base=%s", model, effective_base)
+        
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -315,10 +349,13 @@ class LiteLLMProvider(LLMProvider):
         }
         if api_key:
             kwargs["api_key"] = api_key
+        elif is_ollama_base and effective_base:
+            # Ollama 不需要真实 key，传占位符避免 LiteLLM 使用环境变量中的 OpenAI key
+            kwargs["api_key"] = "ollama"
         if api_base is not None:
             kwargs["api_base"] = api_base
-        elif self.api_base:
-            kwargs["api_base"] = self.api_base
+        elif effective_base:
+            kwargs["api_base"] = effective_base
         
         if tools:
             kwargs["tools"] = tools

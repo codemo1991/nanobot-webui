@@ -165,6 +165,39 @@ export interface Model {
   subagentModel?: string
 }
 
+// New Model Router Types
+export interface ModelInfo {
+  id: string
+  providerId: string
+  name: string
+  litellmId: string
+  aliases: string
+  capabilities: string
+  contextWindow: number
+  costRank?: number
+  qualityRank?: number
+  enabled: boolean
+  isDefault: boolean
+}
+
+export interface ModelProfile {
+  id: string
+  name: string
+  description: string
+  modelChain: string
+  rules?: string
+  enabled: boolean
+}
+
+export interface DiscoveredModel {
+  id: string
+  name: string
+  litellmId: string
+  aliases: string[]
+  capabilities: string[]
+  contextWindow: number
+}
+
 export interface McpServer {
   id: string
   name: string
