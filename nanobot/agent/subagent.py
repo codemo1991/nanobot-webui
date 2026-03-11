@@ -1049,8 +1049,8 @@ class SubagentManager:
                     }
                     if sa_key:
                         chat_kwargs["api_key"] = sa_key
-                        if sa_base:
-                            chat_kwargs["api_base"] = sa_base
+                    if sa_base:
+                        chat_kwargs["api_base"] = sa_base
                     llm_task = asyncio.create_task(self.provider.chat(**chat_kwargs))
                     loop_start_llm = time.monotonic()
                     while not llm_task.done():

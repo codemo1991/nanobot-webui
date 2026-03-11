@@ -90,10 +90,69 @@ class ConfigRepository:
             )
             conn.commit()
             conn.close()
-            logger.debug("Config tables initialized")
+            logger.debug("Base config tables initialized")
         except Exception as e:
-            logger.exception("Failed to initialize config tables")
+            logger.exception("Failed to initialize base config tables")
             raise
+
+        # 独立初始化模型相关表，避免外键约束问题影响核心表创建
+        self._init_model_tables()
+
+    def _init_model_tables(self) -> None:
+        """初始化模型相关表（独立方法，便于错误隔离）。"""
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+
+            # 模型元数据表
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS config_models (
+                    id TEXT PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    litellm_id TEXT NOT NULL,
+                    aliases TEXT DEFAULT '',
+                    capabilities TEXT DEFAULT '',
+                    context_window INTEGER DEFAULT 128000,
+                    cost_rank INTEGER,
+                    quality_rank INTEGER,
+                    enabled INTEGER DEFAULT 1,
+                    is_default INTEGER DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (provider_id) REFERENCES config_providers(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+
+            # 模型场景配置表
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS config_model_profiles (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    model_chain TEXT NOT NULL,
+                    rules TEXT,
+                    enabled INTEGER DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+            # 创建索引
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_models_provider ON config_models(provider_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_models_enabled ON config_models(enabled)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_profiles_enabled ON config_model_profiles(enabled)")
+
+            conn.commit()
+            conn.close()
+            logger.info("Model config tables initialized (config_models, config_model_profiles)")
+        except Exception as e:
+            # 模型表创建失败不应阻止应用启动，记录错误但继续
+            logger.warning(f"Failed to initialize model tables (non-critical): {e}")
+            logger.debug("Model table init error details", exc_info=True)
 
     def _get_timestamp(self) -> str:
         """获取当前时间戳。"""
@@ -540,6 +599,10 @@ class ConfigRepository:
 
         config["mcps"] = self.get_all_mcps()
 
+        # Add models and profiles
+        config["models"] = self.get_all_models()
+        config["modelProfiles"] = self.get_all_model_profiles()
+
         return config
 
     def save_full_config(self, config_data: dict[str, Any]) -> None:
@@ -568,6 +631,7 @@ class ConfigRepository:
             "zhipu": "Zhipu",
             "dashscope": "DashScope",
             "vllm": "vLLM",
+            "ollama": "Ollama",
             "gemini": "Gemini",
             "minimax": "Minimax",
         }
@@ -624,3 +688,265 @@ class ConfigRepository:
         """Convert snake_case to camelCase."""
         components = name.split("_")
         return components[0] + "".join(x.title() for x in components[1:])
+
+    # =========================================================================
+    # Model Management
+    # =========================================================================
+
+    def get_model(self, model_id: str) -> dict[str, Any] | None:
+        """获取模型配置。"""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM config_models WHERE id = ?",
+                    (model_id,)
+                ).fetchone()
+                if row is None:
+                    return None
+                return {
+                    "id": row["id"],
+                    "provider_id": row["provider_id"],
+                    "name": row["name"],
+                    "litellm_id": row["litellm_id"],
+                    "aliases": row["aliases"] or "",
+                    "capabilities": row["capabilities"] or "",
+                    "context_window": row["context_window"],
+                    "cost_rank": row["cost_rank"],
+                    "quality_rank": row["quality_rank"],
+                    "enabled": bool(row["enabled"]),
+                    "is_default": bool(row["is_default"]),
+                }
+        except Exception as e:
+            logger.warning(f"Failed to get model {model_id}: {e}")
+            return None
+
+    def get_model_by_alias(self, alias: str) -> dict[str, Any] | None:
+        """通过别名查找模型。"""
+        try:
+            with self._connect() as conn:
+                # 查找 aliases 包含该别名的模型
+                row = conn.execute(
+                    """SELECT * FROM config_models
+                       WHERE ',' || aliases || ',' LIKE '%,' || ? || ',%'
+                       AND enabled = 1
+                       LIMIT 1""",
+                    (alias,)
+                ).fetchone()
+                if row:
+                    return {
+                        "id": row["id"],
+                        "provider_id": row["provider_id"],
+                        "name": row["name"],
+                        "litellm_id": row["litellm_id"],
+                        "aliases": row["aliases"] or "",
+                        "capabilities": row["capabilities"] or "",
+                        "context_window": row["context_window"],
+                        "cost_rank": row["cost_rank"],
+                        "quality_rank": row["quality_rank"],
+                        "enabled": bool(row["enabled"]),
+                        "is_default": bool(row["is_default"]),
+                    }
+                return None
+        except Exception as e:
+            logger.warning(f"Failed to get model by alias {alias}: {e}")
+            return None
+
+    def get_all_models(self, provider_id: str | None = None) -> list[dict[str, Any]]:
+        """获取所有模型，或指定 provider 的模型。"""
+        try:
+            with self._connect() as conn:
+                if provider_id:
+                    rows = conn.execute(
+                        "SELECT * FROM config_models WHERE provider_id = ? ORDER BY name",
+                        (provider_id,)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM config_models ORDER BY name"
+                    ).fetchall()
+
+                return [
+                    {
+                        "id": row["id"],
+                        "provider_id": row["provider_id"],
+                        "name": row["name"],
+                        "litellm_id": row["litellm_id"],
+                        "aliases": row["aliases"] or "",
+                        "capabilities": row["capabilities"] or "",
+                        "context_window": row["context_window"],
+                        "cost_rank": row["cost_rank"],
+                        "quality_rank": row["quality_rank"],
+                        "enabled": bool(row["enabled"]),
+                        "is_default": bool(row["is_default"]),
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.warning(f"Failed to get all models: {e}")
+            return []
+
+    def get_enabled_models(self) -> list[dict[str, Any]]:
+        """获取所有启用的模型。"""
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """SELECT m.*, p.enabled as provider_enabled
+                       FROM config_models m
+                       JOIN config_providers p ON m.provider_id = p.id
+                       WHERE m.enabled = 1 AND p.enabled = 1
+                       ORDER BY m.name"""
+                ).fetchall()
+
+                return [
+                    {
+                        "id": row["id"],
+                        "provider_id": row["provider_id"],
+                        "name": row["name"],
+                        "litellm_id": row["litellm_id"],
+                        "aliases": row["aliases"] or "",
+                        "capabilities": row["capabilities"] or "",
+                        "context_window": row["context_window"],
+                        "cost_rank": row["cost_rank"],
+                        "quality_rank": row["quality_rank"],
+                        "enabled": True,
+                        "is_default": bool(row["is_default"]),
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.warning(f"Failed to get enabled models: {e}")
+            return []
+
+    def set_model(self, model_id: str, provider_id: str, name: str, litellm_id: str,
+                  aliases: str = "", capabilities: str = "", context_window: int = 128000,
+                  cost_rank: int | None = None, quality_rank: int | None = None,
+                  enabled: bool = True, is_default: bool = False) -> None:
+        """设置模型配置。"""
+        updated_at = self._get_timestamp()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO config_models (id, provider_id, name, litellm_id, aliases,
+                        capabilities, context_window, cost_rank, quality_rank, enabled,
+                        is_default, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        provider_id=excluded.provider_id,
+                        name=excluded.name,
+                        litellm_id=excluded.litellm_id,
+                        aliases=excluded.aliases,
+                        capabilities=excluded.capabilities,
+                        context_window=excluded.context_window,
+                        cost_rank=excluded.cost_rank,
+                        quality_rank=excluded.quality_rank,
+                        enabled=excluded.enabled,
+                        is_default=excluded.is_default,
+                        updated_at=excluded.updated_at
+                    """,
+                    (model_id, provider_id, name, litellm_id, aliases, capabilities,
+                     context_window, cost_rank, quality_rank, int(enabled), int(is_default),
+                     updated_at)
+                )
+        except Exception as e:
+            logger.exception(f"Failed to set model {model_id}")
+            raise
+
+    def delete_model(self, model_id: str) -> bool:
+        """删除模型配置。"""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute("DELETE FROM config_models WHERE id = ?", (model_id,))
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.warning(f"Failed to delete model {model_id}: {e}")
+            return False
+
+    # =========================================================================
+    # Model Profile Management
+    # =========================================================================
+
+    def get_model_profile(self, profile_id: str) -> dict[str, Any] | None:
+        """获取模型场景配置。"""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM config_model_profiles WHERE id = ?",
+                    (profile_id,)
+                ).fetchone()
+                if row is None:
+                    return None
+                return {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "description": row["description"] or "",
+                    "model_chain": row["model_chain"],
+                    "rules": row["rules"] or "",
+                    "enabled": bool(row["enabled"]),
+                }
+        except Exception as e:
+            logger.warning(f"Failed to get model profile {profile_id}: {e}")
+            return None
+
+    def get_all_model_profiles(self) -> list[dict[str, Any]]:
+        """获取所有模型场景配置。"""
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM config_model_profiles ORDER BY id"
+                ).fetchall()
+
+                return [
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "description": row["description"] or "",
+                        "model_chain": row["model_chain"],
+                        "rules": row["rules"] or "",
+                        "enabled": bool(row["enabled"]),
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.warning(f"Failed to get all model profiles: {e}")
+            return []
+
+    def set_model_profile(self, profile_id: str, name: str, model_chain: str,
+                          description: str = "", rules: str = "",
+                          enabled: bool = True) -> None:
+        """设置模型场景配置。"""
+        updated_at = self._get_timestamp()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO config_model_profiles (id, name, description, model_chain,
+                        rules, enabled, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name=excluded.name,
+                        description=excluded.description,
+                        model_chain=excluded.model_chain,
+                        rules=excluded.rules,
+                        enabled=excluded.enabled,
+                        updated_at=excluded.updated_at
+                    """,
+                    (profile_id, name, description, model_chain, rules,
+                     int(enabled), updated_at)
+                )
+        except Exception as e:
+            logger.exception(f"Failed to set model profile {profile_id}")
+            raise
+
+    def delete_model_profile(self, profile_id: str) -> bool:
+        """删除模型场景配置。"""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM config_model_profiles WHERE id = ?",
+                    (profile_id,)
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.warning(f"Failed to delete model profile {profile_id}: {e}")
+            return False

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography, Row, Col } from 'antd'
+import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography, Row, Col, Table, Alert, Tooltip } from 'antd'
 import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined } from '@ant-design/icons'
 import { api } from '../api'
 import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig, WebConcurrencyConfig, WebMemoryConfig } from '../types'
@@ -378,6 +378,7 @@ function ProvidersConfig() {
     { value: 'dashscope', label: 'Qwen (通义 / DashScope)' },
     { value: 'gemini', label: 'Gemini' },
     { value: 'vllm', label: 'vLLM' },
+    { value: 'ollama', label: 'Ollama (本地)' },
     { value: 'moonshot', label: 'Moonshot (Kimi)' },
   ]
 
@@ -877,94 +878,525 @@ function SystemConfig() {
 function ModelsConfig() {
   const { t } = useTranslation()
   const [loading, setLoading] = useState(false)
-  const [form] = Form.useForm()
+  const [discovering, setDiscovering] = useState<string | null>(null)
+  const [models, setModels] = useState<import('../types').ModelInfo[]>([])
+  const [profiles, setProfiles] = useState<import('../types').ModelProfile[]>([])
+  const [providers, setProviders] = useState<import('../types').Provider[]>([])
+  const [activeTab, setActiveTab] = useState('profiles')
+  const [modelModalVisible, setModelModalVisible] = useState(false)
+  const [profileModalVisible, setProfileModalVisible] = useState(false)
+  const [globalDefaultModalVisible, setGlobalDefaultModalVisible] = useState(false)
+  const [editingModel, setEditingModel] = useState<import('../types').ModelInfo | null>(null)
+  const [editingProfile, setEditingProfile] = useState<import('../types').ModelProfile | null>(null)
+  const [modelForm] = Form.useForm()
+  const [profileForm] = Form.useForm()
+  const [globalDefaultForm] = Form.useForm()
 
   useEffect(() => {
-    loadModel()
+    loadData()
   }, [])
 
-  const loadModel = async () => {
+  const loadData = async () => {
     try {
       setLoading(true)
-      const data = await api.getModels()
-      if (data && data.length > 0) {
-        const defaultModel = data.find(m => m.isDefault) || data[0]
-        form.setFieldsValue({
-          modelName: defaultModel.modelName,
-          temperature: defaultModel.parameters?.temperature,
-          maxTokens: defaultModel.parameters?.maxTokens,
-          qwenImageModel: defaultModel.qwenImageModel ?? '',
-          subagentModel: defaultModel.subagentModel ?? '',
-        })
-      }
+      const [modelsData, profilesData, providersData] = await Promise.all([
+        api.getModels().then(m => m as unknown as import('../types').ModelInfo[]),
+        api.getModelProfiles(),
+        api.getProviders()
+      ])
+      setModels(modelsData || [])
+      setProfiles(profilesData || [])
+      setProviders(providersData || [])
     } catch (error) {
       console.error(error)
-      message.error(t('config.model.loadFailed'))
+      message.error('加载配置失败')
     } finally {
       setLoading(false)
     }
   }
 
-  const handleSave = async (values: any) => {
+  const handleDiscover = async (providerId: string) => {
     try {
-      await api.updateModel('default', {
-        providerId: values.modelName.split('/')[0] || 'openai',
-        modelName: values.modelName,
-        parameters: {
-          temperature: values.temperature ? Number(values.temperature) : undefined,
-          maxTokens: values.maxTokens ? Number(values.maxTokens) : undefined
-        },
-        enabled: true,
-        name: values.modelName,
-        qwenImageModel: (values.qwenImageModel ?? '').trim(),
-        subagentModel: (values.subagentModel ?? '').trim(),
-      })
-      message.success(t('config.model.updated'))
-      loadModel()
-    } catch (error) {
-      console.error(error)
-      message.error(t('config.updateFailed'))
+      setDiscovering(providerId)
+      const discovered = await api.discoverModels(providerId)
+      message.success(t('config.model.discovered', { count: discovered.length }))
+      loadData()
+    } catch (error: any) {
+      message.error(`${t('config.discoveryFailed')}: ${error.message}`)
+    } finally {
+      setDiscovering(null)
     }
   }
 
+  const handleCreateModel = () => {
+    setEditingModel(null)
+    modelForm.resetFields()
+    modelForm.setFieldsValue({
+      enabled: true,
+      contextWindow: 128000,
+      capabilities: 'tools'
+    })
+    setModelModalVisible(true)
+  }
+
+  const handleEditModel = (model: import('../types').ModelInfo) => {
+    setEditingModel(model)
+    modelForm.setFieldsValue({
+      ...model,
+      aliases: model.aliases || '',
+      capabilities: model.capabilities || ''
+    })
+    setModelModalVisible(true)
+  }
+
+  const handleSaveModel = async (values: any) => {
+    try {
+      const modelData = {
+        ...values,
+        id: editingModel ? editingModel.id : values.id,
+        costRank: values.costRank || null,
+        qualityRank: values.qualityRank || null
+      }
+
+      if (editingModel) {
+        await api.updateModel(editingModel.id, modelData)
+      } else {
+        await api.createModel(modelData)
+      }
+      message.success(t('config.saveSuccess'))
+      setModelModalVisible(false)
+      loadData()
+    } catch (error: any) {
+      message.error(`${t('config.saveFailed')}: ${error.message}`)
+    }
+  }
+
+  const handleDeleteModel = (modelId: string) => {
+    Modal.confirm({
+      title: '确认删除',
+      content: '删除后无法恢复，是否继续？',
+      onOk: async () => {
+        try {
+          await api.deleteModel(modelId)
+          message.success('删除成功')
+          loadData()
+        } catch (error: any) {
+          message.error(`删除失败: ${error.message}`)
+        }
+      }
+    })
+  }
+
+  const handleSetDefault = async (modelId: string) => {
+    try {
+      await api.setDefaultModel(modelId)
+      message.success('默认模型已设置')
+      loadData()
+    } catch (error: any) {
+      message.error(`设置失败: ${error.message}`)
+    }
+  }
+
+  const handleCreateProfile = () => {
+    setEditingProfile(null)
+    profileForm.resetFields()
+    profileForm.setFieldsValue({ enabled: true, modelChain: '' })
+    setProfileModalVisible(true)
+  }
+
+  const handleEditProfile = (profile: import('../types').ModelProfile) => {
+    setEditingProfile(profile)
+    // 将逗号分隔的 modelChain 转换为数组
+    const modelChainArray = profile.modelChain ? profile.modelChain.split(',').filter(Boolean) : []
+    profileForm.setFieldsValue({
+      ...profile,
+      modelChain: modelChainArray
+    })
+    setProfileModalVisible(true)
+  }
+
+  const handleSaveProfile = async (values: any) => {
+    try {
+      // 将数组转换为逗号分隔的字符串
+      const modelChain = Array.isArray(values.modelChain)
+        ? values.modelChain.join(',')
+        : values.modelChain
+
+      const data = {
+        ...values,
+        modelChain
+      }
+
+      if (editingProfile) {
+        await api.updateModelProfile(editingProfile.id, data)
+      } else {
+        await api.createModelProfile({ ...data, id: values.id || values.name.toLowerCase().replace(/\s+/g, '-') })
+      }
+      message.success('保存成功')
+      setProfileModalVisible(false)
+      loadData()
+    } catch (error: any) {
+      message.error(`保存失败: ${error.message}`)
+    }
+  }
+
+  const handleDeleteProfile = (profileId: string) => {
+    if (['smart', 'fast', 'coding', 'summarize'].includes(profileId)) {
+      message.error('不能删除系统预设场景')
+      return
+    }
+    Modal.confirm({
+      title: '确认删除',
+      content: '删除后无法恢复，是否继续？',
+      onOk: async () => {
+        try {
+          await api.deleteModelProfile(profileId)
+          message.success('删除成功')
+          loadData()
+        } catch (error: any) {
+          message.error(`删除失败: ${error.message}`)
+        }
+      }
+    })
+  }
+
+  // 打开全局默认设置弹窗
+  const handleOpenGlobalDefault = () => {
+    globalDefaultForm.resetFields()
+    const enabledModels = models.filter(m => m.enabled).map(m => m.id)
+    globalDefaultForm.setFieldsValue({
+      modelChain: enabledModels.length > 0 ? [enabledModels[0]] : []
+    })
+    setGlobalDefaultModalVisible(true)
+  }
+
+  // 应用全局默认到所有场景
+  const handleApplyGlobalDefault = async (values: any) => {
+    try {
+      const modelChain = values.modelChain.join(',')
+      if (!modelChain) {
+        message.error('请至少选择一个模型')
+        return
+      }
+
+      // 应用到所有系统场景
+      const systemProfiles = ['smart', 'fast', 'coding', 'summarize']
+      for (const profileId of systemProfiles) {
+        const profile = profiles.find(p => p.id === profileId)
+        if (profile) {
+          await api.updateModelProfile(profileId, {
+            ...profile,
+            modelChain
+          })
+        }
+      }
+
+      message.success(`已将 ${values.modelChain.length} 个模型应用到所有场景`)
+      setGlobalDefaultModalVisible(false)
+      loadData()
+    } catch (error: any) {
+      message.error(`应用失败: ${error.message}`)
+    }
+  }
+
+  const getProviderName = (providerId: string) => {
+    const provider = providers.find(p => p.id === providerId)
+    return provider?.name || providerId
+  }
+
+  const modelColumns = [
+    { title: 'ID', dataIndex: 'id', key: 'id' },
+    { title: '名称', dataIndex: 'name', key: 'name' },
+    { title: 'Provider', dataIndex: 'providerId', key: 'providerId', render: (v: string) => getProviderName(v) },
+    { title: 'LiteLLM ID', dataIndex: 'litellmId', key: 'litellmId' },
+    { title: '别名', dataIndex: 'aliases', key: 'aliases' },
+    { title: '能力', dataIndex: 'capabilities', key: 'capabilities' },
+    {
+      title: '默认',
+      dataIndex: 'isDefault',
+      key: 'isDefault',
+      render: (v: boolean, record: import('../types').ModelInfo) =>
+        v ? <Tag color="green">默认</Tag> : <Button size="small" onClick={() => handleSetDefault(record.id)}>设为默认</Button>
+    },
+    {
+      title: '状态',
+      dataIndex: 'enabled',
+      key: 'enabled',
+      render: (v: boolean) => v ? <Tag color="green">启用</Tag> : <Tag>禁用</Tag>
+    },
+    {
+      title: '操作',
+      key: 'action',
+      render: (_: any, record: import('../types').ModelInfo) => (
+        <Space>
+          <Button size="small" icon={<EditOutlined />} onClick={() => handleEditModel(record)}>编辑</Button>
+          <Button size="small" danger onClick={() => handleDeleteModel(record.id)}>删除</Button>
+        </Space>
+      )
+    }
+  ]
+
+  const profileColumns = [
+    { title: 'ID', dataIndex: 'id', key: 'id' },
+    { title: '名称', dataIndex: 'name', key: 'name' },
+    { title: '描述', dataIndex: 'description', key: 'description' },
+    {
+      title: '模型链',
+      dataIndex: 'modelChain',
+      key: 'modelChain',
+      render: (v: string) => (
+        <Tooltip title={v}>
+          <span style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-block' }}>
+            {v}
+          </span>
+        </Tooltip>
+      )
+    },
+    {
+      title: '状态',
+      dataIndex: 'enabled',
+      key: 'enabled',
+      render: (v: boolean) => v ? <Tag color="green">启用</Tag> : <Tag>禁用</Tag>
+    },
+    {
+      title: '操作',
+      key: 'action',
+      render: (_: any, record: import('../types').ModelProfile) => (
+        <Space>
+          <Button size="small" icon={<EditOutlined />} onClick={() => handleEditProfile(record)}>编辑</Button>
+          <Button size="small" danger onClick={() => handleDeleteProfile(record.id)}>删除</Button>
+        </Space>
+      )
+    }
+  ]
+
   return (
     <div className="config-panel">
-      <Card title={t('config.model.title')} loading={loading}>
-        <Form form={form} layout="vertical" onFinish={handleSave}>
-          <Form.Item name="modelName" label={t('config.model.nameLabel')} rules={[{ required: true }]} help={t('config.model.nameHelp')}>
-            <Input />
-          </Form.Item>
+      <Spin spinning={loading}>
+        <Tabs activeKey={activeTab} onChange={setActiveTab}>
+          <Tabs.TabPane tab="模型场景" key="profiles">
+            <Card
+              title="模型场景配置 (Profiles)"
+              extra={
+                <Space>
+                  <Button onClick={handleOpenGlobalDefault}>
+                    设为全局默认
+                  </Button>
+                  <Button type="primary" icon={<PlusOutlined />} onClick={handleCreateProfile}>
+                    添加场景
+                  </Button>
+                </Space>
+              }
+            >
+              <Table
+                dataSource={profiles}
+                columns={profileColumns}
+                rowKey="id"
+                pagination={false}
+                size="small"
+              />
+              <Alert
+                message="关于模型场景"
+                description={
+                  <div>
+                    <p><strong>smart</strong>: 深度思考，适合复杂任务</p>
+                    <p><strong>fast</strong>: 快速响应，成本低</p>
+                    <p><strong>coding</strong>: 编程专用，支持长上下文</p>
+                    <p><strong>summarize</strong>: 总结归纳，适合记忆维护</p>
+                    <p>模型链格式: model1,model2,model3 (按优先级顺序)</p>
+                  </div>
+                }
+                type="info"
+                style={{ marginTop: 16 }}
+              />
+            </Card>
+          </Tabs.TabPane>
 
-          <Form.Item
-            name="subagentModel"
-            label="子 Agent 模型"
-            help="子 Agent (spawn tool) 使用的模型，留空则与主 Agent 相同。支持视觉模型，如 dashscope/qwen-vl-plus"
-          >
-            <Input placeholder="留空则与主 Agent 相同，例如：dashscope/qwen-vl-plus" />
-          </Form.Item>
-          
-          <Space>
-            <Form.Item name="temperature" label="Temperature">
-              <Input type="number" step="0.1" min="0" max="2" />
+          <Tabs.TabPane tab="模型管理" key="models">
+            <Card
+              title="模型管理"
+              extra={
+                <Button type="primary" icon={<PlusOutlined />} onClick={handleCreateModel}>
+                  手动添加模型
+                </Button>
+              }
+            >
+              <Table
+                dataSource={models}
+                columns={modelColumns}
+                rowKey="id"
+                pagination={false}
+                size="small"
+              />
+            </Card>
+          </Tabs.TabPane>
+
+          <Tabs.TabPane tab="自动发现" key="discovery">
+            <Card title="从 Provider 自动发现模型">
+              <List
+                dataSource={providers.filter(p => p.enabled && p.apiKey)}
+                renderItem={provider => (
+                  <List.Item
+                    actions={[
+                      <Button
+                        type="primary"
+                        loading={discovering === provider.id}
+                        onClick={() => handleDiscover(provider.id)}
+                      >
+                        发现模型
+                      </Button>
+                    ]}
+                  >
+                    <List.Item.Meta
+                      title={provider.name}
+                      description={`ID: ${provider.id} | API Base: ${provider.apiBase || '默认'}`}
+                    />
+                  </List.Item>
+                )}
+              />
+              {providers.filter(p => p.enabled && p.apiKey).length === 0 && (
+                <Alert
+                  message="没有可用的 Provider"
+                  description="请在 Provider 配置页启用并配置至少一个 Provider"
+                  type="warning"
+                />
+              )}
+            </Card>
+          </Tabs.TabPane>
+        </Tabs>
+      </Spin>
+
+      {/* Model Modal */}
+      <Modal
+        title={editingModel ? '编辑模型' : '添加模型'}
+        open={modelModalVisible}
+        onOk={() => modelForm.submit()}
+        onCancel={() => setModelModalVisible(false)}
+        width={600}
+      >
+        <Form form={modelForm} layout="vertical" onFinish={handleSaveModel}>
+          {!editingModel && (
+            <Form.Item name="id" label="模型 ID" rules={[{ required: true }]}>
+              <Input placeholder="如: claude-opus-4-6" />
             </Form.Item>
-            <Form.Item name="maxTokens" label="Max Tokens">
-              <Input type="number" step="1" min="1" />
-            </Form.Item>
-          </Space>
-
-          <Form.Item
-            name="qwenImageModel"
-            label={t('config.model.qwenImageLabel')}
-            help={t('config.model.qwenImageHelp')}
-          >
-            <Input placeholder="qwen-image-plus" />
+          )}
+          <Form.Item name="name" label="显示名称" rules={[{ required: true }]}>
+            <Input placeholder="如: Claude Opus 4.6" />
           </Form.Item>
-
-          <Form.Item>
-            <Button type="primary" htmlType="submit">{t('config.save')}</Button>
+          <Form.Item name="providerId" label="Provider" rules={[{ required: true }]}>
+            <Select placeholder="选择 Provider">
+              {providers.map(p => (
+                <Select.Option key={p.id} value={p.id}>{p.name}</Select.Option>
+              ))}
+            </Select>
+          </Form.Item>
+          <Form.Item name="litellmId" label="LiteLLM ID" rules={[{ required: true }]} help="如: anthropic/claude-opus-4-6">
+            <Input placeholder="anthropic/claude-opus-4-6" />
+          </Form.Item>
+          <Form.Item name="aliases" label="别名" help="逗号分隔，如: opus,smart,4-6">
+            <Input placeholder="opus,smart" />
+          </Form.Item>
+          <Form.Item name="capabilities" label="能力标签" help="逗号分隔，如: tools,vision,thinking">
+            <Input placeholder="tools,vision" />
+          </Form.Item>
+          <Form.Item name="contextWindow" label="上下文窗口" rules={[{ required: true }]}>
+            <InputNumber min={1000} style={{ width: '100%' }} />
+          </Form.Item>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="costRank" label="成本等级 (1-10, 1=便宜)">
+                <InputNumber min={1} max={10} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="qualityRank" label="质量等级 (1-10, 1=最好)">
+                <InputNumber min={1} max={10} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Form.Item name="enabled" valuePropName="checked">
+            <Switch checkedChildren="启用" unCheckedChildren="禁用" />
           </Form.Item>
         </Form>
-      </Card>
+      </Modal>
+
+      {/* Profile Modal */}
+      <Modal
+        title={editingProfile ? '编辑场景' : '添加场景'}
+        open={profileModalVisible}
+        onOk={() => profileForm.submit()}
+        onCancel={() => setProfileModalVisible(false)}
+        width={600}
+      >
+        <Form form={profileForm} layout="vertical" onFinish={handleSaveProfile}>
+          {!editingProfile && (
+            <Form.Item name="id" label="场景 ID" rules={[{ required: true }]} help="唯一标识，如: smart, fast, coding">
+              <Input placeholder="my-custom-profile" />
+            </Form.Item>
+          )}
+          <Form.Item name="name" label="显示名称" rules={[{ required: true }]}>
+            <Input placeholder="如: 深度思考" />
+          </Form.Item>
+          <Form.Item name="description" label="描述">
+            <Input.TextArea rows={2} placeholder="描述该场景适合什么任务" />
+          </Form.Item>
+          <Form.Item
+            name="modelChain"
+            label="模型链"
+            rules={[{ required: true, message: '请至少选择一个模型' }]}
+            help="按优先级顺序选择模型，排在最前的优先使用"
+          >
+            <Select
+              mode="multiple"
+              placeholder="请选择模型（按优先级排序）"
+              options={models.filter(m => m.enabled).map(m => ({
+                value: m.id,
+                label: `${m.name} (${m.id})`,
+              }))}
+              showSearch
+              optionFilterProp="label"
+            />
+          </Form.Item>
+          <Form.Item name="enabled" valuePropName="checked">
+            <Switch checkedChildren="启用" unCheckedChildren="禁用" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* Global Default Modal */}
+      <Modal
+        title="设为全局默认模型"
+        open={globalDefaultModalVisible}
+        onOk={() => globalDefaultForm.submit()}
+        onCancel={() => setGlobalDefaultModalVisible(false)}
+        width={500}
+      >
+        <Form form={globalDefaultForm} layout="vertical" onFinish={handleApplyGlobalDefault}>
+          <Alert
+            message="一键设置默认模型"
+            description="选择一个或多个模型，应用到 smart、fast、coding、summarize 所有场景。按选择顺序确定优先级。"
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+          />
+          <Form.Item
+            name="modelChain"
+            label="选择模型（按优先级排序）"
+            rules={[{ required: true, message: '请至少选择一个模型' }]}
+          >
+            <Select
+              mode="multiple"
+              placeholder="请选择模型"
+              options={models.filter(m => m.enabled).map(m => ({
+                value: m.id,
+                label: `${m.name} (${m.id})`,
+              }))}
+              showSearch
+              optionFilterProp="label"
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
     </div>
   )
 }

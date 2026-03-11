@@ -287,6 +287,33 @@ export const api = {
       method: 'POST',
     }),
 
+  // Model Discovery (New)
+  discoverModels: (providerId: string) =>
+    request<import('./types').DiscoveredModel[]>(`/providers/${providerId}/discover`, {
+      method: 'GET',
+    }),
+
+  // Model Profiles (New)
+  getModelProfiles: () =>
+    request<import('./types').ModelProfile[]>('/model-profiles'),
+
+  createModelProfile: (profile: Omit<import('./types').ModelProfile, 'id'>) =>
+    request<import('./types').ModelProfile>('/model-profiles', {
+      method: 'POST',
+      body: JSON.stringify(profile),
+    }),
+
+  updateModelProfile: (profileId: string, profile: Partial<import('./types').ModelProfile>) =>
+    request<import('./types').ModelProfile>(`/model-profiles/${profileId}`, {
+      method: 'PUT',
+      body: JSON.stringify(profile),
+    }),
+
+  deleteModelProfile: (profileId: string) =>
+    request<{ deleted: boolean }>(`/model-profiles/${profileId}`, {
+      method: 'DELETE',
+    }),
+
   // MCPs
   getMcps: () => request<import('./types').McpServer[]>('/mcps'),
   

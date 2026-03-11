@@ -16,6 +16,7 @@ from loguru import logger
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
+from nanobot.providers.router import ModelRouter, ModelHandle
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -84,8 +85,8 @@ class AgentLoop:
     def __init__(
         self,
         bus: MessageBus,
-        provider: LLMProvider,
         workspace: Path,
+        provider: LLMProvider | None = None,
         model: str | None = None,
         subagent_model: str | None = None,
         max_iterations: int = 40,
@@ -113,13 +114,33 @@ class AgentLoop:
         status_service: "SystemStatusService | None" = None,
         # Agent 模板管理器
         agent_template_manager: "AgentTemplateManager | None" = None,
+        # 新增：模型路由器（新架构）
+        router: ModelRouter | None = None,
+        default_profile: str = "smart",
     ):
         from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig, ClaudeCodeConfig
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
+        self.router = router
+        self._default_profile = default_profile
         self.workspace = workspace
-        self.model = model or provider.get_default_model()
+
+        # 新架构：使用 router 获取默认模型
+        if router:
+            try:
+                handle = router.get(default_profile)
+                self.model = handle.model
+                self._current_handle = handle
+            except Exception as e:
+                logger.warning(f"Failed to resolve default profile '{default_profile}': {e}")
+                # 回退到旧方式
+                self.model = model or (provider.get_default_model() if provider else "anthropic/claude-opus-4-6")
+                self._current_handle = None
+        else:
+            self.model = model or (provider.get_default_model() if provider else "anthropic/claude-opus-4-6")
+            self._current_handle = None
+
         self.subagent_model = subagent_model or ""
         self.max_iterations = max_iterations
         self.max_execution_time = max_execution_time
@@ -1291,6 +1312,8 @@ class AgentLoop:
 
         # Batch 模式：记录本轮 spawn 的 task_id，等待完成后聚合返回
         spawned_task_ids: list[str] = []
+        # task_id -> template，用于区分需要注入的 spawn（如 vision）与异步通知的 spawn（如 coder/claude_code）
+        spawned_task_templates: dict[str, str] = {}
         # 已注入 messages 的 subagent task_id，避免重复注入
         _injected_subagent_task_ids: set[str] = set()
 
@@ -1349,19 +1372,27 @@ class AgentLoop:
                     _emit({"type": "turn_end", "iteration": iteration})
                     break
 
-            # 方案 A：有上一轮 spawn 时，先等待完成，再将子 Agent 结果注入 messages（便于 vision -> claude_code 等链式调用）
+            # 方案 A：有上一轮 spawn 时，仅对需要注入的 spawn（如 vision）等待完成
+            # coder/claude_code 等 spawn 异步通知结果，不在此等待，避免飞书等渠道半天无响应
             if iteration > 1 and spawned_task_ids and self.subagents:
                 running_spawns = [
                     tid for tid in spawned_task_ids
                     if tid in self.subagents._running_tasks
                 ]
-                if running_spawns:
-                    logger.info(f"[SubagentInject] Waiting for spawn tasks before LLM call: {running_spawns}")
+                # 仅 vision 等需要注入结果的 spawn 才等待；coder/claude_code 不等待
+                running_spawns_needing_inject = [
+                    tid for tid in running_spawns
+                    if (spawned_task_templates.get(tid) or "").lower() == "vision"
+                ]
+                if running_spawns_needing_inject:
+                    logger.info(f"[SubagentInject] Waiting for vision spawns before LLM call: {running_spawns_needing_inject}")
                     try:
-                        await self._wait_for_subagents(running_spawns, timeout=120.0)
-                        logger.info("[SubagentInject] Spawn tasks completed")
+                        await self._wait_for_subagents(running_spawns_needing_inject, timeout=120.0)
+                        logger.info("[SubagentInject] Vision spawn tasks completed")
                     except asyncio.TimeoutError:
-                        logger.warning("[SubagentInject] Timeout waiting for spawn tasks")
+                        logger.warning("[SubagentInject] Timeout waiting for vision spawn tasks")
+                elif running_spawns:
+                    logger.info(f"[SubagentInject] Skipping wait for non-inject spawns (coder/claude_code): {running_spawns}")
 
                 # 注入已完成且尚未注入的子 Agent 结果
                 to_inject = [
@@ -1530,19 +1561,25 @@ class AgentLoop:
 
                 progress = msg.metadata.get("progress_callback")
 
-                # 如果有 spawn，需要等待子 Agent 完成后再继续（避免再次 LLM 调用时子 Agent 还在运行）
+                # 如果有 spawn，仅对需要注入的 vision spawn 等待；coder/claude_code 不等待
                 if spawned_task_ids and self.subagents:
                     running_spawns = [
                         tid for tid in spawned_task_ids
                         if tid in self.subagents._running_tasks
                     ]
-                    if running_spawns:
-                        logger.info(f"[BatchMode] Waiting for spawn tasks before next LLM call: {running_spawns}")
+                    running_spawns_needing_inject = [
+                        tid for tid in running_spawns
+                        if (spawned_task_templates.get(tid) or "").lower() == "vision"
+                    ]
+                    if running_spawns_needing_inject:
+                        logger.info(f"[BatchMode] Waiting for vision spawns before next LLM call: {running_spawns_needing_inject}")
                         try:
-                            await self._wait_for_subagents(running_spawns, timeout=120.0)
-                            logger.info(f"[BatchMode] Spawn tasks completed before next LLM call")
+                            await self._wait_for_subagents(running_spawns_needing_inject, timeout=120.0)
+                            logger.info(f"[BatchMode] Vision spawn tasks completed before next LLM call")
                         except asyncio.TimeoutError:
-                            logger.warning(f"[BatchMode] Timeout waiting for spawn tasks")
+                            logger.warning(f"[BatchMode] Timeout waiting for vision spawn tasks")
+                    elif running_spawns:
+                        logger.info(f"[BatchMode] Skipping wait for non-inject spawns: {running_spawns}")
 
                 if has_spawn and has_exec and spawned_task_ids is not None:
                     # Batch 模式：按类型区分执行
@@ -1587,6 +1624,7 @@ class AgentLoop:
                         if task_id_match:
                             task_id = task_id_match.group(1) or task_id_match.group(2)
                             spawned_task_ids.append(task_id)
+                            spawned_task_templates[task_id] = (tc.arguments or {}).get("template", "minimal")
                             logger.info(f"[BatchMode] Spawn vision completed: {task_id}")
 
                     # 阶段 2: spawn(vision) 有结果后，exec(图片相关) 才能执行
@@ -1622,6 +1660,7 @@ class AgentLoop:
                                 if task_id_match:
                                     task_id = task_id_match.group(1) or task_id_match.group(2)
                                     spawned_task_ids.append(task_id)
+                                    spawned_task_templates[task_id] = (tc.arguments or {}).get("template", "minimal")
                                     logger.info(f"[BatchMode] Spawn other completed: {task_id}")
                             else:
                                 exec_results.append((tc, result))
@@ -1669,6 +1708,7 @@ class AgentLoop:
                         if task_id_match:
                             task_id = task_id_match.group(1) or task_id_match.group(2)
                             spawned_task_ids.append(task_id)
+                            spawned_task_templates[task_id] = (tool_call.arguments or {}).get("template", "minimal")
                             logger.info(f"[Spawn] Recorded task_id for inject: {task_id}")
                         logger.info(f"[BatchMode] Spawn result added to messages (final result will be synthesized later)")
                         continue
@@ -1717,6 +1757,7 @@ class AgentLoop:
                         if task_id_match:
                             task_id = task_id_match.group(1) or task_id_match.group(2)
                             spawned_task_ids.append(task_id)
+                            spawned_task_templates[task_id] = (tool_call.arguments or {}).get("template", "minimal")
                             logger.info(f"[BatchMode] Recorded spawn task_id: {task_id}")
 
                     messages = self.context.add_tool_result(
