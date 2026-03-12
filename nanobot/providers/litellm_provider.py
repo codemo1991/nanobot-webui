@@ -347,8 +347,10 @@ class LiteLLMProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        if api_key:
-            kwargs["api_key"] = api_key
+        # 优先使用传入的 api_key，否则使用 provider 实例的 api_key（含热更新后的值）
+        effective_key = api_key if api_key else getattr(self, "api_key", None)
+        if effective_key:
+            kwargs["api_key"] = effective_key
         elif is_ollama_base and effective_base:
             # Ollama 不需要真实 key，传占位符避免 LiteLLM 使用环境变量中的 OpenAI key
             kwargs["api_key"] = "ollama"

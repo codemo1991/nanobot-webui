@@ -287,7 +287,7 @@ export const api = {
       method: 'POST',
     }),
 
-  // Model Discovery (New)
+  // Model Discovery - 仅查询可用模型（不保存），供添加模型时 LiteLLM ID 下拉选择
   discoverModels: (providerId: string) =>
     request<import('./types').DiscoveredModel[]>(`/providers/${providerId}/discover`, {
       method: 'GET',

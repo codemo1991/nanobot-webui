@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography, Row, Col, Table, Alert, Tooltip } from 'antd'
+import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography, Row, Col, Table, Alert, Tooltip, AutoComplete } from 'antd'
 import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined } from '@ant-design/icons'
 import { api } from '../api'
 import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig, WebConcurrencyConfig, WebMemoryConfig } from '../types'
@@ -393,7 +393,7 @@ function ProvidersConfig() {
         grid={{ gutter: 16, column: 2 }}
         dataSource={providers}
         loading={loading}
-        renderItem={item => (
+        renderItem={(item: Provider) => (
           <List.Item>
             <Card 
               title={item.name} 
@@ -407,6 +407,7 @@ function ProvidersConfig() {
               <Space direction="vertical" style={{ width: '100%' }}>
                 <Text>Type: <Tag>{item.type}</Tag></Text>
                 <Text>Status: <Tag color={item.enabled ? 'success' : 'default'}>{item.enabled ? 'Enabled' : 'Disabled'}</Tag></Text>
+                <Text type="secondary">API Key: {item.apiKey ? '已配置' : '未配置'}</Text>
                 {item.apiBase && <Text type="secondary" ellipsis>Base URL: {item.apiBase}</Text>}
               </Space>
             </Card>
@@ -878,7 +879,8 @@ function SystemConfig() {
 function ModelsConfig() {
   const { t } = useTranslation()
   const [loading, setLoading] = useState(false)
-  const [discovering, setDiscovering] = useState<string | null>(null)
+  const [litellmOptions, setLitellmOptions] = useState<{ value: string; label: string }[]>([])
+  const [litellmOptionsLoading, setLitellmOptionsLoading] = useState(false)
   const [models, setModels] = useState<import('../types').ModelInfo[]>([])
   const [profiles, setProfiles] = useState<import('../types').ModelProfile[]>([])
   const [providers, setProviders] = useState<import('../types').Provider[]>([])
@@ -915,22 +917,34 @@ function ModelsConfig() {
     }
   }
 
-  const handleDiscover = async (providerId: string) => {
+  const [discoveredModelsMap, setDiscoveredModelsMap] = useState<Record<string, import('../types').DiscoveredModel>>({})
+
+  const handleDiscoverLitellmOptions = async (providerId: string) => {
+    if (!providerId) {
+      setLitellmOptions([])
+      setDiscoveredModelsMap({})
+      return
+    }
     try {
-      setDiscovering(providerId)
+      setLitellmOptionsLoading(true)
       const discovered = await api.discoverModels(providerId)
-      message.success(t('config.model.discovered', { count: discovered.length }))
-      loadData()
+      const map: Record<string, import('../types').DiscoveredModel> = {}
+      discovered.forEach(m => { map[m.litellmId] = m })
+      setDiscoveredModelsMap(map)
+      setLitellmOptions(discovered.map(m => ({ value: m.litellmId, label: `${m.litellmId} (${m.name})` })))
     } catch (error: any) {
       message.error(`${t('config.discoveryFailed')}: ${error.message}`)
+      setLitellmOptions([])
+      setDiscoveredModelsMap({})
     } finally {
-      setDiscovering(null)
+      setLitellmOptionsLoading(false)
     }
   }
 
   const handleCreateModel = () => {
     setEditingModel(null)
     modelForm.resetFields()
+    setLitellmOptions([])
     modelForm.setFieldsValue({
       enabled: true,
       contextWindow: 128000,
@@ -943,17 +957,31 @@ function ModelsConfig() {
     setEditingModel(model)
     modelForm.setFieldsValue({
       ...model,
-      aliases: model.aliases || '',
       capabilities: model.capabilities || ''
     })
+    handleDiscoverLitellmOptions(model.providerId)
     setModelModalVisible(true)
   }
 
   const handleSaveModel = async (values: any) => {
     try {
+      let litellmId = (values.litellmId || '').trim()
+      const providerId = values.providerId
+      // ollama、vllm 需带前缀，若用户只输入模型名则自动补全
+      if (providerId === 'ollama' && litellmId && !litellmId.startsWith('ollama/')) {
+        litellmId = 'ollama/' + litellmId
+      } else if (providerId === 'vllm' && litellmId && !litellmId.startsWith('vllm/')) {
+        litellmId = 'vllm/' + litellmId
+      }
+      const modelId = editingModel ? editingModel.id : litellmId.replace(/\//g, '-')
+      const modelName = litellmId
       const modelData = {
         ...values,
-        id: editingModel ? editingModel.id : values.id,
+        id: modelId,
+        name: modelName,
+        providerId: values.providerId,
+        litellmId,
+        aliases: '', // 已移除别名字段
         costRank: values.costRank || null,
         qualityRank: values.qualityRank || null
       }
@@ -1105,11 +1133,8 @@ function ModelsConfig() {
   }
 
   const modelColumns = [
-    { title: 'ID', dataIndex: 'id', key: 'id' },
-    { title: '名称', dataIndex: 'name', key: 'name' },
     { title: 'Provider', dataIndex: 'providerId', key: 'providerId', render: (v: string) => getProviderName(v) },
     { title: 'LiteLLM ID', dataIndex: 'litellmId', key: 'litellmId' },
-    { title: '别名', dataIndex: 'aliases', key: 'aliases' },
     { title: '能力', dataIndex: 'capabilities', key: 'capabilities' },
     {
       title: '默认',
@@ -1230,39 +1255,6 @@ function ModelsConfig() {
               />
             </Card>
           </Tabs.TabPane>
-
-          <Tabs.TabPane tab="自动发现" key="discovery">
-            <Card title="从 Provider 自动发现模型">
-              <List
-                dataSource={providers.filter(p => p.enabled && p.apiKey)}
-                renderItem={provider => (
-                  <List.Item
-                    actions={[
-                      <Button
-                        type="primary"
-                        loading={discovering === provider.id}
-                        onClick={() => handleDiscover(provider.id)}
-                      >
-                        发现模型
-                      </Button>
-                    ]}
-                  >
-                    <List.Item.Meta
-                      title={provider.name}
-                      description={`ID: ${provider.id} | API Base: ${provider.apiBase || '默认'}`}
-                    />
-                  </List.Item>
-                )}
-              />
-              {providers.filter(p => p.enabled && p.apiKey).length === 0 && (
-                <Alert
-                  message="没有可用的 Provider"
-                  description="请在 Provider 配置页启用并配置至少一个 Provider"
-                  type="warning"
-                />
-              )}
-            </Card>
-          </Tabs.TabPane>
         </Tabs>
       </Spin>
 
@@ -1275,26 +1267,43 @@ function ModelsConfig() {
         width={600}
       >
         <Form form={modelForm} layout="vertical" onFinish={handleSaveModel}>
-          {!editingModel && (
-            <Form.Item name="id" label="模型 ID" rules={[{ required: true }]}>
-              <Input placeholder="如: claude-opus-4-6" />
-            </Form.Item>
-          )}
-          <Form.Item name="name" label="显示名称" rules={[{ required: true }]}>
-            <Input placeholder="如: Claude Opus 4.6" />
-          </Form.Item>
-          <Form.Item name="providerId" label="Provider" rules={[{ required: true }]}>
-            <Select placeholder="选择 Provider">
+          <Form.Item name="providerId" label="Provider" rules={[{ required: true, message: '请选择 Provider' }]}>
+            <Select
+              placeholder="选择 Provider"
+              onChange={(v) => {
+                handleDiscoverLitellmOptions(v)
+                // ollama、vllm 需带前缀，切换时自动填入
+                const prefix = v === 'ollama' ? 'ollama/' : v === 'vllm' ? 'vllm/' : ''
+                modelForm.setFieldValue('litellmId', prefix || undefined)
+              }}
+            >
               {providers.map(p => (
                 <Select.Option key={p.id} value={p.id}>{p.name}</Select.Option>
               ))}
             </Select>
           </Form.Item>
-          <Form.Item name="litellmId" label="LiteLLM ID" rules={[{ required: true }]} help="如: anthropic/claude-opus-4-6">
-            <Input placeholder="anthropic/claude-opus-4-6" />
-          </Form.Item>
-          <Form.Item name="aliases" label="别名" help="逗号分隔，如: opus,smart,4-6">
-            <Input placeholder="opus,smart" />
+          <Form.Item
+            name="litellmId"
+            label="LiteLLM ID"
+            rules={[{ required: true, message: '请输入或选择 LiteLLM ID' }]}
+            help="选择 Provider 后自动发现下拉可选，或自行输入，如: anthropic/claude-opus-4-6"
+          >
+            <AutoComplete
+              placeholder="anthropic/claude-opus-4-6"
+              options={litellmOptionsLoading ? [] : litellmOptions}
+              filterOption={(inputValue, option) =>
+                (option?.value ?? '').toLowerCase().includes(inputValue.toLowerCase())
+              }
+              onSelect={(value: string) => {
+                const m = discoveredModelsMap[value]
+                if (m) {
+                  modelForm.setFieldsValue({
+                    contextWindow: m.contextWindow,
+                    capabilities: (m.capabilities || []).join(',')
+                  })
+                }
+              }}
+            />
           </Form.Item>
           <Form.Item name="capabilities" label="能力标签" help="逗号分隔，如: tools,vision,thinking">
             <Input placeholder="tools,vision" />
@@ -1730,7 +1739,7 @@ function McpConfig() {
         dataSource={mcps}
         loading={loading}
         locale={{ emptyText: t('config.mcp.emptyText') }}
-        renderItem={item => (
+        renderItem={(item: McpServer) => (
           <List.Item>
             <Card
               title={
@@ -1904,7 +1913,7 @@ function SkillsConfig() {
           grid={{ gutter: 16, column: 2 }}
           dataSource={skills}
           loading={loading}
-        renderItem={item => (
+        renderItem={(item: InstalledSkill) => (
           <List.Item>
             <Card 
               title={
@@ -1919,7 +1928,7 @@ function SkillsConfig() {
               <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>{item.description}</Text>
               {item.tags && item.tags.length > 0 && (
                 <Space size={4} wrap>
-                  {item.tags.map(tag => <Tag key={tag} style={{ fontSize: 10 }}>{tag}</Tag>)}
+                  {item.tags.map((tag: string) => <Tag key={tag} style={{ fontSize: 10 }}>{tag}</Tag>)}
                 </Space>
               )}
             </Card>

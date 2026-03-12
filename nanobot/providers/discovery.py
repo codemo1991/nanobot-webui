@@ -444,8 +444,10 @@ class ModelDiscoveryService:
         models = await self.discover_for_provider(provider_id)
 
         for i, model in enumerate(models):
-            # 设置第一个为默认模型
+            # 设置第一个为默认模型；若设为默认，先清除其他模型的默认状态（全局唯一）
             is_default = (i == 0)
+            if is_default:
+                self.repo.clear_default_for_all_models_except(model.id)
 
             # 推断 cost_rank 和 quality_rank
             cost_rank = self._infer_cost_rank(model.litellm_id)
