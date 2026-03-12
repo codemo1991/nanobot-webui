@@ -817,6 +817,22 @@ class ConfigRepository:
             logger.warning(f"Failed to get enabled models: {e}")
             return []
 
+    def clear_default_for_all_models_except(self, except_model_id: str | None = None) -> None:
+        """清除所有模型的默认状态，仅保留指定模型。用于保证全局只有一个默认模型。"""
+        try:
+            with self._connect() as conn:
+                if except_model_id:
+                    conn.execute(
+                        "UPDATE config_models SET is_default = 0 WHERE id != ?",
+                        (except_model_id,)
+                    )
+                else:
+                    conn.execute("UPDATE config_models SET is_default = 0")
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to clear default status: {e}")
+            raise
+
     def set_model(self, model_id: str, provider_id: str, name: str, litellm_id: str,
                   aliases: str = "", capabilities: str = "", context_window: int = 128000,
                   cost_rank: int | None = None, quality_rank: int | None = None,

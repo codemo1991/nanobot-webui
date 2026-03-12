@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 import cgi
 import io
 import json
@@ -35,6 +36,9 @@ from nanobot.session.manager import SessionManager
 from nanobot.storage.status_repository import StatusRepository
 from nanobot.storage import memory_repository
 
+if TYPE_CHECKING:
+    from nanobot.storage.config_repository import ConfigRepository
+
 
 def _ok(data: Any) -> dict[str, Any]:
     return {"success": True, "data": data, "error": None}
@@ -42,6 +46,20 @@ def _ok(data: Any) -> dict[str, Any]:
 
 def _err(code: str, message: str, details: Any = None) -> dict[str, Any]:
     return {"success": False, "data": None, "error": {"code": code, "message": message, "details": details}}
+
+
+def _sync_smart_profile_default_model(repo: "ConfigRepository", model_id: str) -> None:
+    """将 smart 场景的 model_chain 清空后仅设置为默认模型。"""
+    smart_profile = repo.get_model_profile("smart")
+    if smart_profile:
+        repo.set_model_profile(
+            profile_id="smart",
+            name=smart_profile["name"],
+            model_chain=model_id,
+            description=smart_profile.get("description", ""),
+            rules=smart_profile.get("rules", ""),
+            enabled=smart_profile.get("enabled", True),
+        )
 
 
 class NanobotWebAPI:
@@ -115,6 +133,8 @@ class NanobotWebAPI:
 
         # Pre-register API keys for custom models in templates
         self._register_template_model_keys(provider, config)
+        # 启动时将所有已配置 provider 的 api_key 注入环境变量，供 profile 解析到的模型使用
+        self._register_all_provider_keys(provider, config)
 
         self._workspace_path = workspace_path  # 用于 web-ui 图片等文件保存到 workspace/.nanobot/media
         self.agent = AgentLoop(
@@ -510,6 +530,21 @@ class NanobotWebAPI:
                     logger.warning(f"No API key found for template model: {model}")
         except Exception as e:
             logger.warning(f"Failed to register template model keys: {e}")
+
+    def _register_all_provider_keys(self, provider, config) -> None:
+        """将所有已配置 provider 的 api_key 注入环境变量，供 profile 解析到的模型使用。"""
+        provider_ids = [
+            "anthropic", "openai", "openrouter", "deepseek", "groq",
+            "zhipu", "dashscope", "gemini", "vllm", "ollama", "minimax",
+        ]
+        for pid in provider_ids:
+            pc = getattr(config.providers, pid, None)
+            if pc and getattr(pc, "api_key", None) and hasattr(provider, "ensure_api_key_for_model"):
+                provider.ensure_api_key_for_model(
+                    f"{pid}/placeholder",
+                    pc.api_key,
+                    getattr(pc, "api_base", None),
+                )
 
     def _sync_gateway(self, restart: bool = False) -> None:
         """Start, stop, or restart gateway based on channel configuration."""
@@ -1467,7 +1502,7 @@ class NanobotWebAPI:
                     "id": provider_name,
                     "name": provider_display_names.get(provider_name, provider_name.capitalize()),
                     "type": provider_name,
-                    "apiKey": "***" if provider_config.api_key else None,
+                    "apiKey": provider_config.api_key or None,  # 配置页需展示真实 key 以便编辑
                     "apiBase": provider_config.api_base,
                     "enabled": enabled,
                 })
@@ -1558,6 +1593,14 @@ class NanobotWebAPI:
         from nanobot.config.loader import save_config
         save_config(config)
         
+        # 立即更新该 provider 的环境变量，供后续 chat 使用
+        if provider_config.api_key and hasattr(self.agent.provider, "ensure_api_key_for_model"):
+            self.agent.provider.ensure_api_key_for_model(
+                f"{provider_type}/placeholder",
+                provider_config.api_key,
+                provider_config.api_base,
+            )
+        
         enabled = bool(provider_config.api_key) or (
             provider_type == "ollama" and provider_config.api_base
         )
@@ -1566,7 +1609,7 @@ class NanobotWebAPI:
             "name": data.get("name", provider_type.capitalize()),
             "type": provider_type,
             "apiBase": provider_config.api_base,
-            "apiKey": "***" if provider_config.api_key else None,
+            "apiKey": provider_config.api_key or None,
             "enabled": enabled,
         }
 
@@ -1578,7 +1621,8 @@ class NanobotWebAPI:
             raise KeyError("Provider not found")
         
         provider_config = getattr(config.providers, provider_id)
-        if "apiKey" in data:
+        if "apiKey" in data and data["apiKey"] != "***":
+            # 占位符 "***" 不覆盖；空串或新值则更新
             provider_config.api_key = data["apiKey"]
         if "apiBase" in data:
             provider_config.api_base = data["apiBase"]
@@ -1586,7 +1630,15 @@ class NanobotWebAPI:
         from nanobot.config.loader import save_config
         save_config(config)
         
-        # 若当前默认模型使用此 provider，热更新 agent 的 provider 配置
+        # 始终更新该 provider 的环境变量（MINIMAX_API_KEY 等），供 LiteLLM 使用
+        # 否则当使用 profile 解析到 minimax 时，env 中无 key 会导致 401
+        if provider_config.api_key and hasattr(self.agent.provider, "ensure_api_key_for_model"):
+            self.agent.provider.ensure_api_key_for_model(
+                f"{provider_id}/placeholder",
+                provider_config.api_key,
+                provider_config.api_base,
+            )
+        # 若当前默认模型使用此 provider，热更新 agent 的 provider 实例配置
         model_name = config.agents.defaults.model
         if model_name and model_name.split("/")[0] == provider_id:
             if hasattr(self.agent.provider, "update_config"):
@@ -1602,7 +1654,7 @@ class NanobotWebAPI:
             "name": data.get("name", provider_id.capitalize()),
             "type": provider_id,
             "apiBase": provider_config.api_base,
-            "apiKey": "***" if provider_config.api_key else None,
+            "apiKey": provider_config.api_key or None,
             "enabled": enabled,
         }
 
@@ -3296,10 +3348,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 from nanobot.config.loader import get_config_repository
                 repo = get_config_repository()
                 profiles = repo.get_all_model_profiles()
-                self._write_json(HTTPStatus.OK, _ok(profiles))
+                # 转为 camelCase 供前端展示（前端期望 modelChain 而非 model_chain）
+                profiles_camel = [{
+                    "id": p["id"],
+                    "name": p["name"],
+                    "description": p["description"],
+                    "modelChain": p["model_chain"],
+                    "rules": p.get("rules", ""),
+                    "enabled": p["enabled"],
+                } for p in profiles]
+                self._write_json(HTTPStatus.OK, _ok(profiles_camel))
                 return
 
-            # GET /api/v1/providers/{providerId}/discover - Discover models from provider
+            # GET /api/v1/providers/{providerId}/discover - 仅查询可用模型（不保存），供添加模型时下拉选择
             if len(parts) == 5 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "providers" and parts[4] == "discover":
                 provider_id = parts[3]
                 from nanobot.providers.discovery import ModelDiscoveryService
@@ -3308,7 +3369,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 discovery = ModelDiscoveryService(repo)
                 import asyncio
                 try:
-                    models = asyncio.run(discovery.discover_and_save(provider_id))
+                    models = asyncio.run(discovery.discover_for_provider(provider_id))
                     self._write_json(HTTPStatus.OK, _ok([{
                         "id": m.id,
                         "name": m.name,
@@ -3932,8 +3993,14 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             try:
                 from nanobot.config.loader import get_config_repository
                 repo = get_config_repository()
+                model_id = body["id"]
+                is_default = body.get("isDefault", False)
+                if is_default:
+                    repo.clear_default_for_all_models_except(model_id)
+                    repo.set_config_value("agent", "default_profile", model_id)
+                    _sync_smart_profile_default_model(repo, model_id)
                 repo.set_model(
-                    model_id=body["id"],
+                    model_id=model_id,
                     provider_id=body["providerId"],
                     name=body["name"],
                     litellm_id=body["litellmId"],
@@ -3943,7 +4010,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     cost_rank=body.get("costRank"),
                     quality_rank=body.get("qualityRank"),
                     enabled=body.get("enabled", True),
-                    is_default=body.get("isDefault", False),
+                    is_default=is_default,
                 )
                 self._write_json(HTTPStatus.CREATED, _ok({"success": True}))
             except Exception as e:
@@ -3981,6 +4048,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             repo = get_config_repository()
             model = repo.get_model(model_id)
             if model:
+                # 全局唯一默认：先清除所有模型的默认状态
+                repo.clear_default_for_all_models_except(model_id)
                 repo.set_model(
                     model_id=model_id,
                     provider_id=model["provider_id"],
@@ -3994,22 +4063,22 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     enabled=model.get("enabled", True),
                     is_default=True,
                 )
-                # Clear other models' default status for this provider
-                for m in repo.get_all_models(model["provider_id"]):
-                    if m["id"] != model_id:
-                        repo.set_model(
-                            model_id=m["id"],
-                            provider_id=m["provider_id"],
-                            name=m["name"],
-                            litellm_id=m["litellm_id"],
-                            aliases=m.get("aliases", ""),
-                            capabilities=m.get("capabilities", ""),
-                            context_window=m.get("context_window", 128000),
-                            cost_rank=m.get("cost_rank"),
-                            quality_rank=m.get("quality_rank"),
-                            enabled=m.get("enabled", True),
-                            is_default=False,
-                        )
+                # 同步 agent 的 default_profile，使 router 实际使用该模型（否则会继续用 smart 等 profile）
+                repo.set_config_value("agent", "default_profile", model_id)
+                # 同步 smart 场景的 model_chain，将默认模型置于首位
+                _sync_smart_profile_default_model(repo, model_id)
+                if hasattr(app, "router") and hasattr(app.router, "clear_cache"):
+                    app.router.clear_cache()
+                # 热更新 agent 的模型和 provider 的 api_key
+                if hasattr(app, "agent") and app.agent:
+                    from nanobot.config.loader import load_config
+                    cfg = load_config()
+                    if hasattr(app.agent.provider, "update_config"):
+                        api_key = cfg.get_api_key(model["litellm_id"])
+                        api_base = cfg.get_api_base(model["litellm_id"])
+                        app.agent.provider.update_config(model["litellm_id"], api_key, api_base)
+                    if hasattr(app.agent, "update_model"):
+                        app.agent.update_model(model["litellm_id"])
             self._write_json(HTTPStatus.OK, _ok({"success": True}))
             return
 
@@ -4818,6 +4887,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 if not existing:
                     self._write_json(HTTPStatus.NOT_FOUND, _err("MODEL_NOT_FOUND", "模型不存在"))
                     return
+                is_default = body.get("isDefault", existing.get("is_default", False))
+                if is_default:
+                    repo.clear_default_for_all_models_except(model_id)
+                    repo.set_config_value("agent", "default_profile", model_id)
+                    _sync_smart_profile_default_model(repo, model_id)
                 repo.set_model(
                     model_id=model_id,
                     provider_id=body.get("providerId", existing["provider_id"]),
@@ -4829,7 +4903,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     cost_rank=body.get("costRank", existing.get("cost_rank")),
                     quality_rank=body.get("qualityRank", existing.get("quality_rank")),
                     enabled=body.get("enabled", existing.get("enabled", True)),
-                    is_default=body.get("isDefault", existing.get("is_default", False)),
+                    is_default=is_default,
                 )
                 self._write_json(HTTPStatus.OK, _ok({"success": True}))
             except Exception as e:
