@@ -43,11 +43,12 @@ def main(
 @app.command()
 def onboard():
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_repository, get_db_path, save_config
+    from nanobot.config.loader import ensure_system_db_initialized, get_config_repository, get_system_db_path, save_config
     from nanobot.config.schema import Config
     from nanobot.utils.helpers import get_workspace_path
 
-    db_path = get_db_path()
+    ensure_system_db_initialized()
+    db_path = get_system_db_path()
     repo = get_config_repository()
 
     if repo.has_config():
@@ -160,9 +161,16 @@ def gateway(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
-    from nanobot.config.loader import load_config, get_db_path
+    from nanobot.config.loader import (
+        ensure_system_db_initialized,
+        get_config_repository,
+        get_effective_model,
+        get_system_db_path,
+        load_config,
+    )
     from nanobot.bus.queue import MessageBus
     from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.router import ModelRouter
     from nanobot.agent.loop import AgentLoop
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
@@ -175,13 +183,13 @@ def gateway(
         logging.basicConfig(level=logging.DEBUG)
     
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
-    
+    ensure_system_db_initialized()
     config = load_config()
+    model = get_effective_model()
     
     # Create components
     bus = MessageBus()
     
-    model = config.agents.defaults.model
     # Create provider (supports OpenRouter, Anthropic, OpenAI, Bedrock, Zhipu, etc.)
     api_key = config.get_api_key(model)
     api_base = config.get_api_base(model)
@@ -195,7 +203,7 @@ def gateway(
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
-        default_model=config.agents.defaults.model
+        default_model=model,
     )
 
     subagent_model = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
@@ -207,14 +215,17 @@ def gateway(
             )
     
     # Create cron service first (callback set after agent creation)
-    cron = CronService(get_db_path())
+    cron = CronService(get_system_db_path())
 
     # Create agent with cron service（子 agent 模板由 AgentLoop 内部从 SQLite 加载，所有渠道一致）
+    repo = get_config_repository()
+    router = ModelRouter(repo)
+    default_profile = repo.get_config_value("agent", "default_profile", "smart")
     agent = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
-        model=config.agents.defaults.model,
+        model=model,
         subagent_model=subagent_model or None,
         max_iterations=config.agents.defaults.max_tool_iterations,
         max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
@@ -226,6 +237,8 @@ def gateway(
         max_parallel_tool_calls=getattr(config.agents.defaults, "max_parallel_tool_calls", 5),
         enable_parallel_tools=getattr(config.agents.defaults, "enable_parallel_tools", True),
         thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
+        router=router,
+        default_profile=default_profile,
     )
     
     # Set cron callback (needs agent)
@@ -337,13 +350,13 @@ def mirror_seal_stale(
     dry_run: bool = typer.Option(False, "--dry-run", "-n", help="仅列出将被封存的会话，不实际执行"),
 ):
     """封存非当日、未封存的悟/辩会话。建议通过 crontab 每日 0 点执行。"""
-    from nanobot.config.loader import load_config
+    from nanobot.config.loader import get_effective_model, load_config
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.session.manager import SessionManager
     from nanobot.services.mirror_seal_stale import seal_stale_sessions
 
     config = load_config()
-    model = config.agents.defaults.model
+    model = get_effective_model()
     api_key = config.get_api_key(model)
     api_base = config.get_api_base(model)
 
@@ -361,7 +374,7 @@ def mirror_seal_stale(
     async def llm_chat(messages, model=None, max_tokens=800, temperature=0.3):
         return await provider.chat(
             messages,
-            model=model or config.agents.defaults.model,
+            model=model or get_effective_model(),
             max_tokens=max_tokens,
             temperature=temperature,
         )
@@ -494,14 +507,14 @@ def agent(
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ):
     """Interact with the agent directly."""
-    from nanobot.config.loader import load_config
+    from nanobot.config.loader import get_config_repository, get_effective_model, load_config
     from nanobot.bus.queue import MessageBus
     from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.router import ModelRouter
     from nanobot.agent.loop import AgentLoop
     
     config = load_config()
-    
-    model = config.agents.defaults.model
+    model = get_effective_model()
     api_key = config.get_api_key(model)
     api_base = config.get_api_base(model)
     is_bedrock = model.startswith("bedrock/")
@@ -514,13 +527,17 @@ def agent(
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
-        default_model=config.agents.defaults.model
+        default_model=model
     )
     
+    repo = get_config_repository()
+    router = ModelRouter(repo)
+    default_profile = repo.get_config_value("agent", "default_profile", "smart")
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        model=model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -530,6 +547,8 @@ def agent(
         max_parallel_tool_calls=getattr(config.agents.defaults, "max_parallel_tool_calls", 5),
         enable_parallel_tools=getattr(config.agents.defaults, "enable_parallel_tools", True),
         thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
+        router=router,
+        default_profile=default_profile,
     )
     
     if message:
@@ -770,10 +789,11 @@ def cron_list(
     all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
 ):
     """List scheduled jobs."""
-    from nanobot.config.loader import get_db_path
+    from nanobot.config.loader import ensure_system_db_initialized, get_system_db_path
     from nanobot.cron.service import CronService
-    
-    service = CronService(get_db_path())
+
+    ensure_system_db_initialized()
+    service = CronService(get_system_db_path())
     
     jobs = service.list_jobs(include_disabled=all)
     
@@ -823,10 +843,11 @@ def cron_add(
     channel: str = typer.Option(None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"),
 ):
     """Add a scheduled job."""
-    from nanobot.config.loader import get_db_path
+    from nanobot.config.loader import ensure_system_db_initialized, get_system_db_path
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronSchedule
-    
+
+    ensure_system_db_initialized()
     # Determine schedule type
     if every:
         schedule = CronSchedule(kind="every", every_ms=every * 1000)
@@ -840,7 +861,7 @@ def cron_add(
         console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
         raise typer.Exit(1)
     
-    service = CronService(get_db_path())
+    service = CronService(get_system_db_path())
     
     job = service.add_job(
         name=name,
@@ -859,10 +880,11 @@ def cron_remove(
     job_id: str = typer.Argument(..., help="Job ID to remove"),
 ):
     """Remove a scheduled job."""
-    from nanobot.config.loader import get_db_path
+    from nanobot.config.loader import ensure_system_db_initialized, get_system_db_path
     from nanobot.cron.service import CronService
-    
-    service = CronService(get_db_path())
+
+    ensure_system_db_initialized()
+    service = CronService(get_system_db_path())
     
     if service.remove_job(job_id):
         console.print(f"[green]✓[/green] Removed job {job_id}")
@@ -876,10 +898,11 @@ def cron_enable(
     disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
 ):
     """Enable or disable a job."""
-    from nanobot.config.loader import get_db_path
+    from nanobot.config.loader import ensure_system_db_initialized, get_system_db_path
     from nanobot.cron.service import CronService
-    
-    service = CronService(get_db_path())
+
+    ensure_system_db_initialized()
+    service = CronService(get_system_db_path())
     
     job = service.enable_job(job_id, enabled=not disable)
     if job:
@@ -895,10 +918,11 @@ def cron_run(
     force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
 ):
     """Manually run a job."""
-    from nanobot.config.loader import get_db_path
+    from nanobot.config.loader import ensure_system_db_initialized, get_system_db_path
     from nanobot.cron.service import CronService
-    
-    service = CronService(get_db_path())
+
+    ensure_system_db_initialized()
+    service = CronService(get_system_db_path())
     
     async def run():
         return await service.run_job(job_id, force=force)
@@ -917,20 +941,22 @@ def cron_run(
 @app.command()
 def status():
     """Show nanobot status."""
-    from nanobot.config.loader import load_config, get_db_path, get_config_repository
+    from nanobot.config.loader import ensure_system_db_initialized, load_config, get_system_db_path, get_config_repository
 
-    db_path = get_db_path()
+    ensure_system_db_initialized()
+    db_path = get_system_db_path()
     repo = get_config_repository()
     config = load_config()
     workspace = config.workspace_path
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Database: {db_path} {'[green]✓[/green]' if db_path.exists() else '[red]✗[/red]'}")
+    console.print(f"System DB: {db_path} {'[green]✓[/green]' if db_path.exists() else '[red]✗[/red]'}")
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
     if repo.has_config():
-        console.print(f"Model: {config.agents.defaults.model}")
+        from nanobot.config.loader import get_effective_model
+        console.print(f"Model: {get_effective_model()}")
 
         # Check API keys
         has_openrouter = bool(config.providers.openrouter.api_key)

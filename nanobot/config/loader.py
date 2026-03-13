@@ -9,14 +9,30 @@ from nanobot.config.schema import Config
 from nanobot.storage.config_repository import ConfigRepository
 
 
-def get_db_path() -> Path:
-    """Get the SQLite database path."""
-    return Path.home() / ".nanobot" / "chat.db"
+def get_system_db_path() -> Path:
+    """系统配置数据库路径，仅存放配置相关（~/.nanobot/system.db）。"""
+    return Path.home() / ".nanobot" / "system.db"
 
 
 def get_config_repository() -> ConfigRepository:
     """Get the configuration repository instance."""
-    return ConfigRepository(get_db_path())
+    return ConfigRepository(get_system_db_path())
+
+
+def ensure_system_db_initialized() -> None:
+    """
+    启动时初始化系统数据库。若目录或 system.db 不存在则创建，缺失表则建立。
+    新装机用户首次启动时会自动完成初始化。
+    """
+    from nanobot.storage.config_repository import ConfigRepository
+    from nanobot.storage.cron_repository import CronRepository
+
+    system_db = get_system_db_path()
+    system_db.parent.mkdir(parents=True, exist_ok=True)
+    # ConfigRepository 和 CronRepository 的 __init__ 会执行 _init_tables，自动建表
+    ConfigRepository(system_db)
+    CronRepository(system_db)
+    logger.debug("System DB initialized: %s", system_db)
 
 
 def ensure_initial_config() -> Config:
@@ -24,8 +40,7 @@ def ensure_initial_config() -> Config:
     确保 .nanobot 目录和配置存在；若不存在则创建默认配置和工作空间。
     用于首次启动 web-ui 时自动初始化。
     """
-    get_db_path().parent.mkdir(parents=True, exist_ok=True)
-
+    ensure_system_db_initialized()
     repo = get_config_repository()
 
     if not repo.has_config():
@@ -47,13 +62,26 @@ def get_data_dir() -> Path:
     return get_data_path()
 
 
+def get_effective_model() -> str:
+    """从 ModelRouter 解析当前生效的模型（由 default_profile 决定）。"""
+    from nanobot.providers.router import ModelNotFoundError, ModelRouter
+    repo = get_config_repository()
+    default_profile = repo.get_config_value("agent", "default_profile", "smart")
+    router = ModelRouter(repo)
+    try:
+        return router.get(default_profile).model
+    except (KeyError, ValueError, AttributeError, TypeError, ModelNotFoundError) as e:
+        logger.debug("get_effective_model fallback: %s", e)
+        return "anthropic/claude-opus-4-6"
+
+
 def load_config() -> Config:
     """Load configuration from SQLite."""
     repo = get_config_repository()
     try:
         config_data = repo.load_full_config()
         data = convert_keys(config_data)
-        # 移除 Config  schema 中不存在的扩展字段，避免 Pydantic extra_forbidden 校验失败
+        # 移除 Config schema 中不存在的扩展字段，避免 Pydantic 校验失败
         for key in ("models", "model_profiles"):
             data.pop(key, None)
         return Config.model_validate(data)

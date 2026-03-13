@@ -66,9 +66,8 @@ class ChannelsConfig(BaseModel):
 
 
 class AgentDefaults(BaseModel):
-    """Default agent configuration."""
+    """Default agent configuration. 模型由 ModelRouter + default_profile 决定，不再在此配置。"""
     workspace: str = "~/.nanobot/web-ui"
-    model: str = "anthropic/claude-opus-4-5"
     subagent_model: str = ""  # 子 Agent 使用的模型，留空则与主 Agent 相同
     max_tokens: int = 8192
     temperature: float = 0.7
@@ -248,8 +247,10 @@ class Config(BaseSettings):
     }
 
     def _get_provider_for_model(self, model: str | None) -> str | None:
-        """Get provider name for the given model."""
-        model_lower = (model or self.agents.defaults.model).lower()
+        """Get provider name for the given model. model 为 None 时返回 None，由调用方按 FALLBACK 顺序解析。"""
+        if not model:
+            return None
+        model_lower = model.lower()
         for prefixes, provider in self._MODEL_PROVIDER_MAP.items():
             for prefix in prefixes:
                 if model_lower.startswith(prefix) or prefix in model_lower:

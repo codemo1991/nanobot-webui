@@ -14,6 +14,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.bus.queue import MessageBus
+from nanobot.config.loader import get_system_db_path
 
 
 class ClaudeCodeManager:
@@ -101,8 +102,7 @@ class ClaudeCodeManager:
         """从 nanobot 配置数据库读取 Anthropic API Key。"""
         try:
             import sqlite3
-            # nanobot 默认 DB 路径：~/.nanobot/chat.db
-            db_path = Path.home() / ".nanobot" / "chat.db"
+            db_path = get_system_db_path()
             if not db_path.exists():
                 return None
             conn = sqlite3.connect(str(db_path))
