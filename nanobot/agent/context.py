@@ -326,6 +326,9 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
             # 音频文件路径作为文本提示，告诉模型有音频待处理
             audio_paths = "\n".join([f"[Attached Audio: {a['audio_url']['url']}]" for a in audio_files])
             content_parts.append({"type": "text", "text": f"{audio_paths}\n\n{text}" if text else audio_paths})
+        elif content_parts:
+            # 仅有图片时，必须附加用户文本，否则 LLM 可能无法正确理解请求（部分模型/实现会忽略纯图片消息）
+            content_parts.append({"type": "text", "text": text or "请描述图片内容"})
 
         if not content_parts:
             return text
