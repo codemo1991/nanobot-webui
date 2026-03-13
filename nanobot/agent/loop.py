@@ -829,6 +829,12 @@ class AgentLoop:
         vision_keywords = ["vision", "vl", "qwen-vl", "gpt-4v", "gpt-4o", "claude-3-opus", "claude-3-sonnet", "claude-3-5", "claude-4"]
         return any(kw in model_lower for kw in vision_keywords)
 
+    def _is_dashscope_model(self, model: str) -> bool:
+        """Check if model is DashScope/Qwen (LiteLLM has known bug #16007 that drops images)."""
+        if not model:
+            return False
+        return any(k in model.lower() for k in ("dashscope", "qwen"))
+
     def _is_image_file(self, path: str) -> bool:
         """Check if a file is an image based on extension or mime type."""
         import mimetypes
@@ -1265,19 +1271,20 @@ class AgentLoop:
 
         if image_files:
             main_model_supports_vision = self._is_vision_model(self.model)
+            # LiteLLM 存在 Bug #16007：DashScope 图文混排时丢弃图片，仅传递文本
+            # 对 DashScope 模型强制使用 inline recognition 以 bypass LiteLLM
+            # 主模型不支持视觉 或 DashScope（LiteLLM Bug #16007 会丢图）时，用 vision 子 agent
+            use_vision_subagent = (
+                (not main_model_supports_vision)
+                or (main_model_supports_vision and self._is_dashscope_model(self.model))
+            )
 
-            if main_model_supports_vision:
-                # 主模型支持视觉，直接发送图片给主模型（让模型自己决定是否需要处理）
-                # 不需要 inline recognition，主模型会自己分析图片
+            if main_model_supports_vision and not self._is_dashscope_model(self.model):
+                # 主模型支持视觉且非 DashScope，直接发送图片
                 logger.info("[Image] Main model supports vision, letting model handle images directly")
-            elif self.subagent_model and self.subagent_model != self.model:
-                # 主模型不支持视觉，但配置了 subagent_model
-                # 让模型自己决定是否需要 spawn vision 子agent
-                # 暂时不做 inline recognition，让模型在 loop 中自己处理
-                # 如果模型没有 spawn 子agent，最后会在 loop 结束后做兜底
-                logger.info("[Image] Main model doesn't support vision, expecting model to spawn vision subagent or fallback to inline")
-            else:
-                # 没有配置 subagent_model，主模型也不支持视觉，直接 inline recognition
+            elif use_vision_subagent:
+                # 使用 vision 子 agent 分析（模板 model/system_prompt 可配置，支持不同视觉解读风格）
+                logger.info("[Image] Using vision subagent for analysis (template configurable)")
                 await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
                 progress_cb = msg.metadata.get("progress_callback")
                 if progress_cb:
@@ -1285,20 +1292,25 @@ class AgentLoop:
                         progress_cb({"type": "tool_start", "name": "image_recognition", "arguments": {"images": len(image_files)}})
                     except Exception:
                         pass
-                img_desc = await self._inline_image_recognition(image_files, user_text=msg.content)
+                session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
+                channel, chat_id = (session_key.split(":", 1) + [session_key])[:2]
+                task_text = msg.content.strip() or "请详细分析这些图片的内容。"
+                img_desc = await self.subagents.run_vision_analysis(
+                    task=task_text, media=image_files,
+                    origin_channel=channel, origin_chat_id=chat_id,
+                )
                 if progress_cb:
                     try:
                         progress_cb({"type": "tool_end", "name": "image_recognition", "arguments": {}, "result": (img_desc or "")[:200]})
                     except Exception:
                         pass
-
                 last_user = messages[-1] if messages and messages[-1].get("role") == "user" else None
                 if last_user:
-                    if img_desc:
+                    if img_desc and img_desc.strip():
                         text_content = msg.content.strip() or "请描述这张图片。"
-                        last_user["content"] = f"{text_content}\n\n[图片识别结果]\n{img_desc}"
+                        last_user["content"] = f"{text_content}\n\n[Vision 子 Agent 分析结果]\n{img_desc.strip()}"
                     else:
-                        last_user["content"] = f"{msg.content}\n\n[图片识别失败，请用户用文字描述图片内容]"
+                        last_user["content"] = f"{msg.content}\n\n[图片分析失败，请检查 vision 模板配置或 DashScope API Key]"
         
         # Agent loop
         sk = msg.session_key
@@ -1956,8 +1968,8 @@ class AgentLoop:
                 for step in tool_steps
             )
             if not spawned_vision:
-                # 模型没有 spawn vision 子agent，做 inline recognition 兜底
-                logger.info("[Image] Model didn't spawn vision subagent, using inline recognition as fallback")
+                # 模型没有 spawn vision 子agent，用 vision 子 agent 兜底
+                logger.info("[Image] Model didn't spawn vision subagent, using vision subagent as fallback")
                 await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
                 progress_cb = msg.metadata.get("progress_callback")
                 if progress_cb:
@@ -1965,10 +1977,14 @@ class AgentLoop:
                         progress_cb({"type": "tool_start", "name": "image_recognition_fallback", "arguments": {"images": len(image_files)}})
                     except Exception:
                         pass
-
-                img_desc = await self._inline_image_recognition(image_files, user_text=msg.content)
-                if img_desc:
-                    final_content = f"{final_content or ''}\n\n---\n\n[图片识别结果]\n{img_desc}"
+                session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
+                channel, chat_id = (session_key.split(":", 1) + [session_key])[:2]
+                img_desc = await self.subagents.run_vision_analysis(
+                    task=msg.content.strip() or "请详细分析这些图片的内容。",
+                    media=image_files, origin_channel=channel, origin_chat_id=chat_id,
+                )
+                if img_desc and img_desc.strip():
+                    final_content = f"{final_content or ''}\n\n---\n\n[Vision 子 Agent 分析结果]\n{img_desc.strip()}"
 
                 if progress_cb:
                     try:
@@ -1987,140 +2003,6 @@ class AgentLoop:
             chat_id=msg.chat_id,
             content=final_content
         )
-    
-    async def _inline_image_recognition(
-        self,
-        media_paths: list[str],
-        user_text: str = "",
-    ) -> str | None:
-        """
-        使用视觉模型对图片进行 inline 识别（同步 await）。
-
-        对 DashScope 模型绕过 LiteLLM（LiteLLM 存在已知 Bug #16007 会丢弃图片），
-        直接调用 DashScope OpenAI 兼容 API。其他 provider 走正常 provider.chat() 路径。
-
-        Returns:
-            图片描述文本，识别失败时返回 None。
-        """
-        import base64
-        import mimetypes as _mimetypes
-
-        vision_model = self.subagent_model if self.subagent_model else self.model
-
-        images: list[dict[str, Any]] = []
-        for path_str in media_paths:
-            p = Path(path_str)
-            mime, _ = _mimetypes.guess_type(path_str)
-            if not p.is_file() or not mime or not mime.startswith("image/"):
-                continue
-            try:
-                b64 = base64.b64encode(p.read_bytes()).decode()
-                images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
-            except Exception as e:
-                logger.warning("Failed to read media file for recognition %s: %s", path_str, e)
-
-        if not images:
-            return None
-
-        image_count = len(images)
-        task = user_text or (
-            f"请详细分析这{image_count}张图片的内容，包括："
-            "1) 图片中的主要内容和对象；"
-            "2) 场景和环境；"
-            "3) 文字信息（如果有）；"
-            "4) 任何值得注意的细节。用中文回复。"
-        )
-
-        model_lower = vision_model.lower()
-        is_dashscope = any(k in model_lower for k in ("dashscope", "qwen"))
-
-        if is_dashscope:
-            return await self._dashscope_image_call(images, task, vision_model, image_count)
-
-        user_content: list[dict[str, Any]] = images + [{"type": "text", "text": task}]
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": "你是一个图片分析助手。请仔细观察并描述图片内容。"},
-            {"role": "user", "content": user_content},
-        ]
-        try:
-            response = await self.provider.chat(
-                messages=messages,
-                tools=None,
-                model=vision_model,
-            )
-            if response.content and response.content.strip():
-                logger.info("Inline image recognition completed (%d images, model: %s)", image_count, vision_model)
-                return response.content.strip()
-            return None
-        except Exception as e:
-            logger.warning("Inline image recognition failed (model: %s): %s", vision_model, e)
-            return None
-
-    async def _dashscope_image_call(
-        self,
-        images: list[dict[str, Any]],
-        task: str,
-        vision_model: str,
-        image_count: int,
-    ) -> str | None:
-        """
-        直接调用 DashScope OpenAI 兼容 API 进行图片识别。
-        绕过 LiteLLM 的 DashScope 适配层（存在已知 Bug 会丢弃 image_url 内容）。
-        """
-        import os
-        import httpx
-
-        api_key = os.environ.get("DASHSCOPE_API_KEY", "")
-        if not api_key:
-            from nanobot.config.loader import load_config
-            cfg = load_config()
-            api_key = (cfg.providers.dashscope.api_key or "").strip()
-        if not api_key:
-            logger.warning("DashScope API key not found, cannot perform image recognition")
-            return None
-
-        model_name = vision_model
-        if "/" in model_name:
-            model_name = model_name.split("/", 1)[1]
-
-        user_content: list[dict[str, Any]] = images + [{"type": "text", "text": task}]
-        payload: dict[str, Any] = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": "你是一个图片分析助手。请仔细观察并描述图片内容。"},
-                {"role": "user", "content": user_content},
-            ],
-        }
-
-        url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                resp = await client.post(url, json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            if content and content.strip():
-                logger.info(
-                    "DashScope image recognition completed (%d images, model: %s)",
-                    image_count, model_name,
-                )
-                return content.strip()
-            return None
-        except httpx.HTTPStatusError as e:
-            logger.warning(
-                "DashScope image recognition HTTP error (model: %s): %s %s",
-                model_name, e.response.status_code, e.response.text[:500],
-            )
-            return None
-        except Exception as e:
-            logger.warning("DashScope image recognition failed (model: %s): %s", model_name, e)
-            return None
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
@@ -2512,10 +2394,15 @@ class AgentLoop:
             session.add_message("user", "[图片消息]", **user_message_kwargs)
             self.sessions.save(session)
 
-        desc = await self._inline_image_recognition(media)
+        desc = await self.subagents.run_vision_analysis(
+            task="请详细分析这些图片的内容。",
+            media=media,
+            origin_channel=channel,
+            origin_chat_id=chat_id,
+        )
         if desc:
             if session:
                 session.add_message("assistant", desc)
                 self.sessions.save(session)
             return desc
-        return "无法识别图片内容，请确认已配置视觉模型（如 dashscope/qwen-vl-plus）。"
+        return "无法识别图片内容，请检查 vision 模板配置或 DashScope API Key。"

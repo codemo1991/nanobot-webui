@@ -211,6 +211,73 @@ class SubagentManager:
             self.cancel_task(task_id)
         return count
 
+    async def run_vision_analysis(
+        self,
+        task: str,
+        media: list[str],
+        origin_channel: str = "web",
+        origin_chat_id: str = "direct",
+    ) -> str | None:
+        """
+        同步运行 vision 子 agent 进行图片分析，使用子 agent 配置（模板 model、backend、system_prompt）。
+        供主 loop 在需要图片分析时调用，避免 inline recognition 固定单一解读方式。
+
+        Returns:
+            图片分析结果文本，失败时返回 None。
+        """
+        if not media:
+            return None
+        origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+        origin_key = f"{origin_channel}:{origin_chat_id}"
+        task_id = f"vision-inline-{uuid.uuid4().hex[:8]}"
+
+        # 使用 vision 模板的 model，或 subagent 默认 model
+        effective_model = self.model
+        if self._agent_template_manager:
+            tm = self._agent_template_manager.get_model_for_template("vision")
+            if tm:
+                effective_model = tm
+                logger.info("[run_vision_analysis] Using vision template model: %s", effective_model)
+
+        backend = self._backend_resolver.resolve("vision", "native", media=media, model=effective_model)
+        # 若 backend 为 native 但 model 非视觉模型，尝试用 dashscope_vision 兜底（需有 API key）
+        if backend == "native" and "dashscope_vision" in self._backend_registry.list_available():
+            def _is_vision(m: str) -> bool:
+                return m and any(k in (m or "").lower() for k in ("vision", "vl", "qwen-vl", "gpt-4v", "gpt-4o"))
+            if not _is_vision(effective_model):
+                import os
+                has_key = bool(os.environ.get("DASHSCOPE_API_KEY"))
+                if not has_key:
+                    try:
+                        from nanobot.config.loader import load_config
+                        has_key = bool((load_config().providers.dashscope.api_key or "").strip())
+                    except Exception:
+                        pass
+                if has_key:
+                    backend = "dashscope_vision"
+                    effective_model = "qwen-vl-plus"
+                    logger.info("[run_vision_analysis] Original model doesn't support vision, fallback to dashscope_vision (qwen-vl-plus)")
+        logger.info("[run_vision_analysis] task_id=%s, backend=%s, model=%s", task_id, backend, effective_model)
+
+        runner = self._backend_registry.get(backend)
+        if runner and backend != "native":
+            await runner(
+                task_id, task, task[:50], origin,
+                template="vision", batch_id=None, subagent_manager=self,
+                media=media, model=effective_model,
+            )
+        else:
+            await self._run_subagent(
+                task_id, task, task[:50], origin,
+                template="vision", media=media, backend="native",
+            )
+
+        if self.sessions:
+            session = self.sessions.get_or_create(origin_key)
+            if task_id in session.subagent_results:
+                return session.subagent_results[task_id].get("result")
+        return None
+
     async def spawn(
         self,
         task: str,
