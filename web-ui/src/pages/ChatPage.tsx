@@ -974,10 +974,10 @@ function ChatPage() {
         clearStreamingState(currentSession.id)
       }
 
-      if (abortControllerRef.current === controller) {
-        setLoading(false)
-        abortControllerRef.current = null
-      }
+      // 直接清除 loading 状态，无需条件检查
+      // 避免竞态条件：visibilitychange 恢复时 tryReconnectChatStream 可能已覆盖 abortControllerRef
+      setLoading(false)
+      abortControllerRef.current = null
     }
   }, [input, loading, messages, currentSession, pendingImages.length, t, handleStreamEvent])
 
