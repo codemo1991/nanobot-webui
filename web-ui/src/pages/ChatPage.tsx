@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useLocation } from 'react-router-dom'
-import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Dropdown, Badge, Tag, Modal, Popconfirm, Pagination } from 'antd'
-import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, TagsOutlined, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
+import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Tag, Modal, Popconfirm } from 'antd'
+import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -187,15 +187,7 @@ function ChatPage() {
     totalTokens: 0,
   })
   const [tasks, setTasks] = useState<Task[]>([])
-  const [loadingTasks, setLoadingTasks] = useState(false)
-  const [tasksDropdownOpen, setTasksDropdownOpen] = useState(false)
-  const [selectedTask, setSelectedTask] = useState<Task | null>(null)
-  const [taskDetailOpen, setTaskDetailOpen] = useState(false)
-  // 分页状态
-  const [tasksPage, setTasksPage] = useState(1)
-  const [tasksPageSize, setTasksPageSize] = useState(20)
-  const [tasksTotal, setTasksTotal] = useState(0)
-  const [tasksLoadError, setTasksLoadError] = useState<string | null>(null)
+  const [currentModelName, setCurrentModelName] = useState<string>('')
   // 使用 ref 来跟踪是否需要轮询（避免 useEffect 依赖问题）
   const pollingEnabledRef = useRef(true)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -622,6 +614,22 @@ function ChatPage() {
     void requestNotificationPermission()
   }, [])
 
+  // 加载当前使用的模型名称（页面可见时刷新，确保配置变更后能实时更新）
+  const loadCurrentModel = useCallback(() => {
+    api.getConfig().then((config) => {
+      const defaultModel = config.models?.find((m) => m.isDefault) ?? config.models?.[0]
+      setCurrentModelName(defaultModel?.modelName || defaultModel?.name || '')
+    }).catch(() => {})
+  }, [])
+  useEffect(() => {
+    loadCurrentModel()
+  }, [loadCurrentModel])
+  useEffect(() => {
+    const onVisible = () => { loadCurrentModel() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [loadCurrentModel])
+
   // Session 切换时恢复状态
   useEffect(() => {
     // 🔧 修复1：切换 session 时中止正在进行的请求
@@ -638,6 +646,7 @@ function ChatPage() {
     isStreamingRef.current = false
 
     if (currentSession) {
+      loadCurrentModel()
       loadMessages(currentSession.id)
       loadSessionTokenUsage(currentSession.id)
 
@@ -668,10 +677,13 @@ function ChatPage() {
     } else {
       setSessionTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 })
     }
-  }, [currentSession, tryReconnectChatStream])
+  }, [currentSession, tryReconnectChatStream, loadCurrentModel])
 
   // 监听路由变化，当从其他页面切回聊天页面时恢复状态
   useEffect(() => {
+    if (location.pathname === '/chat') {
+      loadCurrentModel()
+    }
     // 只有当前 session 存在时才尝试恢复状态
     if (currentSession && location.pathname === '/chat') {
       const savedState = loadStreamingState(currentSession.id)
@@ -701,7 +713,7 @@ function ChatPage() {
         }
       }
     }
-  }, [location.pathname])
+  }, [location.pathname, currentSession, loadCurrentModel])
 
   useEffect(() => {
     scrollToBottom()
@@ -739,55 +751,18 @@ function ChatPage() {
     }
   }
 
-  const loadTasks = async (page = tasksPage, pageSize = tasksPageSize) => {
+  const loadTasks = async (page = 1, pageSize = 20) => {
     try {
-      setLoadingTasks(true)
-      setTasksLoadError(null)
       const data: TaskListResponse = await api.getTasks(page, pageSize, 'all')
       setTasks(data.items)
-      setTasksTotal(data.total)
       // 如果没有运行中的任务，停止轮询
       const runningCount = data.items.filter(task => task.status === 'running').length
       pollingEnabledRef.current = runningCount > 0
     } catch (error) {
       console.error(error)
-      setTasksLoadError(error instanceof Error ? error.message : t('chat.tasks.loadFailed'))
-    } finally {
-      setLoadingTasks(false)
     }
   }
 
-  const handleCancelTask = async (taskId: string) => {
-    try {
-      await api.cancelTask(taskId)
-      antMessage.success(t('chat.tasks.cancelSuccess'))
-      loadTasks()
-    } catch (error) {
-      antMessage.error(t('chat.tasks.cancelFailed'))
-      console.error(error)
-    }
-  }
-
-  const handleViewTaskDetails = async (task: Task) => {
-    try {
-      const fullTask = await api.getTask(task.task_id)
-      setSelectedTask(fullTask)
-      setTaskDetailOpen(true)
-    } catch (error) {
-      antMessage.error(t('chat.tasks.loadFailed'))
-      console.error(error)
-    }
-  }
-
-  // 分页变化处理
-  const handleTasksPageChange = (page: number, pageSize: number) => {
-    setTasksPage(page)
-    setTasksPageSize(pageSize)
-    loadTasks(page, pageSize)
-  }
-
-  // 获取运行中的任务数量
-  const runningTasksCount = tasks.filter(task => task.status === 'running').length
   const runningBgAgentsCount = bgAgents.filter(a => a.status === 'running').length
 
   const loadMessages = async (sessionId: string) => {
@@ -1116,116 +1091,10 @@ function ChatPage() {
               </Text>
             </Space>
             <Space>
-              {/* 任务状态指示器 */}
-              <Dropdown
-                dropdownRender={() => (
-                  <div className="tasks-dropdown">
-                    <div className="tasks-dropdown-header">
-                      <Text strong>{t('chat.tasks.title')}</Text>
-                      <Button type="link" size="small" onClick={() => loadTasks()}>
-                        <SyncOutlined spin={loadingTasks} />
-                      </Button>
-                    </div>
-                    {/* 加载错误显示 */}
-                    {tasksLoadError && (
-                      <div className="tasks-error">
-                        <Text type="danger">{tasksLoadError}</Text>
-                        <Button type="link" size="small" onClick={() => loadTasks()}>
-                          {t('chat.tasks.retry')}
-                        </Button>
-                      </div>
-                    )}
-                    {/* 加载中显示 */}
-                    {loadingTasks && tasks.length === 0 ? (
-                      <div className="tasks-loading">
-                        <Spin size="small" />
-                      </div>
-                    ) : tasks.length === 0 ? (
-                      <div className="tasks-empty">
-                        <Text type="secondary">{t('chat.tasks.empty')}</Text>
-                      </div>
-                    ) : (
-                      <div className="tasks-list">
-                        {tasks.map(task => (
-                          <div key={task.task_id} className="task-item">
-                            <div className="task-item-info">
-                              <Tag
-                                color={
-                                  task.status === 'running' ? 'blue' :
-                                  task.status === 'done' ? 'green' :
-                                  task.status === 'cancelled' ? 'default' :
-                                  'red'
-                                }
-                              >
-                                {task.status === 'running' && <SyncOutlined spin style={{ marginRight: 4 }} />}
-                                {t(`chat.tasks.${task.status}`)}
-                              </Tag>
-                              <Text ellipsis style={{ maxWidth: 200 }} title={task.prompt}>
-                                {task.prompt}
-                              </Text>
-                            </div>
-                            <div className="task-item-actions">
-                              <Button
-                                type="link"
-                                size="small"
-                                onClick={() => handleViewTaskDetails(task)}
-                              >
-                                {t('chat.tasks.viewDetails')}
-                              </Button>
-                              {task.status === 'running' && (
-                                <Popconfirm
-                                  title={t('chat.tasks.cancelConfirm')}
-                                  onConfirm={() => handleCancelTask(task.task_id)}
-                                  okText={t('common.yes')}
-                                  cancelText={t('common.no')}
-                                >
-                                  <Button type="link" size="small" danger>
-                                    {t('chat.tasks.cancel')}
-                                  </Button>
-                                </Popconfirm>
-                              )}
-                            </div>
-                          </div>
-                        ))}
-                        {/* 分页组件 */}
-                        {tasksTotal > tasksPageSize && (
-                          <div className="tasks-pagination">
-                            <Pagination
-                              size="small"
-                              current={tasksPage}
-                              pageSize={tasksPageSize}
-                              total={tasksTotal}
-                              onChange={handleTasksPageChange}
-                              showSizeChanger={false}
-                              showTotal={(total) => `${t('chat.tasks.total', { total })}`}
-                            />
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-                trigger={['click']}
-                open={tasksDropdownOpen}
-                onOpenChange={(open) => {
-                  setTasksDropdownOpen(open)
-                  // 当打开下拉菜单时，恢复轮询并刷新任务列表
-                  if (open) {
-                    pollingEnabledRef.current = true
-                    loadTasks()
-                  }
-                }}
-              >
-                <Badge count={runningTasksCount} offset={[-2, 2]}>
-                  <Button
-                    type="text"
-                    icon={<TagsOutlined />}
-                    onClick={() => setTasksDropdownOpen(!tasksDropdownOpen)}
-                  >
-                    {runningTasksCount > 0 ? t('chat.tasks.runningCount', { count: runningTasksCount }) : t('chat.tasks.title')}
-                  </Button>
-                </Badge>
-              </Dropdown>
+              {/* 当前模型名称 */}
+              {currentModelName && (
+                <Tag color="blue">{currentModelName}</Tag>
+              )}
             </Space>
           </Space>
         </Header>
@@ -1523,68 +1392,6 @@ function ChatPage() {
             </Text>
           </div>
         </div>
-
-        {/* 任务详情弹窗 */}
-        <Modal
-          title={t('chat.tasks.title')}
-          open={taskDetailOpen}
-          onCancel={() => setTaskDetailOpen(false)}
-          footer={[
-            <Button key="close" onClick={() => setTaskDetailOpen(false)}>
-              {t('common.close')}
-            </Button>,
-          ]}
-          width={600}
-        >
-          {selectedTask && (
-            <div className="task-detail">
-              <div className="task-detail-row">
-                <Text type="secondary">{t('chat.tasks.prompt')}:</Text>
-                <Text>{selectedTask.prompt}</Text>
-              </div>
-              <div className="task-detail-row">
-                <Text type="secondary">Status:</Text>
-                <Tag
-                  color={
-                    selectedTask.status === 'running' ? 'blue' :
-                    selectedTask.status === 'done' ? 'green' :
-                    selectedTask.status === 'cancelled' ? 'default' :
-                    'red'
-                  }
-                >
-                  {selectedTask.status === 'running' && <SyncOutlined spin style={{ marginRight: 4 }} />}
-                  {t(`chat.tasks.${selectedTask.status}`)}
-                </Tag>
-              </div>
-              {selectedTask.workdir && (
-                <div className="task-detail-row">
-                  <Text type="secondary">{t('chat.tasks.workdir')}:</Text>
-                  <Text code>{selectedTask.workdir}</Text>
-                </div>
-              )}
-              {selectedTask.start_time && (
-                <div className="task-detail-row">
-                  <Text type="secondary">{t('chat.tasks.startTime')}:</Text>
-                  <Text>{formatMessageTime(selectedTask.start_time)}</Text>
-                </div>
-              )}
-              {selectedTask.end_time && (
-                <div className="task-detail-row">
-                  <Text type="secondary">{t('chat.tasks.endTime')}:</Text>
-                  <Text>{formatMessageTime(selectedTask.end_time)}</Text>
-                </div>
-              )}
-              {selectedTask.result && (
-                <div className="task-detail-row">
-                  <Text type="secondary">{t('chat.tasks.result')}:</Text>
-                  <div className="task-result">
-                    <pre>{selectedTask.result}</pre>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </Modal>
       </Layout>
     </Layout>
   )

@@ -26,7 +26,7 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.bus.queue import MessageBus
 from nanobot.config.defaults import init_default_profiles, init_default_agent_config
-from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, load_config, save_config
+from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, get_system_db_path, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.router import ModelRouter
@@ -97,9 +97,8 @@ class NanobotWebAPI:
             # Create a dummy router that will fail gracefully
             handle = None
 
-        # Keep provider for backward compatibility during migration
-        # TODO: Remove after full migration to ModelRouter
-        model = config.agents.defaults.model
+        # 使用 ModelRouter 解析的模型，不再依赖 config.agents.defaults.model
+        model = handle.model if handle else "anthropic/claude-opus-4-6"
         api_key = config.get_api_key(model)
         api_base = config.get_api_base(model)
         provider = LiteLLMProvider(
@@ -141,7 +140,7 @@ class NanobotWebAPI:
             bus=MessageBus(),
             provider=provider,
             workspace=config.workspace_path,
-            model=config.agents.defaults.model,
+            model=model,
             subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
             max_iterations=config.agents.defaults.max_tool_iterations,
             max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
@@ -182,8 +181,8 @@ class NanobotWebAPI:
             _feishu_sender.setup_client()
             self._channel_senders["feishu"] = _feishu_sender
 
-        # Cron service — 使用与 status 相同的数据库
-        cron_db_path = status_db_path
+        # Cron service — 使用系统配置库 system.db（与 Config 同库）
+        cron_db_path = get_system_db_path()
         from nanobot.cron.service import CronService
 
         async def cron_job_callback(job: dict):
@@ -274,7 +273,7 @@ class NanobotWebAPI:
         self.auto_memory_integration = AutoMemoryIntegrationService(
             workspace=workspace_path,
             provider=provider,
-            model=config.agents.defaults.model,
+            model=model,
             lookback_minutes=config.memory.lookback_minutes,
             max_messages=config.memory.max_messages,
         )
@@ -284,7 +283,7 @@ class NanobotWebAPI:
         self.memory_maintenance = MemoryMaintenanceService(
             workspace=workspace_path,
             provider=provider,
-            model=config.agents.defaults.model,
+            model=model,
             summarize_interval_min=config.memory.auto_integrate_interval_minutes,
             max_entries=config.memory.max_entries,
             max_chars=config.memory.max_chars,
@@ -368,10 +367,19 @@ class NanobotWebAPI:
             logger.error(f"系统任务 '{job_name}' 执行失败: {e}")
             return None
 
+    def _get_effective_model(self) -> str:
+        """从 ModelRouter 解析当前生效的模型，不再使用 config.agents.defaults.model"""
+        if hasattr(self, "router") and hasattr(self, "default_profile"):
+            try:
+                return self.router.get(self.default_profile).model
+            except Exception:
+                pass
+        return "anthropic/claude-opus-4-6"
+
     def _reinit_agent_and_status(self, workspace_path: Path) -> None:
         """Reinitialize agent and status service with new workspace (hot reload)."""
         config = load_config()
-        model = config.agents.defaults.model
+        model = self._get_effective_model()
         api_key = config.get_api_key(model)
         api_base = config.get_api_base(model)
         is_bedrock = model.startswith("bedrock/")
@@ -380,7 +388,7 @@ class NanobotWebAPI:
         provider = LiteLLMProvider(
             api_key=api_key,
             api_base=api_base,
-            default_model=config.agents.defaults.model,
+            default_model=model,
         )
         subagent_model_cfg = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
         if subagent_model_cfg:
@@ -409,7 +417,7 @@ class NanobotWebAPI:
             bus=self.agent.bus,
             provider=provider,
             workspace=workspace_path,
-            model=config.agents.defaults.model,
+            model=model,
             subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
             max_iterations=config.agents.defaults.max_tool_iterations,
             max_execution_time=getattr(config.agents.defaults, "max_execution_time", 600) or 0,
@@ -419,6 +427,8 @@ class NanobotWebAPI:
             claude_code_config=config.tools.claude_code,
             status_service=status_service,
             agent_template_manager=self.agent_template_manager,
+            router=self.router,
+            default_profile=self.default_profile,
         )
         self.sessions = self.agent.sessions
 
@@ -1507,12 +1517,13 @@ class NanobotWebAPI:
                     "enabled": enabled,
                 })
         
-        # Create default model entry
+        # Create default model entry - 使用 ModelRouter 解析的实际模型
+        effective_model = self._get_effective_model()
         models = [{
             "id": "default",
-            "name": config.agents.defaults.model,
-            "providerId": config.agents.defaults.model.split('/')[0] if '/' in config.agents.defaults.model else "openai",
-            "modelName": config.agents.defaults.model,
+            "name": effective_model,
+            "providerId": effective_model.split('/')[0] if '/' in effective_model else "openai",
+            "modelName": effective_model,
             "enabled": True,
             "isDefault": True,
             "parameters": {
@@ -1639,7 +1650,7 @@ class NanobotWebAPI:
                 provider_config.api_base,
             )
         # 若当前默认模型使用此 provider，热更新 agent 的 provider 实例配置
-        model_name = config.agents.defaults.model
+        model_name = self._get_effective_model()
         if model_name and model_name.split("/")[0] == provider_id:
             if hasattr(self.agent.provider, "update_config"):
                 api_key = config.get_api_key(model_name)
@@ -2209,14 +2220,13 @@ class NanobotWebAPI:
         return self.get_config()["channels"]
 
     def create_model(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create/update model configuration."""
+        """Create/update model configuration (legacy API，新配置请用 config_repository)."""
         config = load_config()
         
         model_name = data.get("modelName", "")
         if not model_name:
             raise ValueError("modelName is required")
         
-        config.agents.defaults.model = model_name
         if "parameters" in data:
             params = data["parameters"]
             if "temperature" in params:
@@ -2263,8 +2273,7 @@ class NanobotWebAPI:
     def update_model(self, model_id: str, data: dict[str, Any]) -> dict[str, Any]:
         """Update model configuration."""
         if data.get("isDefault") and not data.get("modelName"):
-            config = load_config()
-            model_name = config.agents.defaults.model if model_id == "default" else model_id
+            model_name = self._get_effective_model() if model_id == "default" else model_id
             data = {**data, "modelName": model_name}
         return self.create_model(data)
 
@@ -2366,7 +2375,7 @@ class NanobotWebAPI:
                 "skills": getattr(t, "skills", []) or [],
                 "model": t.model,
                 "is_system": t.is_system,
-                "is_builtin": t.is_builtin,  # 兼容旧字段
+                "is_builtin": t.is_builtin,
                 "is_editable": t.is_editable,
                 "is_deletable": t.is_deletable,
                 "enabled": t.enabled,
@@ -2390,7 +2399,7 @@ class NanobotWebAPI:
             "skills": getattr(template, "skills", []) or [],
             "model": template.model,
             "is_system": template.is_system,
-            "is_builtin": template.is_builtin,  # 兼容旧字段
+            "is_builtin": template.is_builtin,
             "is_editable": template.is_editable,
             "is_deletable": template.is_deletable,
             "enabled": template.enabled,
@@ -2980,27 +2989,33 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
         try:
             loop_count = 0
-            while thread.is_alive() or not evt_queue.empty():
+            while True:
                 loop_count += 1
-                if loop_count % 100 == 0:  # Log every ~50 seconds
-                    logger.debug(f"Chat stream loop: alive={thread.is_alive()}, queue_empty={evt_queue.empty()}, count={loop_count}")
+                evt = None
                 try:
                     evt = evt_queue.get(timeout=0.5)
                     if isinstance(evt, dict) and evt.get('type'):
                         logger.debug(f"Got event: {evt.get('type')}")
                 except queue.Empty:
-                    # 发送心跳保持连接活跃
                     now = time.time()
-                    if now - last_heartbeat >= heartbeat_interval:
+                    if not thread.is_alive():
+                        # 线程已结束，尝试非阻塞获取可能存在的最后一事件（如 done）
+                        # 避免 evt_queue.empty() 竞态导致 done 事件丢失（多轮对话场景）
                         try:
-                            self.wfile.write(b": heartbeat\n\n")
-                            self.wfile.flush()
-                            last_heartbeat = now
-                            logger.debug("SSE heartbeat sent")
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            logger.debug("Client disconnected, stopping stream")
+                            evt = evt_queue.get_nowait()
+                        except queue.Empty:
                             break
-                    continue
+                    if evt is None:
+                        if now - last_heartbeat >= heartbeat_interval:
+                            try:
+                                self.wfile.write(b": heartbeat\n\n")
+                                self.wfile.flush()
+                                last_heartbeat = now
+                                logger.debug("SSE heartbeat sent")
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                logger.debug("Client disconnected, stopping stream")
+                                break
+                        continue
                 try:
                     payload = json.dumps(evt, ensure_ascii=False)
                 except (TypeError, ValueError) as e:
@@ -3117,26 +3132,30 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
         try:
             loop_count = 0
-            while thread.is_alive() or not evt_queue.empty():
+            while True:
                 loop_count += 1
-                if loop_count % 100 == 0:  # Log every ~50 seconds
-                    logger.debug(f"Chat stream loop: alive={thread.is_alive()}, queue_empty={evt_queue.empty()}, count={loop_count}")
+                evt = None
                 try:
                     evt = evt_queue.get(timeout=0.5)
                     if isinstance(evt, dict) and evt.get('type'):
                         logger.debug(f"Got event: {evt.get('type')}")
                 except queue.Empty:
-                    # 发送心跳保持连接活跃
                     now = time.time()
-                    if now - last_heartbeat >= heartbeat_interval:
+                    if not thread.is_alive():
                         try:
-                            self.wfile.write(b": heartbeat\n\n")
-                            self.wfile.flush()
-                            last_heartbeat = now
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            logger.debug("Client disconnected, stopping stream")
+                            evt = evt_queue.get_nowait()
+                        except queue.Empty:
                             break
-                    continue
+                    if evt is None:
+                        if now - last_heartbeat >= heartbeat_interval:
+                            try:
+                                self.wfile.write(b": heartbeat\n\n")
+                                self.wfile.flush()
+                                last_heartbeat = now
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                logger.debug("Client disconnected, stopping stream")
+                                break
+                        continue
                 try:
                     payload = json.dumps(evt, ensure_ascii=False)
                 except (TypeError, ValueError) as e:
@@ -4124,19 +4143,27 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     heartbeat_interval = 30  # 心跳间隔（秒）
                     last_heartbeat = time.time()
                     try:
-                        while thread.is_alive() or not evt_queue.empty():
+                        while True:
+                            evt = None
                             try:
                                 evt = evt_queue.get(timeout=0.5)
                             except queue.Empty:
-                                # 发送心跳保持连接活跃
                                 now = time.time()
-                                if now - last_heartbeat >= heartbeat_interval:
+                                if not thread.is_alive():
                                     try:
-                                        self.wfile.write(b": heartbeat\n\n")
-                                        self.wfile.flush()
-                                        last_heartbeat = now
-                                    except (BrokenPipeError, ConnectionResetError, OSError):
+                                        evt = evt_queue.get_nowait()
+                                    except queue.Empty:
                                         break
+                                if evt is None:
+                                    if now - last_heartbeat >= heartbeat_interval:
+                                        try:
+                                            self.wfile.write(b": heartbeat\n\n")
+                                            self.wfile.flush()
+                                            last_heartbeat = now
+                                        except (BrokenPipeError, ConnectionResetError, OSError):
+                                            break
+                                    continue
+                            if evt is None:
                                 continue
                             payload = json.dumps(evt, ensure_ascii=False)
                             self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
@@ -4192,19 +4219,27 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     heartbeat_interval = 30  # 心跳间隔（秒）
                     last_heartbeat = time.time()
                     try:
-                        while thread.is_alive() or not evt_queue.empty():
+                        while True:
+                            evt = None
                             try:
                                 evt = evt_queue.get(timeout=0.5)
                             except queue.Empty:
-                                # 发送心跳保持连接活跃
                                 now = time.time()
-                                if now - last_heartbeat >= heartbeat_interval:
+                                if not thread.is_alive():
                                     try:
-                                        self.wfile.write(b": heartbeat\n\n")
-                                        self.wfile.flush()
-                                        last_heartbeat = now
-                                    except (BrokenPipeError, ConnectionResetError, OSError):
+                                        evt = evt_queue.get_nowait()
+                                    except queue.Empty:
                                         break
+                                if evt is None:
+                                    if now - last_heartbeat >= heartbeat_interval:
+                                        try:
+                                            self.wfile.write(b": heartbeat\n\n")
+                                            self.wfile.flush()
+                                            last_heartbeat = now
+                                        except (BrokenPipeError, ConnectionResetError, OSError):
+                                            break
+                                    continue
+                            if evt is None:
                                 continue
                             payload = json.dumps(evt, ensure_ascii=False)
                             self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))

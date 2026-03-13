@@ -56,7 +56,6 @@ class MemoryRepository:
     _instances: dict[Path, "MemoryRepository"] = {}
     _lock = threading.Lock()
 
-    # 默认数据库路径（用于迁移）
     DEFAULT_DB_PATH = Path.home() / ".nanobot" / "chat.db"
 
     @classmethod
@@ -71,7 +70,7 @@ class MemoryRepository:
 
     @classmethod
     def get_default_repository(cls) -> "MemoryRepository":
-        """获取默认数据库的实例（用于迁移）"""
+        """获取默认数据库的实例"""
         return cls(cls.DEFAULT_DB_PATH)
 
     def __new__(cls, db_path: Path | None = None):
