@@ -239,7 +239,7 @@ def gateway(
         thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
         router=router,
         default_profile=default_profile,
-        microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", False),
+        microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
         microkernel_escalation_threshold=getattr(config.agents.defaults, "microkernel_escalation_threshold", 10),
         microkernel_timeout_seconds=getattr(config.agents.defaults, "microkernel_timeout_seconds", 120.0),
     )
@@ -552,7 +552,7 @@ def agent(
         thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
         router=router,
         default_profile=default_profile,
-        microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", False),
+        microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
         microkernel_escalation_threshold=getattr(config.agents.defaults, "microkernel_escalation_threshold", 10),
         microkernel_timeout_seconds=getattr(config.agents.defaults, "microkernel_timeout_seconds", 120.0),
     )

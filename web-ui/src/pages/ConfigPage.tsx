@@ -483,6 +483,8 @@ function SystemConfig() {
       agentForm.setFieldsValue({
         maxToolIterations: agent.maxToolIterations,
         maxExecutionTime: agent.maxExecutionTime,
+        microkernelEscalationEnabled: agent.microkernelEscalationEnabled ?? true,
+        microkernelEscalationThreshold: agent.microkernelEscalationThreshold ?? 10,
       })
     } catch (error) {
       console.error(error)
@@ -540,6 +542,8 @@ function SystemConfig() {
       await api.updateAgentConfig({
         maxToolIterations: values.maxToolIterations != null ? Number(values.maxToolIterations) : undefined,
         maxExecutionTime: values.maxExecutionTime != null ? Number(values.maxExecutionTime) : undefined,
+        microkernelEscalationEnabled: values.microkernelEscalationEnabled,
+        microkernelEscalationThreshold: values.microkernelEscalationThreshold != null ? Number(values.microkernelEscalationThreshold) : undefined,
       })
       message.success(t('config.agent.saveSuccess'))
     } catch (error) {
@@ -646,6 +650,32 @@ function SystemConfig() {
                   help={t('config.agent.maxExecutionTimeHelp')}
                 >
                   <InputNumber min={0} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Row gutter={16}>
+              <Col span={12}>
+                <Form.Item
+                  name="microkernelEscalationEnabled"
+                  label={t('config.agent.microkernelEscalationEnabled')}
+                  valuePropName="checked"
+                  help={t('config.agent.microkernelEscalationEnabledHelp')}
+                >
+                  <Switch />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item noStyle shouldUpdate={(prev, curr) => prev.microkernelEscalationEnabled !== curr.microkernelEscalationEnabled}>
+                  {({ getFieldValue }) => (
+                    <Form.Item
+                      name="microkernelEscalationThreshold"
+                      label={t('config.agent.microkernelEscalationThreshold')}
+                      rules={[{ type: 'number', min: 1, max: 50 }]}
+                      help={t('config.agent.microkernelEscalationThresholdHelp')}
+                    >
+                      <InputNumber min={1} max={50} style={{ width: '100%' }} disabled={!getFieldValue('microkernelEscalationEnabled')} />
+                    </Form.Item>
+                  )}
                 </Form.Item>
               </Col>
             </Row>

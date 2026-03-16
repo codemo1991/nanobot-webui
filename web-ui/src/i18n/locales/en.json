@@ -255,6 +255,10 @@
       "maxToolIterationsHelp": "Max tool calls per turn (1-200). Typical: simple 0-5, medium 5-15, complex 15-35",
       "maxExecutionTime": "Max Execution Time (sec)",
       "maxExecutionTimeHelp": "Max run time per turn. 0 = no limit. Prevents runaway.",
+      "microkernelEscalationEnabled": "Enable Microkernel Escalation",
+      "microkernelEscalationEnabledHelp": "Complex tasks (tool calls ≥ threshold) auto-delegate to AgentLoop microkernel",
+      "microkernelEscalationThreshold": "Microkernel Escalation Threshold",
+      "microkernelEscalationThresholdHelp": "Delegate when tool calls reach this and more steps remain (1-50)",
       "saveSuccess": "System config updated",
       "saveFailed": "Save failed"
     },

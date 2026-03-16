@@ -255,6 +255,10 @@
       "maxToolIterationsHelp": "单轮对话中允许的工具调用上限（1-200）。典型：简单 0-5、中等 5-15、复杂 15-35",
       "maxExecutionTime": "最大执行时间(秒)",
       "maxExecutionTimeHelp": "单轮对话最大运行时长，0 表示不限。防止长时间挂起",
+      "microkernelEscalationEnabled": "启用微内核委托",
+      "microkernelEscalationEnabledHelp": "复杂任务（工具调用≥阈值）自动交由 AgentLoop 微内核编排执行",
+      "microkernelEscalationThreshold": "微内核委托阈值",
+      "microkernelEscalationThresholdHelp": "工具调用次数达到此值且仍有待执行步骤时触发委托（1-50）",
       "saveSuccess": "系统配置已更新",
       "saveFailed": "保存失败"
     },

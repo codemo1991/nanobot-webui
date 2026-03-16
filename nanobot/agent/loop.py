@@ -119,7 +119,7 @@ class AgentLoop:
         router: ModelRouter | None = None,
         default_profile: str = "smart",
         # 微内核委托配置
-        microkernel_escalation_enabled: bool = False,
+        microkernel_escalation_enabled: bool = True,
         microkernel_escalation_threshold: int = 10,
         microkernel_timeout_seconds: float = 120.0,
     ):
@@ -333,6 +333,8 @@ class AgentLoop:
         smart_tool_selection: bool | None = None,
         system_prompt_max_tokens: int | None = None,
         memory_max_tokens: int | None = None,
+        microkernel_escalation_enabled: bool | None = None,
+        microkernel_escalation_threshold: int | None = None,
     ) -> None:
         """Hot-update agent params without restart."""
         if max_iterations is not None:
@@ -351,6 +353,14 @@ class AgentLoop:
         if memory_max_tokens is not None:
             self._memory_max_tokens = max(200, memory_max_tokens)
             self.context.update_token_budget(memory=self._memory_max_tokens)
+        if microkernel_escalation_enabled is not None:
+            self._microkernel_escalation_enabled = microkernel_escalation_enabled
+            if microkernel_escalation_enabled and self.tools.get("delegate_to_microkernel") is None:
+                delegate_tool = DelegateMicrokernelTool(delegate_fn=self._delegate_to_microkernel)
+                self.tools.register(delegate_tool)
+                logger.info("[AgentLoop] DelegateMicrokernelTool registered (hot-update)")
+        if microkernel_escalation_threshold is not None:
+            self._microkernel_escalation_threshold = max(1, min(microkernel_escalation_threshold, 50))
 
     async def close(self) -> None:
         """关闭agent并清理资源"""

@@ -23,6 +23,7 @@ from uuid import uuid4
 from loguru import logger
 
 from nanobot.agent.loop import AgentLoop
+from nanobot.agentloop.db import connect_chat, connect_system, init_chat_schema, init_system_schema
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.bus.queue import MessageBus
 from nanobot.config.defaults import init_default_profiles, init_default_agent_config
@@ -110,6 +111,17 @@ class NanobotWebAPI:
         # Initialize system status service first (needed by AgentLoop)
         # 优先使用 workspace 特定的数据库，否则使用默认数据库
         workspace_path = config.workspace_path
+
+        # 启动时检测并创建 AgentLoop 微内核表（chat.db / system.db）
+        try:
+            chat_conn = connect_chat(workspace_path)
+            init_chat_schema(chat_conn)
+            chat_conn.close()
+            sys_conn = connect_system()
+            init_system_schema(sys_conn)
+            sys_conn.close()
+        except Exception as e:
+            logger.warning("AgentLoop schema 初始化失败（可忽略，首次使用微内核时会重试）: %s", e)
         workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
         if workspace_db_path.exists():
             status_db_path = workspace_db_path
@@ -157,7 +169,7 @@ class NanobotWebAPI:
             router=self.router,
             default_profile=self.default_profile,
             # 微内核委托配置
-            microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", False),
+            microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
             microkernel_escalation_threshold=getattr(config.agents.defaults, "microkernel_escalation_threshold", 10),
             microkernel_timeout_seconds=getattr(config.agents.defaults, "microkernel_timeout_seconds", 120.0),
         )
@@ -434,7 +446,7 @@ class NanobotWebAPI:
             router=self.router,
             default_profile=self.default_profile,
             # 微内核委托配置
-            microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", False),
+            microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
             microkernel_escalation_threshold=getattr(config.agents.defaults, "microkernel_escalation_threshold", 10),
             microkernel_timeout_seconds=getattr(config.agents.defaults, "microkernel_timeout_seconds", 120.0),
         )
@@ -1561,10 +1573,16 @@ class NanobotWebAPI:
                 "tags": [t.strip() for t in meta.get("tags", "").split(",")] if meta.get("tags") else []
             })
 
-        # Agent system config (max_tool_iterations, max_execution_time)
+        # Agent system config (max_tool_iterations, max_execution_time, microkernel)
         agent = {
             "maxToolIterations": config.agents.defaults.max_tool_iterations,
             "maxExecutionTime": getattr(config.agents.defaults, "max_execution_time", 600) or 0,
+            "microkernelEscalationEnabled": getattr(
+                config.agents.defaults, "microkernel_escalation_enabled", True
+            ),
+            "microkernelEscalationThreshold": getattr(
+                config.agents.defaults, "microkernel_escalation_threshold", 10
+            ),
         }
 
         return {
@@ -1994,7 +2012,7 @@ class NanobotWebAPI:
             return {"connected": False, "message": str(e)}
 
     def update_agent_config(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Update agent system config (max_tool_iterations, max_execution_time). Hot-updates running agent."""
+        """Update agent system config (max_tool_iterations, max_execution_time, microkernel). Hot-updates running agent."""
         config = load_config()
         defaults = config.agents.defaults
         if "maxToolIterations" in data and data["maxToolIterations"] is not None:
@@ -2003,14 +2021,23 @@ class NanobotWebAPI:
         if "maxExecutionTime" in data and data["maxExecutionTime"] is not None:
             v = int(data["maxExecutionTime"])
             defaults.max_execution_time = max(0, v)
+        if "microkernelEscalationEnabled" in data and data["microkernelEscalationEnabled"] is not None:
+            defaults.microkernel_escalation_enabled = bool(data["microkernelEscalationEnabled"])
+        if "microkernelEscalationThreshold" in data and data["microkernelEscalationThreshold"] is not None:
+            v = int(data["microkernelEscalationThreshold"])
+            defaults.microkernel_escalation_threshold = max(1, min(v, 50))
         save_config(config)
         self.agent.update_agent_params(
             max_iterations=defaults.max_tool_iterations,
             max_execution_time=defaults.max_execution_time,
+            microkernel_escalation_enabled=defaults.microkernel_escalation_enabled,
+            microkernel_escalation_threshold=defaults.microkernel_escalation_threshold,
         )
         return {
             "maxToolIterations": defaults.max_tool_iterations,
             "maxExecutionTime": defaults.max_execution_time,
+            "microkernelEscalationEnabled": defaults.microkernel_escalation_enabled,
+            "microkernelEscalationThreshold": defaults.microkernel_escalation_threshold,
         }
 
     def get_concurrency_config(self) -> dict[str, Any]:

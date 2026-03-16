@@ -223,6 +223,10 @@ export interface InstalledSkill {
 export interface AgentConfig {
   maxToolIterations: number
   maxExecutionTime: number
+  /** 启用微内核委托：复杂任务（工具调用≥阈值）自动交由微内核编排 */
+  microkernelEscalationEnabled?: boolean
+  /** 微内核委托阈值：工具调用次数达到此值且仍有 tool_calls 时触发 */
+  microkernelEscalationThreshold?: number
   // 并发配置
   maxParallelToolCalls?: number
   maxConcurrentSubagents?: number

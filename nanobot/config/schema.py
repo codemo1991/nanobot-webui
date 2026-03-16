@@ -91,7 +91,7 @@ class AgentDefaults(BaseModel):
     smart_parallel_model: str = ""  # 智能并行判断使用的模型（留空使用默认轻量模型）
 
     # 微内核委托配置
-    microkernel_escalation_enabled: bool = False  # 是否启用阈值切换，默认关闭
+    microkernel_escalation_enabled: bool = True  # 是否启用阈值切换，默认开启
     microkernel_escalation_threshold: int = 10  # 工具调用次数阈值，超过则委托微内核
     microkernel_timeout_seconds: float = 120.0  # 微内核单次执行超时（秒）
 
