@@ -24,6 +24,7 @@ class SystemStatusService:
         "thread_pool_size": 4,
         "enable_subagent_parallel": True,
         "claude_code_max_concurrent": 3,
+        "claude_code_permission_mode": "auto",
         "enable_smart_parallel": True,
         "smart_parallel_model": "",
     }

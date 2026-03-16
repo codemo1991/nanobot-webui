@@ -173,6 +173,8 @@ class ClaudeCodeConfig(BaseModel):
     default_timeout: int = 600  # Default task timeout in seconds
     max_concurrent_tasks: int = 3  # Maximum concurrent Claude Code tasks
     enable_subagent_parallel: bool = True  # 是否启用子Agent并行执行
+    # permission_mode: auto(默认逐项确认) | bypassPermissions(自动批准所有工具) | plan | acceptEdits | default
+    permission_mode: str = "auto"
 
 
 class McpServerConfig(BaseModel):

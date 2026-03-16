@@ -61,6 +61,7 @@ class SubagentManager:
         sessions: "SessionManager | None" = None,
         max_concurrent_subagents: int = 10,
         claude_code_manager: "ClaudeCodeManager | None" = None,
+        claude_code_permission_mode: str = "auto",
         status_service: "SystemStatusService | None" = None,
         agent_template_manager: "AgentTemplateManager | None" = None,
         backend_registry: "BackendRegistry | None" = None,
@@ -78,6 +79,7 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.sessions = sessions
         self._claude_code_manager = claude_code_manager
+        self._claude_code_permission_mode = claude_code_permission_mode
         self._running_tasks: dict[str, tuple[str | None, Any]] = {}  # task_id -> (origin_key, task)
         self._status_service = status_service
         self._agent_template_manager = agent_template_manager
@@ -526,12 +528,21 @@ class SubagentManager:
 
         timeout_sec = self._claude_code_manager.default_timeout
 
+        # 优先使用系统配置（Web UI）中的 permission_mode，否则使用初始化时的配置
+        perm_mode = self._claude_code_permission_mode
+        if self._status_service:
+            try:
+                cc = self._status_service.get_concurrency_config()
+                perm_mode = cc.get("claude_code_permission_mode") or perm_mode
+            except Exception:
+                pass
+
         async def _run_and_maybe_wait_late() -> dict[str, Any]:
             """运行 run_task；超时后用 shield 保护，后台完成后可再通知。"""
             return await self._claude_code_manager.run_task(
                 prompt=task,
                 workdir=None,
-                permission_mode="auto",
+                permission_mode=perm_mode,
                 enable_subagents=True,
                 timeout=timeout_sec * 2,  # 内部超时设大，由外层 wait_for 控制
                 progress_callback=_progress_callback,

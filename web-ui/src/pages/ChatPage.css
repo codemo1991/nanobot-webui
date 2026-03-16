@@ -118,6 +118,8 @@
   padding: 24px;
   max-width: 1200px;
   width: 95%;
+  min-width: 0;
+  overflow-x: hidden;
   margin: 0 auto;
   min-height: min-content;
 }
@@ -203,6 +205,8 @@
   flex: 1;
   min-width: 0;
   overflow-wrap: break-word;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 .message-header {
@@ -225,7 +229,9 @@
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
   word-wrap: break-word;
   overflow-wrap: break-word;
-  overflow-x: auto;
+  word-break: break-word;
+  max-width: 100%;
+  overflow-x: hidden;
   overflow-y: visible;
 }
 
@@ -281,6 +287,9 @@
   margin: 0;
   padding: 0.2em 0.4em;
   font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+  word-break: break-all;
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .markdown-body pre {
@@ -289,6 +298,7 @@
   padding: 16px;
   overflow: auto;
   margin: 16px 0;
+  max-width: 100%;
 }
 
 .markdown-body pre code {
@@ -302,6 +312,7 @@
   word-wrap: normal;
   font-size: 12px;
   color: #d4d4d4;
+  white-space: pre;
 }
 
 .markdown-body blockquote {
@@ -321,12 +332,25 @@
   margin: 4px 0;
 }
 
-/* Wide tables: parent scrolls horizontally */
+/* Wide tables: wrap in scroll container, allow horizontal scroll */
+.markdown-body {
+  max-width: 100%;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  overflow-x: hidden;
+}
+
+.markdown-table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+  margin: 16px 0;
+}
+
 .markdown-body table {
   border-collapse: collapse;
   width: 100%;
   min-width: max-content;
-  margin: 16px 0;
+  margin: 0;
 }
 
 .markdown-body table th,

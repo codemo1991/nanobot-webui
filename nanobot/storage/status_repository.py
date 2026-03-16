@@ -136,6 +136,7 @@ class StatusRepository:
         "thread_pool_size",
         "enable_subagent_parallel",
         "claude_code_max_concurrent",
+        "claude_code_permission_mode",
         "enable_smart_parallel",
         "smart_parallel_model",
     ]

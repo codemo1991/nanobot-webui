@@ -265,6 +265,8 @@
       "maxConcurrentSubagents": "Max Concurrent Subagents",
       "threadPoolSize": "Thread Pool Size",
       "claudeCodeMaxConcurrent": "Claude Code Max Concurrent",
+      "claudeCodePermissionMode": "Claude Code Permission Mode",
+      "claudeCodePermissionModeHelp": "auto: confirm each action. bypassPermissions: auto-approve all tools (read/write/exec)",
       "enableParallelTools": "Enable Parallel Tool Calls",
       "enableSubagentParallel": "Enable Subagent Parallel Execution",
       "enableSmartParallel": "Enable Smart Parallel Decision",

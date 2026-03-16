@@ -2019,6 +2019,7 @@ class NanobotWebAPI:
                 "thread_pool_size": 4,
                 "enable_subagent_parallel": True,
                 "claude_code_max_concurrent": 3,
+                "claude_code_permission_mode": "auto",
             }
 
     def update_concurrency_config(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -2030,6 +2031,7 @@ class NanobotWebAPI:
             "threadPoolSize": "thread_pool_size",
             "enableSubagentParallel": "enable_subagent_parallel",
             "claudeCodeMaxConcurrent": "claude_code_max_concurrent",
+            "claudeCodePermissionMode": "claude_code_permission_mode",
             "enableSmartParallel": "enable_smart_parallel",
             "smartParallelModel": "smart_parallel_model",
         }
@@ -2039,7 +2041,7 @@ class NanobotWebAPI:
             if web_key in data and data[web_key] is not None:
                 if web_key in ("enableParallelTools", "enableSubagentParallel", "enableSmartParallel"):
                     config[db_key] = bool(data[web_key])
-                elif web_key == "smartParallelModel":
+                elif web_key in ("smartParallelModel", "claudeCodePermissionMode"):
                     config[db_key] = str(data[web_key])
                 else:
                     config[db_key] = int(data[web_key])

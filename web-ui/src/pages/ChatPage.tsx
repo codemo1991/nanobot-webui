@@ -1145,6 +1145,13 @@ function ChatPage() {
                               remarkPlugins={[remarkGfm]}
                               rehypePlugins={[rehypeHighlight]}
                               className="markdown-body"
+                              components={{
+                                table: ({ children }) => (
+                                  <div className="markdown-table-wrapper">
+                                    <table>{children}</table>
+                                  </div>
+                                ),
+                              }}
                             >
                               {message.content}
                             </ReactMarkdown>

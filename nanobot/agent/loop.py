@@ -231,6 +231,7 @@ class AgentLoop:
             sessions=self.sessions,
             max_concurrent_subagents=self._max_parallel_tool_calls,
             claude_code_manager=self.claude_code_manager,
+            claude_code_permission_mode=self.claude_code_config.permission_mode,
             status_service=status_service,
             agent_template_manager=agent_template_manager,
             backend_registry=self._backend_registry,

@@ -934,6 +934,56 @@ def cron_run(
 
 
 # ============================================================================
+# AgentLoop 微内核
+# ============================================================================
+
+
+@app.command()
+def agentloop(
+    prompt: str = typer.Argument("设计 agentloop 微内核", help="用户输入"),
+    workspace: Path = typer.Option(None, "--workspace", "-w", help="工作空间路径，默认使用配置中的 workspace"),
+):
+    """运行 AgentLoop 微内核示例（任务树 + Artifact DAG）。"""
+    import asyncio
+    import json
+    from nanobot.agentloop.kernel.kernel import create_kernel
+    from nanobot.config.loader import ensure_system_db_initialized, load_config
+
+    ensure_system_db_initialized()
+    config = load_config()
+    ws = workspace or config.workspace_path if config else None
+
+    async def _run():
+        kernel = create_kernel(workspace=ws)
+        try:
+            trace_id, _ = await kernel.submit(prompt)
+            console.print(f"[dim]trace_id: {trace_id}[/dim]")
+            await kernel.run_until_done(trace_id, worker_count=4, timeout_seconds=60)
+            from nanobot.agentloop.kernel.artifact_repo import get_artifact_payload
+
+            row = kernel.conn.execute(
+                """
+                SELECT t.result_artifact_id FROM agentloop_tasks t
+                WHERE t.trace_id = ? AND t.output_schema = 'final_result_v1' AND t.state = 'DONE'
+                ORDER BY t.finished_at DESC LIMIT 1
+                """,
+                (trace_id,),
+            ).fetchone()
+            if row and row["result_artifact_id"]:
+                payload = get_artifact_payload(kernel.conn, row["result_artifact_id"])
+                if payload:
+                    console.print(json.dumps(payload, ensure_ascii=False, indent=2))
+                else:
+                    console.print("[yellow]未获取到最终结果[/yellow]")
+            else:
+                console.print("[yellow]未获取到最终结果[/yellow]")
+        finally:
+            kernel.conn.close()
+
+    asyncio.run(_run())
+
+
+# ============================================================================
 # Status Commands
 # ============================================================================
 

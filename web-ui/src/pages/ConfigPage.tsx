@@ -502,6 +502,7 @@ function SystemConfig() {
         threadPoolSize: data.thread_pool_size || 4,
         enableSubagentParallel: data.enable_subagent_parallel !== false,
         claudeCodeMaxConcurrent: data.claude_code_max_concurrent || 3,
+        claudeCodePermissionMode: data.claude_code_permission_mode || 'auto',
         enableSmartParallel: data.enable_smart_parallel !== false,
         smartParallelModel: data.smart_parallel_model || '',
       })
@@ -560,6 +561,7 @@ function SystemConfig() {
         threadPoolSize: Number(values.threadPoolSize),
         enableSubagentParallel: values.enableSubagentParallel,
         claudeCodeMaxConcurrent: Number(values.claudeCodeMaxConcurrent),
+        claudeCodePermissionMode: values.claudeCodePermissionMode || 'auto',
         enableSmartParallel: values.enableSmartParallel,
         smartParallelModel: values.smartParallelModel || undefined,
       })
@@ -727,6 +729,26 @@ function SystemConfig() {
                   <InputNumber min={1} max={10} style={{ width: '100%' }} />
                 </Form.Item>
               </Col>
+              <Col span={12}>
+                <Form.Item
+                  name="claudeCodePermissionMode"
+                  label={t('config.concurrency.claudeCodePermissionMode') || 'Claude Code 权限模式'}
+                  tooltip={t('config.concurrency.claudeCodePermissionModeHelp')}
+                >
+                  <Select
+                    options={[
+                      { value: 'auto', label: 'auto（逐项确认）' },
+                      { value: 'bypassPermissions', label: 'bypassPermissions（自动批准）' },
+                      { value: 'plan', label: 'plan（先展示计划）' },
+                      { value: 'acceptEdits', label: 'acceptEdits（接受编辑）' },
+                      { value: 'default', label: 'default（默认）' },
+                    ]}
+                    placeholder={t('config.concurrency.claudeCodePermissionMode')}
+                  />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Row gutter={16}>
               <Col span={12}>
                 <Form.Item
                   name="smartParallelModel"
