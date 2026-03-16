@@ -8,7 +8,11 @@ from loguru import logger
 
 from nanobot.agentloop.db import connect_chat, connect_system, init_chat_schema, init_system_schema
 from nanobot.agentloop.kernel.task_repo import lease_one_ready_task, mark_task_running
-from nanobot.agentloop.kernel.trace_repo import create_trace_and_root_task, mark_trace_canceled
+from nanobot.agentloop.kernel.trace_repo import (
+    create_initial_artifacts,
+    create_trace_and_root_task,
+    mark_trace_canceled,
+)
 
 
 class Kernel:
@@ -21,13 +25,32 @@ class Kernel:
         self.workspace = workspace
         self.shutdown = False
 
-    async def submit(self, user_input: str) -> tuple[str, str]:
+    async def submit(
+        self,
+        user_input: str,
+        initial_artifacts: dict[str, dict] | None = None,
+        attempted_steps: list[dict] | None = None,
+        conversation_summary: str | None = None,
+    ) -> tuple[str, str]:
         """提交用户请求，返回 (trace_id, root_task_id)。"""
+        request_payload = {
+            "user_goal": user_input,
+            "attempted_steps": attempted_steps or [],
+            "conversation_summary": conversation_summary,
+        }
         trace_id, root_task_id = create_trace_and_root_task(
             self.conn,
             user_input=user_input,
-            request_payload={"user_goal": user_input},
+            request_payload=request_payload,
         )
+        if initial_artifacts:
+            create_initial_artifacts(
+                self.conn,
+                trace_id=trace_id,
+                root_task_id=root_task_id,
+                artifacts=initial_artifacts,
+                workspace_root=self.workspace,
+            )
         logger.info("AgentLoop 已提交 trace=%s root_task=%s", trace_id, root_task_id)
         return trace_id, root_task_id
 

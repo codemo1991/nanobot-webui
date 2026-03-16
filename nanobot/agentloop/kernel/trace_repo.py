@@ -3,7 +3,9 @@
 import json
 
 from nanobot.agentloop.db import tx
+from nanobot.agentloop.kernel.artifact_repo import create_artifact
 from nanobot.agentloop.kernel.ids import new_id, now_ts
+from nanobot.agentloop.kernel.task_repo import fulfill_pending_deps_for_artifact, mark_waiting_artifacts_tasks_ready
 
 
 def create_trace_and_root_task(
@@ -52,6 +54,29 @@ def create_trace_and_root_task(
         )
 
     return trace_id, root_task_id
+
+
+def create_initial_artifacts(
+    conn,
+    trace_id: str,
+    root_task_id: str,
+    artifacts: dict[str, dict],
+    workspace_root=None,
+) -> None:
+    """将主 Agent 已产出的 initial_artifacts 写入 agentloop_artifacts，状态为 READY。"""
+    for artifact_type, payload in artifacts.items():
+        if not isinstance(payload, dict):
+            continue
+        artifact_id = create_artifact(
+            conn,
+            trace_id=trace_id,
+            producer_task_id=root_task_id,
+            artifact_type=artifact_type,
+            payload=payload,
+            workspace_root=workspace_root,
+        )
+        fulfill_pending_deps_for_artifact(conn, artifact_id)
+        mark_waiting_artifacts_tasks_ready(conn, artifact_id)
 
 
 def mark_trace_canceled(conn, trace_id: str, reason: str = "CANCELED") -> None:

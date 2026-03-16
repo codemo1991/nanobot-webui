@@ -156,6 +156,10 @@ class NanobotWebAPI:
             # 新架构：传入 ModelRouter
             router=self.router,
             default_profile=self.default_profile,
+            # 微内核委托配置
+            microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", False),
+            microkernel_escalation_threshold=getattr(config.agents.defaults, "microkernel_escalation_threshold", 10),
+            microkernel_timeout_seconds=getattr(config.agents.defaults, "microkernel_timeout_seconds", 120.0),
         )
         self.sessions = self.agent.sessions
 
@@ -429,6 +433,10 @@ class NanobotWebAPI:
             agent_template_manager=self.agent_template_manager,
             router=self.router,
             default_profile=self.default_profile,
+            # 微内核委托配置
+            microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", False),
+            microkernel_escalation_threshold=getattr(config.agents.defaults, "microkernel_escalation_threshold", 10),
+            microkernel_timeout_seconds=getattr(config.agents.defaults, "microkernel_timeout_seconds", 120.0),
         )
         self.sessions = self.agent.sessions
 

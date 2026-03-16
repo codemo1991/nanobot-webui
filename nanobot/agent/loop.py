@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,6 +28,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.tools.get_subagent_results import GetSubagentResultsTool
+from nanobot.agent.tools.delegate_microkernel import DelegateMicrokernelTool
 from nanobot.agent.tool_errors import format_tool_error
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
@@ -117,6 +118,10 @@ class AgentLoop:
         # 新增：模型路由器（新架构）
         router: ModelRouter | None = None,
         default_profile: str = "smart",
+        # 微内核委托配置
+        microkernel_escalation_enabled: bool = False,
+        microkernel_escalation_threshold: int = 10,
+        microkernel_timeout_seconds: float = 120.0,
     ):
         from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig, ClaudeCodeConfig
         from nanobot.cron.service import CronService
@@ -164,6 +169,11 @@ class AgentLoop:
         self._enable_smart_parallel = enable_smart_parallel
         self._smart_parallel_model = smart_parallel_model
         self._status_service = status_service
+
+        # 微内核委托配置
+        self._microkernel_escalation_enabled = microkernel_escalation_enabled
+        self._microkernel_escalation_threshold = microkernel_escalation_threshold
+        self._microkernel_timeout_seconds = microkernel_timeout_seconds
 
         # 初始化智能并行判断器
         self._smart_parallel_decider = None
@@ -433,6 +443,171 @@ class AgentLoop:
         if len(deduped) < len(tool_calls):
             logger.info(f"[AgentLoop] Deduplicated tool calls: {len(tool_calls)} -> {len(deduped)}")
         return deduped
+
+    def _extract_initial_artifacts(self, tool_steps: list[dict[str, Any]]) -> dict[str, dict]:
+        """从 tool_steps 提取可传递给微内核的 initial_artifacts。"""
+        artifacts: dict[str, dict] = {}
+        total_size = 0
+        _MAX_TOTAL = 100 * 1024  # 100KB
+
+        def _parse_list_dir_result(result: str) -> list:
+            if not result or not isinstance(result, str):
+                return []
+            lines = result.strip().split("\n")
+            entries = []
+            for line in lines:
+                line = line.strip()
+                if line.startswith("📁 ") or line.startswith("📄 "):
+                    entries.append(line[2:])
+                elif line and not line.startswith("Error:"):
+                    entries.append(line)
+            return entries
+
+        for step in tool_steps:
+            name = step.get("name", "")
+            result = step.get("result", "")
+            args = step.get("arguments", {}) or {}
+
+            if name == "read_file" and result and not str(result).startswith("Error:"):
+                path = args.get("path", "")
+                content = str(result)[:50000]
+                if total_size + len(content) <= _MAX_TOTAL:
+                    artifacts["doc_content_v1"] = {"path": path, "content": content}
+                    total_size += len(content)
+
+            elif name == "list_dir" and result and not str(result).startswith("Error:"):
+                path = args.get("path", "")
+                entries = _parse_list_dir_result(str(result))
+                if total_size + 2000 <= _MAX_TOTAL:
+                    artifacts["dir_listing_v1"] = {"path": path, "entries": entries}
+                    total_size += 2000
+
+            elif name == "web_search" and result and not str(result).startswith("Error:"):
+                query = args.get("query", "")
+                raw = str(result)[:2000]
+                if total_size + len(raw) <= _MAX_TOTAL:
+                    items = [{"title": query[:100], "snippet": raw[:500], "score": 1.0}]
+                    artifacts["search_result_v1"] = {"query": query, "raw": raw, "items": items}
+                    total_size += len(raw)
+
+        return artifacts
+
+    async def _delegate_to_microkernel(
+        self,
+        goal: str,
+        attempted_steps: list[dict],
+        initial_artifacts: dict[str, Any],
+        channel: str,
+        chat_id: str,
+    ) -> str:
+        """委托任务给微内核，返回 trace_id。"""
+        from nanobot.agentloop.kernel.kernel import create_kernel
+
+        kernel = create_kernel(workspace=self.workspace)
+        trace_id, _ = await kernel.submit(
+            user_input=goal,
+            initial_artifacts=initial_artifacts or None,
+            attempted_steps=attempted_steps,
+        )
+        asyncio.create_task(
+            self._run_kernel_and_notify(kernel, trace_id, goal, channel, chat_id)
+        )
+        return trace_id
+
+    async def _run_kernel_and_notify(
+        self,
+        kernel: Any,
+        trace_id: str,
+        goal: str,
+        channel: str,
+        chat_id: str,
+    ) -> None:
+        """运行微内核直至完成，然后通知用户。"""
+        try:
+            await kernel.run_until_done(
+                trace_id,
+                worker_count=4,
+                timeout_seconds=self._microkernel_timeout_seconds,
+            )
+            row = kernel.conn.execute(
+                """
+                SELECT t.result_artifact_id
+                FROM agentloop_tasks t
+                WHERE t.trace_id = ?
+                  AND t.output_schema = 'final_result_v1'
+                  AND t.state = 'DONE'
+                ORDER BY t.finished_at DESC
+                LIMIT 1
+                """,
+                (trace_id,),
+            ).fetchone()
+            final_result = None
+            if row and row.get("result_artifact_id"):
+                from nanobot.agentloop.kernel.artifact_repo import get_artifact_payload
+
+                payload = get_artifact_payload(kernel.conn, row["result_artifact_id"])
+                if payload:
+                    val = payload.get("final_text") or payload.get("result") or payload.get("summary")
+                    final_result = str(val) if val is not None else None
+            await self._on_microkernel_done(trace_id, goal, final_result, channel, chat_id, status="ok")
+        except Exception as e:
+            logger.exception("微内核执行异常: %s", e)
+            await self._on_microkernel_done(
+                trace_id, goal, f"微内核执行失败: {str(e)}", channel, chat_id, status="error"
+            )
+        finally:
+            try:
+                kernel.conn.close()
+            except Exception as close_err:
+                logger.debug("关闭 kernel 连接时异常（可忽略）: %s", close_err)
+
+    async def _on_microkernel_done(
+        self,
+        trace_id: str,
+        goal: str,
+        final_result: str | None,
+        channel: str,
+        chat_id: str,
+        status: str = "ok",
+    ) -> None:
+        """微内核完成后写入 session 并推送通知。"""
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+
+        origin_key = f"{channel}:{chat_id}"
+        session = self.sessions.get_or_create(origin_key)
+        result_text = final_result or (
+            "微内核执行完成，但未获取到结果摘要。" if status == "ok" else "微内核执行失败。"
+        )
+        mk_key = f"mk_{trace_id}"
+
+        session.subagent_results[mk_key] = {
+            "label": "微内核",
+            "task": goal[:200],
+            "result": result_text,
+            "status": status,
+            "trace_id": trace_id,
+        }
+        session.add_message(
+            "assistant",
+            f"✅ 微内核任务已完成 (trace_id: {trace_id})\n\n{result_text[:1500]}",
+        )
+        self.sessions.save(session)
+
+        bus = SubagentProgressBus.get()
+        bus.push(origin_key, {
+            "type": "microkernel_end",
+            "trace_id": trace_id,
+            "task_id": mk_key,
+            "label": "微内核",
+            "status": status,
+            "summary": result_text[:300],
+            "result": result_text,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        await self.bus.publish_outbound(
+            OutboundMessage(channel=channel, chat_id=chat_id, content=f"✅ 微内核任务已完成\n\n{result_text[:2000]}")
+        )
 
     def _resolve_vision_exec_groups(
         self,
@@ -994,6 +1169,12 @@ class AgentLoop:
         # Get subagent results tool (查询子agent执行结果)
         self.tools.register(GetSubagentResultsTool(sessions=self.sessions))
 
+        # Delegate to microkernel tool (复杂任务委托微内核)
+        if self._microkernel_escalation_enabled:
+            delegate_tool = DelegateMicrokernelTool(delegate_fn=self._delegate_to_microkernel)
+            self.tools.register(delegate_tool)
+            logger.info("[AgentLoop] DelegateMicrokernelTool registered")
+
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -1207,6 +1388,10 @@ class AgentLoop:
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
+
+        delegate_tool = self.tools.get("delegate_to_microkernel")
+        if isinstance(delegate_tool, DelegateMicrokernelTool):
+            delegate_tool.set_context(msg.channel, msg.chat_id)
 
         # MCP tools are tied to the event loop that created them. Web uses asyncio.run() per request,
         # so each request gets a new loop; prior MCP sessions become stale (ClosedResourceError).
@@ -1498,6 +1683,28 @@ class AgentLoop:
 
             # Handle tool calls
             if response.has_tool_calls:
+                # 阈值触发：工具调用次数已达阈值且仍有 tool_calls 时，委托微内核
+                if (
+                    self._microkernel_escalation_enabled
+                    and len(tool_steps) >= self._microkernel_escalation_threshold
+                ):
+                    attempted_summary = [
+                        {"name": s["name"], "result_preview": str(s.get("result", ""))[:200]}
+                        for s in tool_steps[-self._microkernel_escalation_threshold :]
+                    ]
+                    initial_artifacts = self._extract_initial_artifacts(tool_steps)
+                    trace_id = await self._delegate_to_microkernel(
+                        goal=current_message or msg.content,
+                        attempted_steps=attempted_summary,
+                        initial_artifacts=initial_artifacts,
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                    )
+                    final_content = f"✅ 任务较复杂，已交由微内核处理 (trace_id: {trace_id})，执行完成后将通知你。"
+                    exit_reason = "microkernel"
+                    _emit({"type": "turn_end", "iteration": iteration})
+                    break
+
                 logger.info(f"[AgentLoop] LLM returned {len(response.tool_calls)} tool calls: {[tc.name for tc in response.tool_calls]}")
                 if any(tc.name == 'spawn' for tc in response.tool_calls):
                     logger.info(f"[AgentLoop] SPAWN tool detected in tool calls!")
