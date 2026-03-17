@@ -92,8 +92,12 @@ class AgentDefaults(BaseModel):
 
     # 微内核委托配置
     microkernel_escalation_enabled: bool = True  # 是否启用阈值切换，默认开启
-    microkernel_escalation_threshold: int = 10  # 工具调用次数阈值，超过则委托微内核
+    microkernel_escalation_threshold: int = 10  # 中等工具阈值（向后兼容）
     microkernel_timeout_seconds: float = 120.0  # 微内核单次执行超时（秒）
+    # 动态阈值：按工具复杂度区分
+    microkernel_threshold_simple: int = 15  # 简单工具（read_file, list_dir）
+    microkernel_threshold_medium: int = 10  # 中等工具（exec, web_search 等）
+    microkernel_threshold_complex: int = 5  # 复杂工具（spawn）
 
 
 class AgentsConfig(BaseModel):

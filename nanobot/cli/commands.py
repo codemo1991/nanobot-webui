@@ -242,6 +242,9 @@ def gateway(
         microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
         microkernel_escalation_threshold=getattr(config.agents.defaults, "microkernel_escalation_threshold", 10),
         microkernel_timeout_seconds=getattr(config.agents.defaults, "microkernel_timeout_seconds", 120.0),
+        microkernel_threshold_simple=getattr(config.agents.defaults, "microkernel_threshold_simple", 15),
+        microkernel_threshold_medium=getattr(config.agents.defaults, "microkernel_threshold_medium", 10),
+        microkernel_threshold_complex=getattr(config.agents.defaults, "microkernel_threshold_complex", 5),
     )
     
     # Set cron callback (needs agent)
@@ -555,6 +558,9 @@ def agent(
         microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
         microkernel_escalation_threshold=getattr(config.agents.defaults, "microkernel_escalation_threshold", 10),
         microkernel_timeout_seconds=getattr(config.agents.defaults, "microkernel_timeout_seconds", 120.0),
+        microkernel_threshold_simple=getattr(config.agents.defaults, "microkernel_threshold_simple", 15),
+        microkernel_threshold_medium=getattr(config.agents.defaults, "microkernel_threshold_medium", 10),
+        microkernel_threshold_complex=getattr(config.agents.defaults, "microkernel_threshold_complex", 5),
     )
     
     if message:

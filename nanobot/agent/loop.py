@@ -58,6 +58,11 @@ for tool, keywords in TOOL_KEYWORDS.items():
 
 ESSENTIAL_TOOLS = ["read_file", "write_file", "exec", "remember", "spawn"]
 
+# 工具复杂度分类：用于动态阈值
+TOOLS_SIMPLE = frozenset({"read_file", "list_dir"})
+TOOLS_MEDIUM = frozenset({"exec", "web_search", "web_fetch", "write_file", "edit_file", "remember", "message", "cron", "voice_transcribe", "get_subagent_results"})
+TOOLS_COMPLEX = frozenset({"spawn"})
+
 # Marker embedded in assistant reply when limits are hit.
 # Used to detect "continue" commands from the user in the next turn.
 LIMIT_REACHED_MARKER = "<!-- LIMIT_REACHED -->"
@@ -122,6 +127,9 @@ class AgentLoop:
         microkernel_escalation_enabled: bool = True,
         microkernel_escalation_threshold: int = 10,
         microkernel_timeout_seconds: float = 120.0,
+        microkernel_threshold_simple: int = 15,
+        microkernel_threshold_medium: int = 10,
+        microkernel_threshold_complex: int = 5,
     ):
         from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig, ClaudeCodeConfig
         from nanobot.cron.service import CronService
@@ -174,6 +182,9 @@ class AgentLoop:
         self._microkernel_escalation_enabled = microkernel_escalation_enabled
         self._microkernel_escalation_threshold = microkernel_escalation_threshold
         self._microkernel_timeout_seconds = microkernel_timeout_seconds
+        self._microkernel_threshold_simple = microkernel_threshold_simple
+        self._microkernel_threshold_medium = microkernel_threshold_medium
+        self._microkernel_threshold_complex = microkernel_threshold_complex
 
         # 初始化智能并行判断器
         self._smart_parallel_decider = None
@@ -361,6 +372,7 @@ class AgentLoop:
                 logger.info("[AgentLoop] DelegateMicrokernelTool registered (hot-update)")
         if microkernel_escalation_threshold is not None:
             self._microkernel_escalation_threshold = max(1, min(microkernel_escalation_threshold, 50))
+            self._microkernel_threshold_medium = self._microkernel_escalation_threshold
 
     async def close(self) -> None:
         """关闭agent并清理资源"""
@@ -501,6 +513,56 @@ class AgentLoop:
                     total_size += len(raw)
 
         return artifacts
+
+    def _is_step_failed(self, step: dict) -> bool:
+        """判断单步是否为失败。"""
+        result = step.get("result", "")
+        if not result or not isinstance(result, str):
+            return False
+        r = result.strip()
+        if not r:
+            return False
+        if r.startswith("[ERROR]") or r.startswith("[RETRYABLE]"):
+            return True
+        if r.lower().startswith("error:"):
+            return True
+        fail_keywords = ("failed", "失败", "exception", "timeout", "超时")
+        return any(kw in r.lower() for kw in fail_keywords)
+
+    def _get_base_threshold(self, tool_steps: list[dict]) -> int:
+        """根据工具复杂度返回基础阈值：简单15、中等10、复杂5。"""
+        names = {s.get("name", "") for s in tool_steps if s.get("name")}
+        if names & TOOLS_COMPLEX:
+            return self._microkernel_threshold_complex
+        if names & TOOLS_MEDIUM:
+            return self._microkernel_threshold_medium
+        return self._microkernel_threshold_simple
+
+    def _compute_effective_threshold(self, tool_steps: list[dict]) -> int:
+        """计算有效阈值：基础阈值 × 失败累积系数（3-5次降50%，6+次降75%）。"""
+        base = self._get_base_threshold(tool_steps)
+        failure_count = sum(1 for s in tool_steps if self._is_step_failed(s))
+        if failure_count >= 6:
+            effective = max(1, int(base * 0.25))
+        elif failure_count >= 3:
+            effective = max(1, int(base * 0.5))
+        else:
+            effective = base
+        return effective
+
+    def _should_escalate_to_microkernel(
+        self, tool_steps: list[dict], response_has_tool_calls: bool
+    ) -> tuple[bool, int, str]:
+        """
+        判断是否应委托微内核。
+        Returns: (should_escalate, effective_threshold, reason)
+        """
+        if not self._microkernel_escalation_enabled or not response_has_tool_calls:
+            return False, 0, ""
+        effective = self._compute_effective_threshold(tool_steps)
+        if len(tool_steps) >= effective:
+            return True, effective, f"steps={len(tool_steps)}>=effective={effective}"
+        return False, effective, ""
 
     async def _delegate_to_microkernel(
         self,
@@ -1693,14 +1755,18 @@ class AgentLoop:
 
             # Handle tool calls
             if response.has_tool_calls:
-                # 阈值触发：工具调用次数已达阈值且仍有 tool_calls 时，委托微内核
-                if (
-                    self._microkernel_escalation_enabled
-                    and len(tool_steps) >= self._microkernel_escalation_threshold
-                ):
+                # 动态阈值 + 失败累积：工具复杂度（简单15/中等10/复杂5）× 失败系数（3-5次降50%，6+次降75%）
+                should_escalate, effective_threshold, reason = self._should_escalate_to_microkernel(
+                    tool_steps, response.has_tool_calls
+                )
+                if should_escalate:
+                    logger.info(
+                        "[AgentLoop] Microkernel escalation: %s (steps=%d, effective=%d)",
+                        reason, len(tool_steps), effective_threshold,
+                    )
                     attempted_summary = [
                         {"name": s["name"], "result_preview": str(s.get("result", ""))[:200]}
-                        for s in tool_steps[-self._microkernel_escalation_threshold :]
+                        for s in tool_steps[-effective_threshold:]
                     ]
                     initial_artifacts = self._extract_initial_artifacts(tool_steps)
                     trace_id = await self._delegate_to_microkernel(
