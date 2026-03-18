@@ -1942,6 +1942,41 @@ class AgentLoop:
                                 exec_results.append((tc, result))
                                 logger.info(f"[BatchMode] Exec image completed")
 
+                    # 阶段 2.5: 如果有 spawn_vision 和 spawn_other，需要等待 vision 完成并注入结果
+                    # 这解决了一个 LLM 同时 spawn(vision) 和 spawn(claude-coder) 时，
+                    # claude-coder 拿不到 vision 结果的问题
+                    if spawn_vision and spawn_other and self.subagents:
+                        logger.info("[BatchMode] Waiting for vision spawn to complete before spawning other subagents")
+                        # 从 spawn_results 获取 vision 的 task_id
+                        for tc, result in spawn_results:
+                            task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
+                            if task_id_match:
+                                vision_task_id = task_id_match.group(1) or task_id_match.group(2)
+                                # 等待 vision spawn 完成
+                                try:
+                                    await self._wait_for_subagents([vision_task_id], timeout=120.0)
+                                    logger.info(f"[BatchMode] Vision spawn {vision_task_id} completed")
+
+                                    # 注入 vision 结果到 spawn_other 的 task
+                                    if vision_task_id in session.subagent_results:
+                                        vision_result = session.subagent_results[vision_task_id].get("result", "")
+                                        if vision_result:
+                                            # 修改 spawn_other 的 task 参数，注入 vision 结果
+                                            for tc_other in spawn_other:
+                                                if tc_other.arguments and "task" in tc_other.arguments:
+                                                    original_task = tc_other.arguments.get("task", "")
+                                                    vision_label = session.subagent_results[vision_task_id].get("label", "图片识别")
+                                                    injected_task = (
+                                                        f"[图片来源分析结果（来自 {vision_label}）]\n"
+                                                        f"{vision_result}\n\n"
+                                                        f"[用户原始任务]\n{original_task}"
+                                                    )
+                                                    tc_other.arguments["task"] = injected_task
+                                                    logger.info(f"[BatchMode] Injected vision result into spawn_other task")
+                                except asyncio.TimeoutError:
+                                    logger.warning(f"[BatchMode] Timeout waiting for vision spawn {vision_task_id}")
+                                break
+
                     # 阶段 3: exec(非图片) 和 spawn(非 vision) 并行执行
                     parallel_tasks = []
                     for tc in spawn_other + exec_other:
