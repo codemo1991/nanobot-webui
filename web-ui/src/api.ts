@@ -112,17 +112,16 @@ export const api = {
     try {
       while (true) {
         const { done, value } = await reader.read()
-        if (done) break
-        buf += dec.decode(value, { stream: true })
+        if (value) buf += dec.decode(value, { stream: true })
         const lines = buf.split('\n\n')
-        buf = lines.pop() ?? ''
+        buf = done ? '' : (lines.pop() ?? '')
         for (const block of lines) {
           // SSE: data can be multi-line; collapse all "data:" lines
           const dataParts = block.split('\n')
             .filter(line => line.startsWith('data:'))
             .map(line => line.slice(5).trimStart())
           const dataStr = dataParts.join('\n')
-          if (!dataStr) continue
+          if (!dataStr || dataStr === ': heartbeat') continue
           try {
             const evt = JSON.parse(dataStr) as StreamEvent
             onEvent(evt)
@@ -139,6 +138,7 @@ export const api = {
             throw e  // 重抛任何异常，不吞掉非 Error 类型
           }
         }
+        if (done) break
       }
     } finally {
       reader.releaseLock()
@@ -161,10 +161,9 @@ export const api = {
     try {
       while (true) {
         const { done, value } = await reader.read()
-        if (done) break
-        buf += dec.decode(value, { stream: true })
+        if (value) buf += dec.decode(value, { stream: true })
         const lines = buf.split('\n\n')
-        buf = lines.pop() ?? ''
+        buf = done ? '' : (lines.pop() ?? '')
         for (const block of lines) {
           const dataParts = block.split('\n')
             .filter(line => line.startsWith('data:'))
@@ -188,6 +187,7 @@ export const api = {
             if (e instanceof Error && e.message === 'Stream error') throw e
           }
         }
+        if (done) break
       }
     } finally {
       reader.releaseLock()

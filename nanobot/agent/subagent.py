@@ -576,10 +576,18 @@ class SubagentManager:
                             **({"batch_id": batch_id} if batch_id else {}),
                         }
                         self.sessions.save(main_session)
-                # Web 渠道：推送 summary；非 web：announce 给主 agent
-                if origin.get("channel") == "web":
-                    if status == "done":
-                        await self._generate_and_push_summary(task_id, label, task, output, origin, from_late_result=True)
+                # Web 渠道：vision/voice 走 announce 让主 agent 注入综合；其余推 summary
+                # 非 web：announce 给主 agent
+                if template in ("vision", "voice") and origin.get("channel") == "web":
+                    await self._announce_result(
+                        task_id, label, task,
+                        output or f"status={status}",
+                        origin,
+                        "ok" if status == "done" else "timeout" if status == "timeout" else "error",
+                        template=template,
+                    )
+                elif origin.get("channel") == "web":
+                    await self._generate_and_push_summary(task_id, label, task, output, origin, from_late_result=True)
                 else:
                     await self._announce_result(
                         task_id, label, task,
@@ -684,7 +692,11 @@ class SubagentManager:
                     if len(batch_task_ids) > 1:
                         await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
                     else:
-                        if status == "done":
+                        # vision/voice 模板：web 渠道也走 _announce_result，
+                        # 让主 agent 注入并综合（避免直接推前端造成割裂感）
+                        if template in ("vision", "voice") and origin.get("channel") == "web":
+                            await self._announce_result(task_id, label, task, output, origin, "ok", template=template)
+                        elif status == "done":
                             if origin.get("channel") == "web":
                                 await self._generate_and_push_summary(task_id, label, task, output, origin)
                             else:
@@ -702,10 +714,12 @@ class SubagentManager:
                                     output or f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
                                     origin, "timeout", template=template
                                 )
-                        elif status != "done" and origin.get("channel") != "web":
+                        elif origin.get("channel") != "web":
                             await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error", template=template)
                 else:
-                    if status == "done":
+                    if template in ("vision", "voice") and origin.get("channel") == "web":
+                        await self._announce_result(task_id, label, task, output, origin, "ok", template=template)
+                    elif status == "done":
                         if origin.get("channel") == "web":
                             await self._generate_and_push_summary(task_id, label, task, output, origin)
                         else:
@@ -723,7 +737,7 @@ class SubagentManager:
                                 output or f"⏳ 任务执行超时（{self._claude_code_manager.default_timeout}秒），任务可能仍在后台运行。",
                                 origin, "timeout", template=template
                             )
-                    elif status != "done" and origin.get("channel") != "web":
+                    elif origin.get("channel") != "web":
                         await self._announce_result(task_id, label, task, output or f"status={status}", origin, "error", template=template)
         except Exception as exc:
             logger.error(f"Subagent [{task_id}] Claude Code backend failed: {exc}")
@@ -816,12 +830,18 @@ class SubagentManager:
                     if len(batch_task_ids) > 1:
                         await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
                     else:
-                        if origin.get("channel") == "web":
+                        # vision/voice 模板：web 渠道也走 _announce_result
+                        if template in ("vision", "voice") and origin.get("channel") == "web":
+                            await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
+                        elif origin.get("channel") == "web":
                             await self._generate_and_push_summary(task_id, label, task, final_result, origin)
                         else:
                             await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                 else:
-                    if origin.get("channel") == "web":
+                    # vision/voice 模板：web 渠道也走 _announce_result
+                    if template in ("vision", "voice") and origin.get("channel") == "web":
+                        await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
+                    elif origin.get("channel") == "web":
                         await self._generate_and_push_summary(task_id, label, task, final_result, origin)
                     else:
                         await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
@@ -957,13 +977,14 @@ class SubagentManager:
                     if len(batch_task_ids) > 1:
                         await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
                     else:
+                        # DashScope vision 是 vision 专用后端：web 渠道也走 _announce_result
                         if origin.get("channel") == "web":
-                            await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                            await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                         else:
                             await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                 else:
                     if origin.get("channel") == "web":
-                        await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                        await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                     else:
                         await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
         except Exception as e:
@@ -1280,15 +1301,15 @@ class SubagentManager:
                     if len(batch_task_ids) > 1:
                         await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
                     else:
-                        # vision/voice 模板：web 渠道走 _generate_and_push_summary 推送到 SubagentProgressBus，前端才能刷新
-                        # 非 web 渠道用 _announce_result 触发主 agent 处理
+                        # vision/voice 模板：web 渠道也走 _announce_result，
+                        # 让主 agent 注入并综合（避免直接推前端造成割裂感）
                         if template in ("vision", "voice") and origin.get("channel") == "web":
-                            await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                            await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                         else:
                             await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                 else:
                     if template in ("vision", "voice") and origin.get("channel") == "web":
-                        await self._generate_and_push_summary(task_id, label, task, final_result, origin)
+                        await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                     else:
                         await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
 
@@ -1661,6 +1682,18 @@ class SubagentManager:
         if template == "voice" and origin.get("channel") != "web" and status == "ok":
             await self._inject_voice_as_user_message(origin, result)
             return
+
+        # 检查结果是否已被主 agent 循环注入（通过检查 session 消息历史）。
+        # 若已注入，说明主 agent 已经综合过此结果，不需要再次 announce（避免重复消息）。
+        if self.sessions:
+            origin_key = f"{origin['channel']}:{origin['chat_id']}"
+            session = self.sessions.get(origin_key)
+            if session and session.messages:
+                for m in reversed(session.messages[-10:]):  # 只检查最近 10 条
+                    content = m.get("content") or ""
+                    if m.get("role") == "user" and f"### {label}" in content and content[:50] == "[子 Agent 已完成]":
+                        logger.info(f"[SubagentAnnounce] Result for {task_id} already injected, skipping announce")
+                        return
 
         status_text = "completed successfully" if status == "ok" else "failed"
 

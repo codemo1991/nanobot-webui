@@ -397,7 +397,12 @@ function ChatPage() {
 
   // 流式事件处理（供 handleSend 和 SSE 重连共用）
   const handleStreamEvent = useCallback((evt: StreamEvent) => {
-    if (evt.type === 'thinking') {
+    if (evt.type === 'done') {
+      // 收到 done 时立即清除流式状态，避免页面卡在「正在思考/调用工具」
+      setStreamingThinking(false)
+      setStreamingToolSteps([])
+      setClaudeCodeProgress('')
+    } else if (evt.type === 'thinking') {
       setStreamingThinking(true)
     } else if (evt.type === 'tool_start' && evt.name) {
       setStreamingThinking(false)

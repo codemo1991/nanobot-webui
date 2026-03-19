@@ -23,7 +23,12 @@ class RootAgent(Capability):
                     intent="plan_tasks",
                     priority=15,
                     output_schema="plan_v1",
-                    request_payload={"user_goal": goal, "goal": goal},
+                    request_payload={
+                        "user_goal": goal,
+                        "goal": goal,
+                        "attempted_steps": request.get("attempted_steps", []),
+                        "initial_artifacts_keys": request.get("initial_artifacts_keys", []),
+                    },
                 ),
             ],
         )

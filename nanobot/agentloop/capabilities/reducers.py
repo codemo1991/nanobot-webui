@@ -51,12 +51,16 @@ class FinalReducer(Capability):
         draft = artifacts.get("draft_v1") or {}
         critique = artifacts.get("critique_v1") or {}
 
+        final_text = draft.get("summary", "这是最终聚合结果。")
+        if isinstance(final_text, str) and len(final_text) > 500:
+            final_text = final_text[:500] + "..."
+
         final_payload = {
             "goal": plan.get("goal", ""),
             "draft": draft,
             "critique": critique,
             "evidence_count": len(evidence.get("items", [])),
-            "final_text": "这是最终聚合结果。",
+            "final_text": final_text,
         }
 
         return CapabilityResult(

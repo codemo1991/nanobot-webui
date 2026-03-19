@@ -38,6 +38,8 @@ class Kernel:
             "attempted_steps": attempted_steps or [],
             "conversation_summary": conversation_summary,
         }
+        if initial_artifacts:
+            request_payload["initial_artifacts_keys"] = list(initial_artifacts.keys())
         trace_id, root_task_id = create_trace_and_root_task(
             self.conn,
             user_input=user_input,
@@ -110,7 +112,12 @@ class Kernel:
         await asyncio.gather(*workers)
 
 
-def create_kernel(workspace: Path | None = None, registry=None, runtime=None):
+def create_kernel(
+    workspace: Path | None = None,
+    registry=None,
+    runtime=None,
+    brave_api_key: str | None = None,
+):
     """创建并初始化 Kernel 实例。"""
     conn = connect_chat(workspace)
     init_chat_schema(conn)
@@ -121,7 +128,7 @@ def create_kernel(workspace: Path | None = None, registry=None, runtime=None):
 
     if registry is None:
         from nanobot.agentloop.capabilities.registry import create_default_registry
-        registry = create_default_registry()
+        registry = create_default_registry(brave_api_key=brave_api_key)
 
     if runtime is None:
         from nanobot.agentloop.kernel.runtime import Runtime

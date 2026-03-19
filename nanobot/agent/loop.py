@@ -575,7 +575,10 @@ class AgentLoop:
         """委托任务给微内核，返回 trace_id。"""
         from nanobot.agentloop.kernel.kernel import create_kernel
 
-        kernel = create_kernel(workspace=self.workspace)
+        kernel = create_kernel(
+            workspace=self.workspace,
+            brave_api_key=getattr(self, "brave_api_key", None),
+        )
         trace_id, _ = await kernel.submit(
             user_input=goal,
             initial_artifacts=initial_artifacts or None,
@@ -729,6 +732,45 @@ class AgentLoop:
             groups.append([tc])
         return groups
 
+    def _resolve_vision_first_groups(
+        self,
+        tool_calls: list,
+        image_files: list[str],
+    ) -> tuple[list[list], bool] | None:
+        """
+        方案 C：当存在 spawn(vision) + 任意其他工具时，vision 先行，整批完成后统一推送。
+        返回 (groups, use_buffered_progress)。
+        """
+        if len(tool_calls) < 2:
+            return None
+
+        spawn_vision: list = []
+        others: list = []
+
+        for tc in tool_calls:
+            name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else None)
+            args = getattr(tc, "arguments", None) or (tc.get("arguments", {}) if isinstance(tc, dict) else {})
+            if not isinstance(args, dict):
+                args = {}
+
+            if name == "spawn" and str(args.get("template", "")).lower() == "vision":
+                spawn_vision.append(tc)
+            else:
+                others.append(tc)
+
+        if not spawn_vision or not others:
+            return None
+
+        # 有图片时启用（vision 分析图片）
+        use_buffered = bool(image_files)
+
+        vision_deduped = spawn_vision[:1]
+        if len(spawn_vision) > 1:
+            logger.info("[AgentLoop] Vision-first: deduplicated spawn(vision) (%d -> 1)", len(spawn_vision))
+
+        groups = [vision_deduped] + [[tc] for tc in others]
+        return (groups, use_buffered)
+
     async def _execute_tool_parallel(
         self,
         tool_calls: list,
@@ -761,6 +803,84 @@ class AgentLoop:
                 await self._check_cancelled(session_key)
                 result = await self._execute_single_tool(tool_call, progress)
                 results.append((tool_call, result))
+            return results
+
+        # 方案 C：spawn(vision) + 任意其他工具时，vision 先行，整批完成后统一推送（避免体验割裂）
+        vision_first = self._resolve_vision_first_groups(tool_calls, image_files or [])
+        if vision_first:
+            groups, use_buffered_progress = vision_first
+            logger.info("[AgentLoop] Vision-first batch: vision runs first, progress %s", "buffered" if use_buffered_progress else "immediate")
+            if self._status_service:
+                try:
+                    for _ in tool_calls:
+                        self._status_service.increment_tool_call(is_parallel=False)
+                except Exception as e:
+                    logger.debug(f"Failed to record serial tool metrics: {e}")
+            results = []
+            buffered: list[dict[str, Any]] = []
+
+            def buffered_progress(evt: dict[str, Any]) -> None:
+                buffered.append(evt)
+
+            _run_progress = buffered_progress if (use_buffered_progress and progress) else progress
+
+            # 阶段 1: 执行 vision
+            vision_group = groups[0]
+            for tool_call in vision_group:
+                await self._check_cancelled(session_key)
+                result = await self._execute_single_tool(tool_call, _run_progress)
+                results.append((tool_call, result))
+
+            # 阶段 2: 若有 spawn(非 vision)，等待 vision 完成并注入结果
+            others_groups = groups[1:]
+            spawn_others = [
+                tc for group in others_groups for tc in group
+                if getattr(tc, "name", None) == "spawn"
+                and str((getattr(tc, "arguments") or {}).get("template", "")).lower() != "vision"
+            ]
+            if spawn_others and self.subagents and session_key:
+                session = self.sessions.get(session_key) or self.sessions.get_or_create(session_key)
+                for tc, result in results:
+                    if getattr(tc, "name", None) != "spawn":
+                        continue
+                    task_id_match = re.search(r"\(id: ([^)]+)\)|session \[([^\]]+)\]", result)
+                    if task_id_match:
+                        vision_task_id = task_id_match.group(1) or task_id_match.group(2)
+                        try:
+                            await self._wait_for_subagents([vision_task_id], timeout=120.0)
+                            logger.info("[AgentLoop] Vision-first: vision spawn %s completed, injecting into spawn_other", vision_task_id)
+                            if vision_task_id in session.subagent_results:
+                                vision_result = session.subagent_results[vision_task_id].get("result", "")
+                                if vision_result:
+                                    vision_label = session.subagent_results[vision_task_id].get("label", "图片识别")
+                                    for tc_other in spawn_others:
+                                        args = getattr(tc_other, "arguments", None) or {}
+                                        if isinstance(args, dict) and "task" in args:
+                                            original_task = args.get("task", "")
+                                            injected_task = (
+                                                f"[图片来源分析结果（来自 {vision_label}）]\n"
+                                                f"{vision_result}\n\n"
+                                                f"[用户原始任务]\n{original_task}"
+                                            )
+                                            tc_other.arguments["task"] = injected_task
+                                            logger.info("[AgentLoop] Vision-first: injected vision result into spawn_other task")
+                        except asyncio.TimeoutError:
+                            logger.warning("[AgentLoop] Vision-first: timeout waiting for vision spawn %s", vision_task_id)
+                        break
+
+            # 阶段 3: 执行 others
+            for group in others_groups:
+                for tool_call in group:
+                    await self._check_cancelled(session_key)
+                    result = await self._execute_single_tool(tool_call, _run_progress)
+                    results.append((tool_call, result))
+
+            if use_buffered_progress and progress and buffered:
+                for evt in buffered:
+                    try:
+                        progress(evt)
+                    except Exception:
+                        pass
             return results
 
         # vision-exec 冲突检测：有图片且同时存在 spawn(vision) 与 exec(图片相关) 时，串行分组（vision 先行）
@@ -938,11 +1058,19 @@ class AgentLoop:
             except Exception as e:
                 logger.debug(f"Failed to record tool metrics: {e}")
 
+        # suppress tool_end for spawn(vision): the result will be injected into the main agent
+        # loop and synthesized as part of the final response, avoiding a separate raw message
+        is_spawn_vision = (
+            tool_call.name == "spawn"
+            and isinstance(getattr(tool_call, "arguments", None), dict)
+            and str(getattr(tool_call.arguments, "get", {}.get)("template", "")).lower() == "vision"
+        )
         if progress:
             try:
                 truncated = _truncate(result)
                 evt = {"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated}
-                progress(evt)
+                if not is_spawn_vision:
+                    progress(evt)
                 progress({**evt, "type": "tool_execution_end"})  # 细粒度事件流
             except Exception:
                 pass
@@ -1681,6 +1809,9 @@ class AgentLoop:
                         _injected_subagent_task_ids.add(tid)
                     inject_content = "\n".join(parts)
                     messages.append({"role": "user", "content": inject_content})
+                    # 同步到 session，确保后续 build_messages 能看到注入的内容
+                    session.add_message("user", inject_content)
+                    self.sessions.save(session)
                     logger.info(f"[SubagentInject] Injected {len(to_inject)} subagent results into messages: {to_inject}")
 
             # 细粒度事件流：thinking
@@ -1912,9 +2043,23 @@ class AgentLoop:
                     spawn_results = []
                     exec_results = []
 
+                    # 方案 C：有 vision + 其他工具时，整批完成后统一推送
+                    use_buffered = bool(spawn_vision and (exec_image or spawn_other or exec_other) and image_files)
+                    if use_buffered:
+                        logger.info("[BatchMode] Vision-first: buffering progress until batch done")
+                    buffered_evts: list[dict[str, Any]] = []
+
+                    def _batch_progress(evt: dict[str, Any]) -> None:
+                        if use_buffered:
+                            buffered_evts.append(evt)
+                        elif progress:
+                            progress(evt)
+
+                    _progress = progress if not use_buffered else _batch_progress
+
                     # 阶段 1: 先执行 spawn(vision)
                     for tc in spawn_vision:
-                        result = await self._execute_single_tool(tc, progress)
+                        result = await self._execute_single_tool(tc, _progress)
                         spawn_results.append((tc, result))
                         task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
                         if task_id_match:
@@ -1938,7 +2083,7 @@ class AgentLoop:
                         else:
                             # spawn(vision) 已完成或没有 spawn(vision)，执行 exec_image
                             for tc in exec_image:
-                                result = await self._execute_single_tool(tc, progress)
+                                result = await self._execute_single_tool(tc, _progress)
                                 exec_results.append((tc, result))
                                 logger.info(f"[BatchMode] Exec image completed")
 
@@ -1980,7 +2125,7 @@ class AgentLoop:
                     # 阶段 3: exec(非图片) 和 spawn(非 vision) 并行执行
                     parallel_tasks = []
                     for tc in spawn_other + exec_other:
-                        parallel_tasks.append(self._execute_single_tool(tc, progress))
+                        parallel_tasks.append(self._execute_single_tool(tc, _progress))
 
                     if parallel_tasks:
                         parallel_results = await asyncio.gather(*parallel_tasks)
@@ -1999,6 +2144,14 @@ class AgentLoop:
 
                     # 合并所有结果
                     exec_results = spawn_results + exec_results
+
+                    # 方案 C：整批完成后统一推送
+                    if use_buffered and progress and buffered_evts:
+                        for evt in buffered_evts:
+                            try:
+                                progress(evt)
+                            except Exception:
+                                pass
                 else:
                     # 正常模式：并行/串行执行
                     exec_results = await self._execute_tool_parallel(
@@ -2121,12 +2274,49 @@ class AgentLoop:
         # 子 Agent 完成后会触发综合并通过 SSE 推送结果
         # 若已注入过子 Agent 结果（方案 A：vision -> claude_code 链式调用），则返回 LLM 合成结果，不覆盖
         if spawned_task_ids and not _injected_subagent_task_ids:
-            logger.info(f"[BatchMode] Non-blocking mode: spawn {len(spawned_task_ids)} tasks, returning immediately")
-            # 直接返回 spawn 的结果，不再继续 LLM 调用
-            # 使用 spawn 返回的消息（已经在 response.content 中）
-            final_content = response.content if response.content else f"任务已启动，正在后台处理中 (id: {spawned_task_ids[0]})..."
-            # 强制设置 exit_reason 避免后续继续循环
-            exit_reason = "spawn_nonblocking"
+            # 在退出前，等待仍在运行的 vision spawn 完成，并将结果注入到 session
+            # 这样 vision 结果会被主 agent 的 LLM 综合处理，而不是直接推送到前端（造成割裂感）
+            running_vision_ids = [
+                tid for tid in spawned_task_ids
+                if (spawned_task_templates.get(tid) or "").lower() == "vision"
+                and self.subagents
+                and tid in self.subagents._running_tasks
+            ]
+            if running_vision_ids and self.subagents:
+                logger.info(f"[BatchMode] Waiting for vision spawns before return: {running_vision_ids}")
+                try:
+                    await self._wait_for_subagents(running_vision_ids, timeout=120.0)
+                    logger.info(f"[BatchMode] Vision spawns completed, injecting results")
+                    # 注入已完成且尚未注入的子 Agent 结果
+                    to_inject = [
+                        tid for tid in spawned_task_ids
+                        if tid not in _injected_subagent_task_ids
+                        and tid in session.subagent_results
+                    ]
+                    if to_inject:
+                        parts = ["[子 Agent 已完成] 以下是已完成的子 Agent 执行结果，请基于这些结果继续处理用户请求：\n"]
+                        for tid in to_inject:
+                            sa = session.subagent_results[tid]
+                            label = sa.get("label", "任务")
+                            task = sa.get("task", "")[:200]
+                            result = (sa.get("result") or "")[:1500]
+                            parts.append(f"\n### {label}\n- 任务: {task}\n- 结果:\n{result}")
+                            _injected_subagent_task_ids.add(tid)
+                        inject_content = "\n".join(parts)
+                        messages.append({"role": "user", "content": inject_content})
+                        # 关键：同步到 session，确保后续 LLM 调用的 build_messages 能看到注入的内容
+                        session.add_message("user", inject_content)
+                        self.sessions.save(session)
+                        logger.info(f"[BatchMode] Injected {len(to_inject)} subagent results before return")
+                except asyncio.TimeoutError:
+                    logger.warning(f"[BatchMode] Timeout waiting for vision spawns before return")
+
+            if not _injected_subagent_task_ids:
+                # 没有 vision 需要等待，直接返回（其他类型的 spawn 结果会通过 announce 机制处理）
+                logger.info(f"[BatchMode] Non-blocking mode: spawn {len(spawned_task_ids)} tasks, returning immediately")
+                final_content = response.content if response.content else f"任务已启动，正在后台处理中 (id: {spawned_task_ids[0]})..."
+                exit_reason = "spawn_nonblocking"
+            # 如果有注入过结果，_injected_subagent_task_ids 非空，继续下面的综合流程（不覆盖 response.content）
 
         if final_content is None and exit_reason is None:
             exit_reason = "iterations"

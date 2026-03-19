@@ -76,7 +76,7 @@ class Runtime:
                 else:
                     artifacts[artifact_type] = payload
 
-        return {
+        ctx = {
             "trace_id": task["trace_id"],
             "task_id": task_id,
             "constraints": {
@@ -88,6 +88,9 @@ class Runtime:
             "artifacts": artifacts,
             "artifact_list": artifact_list,
         }
+        if self.workspace is not None:
+            ctx["workspace"] = self.workspace
+        return ctx
 
     def write_output_artifact(self, task: dict, output_artifact: dict | None) -> str | None:
         """写入任务产出 artifact，返回 artifact_id。"""

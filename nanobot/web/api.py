@@ -770,6 +770,7 @@ class NanobotWebAPI:
                 pass
 
         def run_agent() -> None:
+            loop = None
             try:
                 # 创建新的事件循环（避免与主线程冲突）
                 loop = asyncio.new_event_loop()
@@ -784,25 +785,27 @@ class NanobotWebAPI:
                 logger.exception("Mirror chat stream failed")
                 evt_queue.put({"type": "error", "message": str(e)})
             finally:
-                # 等待子代理后台任务完成（避免事件循环关闭导致任务被取消）
-                if hasattr(self.agent, 'subagents'):
-                    running_tasks = list(getattr(self.agent.subagents, '_running_tasks', {}).items())
-                    if running_tasks:
-                        logger.info(f"[MirrorChatStream] Waiting for {len(running_tasks)} subagent tasks to complete...")
-                        for task_id, task in running_tasks:
-                            if not task.done():
-                                try:
-                                    loop.run_until_complete(asyncio.wait_for(task, timeout=300))
-                                    logger.info(f"[MirrorChatStream] Subagent task {task_id} completed")
-                                except asyncio.TimeoutError:
-                                    logger.warning(f"[MirrorChatStream] Subagent task {task_id} timed out after 300s")
-                                except Exception as e:
-                                    logger.error(f"[MirrorChatStream] Subagent task {task_id} failed: {e}")
-                        logger.info("[MirrorChatStream] All subagent tasks completed or timed out")
-                try:
-                    loop.close()
-                except Exception:
-                    pass
+                # 等待事件循环内未完成的任务（含微内核、子代理），避免 loop.close() 导致 Task was destroyed / coroutine ignored GeneratorExit
+                if loop:
+                    try:
+                        current = asyncio.current_task()
+                        pending = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not current]
+                        if pending:
+                            logger.info(f"[MirrorChatStream] Waiting for {len(pending)} pending tasks before closing loop")
+                            try:
+                                loop.run_until_complete(asyncio.wait_for(
+                                    asyncio.gather(*pending, return_exceptions=True),
+                                    timeout=130,
+                                ))
+                            except asyncio.TimeoutError:
+                                logger.warning("[MirrorChatStream] Pending tasks timed out after 130s, cancelling")
+                                for t in pending:
+                                    if not t.done():
+                                        t.cancel()
+                                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        loop.close()
+                    except Exception as e:
+                        logger.debug("Loop close error (ignored): %s", e)
 
         thread = threading.Thread(target=run_agent, daemon=False)
         return evt_queue, thread
@@ -1343,21 +1346,27 @@ class NanobotWebAPI:
                 _put_evt({"type": "error", "message": str(e)})
             finally:
                 logger.debug("Chat stream thread ending")
-                # 等待子代理后台任务完成（避免事件循环关闭导致任务被取消）
-                logger.info(f"[ChatStream] Checking for subagent tasks, agent id: {id(self.agent)}, has subagents: {hasattr(self.agent, 'subagents')}")
-                if hasattr(self.agent, 'subagents'):
-                    subagents = self.agent.subagents
-                    running_tasks = getattr(subagents, '_running_tasks', {})
-                    logger.info(f"[ChatStream] SubagentManager id: {id(subagents)}, _running_tasks: {running_tasks}")
-                    # 子代理任务现在在独立线程中运行，不需要等待
-                    # 它们会在后台完成后通过 SubagentProgressBus 发送通知
-                    if running_tasks:
-                        logger.info(f"[ChatStream] {len(running_tasks)} subagent tasks running in background threads (will complete independently)")
+                # 等待事件循环内未完成的任务（含微内核），避免 loop.close() 导致 Task was destroyed / coroutine ignored GeneratorExit
                 if loop:
                     try:
+                        current = asyncio.current_task()
+                        pending = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not current]
+                        if pending:
+                            logger.info(f"[ChatStream] Waiting for {len(pending)} pending tasks (incl. microkernel) before closing loop")
+                            try:
+                                loop.run_until_complete(asyncio.wait_for(
+                                    asyncio.gather(*pending, return_exceptions=True),
+                                    timeout=130,
+                                ))
+                            except asyncio.TimeoutError:
+                                logger.warning("[ChatStream] Pending tasks timed out after 130s, cancelling")
+                                for t in pending:
+                                    if not t.done():
+                                        t.cancel()
+                                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                         loop.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Loop close error (ignored): %s", e)
                 for p in media_paths:
                     try:
                         Path(p).unlink(missing_ok=True)
@@ -2653,7 +2662,13 @@ class NanobotWebAPI:
 
 
     def get_logs(self, max_lines: int = 1000) -> list[str]:
-        """Get system logs."""
+        """Get system logs. 优先从内存缓冲读取，避免打开文件导致轮换 rename 失败。"""
+        from nanobot.logging_config import get_buffered_logs
+
+        lines = get_buffered_logs(max_lines=max_lines)
+        if lines:
+            return lines
+        # 缓冲为空时（如冷启动）回退到读文件
         log_file = Path.home() / ".nanobot" / "nanobot.log"
         if not log_file.exists():
             return []
