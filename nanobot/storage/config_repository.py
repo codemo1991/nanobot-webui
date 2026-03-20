@@ -70,6 +70,8 @@ class ConfigRepository:
                     args_json TEXT DEFAULT '[]',
                     url TEXT,
                     enabled INTEGER DEFAULT 1,
+                    env_json TEXT DEFAULT '{}',
+                    headers_json TEXT DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -89,6 +91,22 @@ class ConfigRepository:
                 """
             )
             conn.commit()
+            # 迁移：已有 config_mcps 表增加 env_json 列
+            try:
+                cols = {d[1] for d in conn.execute("PRAGMA table_info(config_mcps)").fetchall()}
+                if "env_json" not in cols:
+                    conn.execute("ALTER TABLE config_mcps ADD COLUMN env_json TEXT DEFAULT '{}'")
+                    conn.commit()
+            except Exception:
+                pass
+            # 迁移：已有 config_mcps 表增加 headers_json 列
+            try:
+                cols = {d[1] for d in conn.execute("PRAGMA table_info(config_mcps)").fetchall()}
+                if "headers_json" not in cols:
+                    conn.execute("ALTER TABLE config_mcps ADD COLUMN headers_json TEXT DEFAULT '{}'")
+                    conn.commit()
+            except Exception:
+                pass
             conn.close()
             logger.debug("Base config tables initialized")
         except Exception as e:
@@ -397,6 +415,8 @@ class ConfigRepository:
                     "args": json.loads(row["args_json"]) if row["args_json"] else [],
                     "url": row["url"],
                     "enabled": bool(row["enabled"]),
+                    "env": json.loads(row["env_json"]) if isinstance(row["env_json"], str) else (row["env_json"] if isinstance(row["env_json"], dict) else {}),
+                    "headers": json.loads(row["headers_json"]) if isinstance(row["headers_json"], str) else (row["headers_json"] if isinstance(row["headers_json"], dict) else {}),
                 }
         except Exception as e:
             logger.warning(f"Failed to get MCP {mcp_id}: {e}")
@@ -416,6 +436,8 @@ class ConfigRepository:
                         "args": json.loads(row["args_json"]) if row["args_json"] else [],
                         "url": row["url"],
                         "enabled": bool(row["enabled"]),
+                        "env": json.loads(row["env_json"]) if isinstance(row["env_json"], str) else (row["env_json"] if isinstance(row["env_json"], dict) else {}),
+                        "headers": json.loads(row["headers_json"]) if isinstance(row["headers_json"], str) else (row["headers_json"] if isinstance(row["headers_json"], dict) else {}),
                     }
                     for row in rows
                 ]
@@ -425,9 +447,13 @@ class ConfigRepository:
 
     def set_mcp(self, mcp_id: str, name: str, transport: str = "stdio",
                 command: str | None = None, args: list[str] | None = None,
-                url: str | None = None, enabled: bool = True) -> None:
+                url: str | None = None, enabled: bool = True,
+                env: dict[str, str] | None = None,
+                headers: dict[str, str] | None = None) -> None:
         """设置 MCP 配置。"""
         args_json = json.dumps(args or [])
+        env_json = json.dumps(env or {})
+        headers_json = json.dumps(headers or {})
         updated_at = self._get_timestamp()
         created_at = updated_at
         try:
@@ -439,8 +465,8 @@ class ConfigRepository:
                     created_at = existing["created_at"]
                 conn.execute(
                     """
-                    INSERT INTO config_mcps (id, name, transport, command, args_json, url, enabled, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO config_mcps (id, name, transport, command, args_json, url, enabled, env_json, headers_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         name=excluded.name,
                         transport=excluded.transport,
@@ -448,9 +474,11 @@ class ConfigRepository:
                         args_json=excluded.args_json,
                         url=excluded.url,
                         enabled=excluded.enabled,
+                        env_json=excluded.env_json,
+                        headers_json=excluded.headers_json,
                         updated_at=excluded.updated_at
                     """,
-                    (mcp_id, name, transport, command, args_json, url, int(enabled), created_at, updated_at)
+                    (mcp_id, name, transport, command, args_json, url, int(enabled), env_json, headers_json, created_at, updated_at)
                 )
         except Exception as e:
             logger.exception(f"Failed to set MCP {mcp_id}")
@@ -673,6 +701,8 @@ class ConfigRepository:
                 args=mcp_data.get("args", []),
                 url=mcp_data.get("url"),
                 enabled=mcp_data.get("enabled", True),
+                env=mcp_data.get("env"),
+                headers=mcp_data.get("headers"),
             )
 
     def _camel_to_snake(self, name: str) -> str:

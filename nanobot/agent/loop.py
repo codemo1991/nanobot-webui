@@ -268,6 +268,8 @@ class AgentLoop:
         self._mcp_loaded = False
         self._mcp_loop_id: int | None = None
         self._mcp_fail_time: float = 0.0
+        self.mcp_loader = None  # 由 _init_mcp_loader 异步填充
+        self._mcp_init_event = asyncio.Event()  # MCP 初始化完成后置位
         self._cancel_event = asyncio.Event()
         self._cancelled_sessions: set[str] = set()  # 按 session 取消，支持多会话并发
         # 初始化执行链路监控
@@ -280,7 +282,7 @@ class AgentLoop:
         logger.info(f'[ExecutionChain] Monitor initialized with db: {db_path}')
 
         self._register_default_tools()
-        self._init_mcp_loader()
+        # MCP 加载移到 run() 里直接 await，避免 create_task 调度到从未运行的 loop
 
 
     def _select_tools_for_message(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
@@ -294,8 +296,11 @@ class AgentLoop:
         Returns:
             选中的工具定义列表
         """
+        logger.debug(f"[ToolSelect] smart={self._smart_tool_selection}, total_tools={len(self.tools.tool_names)}")
         if not self._smart_tool_selection:
-            return self.tools.get_definitions()
+            defs = self.tools.get_definitions()
+            logger.debug(f"[ToolSelect] fast path, returning {len(defs)} tools")
+            return defs
         return self._select_tools_default(message, max_tools)
 
     def _select_tools_default(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
@@ -309,9 +314,31 @@ class AgentLoop:
         Returns:
             选中的工具定义列表
         """
-        message_lower = message.lower()
-        selected_names = set(ESSENTIAL_TOOLS)
+        all_tool_names = self.tools.tool_names
+        mcp_tools = [n for n in all_tool_names if n.startswith("mcp_")]
+        logger.debug(f"[ToolSelect] total={len(all_tool_names)}, mcp={len(mcp_tools)}, essential={len(ESSENTIAL_TOOLS)}, max_tools={max_tools}")
 
+        # Priority 1: Always include essential tools
+        # Priority 2: Always include MCP tools (user-configured, should not be excluded)
+        selected_names: set[str] = set(ESSENTIAL_TOOLS)
+        for tool_name in all_tool_names:
+            if tool_name.startswith("mcp_"):
+                selected_names.add(tool_name)
+                if len(selected_names) >= max_tools:
+                    break
+
+        # If MCP tools already filled the budget, return early
+        if len(selected_names) >= max_tools:
+            definitions = []
+            for name in list(selected_names)[:max_tools]:
+                tool = self.tools.get(name)
+                if tool:
+                    definitions.append(tool.to_schema())
+            logger.debug(f"[ToolSelect] early return with {len(definitions)} tools: {list(selected_names)[:max_tools]}")
+            return definitions
+
+        # Priority 3: Fill remaining slots with keyword-matched tools
+        message_lower = message.lower()
         for tool_name, keywords in TOOL_KEYWORDS.items():
             if tool_name in selected_names:
                 continue
@@ -319,13 +346,6 @@ class AgentLoop:
                 selected_names.add(tool_name)
                 if len(selected_names) >= max_tools:
                     break
-
-        if len(selected_names) < max_tools:
-            for tool_name in self.tools.tool_names:
-                if tool_name.startswith("mcp_"):
-                    selected_names.add(tool_name)
-                    if len(selected_names) >= max_tools:
-                        break
 
         definitions = []
         for name in selected_names:
@@ -575,6 +595,7 @@ class AgentLoop:
         """委托任务给微内核，返回 trace_id。"""
         from nanobot.agentloop.kernel.kernel import create_kernel
 
+        logger.info(f"[Microkernel] _delegate_to_microkernel 被调用, goal={goal[:100]}")
         kernel = create_kernel(
             workspace=self.workspace,
             brave_api_key=getattr(self, "brave_api_key", None),
@@ -584,9 +605,22 @@ class AgentLoop:
             initial_artifacts=initial_artifacts or None,
             attempted_steps=attempted_steps,
         )
-        asyncio.create_task(
-            self._run_kernel_and_notify(kernel, trace_id, goal, channel, chat_id)
-        )
+        logger.info(f"[Microkernel] kernel.submit 完成, trace_id={trace_id}, 在独立线程中运行 kernel")
+        # 在独立线程中运行 kernel，避免 ProactorEventLoop 不调度 create_task 的问题
+        from threading import Thread
+
+        def _run_kernel_thread() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(
+                    self._run_kernel_and_notify(kernel, trace_id, goal, channel, chat_id)
+                )
+            finally:
+                loop.close()
+
+        Thread(target=_run_kernel_thread, daemon=False).start()
+        logger.info(f"[Microkernel] 后台线程已启动, trace_id={trace_id}")
         return trace_id
 
     async def _run_kernel_and_notify(
@@ -598,15 +632,18 @@ class AgentLoop:
         chat_id: str,
     ) -> None:
         """运行微内核直至完成，然后通知用户。"""
+        logger.info(f"[Microkernel] _run_kernel_and_notify 开始, trace_id={trace_id}")
         try:
+            logger.info(f"[Microkernel] 调用 run_until_done, trace_id={trace_id}")
             await kernel.run_until_done(
                 trace_id,
                 worker_count=4,
                 timeout_seconds=self._microkernel_timeout_seconds,
             )
+            logger.info(f"[Microkernel] run_until_done 完成, 查询结果, trace_id={trace_id}")
             row = kernel.conn.execute(
                 """
-                SELECT t.result_artifact_id
+                SELECT t.result_artifact_id, t.state, t.output_schema
                 FROM agentloop_tasks t
                 WHERE t.trace_id = ?
                   AND t.output_schema = 'final_result_v1'
@@ -616,6 +653,7 @@ class AgentLoop:
                 """,
                 (trace_id,),
             ).fetchone()
+            logger.info(f"[Microkernel] 查询结果: row={dict(row) if row else None}, trace_id={trace_id}")
             final_result = None
             if row and row.get("result_artifact_id"):
                 from nanobot.agentloop.kernel.artifact_repo import get_artifact_payload
@@ -624,9 +662,11 @@ class AgentLoop:
                 if payload:
                     val = payload.get("final_text") or payload.get("result") or payload.get("summary")
                     final_result = str(val) if val is not None else None
+            logger.info(f"[Microkernel] final_result={final_result is not None}, 调用 _on_microkernel_done, trace_id={trace_id}")
             await self._on_microkernel_done(trace_id, goal, final_result, channel, chat_id, status="ok")
+            logger.info(f"[Microkernel] _on_microkernel_done 完成, trace_id={trace_id}")
         except Exception as e:
-            logger.exception("微内核执行异常: %s", e)
+            logger.exception(f"[Microkernel] 微内核执行异常: {e}, trace_id={trace_id}")
             await self._on_microkernel_done(
                 trace_id, goal, f"微内核执行失败: {str(e)}", channel, chat_id, status="error"
             )
@@ -646,6 +686,7 @@ class AgentLoop:
         status: str = "ok",
     ) -> None:
         """微内核完成后写入 session 并推送通知。"""
+        logger.info(f"[Microkernel] _on_microkernel_done 被调用, trace_id={trace_id}, status={status}")
         from nanobot.agent.subagent_progress import SubagentProgressBus
 
         origin_key = f"{channel}:{chat_id}"
@@ -732,45 +773,6 @@ class AgentLoop:
             groups.append([tc])
         return groups
 
-    def _resolve_vision_first_groups(
-        self,
-        tool_calls: list,
-        image_files: list[str],
-    ) -> tuple[list[list], bool] | None:
-        """
-        方案 C：当存在 spawn(vision) + 任意其他工具时，vision 先行，整批完成后统一推送。
-        返回 (groups, use_buffered_progress)。
-        """
-        if len(tool_calls) < 2:
-            return None
-
-        spawn_vision: list = []
-        others: list = []
-
-        for tc in tool_calls:
-            name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else None)
-            args = getattr(tc, "arguments", None) or (tc.get("arguments", {}) if isinstance(tc, dict) else {})
-            if not isinstance(args, dict):
-                args = {}
-
-            if name == "spawn" and str(args.get("template", "")).lower() == "vision":
-                spawn_vision.append(tc)
-            else:
-                others.append(tc)
-
-        if not spawn_vision or not others:
-            return None
-
-        # 有图片时启用（vision 分析图片）
-        use_buffered = bool(image_files)
-
-        vision_deduped = spawn_vision[:1]
-        if len(spawn_vision) > 1:
-            logger.info("[AgentLoop] Vision-first: deduplicated spawn(vision) (%d -> 1)", len(spawn_vision))
-
-        groups = [vision_deduped] + [[tc] for tc in others]
-        return (groups, use_buffered)
-
     async def _execute_tool_parallel(
         self,
         tool_calls: list,
@@ -806,9 +808,26 @@ class AgentLoop:
             return results
 
         # 方案 C：spawn(vision) + 任意其他工具时，vision 先行，整批完成后统一推送（避免体验割裂）
-        vision_first = self._resolve_vision_first_groups(tool_calls, image_files or [])
-        if vision_first:
-            groups, use_buffered_progress = vision_first
+        spawn_vision: list = []
+        spawn_others: list = []
+        exec_others: list = []
+        for tc in tool_calls:
+            name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else None)
+            args = getattr(tc, "arguments", None) or (tc.get("arguments", {}) if isinstance(tc, dict) else {})
+            if not isinstance(args, dict):
+                args = {}
+            if name == "spawn" and str(args.get("template", "")).lower() == "vision":
+                if not spawn_vision:  # 去重：只保留第一个 vision
+                    spawn_vision.append(tc)
+            elif name == "spawn":
+                spawn_others.append(tc)
+            else:
+                exec_others.append(tc)
+
+        use_vision_first = bool(spawn_vision and (spawn_others or exec_others))
+        if use_vision_first:
+            # 是否缓冲 progress：只要有 vision + 其他工具就缓冲，与图片文件无关
+            use_buffered_progress = bool(spawn_vision and (spawn_others or exec_others))
             logger.info("[AgentLoop] Vision-first batch: vision runs first, progress %s", "buffered" if use_buffered_progress else "immediate")
             if self._status_service:
                 try:
@@ -819,62 +838,34 @@ class AgentLoop:
             results = []
             buffered: list[dict[str, Any]] = []
 
-            def buffered_progress(evt: dict[str, Any]) -> None:
-                buffered.append(evt)
+            def _make_buffered_progress(buf: list) -> Callable | None:
+                if not (use_buffered_progress and progress):
+                    return progress
 
-            _run_progress = buffered_progress if (use_buffered_progress and progress) else progress
+                def buffered(evt: dict[str, Any]) -> None:
+                    buf.append(evt)
+                return buffered
 
-            # 阶段 1: 执行 vision
-            vision_group = groups[0]
-            for tool_call in vision_group:
+            _run_progress = _make_buffered_progress(buffered)
+
+            # 阶段 1: 执行 vision（只执行第一个，dedup）
+            for tool_call in spawn_vision:
                 await self._check_cancelled(session_key)
                 result = await self._execute_single_tool(tool_call, _run_progress)
                 results.append((tool_call, result))
 
             # 阶段 2: 若有 spawn(非 vision)，等待 vision 完成并注入结果
-            others_groups = groups[1:]
-            spawn_others = [
-                tc for group in others_groups for tc in group
-                if getattr(tc, "name", None) == "spawn"
-                and str((getattr(tc, "arguments") or {}).get("template", "")).lower() != "vision"
-            ]
-            if spawn_others and self.subagents and session_key:
+            if spawn_others:
                 session = self.sessions.get(session_key) or self.sessions.get_or_create(session_key)
-                for tc, result in results:
-                    if getattr(tc, "name", None) != "spawn":
-                        continue
-                    task_id_match = re.search(r"\(id: ([^)]+)\)|session \[([^\]]+)\]", result)
-                    if task_id_match:
-                        vision_task_id = task_id_match.group(1) or task_id_match.group(2)
-                        try:
-                            await self._wait_for_subagents([vision_task_id], timeout=120.0)
-                            logger.info("[AgentLoop] Vision-first: vision spawn %s completed, injecting into spawn_other", vision_task_id)
-                            if vision_task_id in session.subagent_results:
-                                vision_result = session.subagent_results[vision_task_id].get("result", "")
-                                if vision_result:
-                                    vision_label = session.subagent_results[vision_task_id].get("label", "图片识别")
-                                    for tc_other in spawn_others:
-                                        args = getattr(tc_other, "arguments", None) or {}
-                                        if isinstance(args, dict) and "task" in args:
-                                            original_task = args.get("task", "")
-                                            injected_task = (
-                                                f"[图片来源分析结果（来自 {vision_label}）]\n"
-                                                f"{vision_result}\n\n"
-                                                f"[用户原始任务]\n{original_task}"
-                                            )
-                                            tc_other.arguments["task"] = injected_task
-                                            logger.info("[AgentLoop] Vision-first: injected vision result into spawn_other task")
-                        except asyncio.TimeoutError:
-                            logger.warning("[AgentLoop] Vision-first: timeout waiting for vision spawn %s", vision_task_id)
-                        break
+                await self._inject_vision_into_spawn_others(results, spawn_others, session, session_key)
 
-            # 阶段 3: 执行 others
-            for group in others_groups:
-                for tool_call in group:
-                    await self._check_cancelled(session_key)
-                    result = await self._execute_single_tool(tool_call, _run_progress)
-                    results.append((tool_call, result))
+            # 阶段 3: 执行 spawn_others 和 exec_others
+            for tool_call in spawn_others + exec_others:
+                await self._check_cancelled(session_key)
+                result = await self._execute_single_tool(tool_call, _run_progress)
+                results.append((tool_call, result))
 
+            # 统一推送缓冲的 progress 事件
             if use_buffered_progress and progress and buffered:
                 for evt in buffered:
                     try:
@@ -1096,8 +1087,9 @@ class AgentLoop:
 
         return result
 
-    def _init_mcp_loader(self) -> None:
+    async def _init_mcp_loader(self) -> None:
         """Initialize MCP tool loader from config - 按需加载模式。"""
+        logger.debug(f"[MCP] _init_mcp_loader starting, self.id={id(self)}, tools.id={id(self.tools)}")
         self.mcp_loader = None
         self._mcp_loaded = False  # 标记：是否已完成按需加载
         self._mcp_loop_id = None
@@ -1150,16 +1142,72 @@ class AgentLoop:
                         )
                         lazy_tools[tool_name] = adapter
                         self.tools.register(adapter)
+                        logger.debug(f"[Tools] Registered MCP tool '{tool_name}' to registry id={id(self.tools)}, total now={len(self.tools.tool_names)}")
 
                     logger.info(f"MCP {server_id}: registered {len(lazy_tools)} lazy tools (will connect on first call)")
                 else:
-                    # 如果没有配置工具列表，我们无法预知有哪些工具
-                    # 这种情况下，需要一个不同的策略：让 MCP 服务器自己声明工具
-                    # 暂时跳过，等待后续实现
-                    logger.debug(f"MCP {server_id}: no tools defined in config, skipping lazy registration")
+                    # 配置中没有声明工具列表，尝试一次连接获取工具列表（一次性，之后懒加载）
+                    try:
+                        discovered = await self._discover_mcp_tools(server_id, mcp_cfg)
+                        if discovered:
+                            # 将发现的工具注册为懒加载适配器
+                            from nanobot.agent.tools.mcp import McpLazyToolAdapter
+                            lazy_tools: dict[str, McpLazyToolAdapter] = {}
+                            for tool_spec in discovered:
+                                tool_name = tool_spec["name"]
+                                adapter = McpLazyToolAdapter(
+                                    server_id=server_id,
+                                    tool_name=tool_name,
+                                    description=tool_spec.get("description") or f"MCP tool {tool_name}",
+                                    parameters=tool_spec.get("parameters") or {"type": "object", "properties": {}},
+                                    mcp_loader=self.mcp_loader,
+                                    lazy_tools=lazy_tools,
+                                )
+                                lazy_tools[tool_name] = adapter
+                                self.tools.register(adapter)
+                            logger.info(f"MCP {server_id}: discovered {len(lazy_tools)} tools, registered as lazy")
+                        else:
+                            logger.debug(f"MCP {server_id}: no tools discovered, skipping registration")
+                    except Exception as e:
+                        logger.warning(f"MCP {server_id}: tool discovery failed: {e}")
+
+                # 汇总日志（for 循环外部，但仍在外层 try 内）
+            mcp_tool_names = [n for n in self.tools.tool_names if n.startswith("mcp_")]
+            logger.info(f"[MCP] Loaded {len(mcp_tool_names)} tools from {len(mcps)} servers: {mcp_tool_names}")
 
         except Exception as e:
             logger.warning(f"MCP loader init skipped: {e}", exc_info=True)
+        finally:
+            self._mcp_init_event.set()
+
+    async def _discover_mcp_tools(self, server_id: str, mcp_cfg: Any) -> list[dict[str, Any]]:
+        """
+        一次性连接到 MCP 服务器获取工具列表，用于在配置未声明工具时进行工具发现。
+        发现后不保持连接，由 McpLazyToolAdapter 在实际调用时再连接。
+        返回工具配置列表，或空列表（连接失败/无工具）。
+        """
+        if not self.mcp_loader:
+            return []
+        try:
+            result = await self.mcp_loader.connect_lazy(server_id, timeout=30.0)
+            if result is None:
+                return []
+            session, tools = result
+            try:
+                await session.__aexit__(None, None, None)
+            except Exception:
+                pass
+            return [
+                {
+                    "name": t.name,
+                    "description": getattr(t, "description", "") or f"MCP tool {t.name}",
+                    "parameters": getattr(t, "inputSchema", None) or {"type": "object", "properties": {}},
+                }
+                for t in tools
+            ]
+        except Exception as e:
+            logger.warning(f"MCP {server_id}: discovery error: {e}")
+            return []
 
     def _safe_mcp_id(self, name: str) -> str:
         """Convert MCP name to safe ID."""
@@ -1180,9 +1228,10 @@ class AgentLoop:
         self._mcp_loaded = False
         self._mcp_loop_id = None
         self._mcp_fail_time = 0.0
+        self._mcp_init_event.clear()  # 重置事件，等待新加载完成
 
         # 重新初始化（会注册新的懒加载工具）
-        self._init_mcp_loader()
+        await self._init_mcp_loader()
         if self.mcp_loader:
             logger.info("MCP config reloaded (using lazy load mode)")
 
@@ -1255,6 +1304,73 @@ class AgentLoop:
 
             # 等待一段时间再检查
             await asyncio.sleep(check_interval)
+
+    async def _inject_vision_into_spawn_others(
+        self,
+        spawn_results: list[tuple[Any, str]],
+        spawn_others: list[Any],
+        session: Any,
+        session_key: str,
+    ) -> bool:
+        """
+        从 spawn_results 中找到 vision task_id，等待其完成，
+        并将结果注入到 spawn_others 的 task 参数中。
+        返回是否成功注入了结果。
+        """
+        if not spawn_others or not self.subagents:
+            return False
+
+        vision_task_id: str | None = None
+        for tc, result in spawn_results:
+            if getattr(tc, "name", None) != "spawn":
+                continue
+            task_id_match = re.search(r"\(id: ([^)]+)\)|session \[([^\]]+)\]", result)
+            if task_id_match:
+                vision_task_id = task_id_match.group(1) or task_id_match.group(2)
+                break
+
+        if not vision_task_id:
+            return False
+
+        try:
+            await self._wait_for_subagents([vision_task_id], timeout=120.0)
+            logger.info("[VisionInject] Vision spawn %s completed, injecting into spawn_others", vision_task_id)
+        except asyncio.TimeoutError:
+            logger.warning("[VisionInject] Timeout waiting for vision spawn %s", vision_task_id)
+            return False
+
+        if vision_task_id not in session.subagent_results:
+            return False
+
+        vision_result = session.subagent_results[vision_task_id].get("result", "")
+        if not vision_result:
+            return False
+
+        vision_label = session.subagent_results[vision_task_id].get("label", "图片识别")
+        injected = False
+        for tc_other in spawn_others:
+            args = getattr(tc_other, "arguments", None) or {}
+            if isinstance(args, dict) and "task" in args:
+                original_task = args.get("task", "")
+                args["task"] = (
+                    f"[图片来源分析结果（来自 {vision_label}）]\n"
+                    f"{vision_result}\n\n"
+                    f"[用户原始任务]\n{original_task}"
+                )
+                injected = True
+                logger.info("[VisionInject] Injected vision result into spawn_other task")
+
+        if injected:
+            # 同步到 session，确保后续 build_messages 能看到注入的内容
+            inject_content = (
+                f"[图片来源分析结果（来自 {vision_label}）]\n"
+                f"{vision_result}"
+            )
+            session.add_message("user", inject_content)
+            self.sessions.save(session)
+            logger.info("[VisionInject] Saved vision inject to session")
+
+        return injected
 
     async def _synthesize_batch_results(
         self,
@@ -1335,6 +1451,7 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
+        logger.debug(f"[Tools] Registering default tools to registry id={id(self.tools)}")
         ws = str(self.workspace)
         fs_cfg = self.filesystem_config
         # File tools (workspace restriction from config)
@@ -1386,8 +1503,13 @@ class AgentLoop:
         self._running = True
         logger.info("Agent loop started")
 
-        # 按需加载模式：不再在启动时检查 MCP
-        # MCP 工具会在首次被调用时才会建立连接
+        # 直接 await MCP 加载（最多30秒，超时则继续启动，MCP 工具懒加载）
+        try:
+            await asyncio.wait_for(self._init_mcp_loader(), timeout=30.0)
+        except asyncio.TimeoutError:
+            logger.warning("MCP init timed out after 30s, continuing without MCP tools")
+        except Exception as e:
+            logger.warning(f"MCP init failed: {e}")
 
         while self._running:
             try:
@@ -1543,7 +1665,7 @@ class AgentLoop:
                 logger.error(f"[ExecutionChain] Failed to end chain: {e}")
             return None
 
-        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}")
+        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}, self.id={id(self)}, tools.id={id(self.tools)}, total_tools={len(self.tools.tool_names)}")
 
         # /clear 命令：清除聊天记录，清空上下文（飞书等渠道通用）
         _cmd = (msg.content or "").strip().lower()
@@ -2043,8 +2165,8 @@ class AgentLoop:
                     spawn_results = []
                     exec_results = []
 
-                    # 方案 C：有 vision + 其他工具时，整批完成后统一推送
-                    use_buffered = bool(spawn_vision and (exec_image or spawn_other or exec_other) and image_files)
+                    # 方案 C：有 vision + 其他工具时，整批完成后统一推送（缓冲与图片文件无关）
+                    use_buffered = bool(spawn_vision and (exec_image or spawn_other or exec_other))
                     if use_buffered:
                         logger.info("[BatchMode] Vision-first: buffering progress until batch done")
                     buffered_evts: list[dict[str, Any]] = []
@@ -2087,40 +2209,10 @@ class AgentLoop:
                                 exec_results.append((tc, result))
                                 logger.info(f"[BatchMode] Exec image completed")
 
-                    # 阶段 2.5: 如果有 spawn_vision 和 spawn_other，需要等待 vision 完成并注入结果
-                    # 这解决了一个 LLM 同时 spawn(vision) 和 spawn(claude-coder) 时，
-                    # claude-coder 拿不到 vision 结果的问题
-                    if spawn_vision and spawn_other and self.subagents:
-                        logger.info("[BatchMode] Waiting for vision spawn to complete before spawning other subagents")
-                        # 从 spawn_results 获取 vision 的 task_id
-                        for tc, result in spawn_results:
-                            task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
-                            if task_id_match:
-                                vision_task_id = task_id_match.group(1) or task_id_match.group(2)
-                                # 等待 vision spawn 完成
-                                try:
-                                    await self._wait_for_subagents([vision_task_id], timeout=120.0)
-                                    logger.info(f"[BatchMode] Vision spawn {vision_task_id} completed")
-
-                                    # 注入 vision 结果到 spawn_other 的 task
-                                    if vision_task_id in session.subagent_results:
-                                        vision_result = session.subagent_results[vision_task_id].get("result", "")
-                                        if vision_result:
-                                            # 修改 spawn_other 的 task 参数，注入 vision 结果
-                                            for tc_other in spawn_other:
-                                                if tc_other.arguments and "task" in tc_other.arguments:
-                                                    original_task = tc_other.arguments.get("task", "")
-                                                    vision_label = session.subagent_results[vision_task_id].get("label", "图片识别")
-                                                    injected_task = (
-                                                        f"[图片来源分析结果（来自 {vision_label}）]\n"
-                                                        f"{vision_result}\n\n"
-                                                        f"[用户原始任务]\n{original_task}"
-                                                    )
-                                                    tc_other.arguments["task"] = injected_task
-                                                    logger.info(f"[BatchMode] Injected vision result into spawn_other task")
-                                except asyncio.TimeoutError:
-                                    logger.warning(f"[BatchMode] Timeout waiting for vision spawn {vision_task_id}")
-                                break
+                    # 阶段 2.5: 若有 spawn_vision 和 spawn_other，等待 vision 完成并注入结果
+                    # 使用统一的 helper，避免与 _execute_tool_parallel 路径重复
+                    if spawn_vision and spawn_other:
+                        await self._inject_vision_into_spawn_others(spawn_results, spawn_other, session, session_key)
 
                     # 阶段 3: exec(非图片) 和 spawn(非 vision) 并行执行
                     parallel_tasks = []
@@ -2816,8 +2908,16 @@ class AgentLoop:
         Returns:
             The agent's response.
         """
+        # MCP 工具已在 run_server 主线程中通过后台线程初始化完成，
+        # 这里只做安全检查（如果超时会话内有延迟，仍等待但不阻塞）
+        if not self._mcp_init_event.is_set():
+            logger.debug("[MCP] Web API: MCP not yet initialized, waiting...")
+            try:
+                await asyncio.wait_for(self._mcp_init_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("[MCP] Web API: MCP init still pending after 5s")
+
         self._reset_cancel_event(session_key)
-        logger.info(f"Starting new request, cancel state reset for session {session_key}")
         
         if ":" in session_key:
             try:

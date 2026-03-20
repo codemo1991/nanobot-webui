@@ -1624,6 +1624,8 @@ class NanobotWebAPI:
                     "args": m.args,
                     "url": m.url,
                     "enabled": m.enabled,
+                    "env": m.env,
+                    "headers": m.headers,
                 }
                 for m in config.mcps
             ],
@@ -1773,7 +1775,7 @@ class NanobotWebAPI:
                     "command": server_config.get("command"),
                     "args": server_config.get("args", []),
                     "url": server_config.get("url"),
-                    "enabled": server_config.get("enabled", True),
+                    "enabled": server_config.get("enabled", not server_config.get("disabled", False)),
                     "env": server_config.get("env", {}),
                     "headers": server_config.get("headers", {}),
                 }
@@ -1817,6 +1819,19 @@ class NanobotWebAPI:
         )
         config.mcps.append(mcp)
         save_config(config)
+        # Also persist to database (env stored via set_mcp)
+        repo = get_config_repository()
+        repo.set_mcp(
+            mcp_id=mcp.id,
+            name=mcp.name,
+            transport=mcp.transport,
+            command=mcp.command,
+            args=mcp.args,
+            url=mcp.url,
+            enabled=mcp.enabled,
+            env=mcp.env,
+            headers=mcp.headers,
+        )
         return {
             "id": mcp.id,
             "name": mcp.name,
@@ -2004,13 +2019,27 @@ class NanobotWebAPI:
                 if not command:
                     return {"connected": False, "message": "stdio transport 需要 command 参数"}
                 cmd = [command] + (mcp.args or [])
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    env={**os.environ, **mcp.env} if mcp.env else None,
-                )
+                # Windows: npx/npm 等是 .cmd 批处理，Popen(shell=False) 无法直接执行，需用 cmd /c 包装
+                if os.name == "nt" and not os.path.dirname(command):
+                    cmd = ["cmd", "/c", command] + (mcp.args or [])
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        env={**os.environ, **mcp.env} if mcp.env else None,
+                    )
+                except FileNotFoundError:
+                    return {"connected": False, "message": (
+                        f"找不到可执行文件 '{command}'。请确保：1) 已安装并在 PATH 中；"
+                        "2) Windows 下可尝试使用完整路径（如 npx.cmd、docker.exe）；"
+                        "3) 若用 Docker，请确认 Docker Desktop 已启动且 PATH 正确。"
+                    )}
+                except OSError as e:
+                    if getattr(e, "errno", None) == 2:  # WinError 2 / ENOENT
+                        return {"connected": False, "message": f"找不到可执行文件 '{command}'。请检查 PATH 或使用完整路径。"}
+                    raise
                 import time
                 time.sleep(1.5)
                 if proc.poll() is not None:
@@ -5087,6 +5116,31 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
         cron_thread, cron_loop = _run_cron_in_thread(app)
     except Exception as e:
         logger.warning(f"Failed to start cron service: {e}")
+
+    # 在独立线程中启动 MCP 工具加载（等待完成，最多30秒）
+    mcp_init_done = threading.Event()
+    mcp_error: list[str] = []
+
+    def _mcp_init_thread_target() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(app.agent._init_mcp_loader())
+        except Exception as e:
+            mcp_error.append(str(e))
+        finally:
+            loop.close()
+            mcp_init_done.set()
+
+    mcp_init_thread = threading.Thread(target=_mcp_init_thread_target, daemon=True)
+    mcp_init_thread.start()
+    mcp_init_thread.join(timeout=30)
+    if mcp_init_done.is_set():
+        logger.info(f"[WebAPI] MCP tools loaded successfully, {len([n for n in app.agent.tools.tool_names if n.startswith('mcp_')])} MCP tools available")
+    elif mcp_error:
+        logger.warning(f"[WebAPI] MCP tools failed to load: {mcp_error[0]}")
+    else:
+        logger.warning("[WebAPI] MCP tools timed out after 30s, will load lazily on first message")
 
     # Determine static directory
     if static_dir is None:

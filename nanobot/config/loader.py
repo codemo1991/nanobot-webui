@@ -107,7 +107,10 @@ def save_config(config: Config) -> None:
 def convert_keys(data: Any) -> Any:
     """Convert camelCase keys to snake_case for Pydantic."""
     if isinstance(data, dict):
-        return {camel_to_snake(k): convert_keys(v) for k, v in data.items()}
+        return {
+            camel_to_snake(k): (v if k in ("env", "headers") else convert_keys(v))
+            for k, v in data.items()
+        }
     if isinstance(data, list):
         return [convert_keys(item) for item in data]
     return data
@@ -116,7 +119,15 @@ def convert_keys(data: Any) -> Any:
 def convert_to_camel(data: Any) -> Any:
     """Convert snake_case keys to camelCase."""
     if isinstance(data, dict):
-        return {snake_to_camel(k): convert_to_camel(v) for k, v in data.items()}
+        result = {}
+        for k, v in data.items():
+            camel_key = snake_to_camel(k)
+            # Don't convert keys inside env/headers dicts — env vars & HTTP headers must stay as-is
+            if k in ("env", "headers") and isinstance(v, dict):
+                result[camel_key] = v
+            else:
+                result[camel_key] = convert_to_camel(v)
+        return result
     if isinstance(data, list):
         return [convert_to_camel(item) for item in data]
     return data

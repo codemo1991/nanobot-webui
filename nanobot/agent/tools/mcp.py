@@ -134,7 +134,7 @@ class McpLazyToolAdapter(Tool):
 
             try:
                 # 按需连接单个 MCP 服务器
-                result = await self._mcp_loader.connect_lazy(self._server_id, timeout=3.0)
+                result = await self._mcp_loader.connect_lazy(self._server_id, timeout=30.0)
                 if result is None:
                     logger.warning(f"MCP {self._server_id}: failed to connect on first call")
                     return False

@@ -1507,6 +1507,21 @@ function McpConfig() {
       transport: mcp.transport,
       command: mcp.command,
       args: mcp.args?.join(' ') || '',
+      envText: (() => {
+        const raw = mcp.env
+        if (typeof raw === 'string') {
+          // Already a JSON string — parse it back to object for display
+          try { return Object.entries(JSON.parse(raw)).map(([k, v]) => `${k}=${v}`).join('\n') } catch { return '' }
+        }
+        return raw ? Object.entries(raw).map(([k, v]) => `${k}=${v}`).join('\n') : ''
+      })(),
+      headersText: (() => {
+        const raw = mcp.headers
+        if (typeof raw === 'string') {
+          try { return Object.entries(JSON.parse(raw)).map(([k, v]) => `${k}=${v}`).join('\n') } catch { return '' }
+        }
+        return raw ? Object.entries(raw).map(([k, v]) => `${k}=${v}`).join('\n') : ''
+      })(),
       url: mcp.url,
       enabled: mcp.enabled,
     })
@@ -1710,6 +1725,32 @@ function McpConfig() {
       const args = typeof argsStr === 'string' && argsStr.trim()
         ? argsStr.trim().split(/\s+/)
         : []
+      // Parse env: each line is KEY=value
+      const envText = values.envText
+      const env: Record<string, string> = {}
+      if (typeof envText === 'string' && envText.trim()) {
+        for (const line of envText.split('\n')) {
+          const trimmed = line.trim()
+          if (!trimmed) continue
+          const eqIdx = trimmed.indexOf('=')
+          if (eqIdx > 0) {
+            env[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1)
+          }
+        }
+      }
+      // Parse headers: each line is KEY=value
+      const headersText = values.headersText
+      const headers: Record<string, string> = {}
+      if (typeof headersText === 'string' && headersText.trim()) {
+        for (const line of headersText.split('\n')) {
+          const trimmed = line.trim()
+          if (!trimmed) continue
+          const eqIdx = trimmed.indexOf('=')
+          if (eqIdx > 0) {
+            headers[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1)
+          }
+        }
+      }
       const payload = {
         id: values.id?.trim() || undefined,
         name: values.name?.trim(),
@@ -1718,6 +1759,8 @@ function McpConfig() {
         args: values.transport === 'stdio' ? args : undefined,
         url: values.transport !== 'stdio' ? values.url : undefined,
         enabled: values.enabled ?? true,
+        env: Object.keys(env).length > 0 ? env : undefined,
+        headers: Object.keys(headers).length > 0 ? headers : undefined,
       }
       if (editingMcp) {
         await api.updateMcp(editingMcp.id, payload)
@@ -1868,11 +1911,33 @@ function McpConfig() {
                   <Form.Item name="args" label="Args (空格分隔)">
                     <Input placeholder="-y @modelcontextprotocol/server-filesystem" />
                   </Form.Item>
+                  <Form.Item
+                    name="envText"
+                    label="Env (每行 KEY=value)"
+                  >
+                    <Input.TextArea
+                      placeholder={"JIRA_HOST=your-domain.atlassian.net\nJIRA_API_TOKEN=xxx"}
+                      rows={3}
+                      style={{ fontFamily: 'monospace', fontSize: 12 }}
+                    />
+                  </Form.Item>
                 </>
               ) : (
+                <>
                 <Form.Item name="url" label="URL" rules={[{ required: true, message: t('config.mcp.urlRequired') }]}>
                     <Input placeholder="http://localhost:6788/mcp" />
                 </Form.Item>
+                <Form.Item
+                  name="headersText"
+                  label="Headers (每行 KEY=value)"
+                >
+                  <Input.TextArea
+                    placeholder={"Authorization=Bearer xxx\nX-API-Key=xxx"}
+                    rows={3}
+                    style={{ fontFamily: 'monospace', fontSize: 12 }}
+                  />
+                </Form.Item>
+                </>
               )
             }
           </Form.Item>

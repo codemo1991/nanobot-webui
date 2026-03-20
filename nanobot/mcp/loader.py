@@ -1,6 +1,7 @@
 """MCP client loader - connects to MCP servers and registers tools with the agent."""
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -86,20 +87,23 @@ class McpToolLoader:
             return len(self._adapters)  # Already loaded
         return await self._connect_and_register(tools_registry)
     
-    async def _connect_and_register(self, tools_registry: Any) -> int:
+    async def _connect_and_register(self, tools_registry: Any, connect_timeout: float = 8.0) -> int:
         """Connect to each enabled MCP server and register tools."""
         from nanobot.agent.tools.mcp import McpToolAdapter
-        
+
         total = 0
         for mcp_cfg in self._get_enabled_mcps():
             server_id = getattr(mcp_cfg, "id", "") or _safe_id(getattr(mcp_cfg, "name", "mcp"))
             transport = (getattr(mcp_cfg, "transport", "stdio") or "stdio").lower()
             try:
-                session = await self._connect_one(mcp_cfg, server_id, transport)
+                session = await asyncio.wait_for(
+                    self._connect_one(mcp_cfg, server_id, transport),
+                    timeout=connect_timeout,
+                )
                 if session is None:
                     continue
                 self._sessions[server_id] = session
-                result = await session.list_tools()
+                result = await asyncio.wait_for(session.list_tools(), timeout=10.0)
                 for tool in result.tools:
                     adapter = McpToolAdapter(
                         server_id=server_id,
@@ -112,11 +116,13 @@ class McpToolLoader:
                     self._adapters.append(adapter)
                     total += 1
                 logger.info(f"MCP server {server_id}: registered {len(result.tools)} tools")
+            except asyncio.TimeoutError:
+                logger.warning(f"MCP server {server_id}: connection/list timeout after {connect_timeout}s, skipping")
             except (asyncio.CancelledError, BaseExceptionGroup) as e:
                 logger.warning(f"MCP server {server_id}: connection cancelled/failed ({type(e).__name__}), skipping")
             except Exception as e:
-                logger.exception(f"MCP server {server_id} connection failed")
-        
+                logger.warning(f"MCP server {server_id} connection failed: {e}")
+
         return total
     
     async def _connect_one(self, mcp_cfg: Any, server_id: str, transport: str) -> Any | None:
@@ -126,8 +132,12 @@ class McpToolLoader:
             if not cmd:
                 logger.warning(f"MCP {server_id}: stdio requires command")
                 return None
-            args = getattr(mcp_cfg, "args", None) or []
-            params = StdioServerParameters(command=cmd, args=args)
+            args = list(getattr(mcp_cfg, "args", None) or [])
+            env = getattr(mcp_cfg, "env", None) or None
+            # Windows: npx/npm 等是 .cmd 批处理，stdio 无法直接执行，需用 cmd /c 包装
+            if sys.platform == "win32" and not os.path.dirname(cmd):
+                cmd, args = "cmd", ["/c", cmd] + args
+            params = StdioServerParameters(command=cmd, args=args, env=env)
             stdio_ctx = stdio_client(params)
             read_write = await stdio_ctx.__aenter__()
             try:
