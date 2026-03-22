@@ -165,15 +165,15 @@ class McpToolLoader:
             headers = getattr(mcp_cfg, "headers", None) or {}
 
             try:
-                from mcp.client.streamable_http import streamable_http_client
+                from mcp.client.streamable_http import streamablehttp_client
             except ImportError:
                 logger.warning(f"MCP {server_id}: streamable_http client not available")
                 return None
 
             logger.debug(f"MCP {server_id}: connecting to streamable_http: {url}")
             try:
-                # streamable_http_client accepts url and optional auth headers
-                streamable_ctx = streamable_http_client(url, headers=headers if headers else None)
+                # streamablehttp_client accepts url and optional auth headers
+                streamable_ctx = streamablehttp_client(url, headers=headers if headers else None)
                 read_stream, write_stream, _ = await streamable_ctx.__aenter__()
                 session = ClientSession(read_stream, write_stream)
                 await session.__aenter__()

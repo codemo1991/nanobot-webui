@@ -1626,6 +1626,7 @@ class NanobotWebAPI:
                     "enabled": m.enabled,
                     "env": m.env,
                     "headers": m.headers,
+                    "tools": m.tools or [],
                 }
                 for m in config.mcps
             ],
@@ -1842,6 +1843,7 @@ class NanobotWebAPI:
             "enabled": mcp.enabled,
             "env": mcp.env,
             "headers": mcp.headers,
+            "tools": mcp.tools or [],
         }
 
     def update_mcp(self, mcp_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -1869,7 +1871,7 @@ class NanobotWebAPI:
         if "headers" in data:
             mcp.headers = dict(data["headers"]) if data["headers"] else {}
         save_config(config)
-        return {"id": mcp.id, "name": mcp.name, "transport": mcp.transport, "command": mcp.command, "args": mcp.args, "url": mcp.url, "enabled": mcp.enabled, "env": mcp.env, "headers": mcp.headers}
+        return {"id": mcp.id, "name": mcp.name, "transport": mcp.transport, "command": mcp.command, "args": mcp.args, "url": mcp.url, "enabled": mcp.enabled, "env": mcp.env, "headers": mcp.headers, "tools": mcp.tools or []}
 
     def delete_mcp(self, mcp_id: str) -> bool:
         """Delete MCP server configuration."""

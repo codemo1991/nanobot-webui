@@ -1483,6 +1483,19 @@ class SubagentManager:
         })
         logger.info(f"[SubagentBatch] Pushed batch summary for {batch_id}")
 
+        # 推送到 ChatStreamBus，让前端聊天界面刷新显示 batch 总结消息
+        if origin.get("channel") == "web":
+            from nanobot.web.chat_stream_bus import ChatStreamBus
+            chat_bus = ChatStreamBus.get()
+            chat_bus.push(origin_key, {
+                "type": "assistant_message",
+                "content": llm_summary,
+                "source": "subagent_batch_summary",
+                "batch_id": batch_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            logger.info(f"[SubagentBatch] Pushed assistant_message to ChatStreamBus for batch {batch_id}")
+
     async def _announce_batch_result(
         self,
         batch_results: list[tuple[str, dict[str, Any]]],
@@ -1645,6 +1658,20 @@ class SubagentManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         logger.info(f"[SubagentSummary] Pushed subagent_summary for task {task_id}")
+
+        # 推送到 ChatStreamBus，让前端聊天界面刷新显示子 agent 总结消息
+        if origin.get("channel") == "web":
+            from nanobot.web.chat_stream_bus import ChatStreamBus
+            chat_bus = ChatStreamBus.get()
+            chat_bus.push(origin_key, {
+                "type": "assistant_message",
+                "content": llm_summary,
+                "source": "subagent_summary",
+                "task_id": task_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            logger.info(f"[SubagentSummary] Pushed assistant_message to ChatStreamBus for task {task_id}")
+
         if clear_buffer:
             # 裁剪为仅保留最后 5 个事件（subagent_end/summary/stream_done 等），
             # 供重连 replay，同时避免大量 progress 事件导致页面卡顿

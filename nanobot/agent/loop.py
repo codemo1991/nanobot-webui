@@ -1150,6 +1150,15 @@ class AgentLoop:
                     try:
                         discovered = await self._discover_mcp_tools(server_id, mcp_cfg)
                         if discovered:
+                            # 将发现的工具保存到配置中，供前端展示
+                            mcp_cfg.tools = discovered
+                            try:
+                                from nanobot.config.loader import save_config
+                                save_config(config)
+                                logger.info(f"MCP {server_id}: discovered and saved {len(discovered)} tools to config")
+                            except Exception as save_err:
+                                logger.warning(f"MCP {server_id}: failed to save discovered tools to config: {save_err}")
+
                             # 将发现的工具注册为懒加载适配器
                             from nanobot.agent.tools.mcp import McpLazyToolAdapter
                             lazy_tools: dict[str, McpLazyToolAdapter] = {}

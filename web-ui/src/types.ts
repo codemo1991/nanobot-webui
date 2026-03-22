@@ -198,6 +198,11 @@ export interface DiscoveredModel {
   contextWindow: number
 }
 
+export interface McpTool {
+  name: string
+  description?: string
+}
+
 export interface McpServer {
   id: string
   name: string
@@ -208,6 +213,7 @@ export interface McpServer {
   enabled: boolean
   env?: Record<string, string>
   headers?: Record<string, string>
+  tools?: McpTool[]
 }
 
 export interface InstalledSkill {

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography, Row, Col, Table, Alert, Tooltip, AutoComplete } from 'antd'
-import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined } from '@ant-design/icons'
+import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined, ReloadOutlined } from '@ant-design/icons'
 import { api } from '../api'
 import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig, WebConcurrencyConfig, WebMemoryConfig } from '../types'
 import AgentTemplatePage from './AgentTemplatePage'
@@ -1595,10 +1595,11 @@ function McpConfig() {
     }
     if (!name) name = id || 'unnamed'
     if (!id) id = name.replace(/\s+/g, '-').toLowerCase().replace(/[^a-z0-9._-]/g, '') || 'mcp'
-    // Extract env and headers
+    // Extract env, headers, and tools
     const env = (o.env && typeof o.env === 'object') ? o.env as Record<string, string> : undefined
     const headers = (o.headers && typeof o.headers === 'object') ? o.headers as Record<string, string> : undefined
-    return { id, name, transport, command, args, url, enabled: o.enabled !== false, env, headers }
+    const tools = Array.isArray(o.tools) ? o.tools as { name: string; description?: string }[] : undefined
+    return { id, name, transport, command, args, url, enabled: o.enabled !== false, env, headers, tools }
   }
 
   const normOne = (raw: unknown) => normalizeMcpItem(raw)
@@ -1801,6 +1802,7 @@ function McpConfig() {
           <Button icon={<PlusOutlined />} onClick={() => setJsonModalVisible(true)}>
             {t('config.mcp.jsonGenerate')}
           </Button>
+          <Button icon={<ReloadOutlined />} onClick={loadMcps} loading={loading}>{t('config.refresh')}</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>{t('config.mcp.add')}</Button>
         </Space>
       </div>
@@ -1843,6 +1845,9 @@ function McpConfig() {
                   <Tag>{item.transport}</Tag>
                   {item.enabled && <Tag color="success">{t('config.enabled')}</Tag>}
                   {!item.enabled && <Tag>{t('config.disabled')}</Tag>}
+                  {item.tools && item.tools.length > 0 && (
+                    <Tag color="blue">{item.tools.length} 个工具</Tag>
+                  )}
                 </Space>
               }
               extra={
@@ -1944,6 +1949,25 @@ function McpConfig() {
           <Form.Item name="enabled" valuePropName="checked" label={t('config.channel.enabled')}>
             <Switch />
           </Form.Item>
+
+          {/* 工具列表展示 - 仅在编辑模式下且存在工具时显示 */}
+          {editingMcp && editingMcp.tools && editingMcp.tools.length > 0 && (
+            <div style={{ marginTop: 16, padding: 12, background: '#f5f5f5', borderRadius: 6 }}>
+              <Text strong style={{ fontSize: 14 }}>可用工具 ({editingMcp.tools.length}个)</Text>
+              <div style={{ marginTop: 8, maxHeight: 200, overflow: 'auto' }}>
+                {editingMcp.tools.map((tool, index) => (
+                  <div key={index} style={{ marginBottom: 8, padding: 8, background: '#fff', borderRadius: 4 }}>
+                    <Text style={{ fontSize: 13, fontWeight: 500 }}>{tool.name}</Text>
+                    {tool.description && (
+                      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 2 }}>
+                        {tool.description}
+                      </Text>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </Form>
       </Modal>
     </div>
