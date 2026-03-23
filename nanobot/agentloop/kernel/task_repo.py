@@ -132,7 +132,9 @@ def mark_task_done(conn, task_id: str, artifact_id: str | None) -> None:
 
 
 def mark_task_failed(conn, task_id: str, error_code: str, error_message: str) -> None:
-    """将任务标记为 FAILED；若为根任务则同时将 trace 传播为 FAILED。"""
+    """将任务标记为 FAILED；若为根任务则同时将 trace 传播为 FAILED。
+    对非根任务：计入父任务的 finished_children，若父任务所有子任务均已结束则向上传播失败。
+    """
     ts = now_ts()
     row = conn.execute(
         "SELECT trace_id, parent_task_id FROM agentloop_tasks WHERE task_id = ?", (task_id,)
@@ -166,6 +168,7 @@ def mark_task_failed(conn, task_id: str, error_code: str, error_message: str) ->
             (trace_id, task_id, parent_task_id, json.dumps({"error_code": error_code}), ts),
         )
         if parent_task_id is None:
+            # 根任务失败 → trace 直接 FAILED
             conn.execute(
                 """
                 UPDATE agentloop_traces
@@ -181,6 +184,29 @@ def mark_task_failed(conn, task_id: str, error_code: str, error_message: str) ->
                 """,
                 (trace_id, json.dumps({"error_code": error_code, "error_message": error_message}), ts),
             )
+        else:
+            # 非根任务失败：计入父任务 finished_children，触发父任务失败传播
+            conn.execute(
+                """
+                UPDATE agentloop_tasks
+                SET finished_children = finished_children + 1, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (ts, parent_task_id),
+            )
+            parent = conn.execute(
+                "SELECT state, expected_children, finished_children FROM agentloop_tasks WHERE task_id = ?",
+                (parent_task_id,),
+            ).fetchone()
+            if (
+                parent
+                and parent["state"] == "WAITING_CHILDREN"
+                and parent["finished_children"] >= parent["expected_children"]
+            ):
+                _propagate_failure_to_ancestor(
+                    conn, parent_task_id, trace_id, ts, "CHILD_FAILED",
+                    f"子任务 {task_id} 失败: {error_message}"
+                )
 
 
 def mark_task_waiting_children(
@@ -386,3 +412,86 @@ def reset_task_for_retry(conn, task_id: str, error_code: str, error_message: str
             """,
             (error_code, error_message, ts, task_id),
         )
+
+
+def _propagate_failure_to_ancestor(
+    conn, task_id: str, trace_id: str, ts: int, error_code: str, error_message: str
+) -> None:
+    """递归向上传播 FAILED，直至根任务，并将 trace 标记为 FAILED。"""
+    row = conn.execute(
+        "SELECT parent_task_id FROM agentloop_tasks WHERE task_id = ?", (task_id,)
+    ).fetchone()
+
+    conn.execute(
+        """
+        UPDATE agentloop_tasks
+        SET state = 'FAILED', error_code = ?, error_message = ?,
+            finished_at = ?, updated_at = ?, lease_owner = NULL, lease_until = NULL
+        WHERE task_id = ? AND state NOT IN ('FAILED', 'DONE', 'CANCELED')
+        """,
+        (error_code, error_message, ts, ts, task_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
+        VALUES (?, ?, NULL, 'TASK_FAIL', ?, ?)
+        """,
+        (trace_id, task_id, json.dumps({"error_code": error_code, "propagated": True}), ts),
+    )
+
+    parent_id = row["parent_task_id"] if row else None
+    if parent_id is None:
+        # 已到根任务，标记 trace FAILED
+        conn.execute(
+            """
+            UPDATE agentloop_traces SET status = 'FAILED', finished_at = ?, updated_at = ?
+            WHERE trace_id = ? AND status = 'RUNNING'
+            """,
+            (ts, ts, trace_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
+            VALUES (?, NULL, NULL, 'TRACE_FAIL', ?, ?)
+            """,
+            (trace_id, json.dumps({"error_code": error_code, "error_message": error_message}), ts),
+        )
+    else:
+        # 继续向上传播：计入祖父的 finished_children
+        conn.execute(
+            "UPDATE agentloop_tasks SET finished_children = finished_children + 1, updated_at = ? WHERE task_id = ?",
+            (ts, parent_id),
+        )
+        gp = conn.execute(
+            "SELECT state, expected_children, finished_children FROM agentloop_tasks WHERE task_id = ?",
+            (parent_id,),
+        ).fetchone()
+        if gp and gp["state"] == "WAITING_CHILDREN" and gp["finished_children"] >= gp["expected_children"]:
+            _propagate_failure_to_ancestor(conn, parent_id, trace_id, ts, error_code, error_message)
+
+
+def recover_stale_tasks(conn, stale_seconds: int = 300) -> int:
+    """将长期停留在 RUNNING 状态（可能因进程崩溃而僵死）的任务恢复调度。
+    - 还有重试机会：重置为 READY
+    - 已无重试：标记为 FAILED 并传播
+    返回恢复的任务数。
+    """
+    threshold = now_ts() - stale_seconds
+    stale = conn.execute(
+        """
+        SELECT task_id, attempt_no, max_retries, trace_id
+        FROM agentloop_tasks
+        WHERE state = 'RUNNING' AND updated_at < ?
+        """,
+        (threshold,),
+    ).fetchall()
+
+    recovered = 0
+    for row in stale:
+        if row["attempt_no"] <= row["max_retries"]:
+            reset_task_for_retry(conn, row["task_id"], "STALE_RUNNING", "任务执行超时，自动重试")
+        else:
+            mark_task_failed(conn, row["task_id"], "STALE_RUNNING", "任务执行超时且重试次数耗尽")
+        recovered += 1
+
+    return recovered

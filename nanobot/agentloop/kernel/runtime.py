@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import Callable
 
 from loguru import logger
 
@@ -29,6 +30,21 @@ class Runtime:
         self.conn = conn
         self.registry = registry
         self.workspace = workspace
+        self._done_callback: Callable | None = None
+
+    def set_done_callback(self, callback: Callable) -> None:
+        """注册 trace 完成通知回调（由 Kernel 注入，trace 变为 DONE/FAILED 时调用）。"""
+        self._done_callback = callback
+
+    def _notify_if_trace_done(self, trace_id: str) -> None:
+        """检查 trace 状态，若已终结则触发回调通知等待方。"""
+        if not self._done_callback:
+            return
+        row = self.conn.execute(
+            "SELECT status FROM agentloop_traces WHERE trace_id = ?", (trace_id,)
+        ).fetchone()
+        if row and row["status"] in ("DONE", "FAILED", "CANCELED"):
+            self._done_callback()
 
     def _load_artifact_payload(self, row) -> dict | None:
         """从 artifact 行加载 payload，支持 INLINE/FILE，含 JSON 异常处理。"""
@@ -213,6 +229,23 @@ class Runtime:
 
         parent_id = task.get("parent_task_id")
         if not parent_id:
+            # 根任务直接返回 DONE（未经 WAITING_CHILDREN 路径），需主动标记 trace DONE
+            ts = now_ts()
+            with tx(self.conn, immediate=True):
+                self.conn.execute(
+                    """
+                    UPDATE agentloop_traces SET status = 'DONE', finished_at = ?, updated_at = ?
+                    WHERE trace_id = ? AND status = 'RUNNING'
+                    """,
+                    (ts, ts, task["trace_id"]),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
+                    VALUES (?, ?, NULL, 'TRACE_DONE', '{}', ?)
+                    """,
+                    (task["trace_id"], task["task_id"], ts),
+                )
             return
 
         parent = self.conn.execute(
@@ -298,6 +331,9 @@ class Runtime:
                 result.error_message or "Unknown error",
             )
 
+        # 任务执行后通知等待方（trace 可能已完成）
+        self._notify_if_trace_done(task["trace_id"])
+
     def handle_task_exception(self, task: dict, exc: Exception) -> None:
         """处理任务执行异常（重试或失败）。
         attempt_no 表示已执行次数（mark_task_running 中自增），max_retries 表示允许的重试次数，
@@ -317,3 +353,5 @@ class Runtime:
             )
         else:
             mark_task_failed(self.conn, task["task_id"], "FAILED", str(exc))
+
+        self._notify_if_trace_done(task["trace_id"])
