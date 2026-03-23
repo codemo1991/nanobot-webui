@@ -214,6 +214,7 @@ export interface McpServer {
   env?: Record<string, string>
   headers?: Record<string, string>
   tools?: McpTool[]
+  scope?: string[]
 }
 
 export interface InstalledSkill {

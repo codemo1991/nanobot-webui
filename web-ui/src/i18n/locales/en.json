@@ -131,6 +131,12 @@
     "errorBoundaryTitle": "Chat loading error",
     "errorBoundaryUnknown": "Unknown error",
     "errorBoundaryRetry": "Retry",
+    "toolMode": "Tool Mode",
+    "toolModeDisable": "Disable",
+    "toolModeAuto": "Auto",
+    "toolModeSpecified": "Specify",
+    "toolModeServerSelect": "Select MCP Servers",
+    "toolModeNoServers": "No MCP servers available",
     "tasks": {
       "title": "Claude Code Tasks",
       "running": "Running",
@@ -277,6 +283,7 @@
       "enableSmartParallelHelp": "Use LLM to decide if tools can run in parallel",
       "smartParallelModel": "Smart Parallel Model",
       "smartParallelModelHelp": "Leave empty to use default lightweight model",
+      "smartParallelModelPlaceholder": "Leave empty to use default model",
       "saveSuccess": "Concurrency config updated",
       "saveFailed": "Save failed"
     },
@@ -325,6 +332,10 @@
     "notEnabled": "Not enabled",
     "notSet": "Not set",
     "save": "Save changes",
+    "saveSuccess": "Saved successfully",
+    "saveFailed": "Save failed",
+    "refresh": "Refresh",
+    "discoveryFailed": "Discovery failed",
     "configUpdated": "Config updated",
     "updateFailed": "Update failed",
     "loadChannelsFailed": "Failed to load IM config",
@@ -399,7 +410,10 @@
       "urlRequired": "http/sse requires URL",
       "updated": "Updated",
       "created": "Created",
-      "saveFailed": "Save failed"
+      "saveFailed": "Save failed",
+      "scopeLabel": "Scope Keywords",
+      "toolsDiscovered": "Tools discovered",
+      "discoverFailed": "Failed to discover tools"
     },
     "skills": "Skills",
     "skillsPanel": {

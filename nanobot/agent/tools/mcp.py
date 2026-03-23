@@ -43,6 +43,10 @@ class McpToolAdapter(Tool):
         return f"mcp_{self._server_id}_{_sanitize_tool_name(self._tool_name)}"
 
     @property
+    def server_id(self) -> str | None:
+        return self._server_id
+
+    @property
     def description(self) -> str:
         return f"[MCP/{self._server_id}] {self._description}"
 
@@ -106,6 +110,15 @@ class McpLazyToolAdapter(Tool):
     @property
     def name(self) -> str:
         return f"mcp_{self._server_id}_{_sanitize_tool_name(self._tool_name)}"
+
+    @property
+    def server_id(self) -> str | None:
+        return self._server_id
+
+    @property
+    def deferred(self) -> bool:
+        """MCP tools are deferred - loaded on-demand when LLM calls them."""
+        return True
 
     @property
     def description(self) -> str:

@@ -395,6 +395,12 @@ class NanobotWebAPI:
                 pass
         return "anthropic/claude-opus-4-6"
 
+    def _get_stored_mcp_tools(self) -> dict[str, list[dict[str, Any]]]:
+        """Read stored MCP tools from SQLite database, returning a dict mapping mcp_id -> tools list."""
+        repo = get_config_repository()
+        mcps = repo.get_all_mcps()
+        return {m["id"]: m.get("tools", []) for m in mcps}
+
     def _reinit_agent_and_status(self, workspace_path: Path) -> None:
         """Reinitialize agent and status service with new workspace (hot reload)."""
         config = load_config()
@@ -1282,7 +1288,8 @@ class NanobotWebAPI:
         return paths
 
     def chat_stream(
-        self, session_id: str, content: str, images: list[str] | None = None
+        self, session_id: str, content: str, images: list[str] | None = None,
+        tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
     ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
         """
         Run chat with progress events. Returns (event_queue, thread).
@@ -1330,10 +1337,15 @@ class NanobotWebAPI:
                 # 创建新的事件循环（避免与主线程冲突）
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                _extra = {"user_message_saved": True}
+                if tool_mode:
+                    _extra["tool_mode"] = tool_mode
+                if selected_mcp_servers:
+                    _extra["selected_mcp_servers"] = selected_mcp_servers
                 result = loop.run_until_complete(
                     self._chat_with_progress(
                         session_id, content, on_progress, media_paths,
-                        extra_metadata={"user_message_saved": True},
+                        extra_metadata=_extra,
                     )
                 )
                 logger.debug(f"Chat stream completed with result: {result}")
@@ -1462,11 +1474,21 @@ class NanobotWebAPI:
         from nanobot.agent.subagent_progress import SubagentProgressBus
         SubagentProgressBus.get().unsubscribe(f"web:{session_id}", q)
 
-    async def chat(self, session_id: str, content: str, images: list[str] | None = None) -> dict[str, Any]:
+    async def chat(
+        self, session_id: str, content: str, images: list[str] | None = None,
+        tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Non-streaming chat. Reuses _chat_with_progress without callback."""
         media_paths = self._save_images_to_temp(images or [])
+        extra: dict[str, Any] = {}
+        if tool_mode:
+            extra["tool_mode"] = tool_mode
+        if selected_mcp_servers:
+            extra["selected_mcp_servers"] = selected_mcp_servers
         try:
-            return await self._chat_with_progress(session_id, content, progress_callback=None, media=media_paths)
+            return await self._chat_with_progress(
+                session_id, content, progress_callback=None, media=media_paths, extra_metadata=extra or None,
+            )
         finally:
             for p in media_paths:
                 try:
@@ -1626,7 +1648,8 @@ class NanobotWebAPI:
                     "enabled": m.enabled,
                     "env": m.env,
                     "headers": m.headers,
-                    "tools": m.tools or [],
+                    "tools": self._get_stored_mcp_tools().get(m.id, []),
+                    "scope": m.scope or [],
                 }
                 for m in config.mcps
             ],
@@ -1791,9 +1814,10 @@ class NanobotWebAPI:
 
     def _create_mcp_internal(self, config, data: dict[str, Any]) -> dict[str, Any]:
         """Internal method to create a single MCP server configuration."""
-        mcp_id = data.get("id") or str(uuid4()).replace("-", "")[:12]
-        if not re.match(r"^[a-zA-Z0-9._-]+$", mcp_id):
-            raise ValueError("MCP id 只能包含字母、数字、点、下划线、连字符")
+        mcp_id = data.get("id") or ""
+        # If ID is empty or contains non-ASCII, generate a UUID
+        if not mcp_id or not re.match(r"^[a-zA-Z0-9._-]+$", mcp_id):
+            mcp_id = str(uuid4()).replace("-", "")[:12]
         name = (data.get("name") or "").strip()
         if not name:
             raise ValueError("name 不能为空")
@@ -1817,6 +1841,7 @@ class NanobotWebAPI:
             enabled=data.get("enabled", True),
             env=data.get("env") or {},
             headers=data.get("headers") or {},
+            scope=data.get("scope") or [],
         )
         config.mcps.append(mcp)
         save_config(config)
@@ -1832,6 +1857,7 @@ class NanobotWebAPI:
             enabled=mcp.enabled,
             env=mcp.env,
             headers=mcp.headers,
+            scope=mcp.scope,
         )
         return {
             "id": mcp.id,
@@ -1843,6 +1869,7 @@ class NanobotWebAPI:
             "enabled": mcp.enabled,
             "env": mcp.env,
             "headers": mcp.headers,
+            "scope": mcp.scope or [],
             "tools": mcp.tools or [],
         }
 
@@ -1870,8 +1897,25 @@ class NanobotWebAPI:
             mcp.env = dict(data["env"]) if data["env"] else {}
         if "headers" in data:
             mcp.headers = dict(data["headers"]) if data["headers"] else {}
+        if "scope" in data:
+            mcp.scope = list(data["scope"]) if data["scope"] else []
         save_config(config)
-        return {"id": mcp.id, "name": mcp.name, "transport": mcp.transport, "command": mcp.command, "args": mcp.args, "url": mcp.url, "enabled": mcp.enabled, "env": mcp.env, "headers": mcp.headers, "tools": mcp.tools or []}
+        # Persist scope and tools to SQLite (scope changes otherwise lost on reload)
+        repo = get_config_repository()
+        repo.set_mcp(
+            mcp_id=mcp.id,
+            name=mcp.name,
+            transport=mcp.transport,
+            command=mcp.command,
+            args=mcp.args,
+            url=mcp.url,
+            enabled=mcp.enabled,
+            env=mcp.env,
+            headers=mcp.headers,
+            scope=mcp.scope,
+            tools=mcp.tools or [],
+        )
+        return {"id": mcp.id, "name": mcp.name, "transport": mcp.transport, "command": mcp.command, "args": mcp.args, "url": mcp.url, "enabled": mcp.enabled, "env": mcp.env, "headers": mcp.headers, "scope": mcp.scope or [], "tools": mcp.tools or []}
 
     def delete_mcp(self, mcp_id: str) -> bool:
         """Delete MCP server configuration."""
@@ -1921,6 +1965,151 @@ class NanobotWebAPI:
 
         logger.info(f"MCP deleted successfully: '{mcp_id_clean}'")
         return True
+
+    async def get_mcps_with_tools(self) -> list[dict[str, Any]]:
+        """
+        Get MCP list from config, discover tools for each server (connects, lists, disconnects).
+        Returns MCP configs enriched with tools information.
+        """
+        import asyncio
+        from nanobot.config.loader import load_config
+        from nanobot.mcp.loader import McpToolLoader, _safe_id
+
+        config = load_config()
+        mcps = getattr(config, "mcps", None) or []
+        if not mcps:
+            return []
+
+        workspace = config.workspace_path
+        loader = McpToolLoader(mcps, workspace)
+
+        results = []
+        for mcp_cfg in mcps:
+            mcp_dict = {
+                "id": getattr(mcp_cfg, "id", "") or "",
+                "name": getattr(mcp_cfg, "name", "") or "",
+                "transport": getattr(mcp_cfg, "transport", "stdio") or "stdio",
+                "command": getattr(mcp_cfg, "command", None),
+                "args": getattr(mcp_cfg, "args", None) or [],
+                "url": getattr(mcp_cfg, "url", None),
+                "env": dict(getattr(mcp_cfg, "env", None) or {}),
+                "headers": dict(getattr(mcp_cfg, "headers", None) or {}),
+                "enabled": getattr(mcp_cfg, "enabled", True),
+                "scope": list(getattr(mcp_cfg, "scope", None) or []),
+                "tools": [],
+            }
+
+            # Try to discover tools (connect, list, disconnect)
+            server_id = mcp_dict["id"] or mcp_dict["name"]
+            try:
+                result = await asyncio.wait_for(
+                    loader.connect_lazy(server_id, timeout=10.0),
+                    timeout=15.0,
+                )
+                if result:
+                    session, tools = result
+                    mcp_dict["tools"] = [
+                        {
+                            "name": t.name,
+                            "description": getattr(t, "description", "") or "",
+                        }
+                        for t in tools
+                    ]
+                    try:
+                        await session.__aexit__(None, None, None)
+                    except BaseException:
+                        pass
+
+                    # Persist discovered tools to SQLite
+                    if mcp_dict["tools"]:
+                        try:
+                            repo = get_config_repository()
+                            repo.set_mcp(
+                                mcp_id=mcp_cfg.id,
+                                name=mcp_dict["name"],
+                                transport=mcp_dict["transport"],
+                                command=mcp_dict["command"],
+                                args=mcp_dict["args"],
+                                url=mcp_dict["url"],
+                                enabled=mcp_dict["enabled"],
+                                env=mcp_dict["env"],
+                                headers=mcp_dict["headers"],
+                                scope=mcp_dict["scope"],
+                                tools=mcp_dict["tools"],
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to persist tools for {mcp_cfg.id}: {e}")
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.debug(f"MCP {server_id}: tool discovery skipped: {e}")
+
+            results.append(mcp_dict)
+
+        return results
+
+    async def discover_mcp_tools(self, mcp_id: str) -> list[dict[str, Any]]:
+        """
+        Connect to a single MCP server and discover its tools.
+        Returns list of tool schemas [{name, description, parameters}, ...].
+        Saves discovered tools to database for persistence.
+        """
+        import asyncio
+        from nanobot.config.loader import load_config
+        from nanobot.mcp.loader import McpToolLoader, _safe_id
+        from nanobot.config.loader import get_config_repository
+
+        config = load_config()
+        mcp_cfg = next((m for m in config.mcps if m.id == mcp_id), None)
+        if not mcp_cfg:
+            raise KeyError(f"MCP 不存在: {mcp_id}")
+
+        workspace = config.workspace_path
+        loader = McpToolLoader([mcp_cfg], workspace)
+        server_id = mcp_cfg.id or _safe_id(mcp_cfg.name)
+
+        discovered_tools: list[dict[str, Any]] = []
+        try:
+            result = await asyncio.wait_for(
+                loader.connect_lazy(server_id, timeout=10.0),
+                timeout=15.0,
+            )
+            if result:
+                _, tools = result
+                discovered_tools = [
+                    {
+                        "name": t.name,
+                        "description": t.description or "",
+                        "parameters": t.inputSchema or {"type": "object", "properties": {}},
+                    }
+                    for t in tools
+                ]
+        except asyncio.TimeoutError:
+            logger.warning(f"MCP {server_id}: tool discovery timeout")
+        except Exception as e:
+            logger.warning(f"MCP {server_id}: tool discovery failed: {e}")
+
+        # Save discovered tools to database (even if empty, to mark as "attempted")
+        try:
+            repo = get_config_repository()
+            existing = repo.get_mcp(mcp_id)
+            if existing:
+                repo.set_mcp(
+                    mcp_id=mcp_id,
+                    name=existing.get("name", ""),
+                    transport=existing.get("transport", "stdio"),
+                    command=existing.get("command"),
+                    args=existing.get("args"),
+                    url=existing.get("url"),
+                    enabled=existing.get("enabled", True),
+                    env=existing.get("env"),
+                    headers=existing.get("headers"),
+                    scope=existing.get("scope"),
+                    tools=discovered_tools,
+                )
+                logger.debug(f"[MCP] Saved {len(discovered_tools)} tools for {mcp_id}")
+        except Exception as e:
+            logger.warning(f"[MCP] Failed to save tools for {mcp_id}: {e}")
+
+        return discovered_tools
 
     def test_mcp(self, mcp_id: str) -> dict[str, Any]:
         """Test MCP connection. Returns {connected: bool, message: str}."""
@@ -3057,11 +3246,12 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             logger.warning("Chat stream resume error: %s", e)
 
     def _handle_chat_stream(
-        self, app: "NanobotWebAPI", session_id: str, content: str, images: list[str] | None = None
+        self, app: "NanobotWebAPI", session_id: str, content: str, images: list[str] | None = None,
+        tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
     ) -> None:
         """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
         logger.info(f"Starting chat stream for session {session_id}")
-        evt_queue, thread = app.chat_stream(session_id, content, images)
+        evt_queue, thread = app.chat_stream(session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
         logger.info(f"Chat stream thread created: {thread}")
         thread.start()
         logger.info(f"Chat stream thread started: {thread.is_alive()}")
@@ -3494,6 +3684,17 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/mcps":
                 config_data = app.get_config()
                 self._write_json(HTTPStatus.OK, _ok(config_data["mcps"]))
+                return
+
+            # GET /api/v1/mcps/with-tools - 返回 MCP 列表（含发现到的工具详情）
+            if path == "/api/v1/mcps/with-tools":
+                try:
+                    import asyncio
+                    mcps = asyncio.run(app.get_mcps_with_tools())
+                    self._write_json(HTTPStatus.OK, _ok(mcps))
+                except Exception as e:
+                    logger.exception("Failed to get MCPs with tools")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("MCP_TOOLS_FAILED", str(e)))
                 return
 
             # Calendar endpoints
@@ -3950,10 +4151,12 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 return
             session_id = parts[4]
             use_stream = query.get("stream", [None])[0] == "1"
+            tool_mode = body.get("tool_mode")
+            selected_mcp_servers = body.get("selected_mcp_servers")
 
             if use_stream:
                 try:
-                    self._handle_chat_stream(app, session_id, content, images)
+                    self._handle_chat_stream(app, session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
                 except Exception as exc:
                     logger.exception("Chat stream failed")
                     self._write_json(
@@ -3963,7 +4166,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                data = asyncio.run(app.chat(session_id=session_id, content=content, images=images))
+                data = asyncio.run(app.chat(session_id=session_id, content=content, images=images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers))
                 self._write_json(HTTPStatus.OK, _ok(data))
             except RuntimeError as exc:
                 # MCP streamable_http + anyio: "cancel scope in different task" can occur
@@ -4065,7 +4268,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             logger.debug(f"Create MCP request body: {body}")
             try:
                 data = app.create_mcp(body)
-                app._reload_mcp()
                 self._write_json(HTTPStatus.CREATED, _ok(data))
             except ValueError as e:
                 logger.warning(f"Create MCP validation error: {e}, body: {body}")
@@ -4093,6 +4295,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(data))
             except KeyError:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MCP_NOT_FOUND", "MCP 不存在"))
+            return
+
+        # POST /api/v1/mcps/{mcpId}/discover
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "mcps"] and parts[4] == "discover":
+            mcp_id = unquote(parts[3])  # URL 解码
+            try:
+                tools = asyncio.run(app.discover_mcp_tools(mcp_id))
+                self._write_json(HTTPStatus.OK, _ok({"tools": tools}))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MCP_NOT_FOUND", "MCP 不存在"))
+            except Exception as e:
+                logger.exception(f"MCP discover error: {e}")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("MCP_DISCOVER_ERROR", str(e)))
             return
 
         # POST /api/v1/models - Create model manually
@@ -4795,7 +5010,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             mcp_id = unquote(parts[3])  # URL 解码
             deleted = app.delete_mcp(mcp_id)
             if deleted:
-                app._reload_mcp()
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MCP_NOT_FOUND", "MCP 不存在"))
@@ -4992,7 +5206,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             try:
                 data = app.update_mcp(mcp_id, body)
-                app._reload_mcp()
                 self._write_json(HTTPStatus.OK, _ok(data))
             except KeyError:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MCP_NOT_FOUND", "MCP 不存在"))

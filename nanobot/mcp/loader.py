@@ -20,8 +20,9 @@ except ImportError:
 
 
 def _safe_id(name: str) -> str:
-    """Convert tool name to safe identifier (alphanumeric, underscore)."""
-    return "".join(c if c.isalnum() or c == "_" else "_" for c in name)
+    """Convert tool name to safe identifier - must match _safe_mcp_id in loop.py."""
+    import re
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name) or "mcp"
 
 
 class McpToolLoader:
@@ -150,7 +151,7 @@ class McpToolLoader:
                 exc_type, exc_val, exc_tb = sys.exc_info()
                 try:
                     await stdio_ctx.__aexit__(exc_type, exc_val, exc_tb)
-                except Exception:
+                except BaseException:
                     pass
                 raise
         
@@ -186,7 +187,7 @@ class McpToolLoader:
                 exc_type, exc_val, exc_tb = sys.exc_info()
                 try:
                     await streamable_ctx.__aexit__(exc_type, exc_val, exc_tb)
-                except Exception:
+                except BaseException:
                     pass
                 raise
 
@@ -212,7 +213,7 @@ class McpToolLoader:
                 exc_type, exc_val, exc_tb = sys.exc_info()
                 try:
                     await sse_ctx.__aexit__(exc_type, exc_val, exc_tb)
-                except Exception:
+                except BaseException:
                     pass
                 raise
         

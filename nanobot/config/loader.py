@@ -14,9 +14,15 @@ def get_system_db_path() -> Path:
     return Path.home() / ".nanobot" / "system.db"
 
 
+_config_repo: ConfigRepository | None = None
+
+
 def get_config_repository() -> ConfigRepository:
-    """Get the configuration repository instance."""
-    return ConfigRepository(get_system_db_path())
+    """Get the configuration repository instance (cached)."""
+    global _config_repo
+    if _config_repo is None:
+        _config_repo = ConfigRepository(get_system_db_path())
+    return _config_repo
 
 
 def ensure_system_db_initialized() -> None:

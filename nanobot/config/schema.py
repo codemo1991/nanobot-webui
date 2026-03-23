@@ -1,7 +1,9 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from pydantic import BaseModel, Field
+from typing import Any
+
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -197,7 +199,24 @@ class McpServerConfig(BaseModel):
     enabled: bool = True
     env: dict[str, str] = Field(default_factory=dict)  # Environment variables for stdio
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP headers for http/sse
-    tools: list[dict[str, str]] = Field(default_factory=list)  # Optional: pre-defined tool list for lazy loading
+    tools: list[dict[str, Any]] = Field(default_factory=list)  # Optional: pre-defined tool list for lazy loading
+    scope: list[str] = Field(default_factory=list)  # Keywords for intent matching - e.g. ["jira", "issue", "bug"]
+
+    @field_validator("transport", mode="before")
+    @classmethod
+    def _normalize_transport(cls, v: str) -> str:
+        """Normalize transport name: streamable-http → streamable_http."""
+        if isinstance(v, str):
+            lower = v.lower().replace("-", "_")
+            if lower in ("streamable_http", "streamablehttp"):
+                return "streamable_http"
+            if lower == "http":
+                return "http"
+            if lower == "sse":
+                return "sse"
+            if lower == "stdio":
+                return "stdio"
+        return v
 
 
 class ToolsConfig(BaseModel):

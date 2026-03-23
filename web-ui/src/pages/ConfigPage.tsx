@@ -1470,6 +1470,8 @@ function McpConfig() {
   const [modalVisible, setModalVisible] = useState(false)
   const [editingMcp, setEditingMcp] = useState<McpServer | null>(null)
   const [testingId, setTestingId] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [discoveringToolsId, setDiscoveringToolsId] = useState<string | null>(null)
   const [jsonInput, setJsonInput] = useState('')
   const [jsonModalVisible, setJsonModalVisible] = useState(false)
   const jsonInputRef = useRef<HTMLInputElement>(null)
@@ -1522,6 +1524,7 @@ function McpConfig() {
         }
         return raw ? Object.entries(raw).map(([k, v]) => `${k}=${v}`).join('\n') : ''
       })(),
+      scopeText: mcp.scope?.join('\n') || '',
       url: mcp.url,
       enabled: mcp.enabled,
     })
@@ -1567,7 +1570,7 @@ function McpConfig() {
     const lower = (t || '').toLowerCase()
     if (lower === 'stdio') return 'stdio'
     if (lower === 'sse') return 'sse'
-    if (lower === 'streamable_http') return 'streamable_http'
+    if (lower === 'streamablehttp' || lower === 'streamable-http') return 'streamable_http'
     return 'http'
   }
 
@@ -1599,7 +1602,8 @@ function McpConfig() {
     const env = (o.env && typeof o.env === 'object') ? o.env as Record<string, string> : undefined
     const headers = (o.headers && typeof o.headers === 'object') ? o.headers as Record<string, string> : undefined
     const tools = Array.isArray(o.tools) ? o.tools as { name: string; description?: string }[] : undefined
-    return { id, name, transport, command, args, url, enabled: o.enabled !== false, env, headers, tools }
+    const scope = Array.isArray(o.scope) ? o.scope.filter((s): s is string => typeof s === 'string') : undefined
+    return { id, name, transport, command, args, url, enabled: o.enabled !== false, env, headers, tools, scope }
   }
 
   const normOne = (raw: unknown) => normalizeMcpItem(raw)
@@ -1721,6 +1725,7 @@ function McpConfig() {
 
   const handleSave = async () => {
     try {
+      setSaving(true)
       const values = await form.validateFields()
       const argsStr = values.args
       const args = typeof argsStr === 'string' && argsStr.trim()
@@ -1762,6 +1767,11 @@ function McpConfig() {
         enabled: values.enabled ?? true,
         env: Object.keys(env).length > 0 ? env : undefined,
         headers: Object.keys(headers).length > 0 ? headers : undefined,
+        scope: (() => {
+          const text = values.scopeText
+          if (typeof text !== 'string' || !text.trim()) return []
+          return text.split(/[\n,]/).map(s => s.trim()).filter(Boolean)
+        })(),
       }
       if (editingMcp) {
         await api.updateMcp(editingMcp.id, payload)
@@ -1771,10 +1781,14 @@ function McpConfig() {
         message.success(t('config.mcp.created'))
       }
       setModalVisible(false)
-      loadMcps()
+      // 保存后快速刷新 MCP 列表（不 discover 工具，避免连接所有服务器）
+      const data = await api.getMcps()
+      setMcps(data || [])
     } catch (error) {
       console.error(error)
       message.error(t('config.mcp.saveFailed'))
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -1802,7 +1816,18 @@ function McpConfig() {
           <Button icon={<PlusOutlined />} onClick={() => setJsonModalVisible(true)}>
             {t('config.mcp.jsonGenerate')}
           </Button>
-          <Button icon={<ReloadOutlined />} onClick={loadMcps} loading={loading}>{t('config.refresh')}</Button>
+          <Button icon={<ReloadOutlined />} onClick={async () => {
+            setLoading(true)
+            try {
+              const data = await api.getMcpsWithTools()
+              setMcps(data || [])
+            } catch (e) {
+              console.error(e)
+              message.error(t('config.mcp.loadFailed'))
+            } finally {
+              setLoading(false)
+            }
+          }} loading={loading}>{t('config.refresh')}</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>{t('config.mcp.add')}</Button>
         </Space>
       </div>
@@ -1845,9 +1870,9 @@ function McpConfig() {
                   <Tag>{item.transport}</Tag>
                   {item.enabled && <Tag color="success">{t('config.enabled')}</Tag>}
                   {!item.enabled && <Tag>{t('config.disabled')}</Tag>}
-                  {item.tools && item.tools.length > 0 && (
-                    <Tag color="blue">{item.tools.length} 个工具</Tag>
-                  )}
+                  <Tag color={item.tools && item.tools.length > 0 ? 'blue' : 'default'}>
+                    {item.tools?.length ?? 0} 个工具
+                  </Tag>
                 </Space>
               }
               extra={
@@ -1887,11 +1912,31 @@ function McpConfig() {
         open={modalVisible}
         onOk={handleSave}
         onCancel={() => setModalVisible(false)}
+        confirmLoading={saving}
         width={560}
+        destroyOnClose
       >
         <Form form={form} layout="vertical">
-          <Form.Item name="id" label="ID" help={t('config.mcp.idHelp')}>
-            <Input placeholder="my-mcp-server" disabled={!!editingMcp} />
+          <Form.Item
+            name="id"
+            label="ID"
+            help={t('config.mcp.idHelp') || '唯一标识，只支持字母、数字、下划线、连字符、点（留空则自动生成）'}
+            rules={[
+              {
+                pattern: /^$|^[a-zA-Z0-9._-]*$/,
+                message: 'ID 只能包含字母、数字、下划线、连字符、点',
+              },
+            ]}
+          >
+            <Input
+              placeholder="my-mcp-server"
+              disabled={!!editingMcp}
+              onChange={(e) => {
+                // Auto-replace non-ASCII chars in ID field
+                const val = e.target.value.replace(/[^a-zA-Z0-9._-]/g, '_')
+                e.target.value = val
+              }}
+            />
           </Form.Item>
           <Form.Item name="name" label={t('config.mcp.nameLabel')} rules={[{ required: true, message: t('config.mcp.nameRequired') }]}>
             <Input placeholder={t('config.mcp.namePlaceholder')} />
@@ -1942,6 +1987,17 @@ function McpConfig() {
                     style={{ fontFamily: 'monospace', fontSize: 12 }}
                   />
                 </Form.Item>
+                <Form.Item
+                  name="scopeText"
+                  label={t('config.mcp.scopeLabel', 'Scope 关键词 (触发意图匹配)')}
+                  extra="消息中出现这些关键词时激活该 MCP 的工具，每行一个关键词"
+                >
+                  <Input.TextArea
+                    placeholder={"jira\nissue\nbug\ntask"}
+                    rows={2}
+                    style={{ fontFamily: 'monospace', fontSize: 12 }}
+                  />
+                </Form.Item>
                 </>
               )
             }
@@ -1950,22 +2006,51 @@ function McpConfig() {
             <Switch />
           </Form.Item>
 
-          {/* 工具列表展示 - 仅在编辑模式下且存在工具时显示 */}
-          {editingMcp && editingMcp.tools && editingMcp.tools.length > 0 && (
-            <div style={{ marginTop: 16, padding: 12, background: '#f5f5f5', borderRadius: 6 }}>
-              <Text strong style={{ fontSize: 14 }}>可用工具 ({editingMcp.tools.length}个)</Text>
-              <div style={{ marginTop: 8, maxHeight: 200, overflow: 'auto' }}>
-                {editingMcp.tools.map((tool, index) => (
-                  <div key={index} style={{ marginBottom: 8, padding: 8, background: '#fff', borderRadius: 4 }}>
-                    <Text style={{ fontSize: 13, fontWeight: 500 }}>{tool.name}</Text>
-                    {tool.description && (
-                      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 2 }}>
-                        {tool.description}
-                      </Text>
-                    )}
-                  </div>
-                ))}
-              </div>
+          {/* 工具列表展示 - 仅在编辑模式下显示 */}
+          {editingMcp && (
+            <div style={{ marginTop: 16, padding: 12, background: '#fafafa', borderRadius: 6, border: '1px solid #f0f0f0' }}>
+              <Space style={{ marginBottom: 8 }}>
+                <Text strong style={{ fontSize: 14 }}>发现工具 ({editingMcp.tools?.length ?? 0}个)</Text>
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined spin={discoveringToolsId === editingMcp.id} />}
+                  loading={discoveringToolsId === editingMcp.id}
+                  onClick={async () => {
+                    if (!editingMcp.id) return
+                    setDiscoveringToolsId(editingMcp.id)
+                    try {
+                      const result = await api.discoverMcpTools(editingMcp.id)
+                      setEditingMcp(prev => prev ? { ...prev, tools: result.tools || [] } : null)
+                      message.success(t('config.mcp.toolsDiscovered'))
+                    } catch (e) {
+                      console.error(e)
+                      message.error(t('config.mcp.discoverFailed'))
+                    } finally {
+                      setDiscoveringToolsId(null)
+                    }
+                  }}
+                >
+                  {discoveringToolsId === editingMcp.id ? '连接中…' : '刷新'}
+                </Button>
+              </Space>
+              {editingMcp.tools && editingMcp.tools.length > 0 ? (
+                <div style={{ maxHeight: 300, overflow: 'auto' }}>
+                  {editingMcp.tools.map((tool, index) => (
+                    <div key={index} style={{ marginBottom: 10, padding: '8px 10px', background: '#fff', borderRadius: 4, border: '1px solid #f0f0f0' }}>
+                      <Text code style={{ fontSize: 12 }}>{tool.name}</Text>
+                      {tool.description && (
+                        <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+                          {tool.description.length > 200 ? tool.description.slice(0, 200) + '...' : tool.description}
+                        </Text>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  暂未发现工具（可能是连接超时或 MCP 服务器未启动）
+                </Text>
+              )}
             </div>
           )}
         </Form>

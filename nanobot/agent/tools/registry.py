@@ -1,6 +1,8 @@
 """Tool registry for dynamic tool management."""
 
 import asyncio
+import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -24,6 +26,7 @@ class ToolRegistry:
     def __init__(self, thread_pool_executor: ThreadPoolExecutor | None = None):
         self._tools: dict[str, Tool] = {}
         self._thread_pool_executor = thread_pool_executor
+        self._loaded_deferred_tools: set[str] = set()  # deferred tools whose full schema has been loaded
     
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -68,6 +71,17 @@ class ToolRegistry:
         if not tool:
             return format_tool_not_found(name)
 
+        # Deferred MCP tool: return schema in result so LLM can retry with correct params
+        if getattr(tool, "deferred", False) and name not in self._loaded_deferred_tools:
+            self._loaded_deferred_tools.add(name)
+            full_schema = tool.to_schema()
+            func = full_schema.get("function", {})
+            return (
+                f"[DEFERRED_TOOL_LOADED] Deferred MCP tool '{name}' schema loaded. "
+                f"Please call it again with appropriate parameters. "
+                f"Parameters schema: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}"
+            )
+
         try:
             errors = tool.validate_params(params)
             if errors:
@@ -102,6 +116,17 @@ class ToolRegistry:
         if not tool:
             return format_tool_not_found(name)
 
+        # Deferred MCP tool: defer loading to avoid executing with wrong params
+        if getattr(tool, "deferred", False) and name not in self._loaded_deferred_tools:
+            self._loaded_deferred_tools.add(name)
+            full_schema = tool.to_schema()
+            func = full_schema.get("function", {})
+            return (
+                f"[DEFERRED_TOOL_LOADED] Deferred MCP tool '{name}' schema loaded. "
+                f"Please call it again with appropriate parameters. "
+                f"Parameters schema: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}"
+            )
+
         try:
             errors = tool.validate_params(params)
             if errors:
@@ -135,3 +160,76 @@ class ToolRegistry:
     
     def __contains__(self, name: str) -> bool:
         return name in self._tools
+
+    def search_tools(
+        self,
+        query: str,
+        mcp_server_scopes: dict[str, list[str]],
+        max_results: int = 8,
+    ) -> list[dict[str, Any]]:
+        """
+        Search and rank MCP tools by relevance to a query.
+
+        Scoring (MCP tools only; built-in tools are handled in _select_tools_default):
+        - Tool name exact keyword match: +10
+        - Tool name substring match: +5
+        - Tool description keyword match: +3
+        - Server scope keyword match: +5 per keyword
+        MCP tools get a 1.5x score multiplier.
+
+        Args:
+            query: User message to match against
+            mcp_server_scopes: server_id → [scope keywords] mapping
+            max_results: Maximum number of results to return
+
+        Returns:
+            List of tool schema dicts sorted by relevance score (descending)
+        """
+        if not query or not query.strip():
+            return []
+
+        query_lower = query.lower()
+        query_tokens = re.findall(r"[a-z0-9]{2,}", query_lower)
+        if not query_tokens:
+            return []
+
+        scored: list[tuple[float, str]] = []
+
+        for tool in self._tools.values():
+            # Only score MCP tools; built-in tools handled separately
+            server_id = getattr(tool, "server_id", None)
+            if not server_id:
+                continue
+
+            score = 0.0
+            name_lower = tool.name.lower()
+            desc_lower = tool.description.lower()
+
+            # Name and description keyword matching
+            for token in query_tokens:
+                if token in name_lower:
+                    score += 10 if token == name_lower else 5
+                if token in desc_lower:
+                    score += 3
+
+            # Server scope bonus (already matched in _select_tools_default, here as tiebreaker)
+            if server_id in mcp_server_scopes:
+                for scope_kw in mcp_server_scopes[server_id]:
+                    if scope_kw in query_lower:
+                        score += 5
+
+            score *= 1.5
+
+            if score > 0:
+                scored.append((score, tool.name))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        results = []
+        for _, name in scored[:max_results]:
+            tool = self._tools.get(name)
+            if tool:
+                results.append(tool.to_schema())
+
+        logger.debug(f"[ToolSearch] query={query_lower!r}, tokens={query_tokens}, scored={len(scored)}, returned={len(results)}")
+        return results

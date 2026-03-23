@@ -131,6 +131,12 @@
     "errorBoundaryTitle": "聊天加载异常",
     "errorBoundaryUnknown": "未知错误",
     "errorBoundaryRetry": "重试",
+    "toolMode": "工具模式",
+    "toolModeDisable": "禁用",
+    "toolModeAuto": "自动",
+    "toolModeSpecified": "指定",
+    "toolModeServerSelect": "选择 MCP 服务器",
+    "toolModeNoServers": "无可用的 MCP 服务器",
     "tasks": {
       "title": "Claude Code 任务",
       "running": "运行中",
@@ -277,6 +283,7 @@
       "enableSmartParallelHelp": "使用LLM判断工具是否可以并行执行",
       "smartParallelModel": "智能并行判断模型",
       "smartParallelModelHelp": "留空使用默认轻量模型",
+      "smartParallelModelPlaceholder": "留空使用默认模型",
       "saveSuccess": "并发配置已更新",
       "saveFailed": "保存失败"
     },
@@ -325,6 +332,10 @@
     "notEnabled": "未启用",
     "notSet": "未设置",
     "save": "保存更改",
+    "saveSuccess": "保存成功",
+    "saveFailed": "保存失败",
+    "refresh": "刷新",
+    "discoveryFailed": "发现失败",
     "configUpdated": "配置已更新",
     "updateFailed": "更新失败",
     "loadChannelsFailed": "加载 IM 配置失败",
@@ -399,7 +410,10 @@
       "urlRequired": "http/sse 需填写 URL",
       "updated": "更新成功",
       "created": "创建成功",
-      "saveFailed": "保存失败"
+      "saveFailed": "保存失败",
+      "scopeLabel": "Scope 关键词",
+      "toolsDiscovered": "工具已发现",
+      "discoverFailed": "发现工具失败"
     },
     "skills": "技能",
     "skillsPanel": {

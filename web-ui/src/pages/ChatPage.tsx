@@ -1,13 +1,13 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useLocation } from 'react-router-dom'
-import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Tag, Modal, Popconfirm } from 'antd'
-import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
+import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Tag, Modal, Popconfirm, Checkbox, Popover } from 'antd'
+import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, MessageOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { api } from '../api'
-import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, SubagentProgressEvent, StreamEvent } from '../types'
+import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, SubagentProgressEvent, StreamEvent, McpServer } from '../types'
 import './ChatPage.css'
 import 'highlight.js/styles/github-dark.css'
 import { useTaskPolling } from '../hooks/useTaskPolling'
@@ -188,6 +188,10 @@ function ChatPage() {
   })
   const [tasks, setTasks] = useState<Task[]>([])
   const [currentModelName, setCurrentModelName] = useState<string>('')
+  // 工具模式选择
+  const [toolMode, setToolMode] = useState<'disable' | 'auto' | 'specified'>('auto')
+  const [selectedMcpServers, setSelectedMcpServers] = useState<string[]>([])
+  const [availableMcps, setAvailableMcps] = useState<McpServer[]>([])
   // 使用 ref 来跟踪是否需要轮询（避免 useEffect 依赖问题）
   const pollingEnabledRef = useRef(true)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -473,6 +477,7 @@ function ChatPage() {
       console.warn('Chat stream reconnect failed:', err)
     } finally {
       isStreamingRef.current = false
+      isRestoringRef.current = false
       setLoading(false)
       setStreamingToolSteps([])
       setStreamingThinking(false)
@@ -520,6 +525,15 @@ function ChatPage() {
       setBgAgents([])
     }
   }, [currentSession?.id])
+
+  // 工具模式切换到 specified 时加载 MCP 列表
+  useEffect(() => {
+    if (toolMode === 'specified') {
+      api.getMcps().then(data => {
+        setAvailableMcps(data || [])
+      }).catch(console.error)
+    }
+  }, [toolMode])
 
   // 页面可见性变化处理
   useEffect(() => {
@@ -634,6 +648,20 @@ function ChatPage() {
     document.addEventListener('visibilitychange', onVisible)
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [loadCurrentModel])
+
+  // 加载 MCP 服务器列表（仅在可见性变化时刷新，避免每次 session 切换都请求）
+  useEffect(() => {
+    api.getMcps().then(setAvailableMcps).catch(() => setAvailableMcps([]))
+  }, [])
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        api.getMcps().then(setAvailableMcps).catch(() => setAvailableMcps([]))
+      }
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [])
 
   // Session 切换时恢复状态
   useEffect(() => {
@@ -912,6 +940,8 @@ function ChatPage() {
         handleStreamEvent,
         controller.signal,
         imagesToSend.length > 0 ? imagesToSend : undefined,
+        toolMode,
+        toolMode === 'specified' ? selectedMcpServers : undefined,
       )
       if (imagesToSend.length > 0) {
         setImageSendStatus(prev => {
@@ -948,22 +978,18 @@ function ChatPage() {
       // 标记流式传输结束
       isStreamingRef.current = false
 
-      // 如果页面正在恢复（可见性变化导致的状态恢复），则需要根据情况处理
+      // 如果页面正在恢复（可见性变化导致的状态恢复），统一清理所有状态后返回
+      // 无论 savedState.loading 是什么值，handleSend 的 finally 代表流已结束，必须清除 loading
       if (isRestoringRef.current && currentSession) {
-        const savedState = loadStreamingState(currentSession.id)
-
-        // 如果请求已完成（savedState.loading 为 false），清除 loading
-        // 如果请求仍在进行中（savedState.loading 为 true），保留 loading
-        if (savedState && !savedState.loading) {
-          setLoading(false)
-          abortControllerRef.current = null
-          // 请求完成，清理 taskId
-          currentTaskIdRef.current = null
-          setPollingTaskId(null)
-        }
-        // 无论哪种情况，都清除恢复标志和 sessionStorage
         clearStreamingState(currentSession.id)
         isRestoringRef.current = false
+        setLoading(false)
+        abortControllerRef.current = null
+        currentTaskIdRef.current = null
+        setPollingTaskId(null)
+        setStreamingToolSteps([])
+        setStreamingThinking(false)
+        setClaudeCodeProgress('')
         return
       }
 
@@ -1394,9 +1420,70 @@ function ChatPage() {
               {(loading || runningBgAgentsCount > 0) ? t('chat.stop') : t('chat.send')}
             </Button>
           </div>
-          <div className="chat-token-summary">
-            <Text type="secondary">
-              {t('chat.tokenUsageSummary', {
+          <div className="chat-tool-status-row">
+            <Popover
+              trigger="click"
+              placement="bottomLeft"
+              content={
+                toolMode !== 'specified' ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 120 }}>
+                    {(['disable', 'auto', 'specified'] as const).map(mode => (
+                      <Button
+                        key={mode}
+                        type={toolMode === mode ? 'primary' : 'text'}
+                        size="small"
+                        block
+                        onClick={() => setToolMode(mode)}
+                        style={{ textAlign: 'left' }}
+                      >
+                        {mode === 'disable' ? t('chat.toolModeDisable') : mode === 'auto' ? t('chat.toolModeAuto') : t('chat.toolModeSpecified')}
+                      </Button>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ minWidth: 180 }}>
+                    <div style={{ marginBottom: 8, fontSize: 12, color: '#888' }}>{t('chat.toolModeServerSelect')}</div>
+                    {availableMcps.length === 0 ? (
+                      <div style={{ color: '#888', fontSize: 12 }}>{t('chat.toolModeNoServers')}</div>
+                    ) : (
+                      <Checkbox.Group
+                        value={selectedMcpServers}
+                        onChange={(vals) => setSelectedMcpServers(vals as string[])}
+                        style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
+                      >
+                        {availableMcps.filter(m => m.enabled).map(mcp => (
+                          <Checkbox key={mcp.id} value={mcp.id} style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                            {mcp.name}
+                          </Checkbox>
+                        ))}
+                      </Checkbox.Group>
+                    )}
+                    <Button
+                      type="text"
+                      size="small"
+                      onClick={() => setToolMode('auto')}
+                      style={{ marginTop: 8, fontSize: 12, padding: '0' }}
+                    >
+                      ← {t('chat.toolModeAuto')}
+                    </Button>
+                  </div>
+                )
+              }
+            >
+              <Tooltip title={t('chat.toolMode')}>
+                <Button
+                  type="text"
+                  icon={<SettingOutlined />}
+                  disabled={!currentSession || loading}
+                  style={{
+                    color: toolMode === 'disable' ? '#bbb' : '#1890ff',
+                    fontSize: 16,
+                  }}
+                />
+              </Tooltip>
+            </Popover>
+            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+              {t('chat.tokenUsageInline', {
                 input: formatTokenNumber(sessionTokenUsage.promptTokens),
                 output: formatTokenNumber(sessionTokenUsage.completionTokens),
                 total: formatTokenNumber(sessionTokenUsage.totalTokens),

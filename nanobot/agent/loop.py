@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import json
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -269,7 +270,8 @@ class AgentLoop:
         self._mcp_loop_id: int | None = None
         self._mcp_fail_time: float = 0.0
         self.mcp_loader = None  # 由 _init_mcp_loader 异步填充
-        self._mcp_init_event = asyncio.Event()  # MCP 初始化完成后置位
+        self._mcp_init_event = threading.Event()  # MCP 初始化完成后置位
+        self._mcp_server_scopes: dict[str, list[str]] = {}  # server_id → scope keywords
         self._cancel_event = asyncio.Event()
         self._cancelled_sessions: set[str] = set()  # 按 session 取消，支持多会话并发
         # 初始化执行链路监控
@@ -285,73 +287,145 @@ class AgentLoop:
         # MCP 加载移到 run() 里直接 await，避免 create_task 调度到从未运行的 loop
 
 
-    def _select_tools_for_message(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
+    def _select_tools_for_message(
+        self,
+        message: str,
+        max_tools: int = 12,
+        tool_mode: str | None = None,
+        selected_mcp_servers: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """
         根据消息内容通过关键词匹配选择相关工具定义。
 
         Args:
             message: 用户消息内容
             max_tools: 最大返回工具数量
-
+            tool_mode: 'disable' | 'auto' | 'specified' | None
+                - 'disable': 不使用任何 MCP 工具
+                - 'specified': 只使用 selected_mcp_servers 中的 MCP 工具
+                - 'auto' 或 None: 系统自动决定（使用 scope 匹配）
         Returns:
             选中的工具定义列表
         """
-        logger.debug(f"[ToolSelect] smart={self._smart_tool_selection}, total_tools={len(self.tools.tool_names)}")
+        logger.debug(f"[ToolSelect] smart={self._smart_tool_selection}, total_tools={len(self.tools.tool_names)}, tool_mode={tool_mode}")
         if not self._smart_tool_selection:
             defs = self.tools.get_definitions()
             logger.debug(f"[ToolSelect] fast path, returning {len(defs)} tools")
             return defs
-        return self._select_tools_default(message, max_tools)
+        return self._select_tools_default(message, max_tools, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
 
-    def _select_tools_default(self, message: str, max_tools: int = 12) -> list[dict[str, Any]]:
+
+    def _select_tools_default(
+        self,
+        message: str,
+        max_tools: int = 12,
+        tool_mode: str | None = None,
+        selected_mcp_servers: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """
-        默认的工具选择逻辑（原有实现）。
+        默认的工具选择逻辑，支持 scope 关键词过滤和语义搜索。
+
+        工具选择顺序：
+        1. Essential tools（始终包含）
+        2. MCP tools from matched scopes，按相关性评分排序（最多 max_tools - len(essential) 个）
+        3. Keyword 匹配的内置工具（填满剩余 slot）
 
         Args:
             message: 用户消息内容
             max_tools: 最大返回工具数量
+            tool_mode: 'disable' | 'auto' | 'specified' | None
+                - 'disable': 不使用任何 MCP 工具
+                - 'specified': 只使用 selected_mcp_servers 中的 MCP 工具
+                - 'auto' 或 None: 系统自动决定（使用 scope 匹配）
+            selected_mcp_servers: 当 tool_mode='specified' 时，指定允许的 MCP server id 列表
 
         Returns:
             选中的工具定义列表
         """
         all_tool_names = self.tools.tool_names
         mcp_tools = [n for n in all_tool_names if n.startswith("mcp_")]
-        logger.debug(f"[ToolSelect] total={len(all_tool_names)}, mcp={len(mcp_tools)}, essential={len(ESSENTIAL_TOOLS)}, max_tools={max_tools}")
+        logger.debug(f"[ToolSelect] total={len(all_tool_names)}, mcp={len(mcp_tools)}, essential={len(ESSENTIAL_TOOLS)}, max_tools={max_tools}, tool_mode={tool_mode}")
 
-        # Priority 1: Always include essential tools
-        # Priority 2: Always include MCP tools (user-configured, should not be excluded)
-        selected_names: set[str] = set(ESSENTIAL_TOOLS)
-        for tool_name in all_tool_names:
-            if tool_name.startswith("mcp_"):
-                selected_names.add(tool_name)
-                if len(selected_names) >= max_tools:
-                    break
+        # Step 1: Always include essential tools
+        essential_names = set(ESSENTIAL_TOOLS)
+        remaining_slots = max_tools - len(essential_names)
 
-        # If MCP tools already filled the budget, return early
-        if len(selected_names) >= max_tools:
-            definitions = []
-            for name in list(selected_names)[:max_tools]:
-                tool = self.tools.get(name)
-                if tool:
-                    definitions.append(tool.to_schema())
-            logger.debug(f"[ToolSelect] early return with {len(definitions)} tools: {list(selected_names)[:max_tools]}")
-            return definitions
-
-        # Priority 3: Fill remaining slots with keyword-matched tools
+        # Step 2: MCP tool selection based on tool_mode
         message_lower = message.lower()
+        matched_server_ids: set[str] = set()
+        mcp_selected: list[str] = []
+
+        if tool_mode == "specified":
+            if selected_mcp_servers:
+                # User-specified MCP servers: include ALL tools from these servers, no limit
+                matched_server_ids = set(selected_mcp_servers)
+                logger.debug(f"[ToolSelect] specified MCP servers: {matched_server_ids}")
+                # Get all tools from matched servers (no max_results limit)
+                for tool_name in mcp_tools:
+                    parts = tool_name.split("_", 2)
+                    if len(parts) >= 2 and parts[1] in matched_server_ids:
+                        mcp_selected.append(tool_name)
+                logger.debug(f"[ToolSelect] specified mode: included {len(mcp_selected)} MCP tools from servers")
+            else:
+                logger.debug("[ToolSelect] specified mode with no servers selected, skipping MCP tools")
+        elif tool_mode == "auto":
+            # Auto mode: use scope-based matching with semantic search and limit
+            if self._mcp_server_scopes:
+                for server_id, scope_keywords in self._mcp_server_scopes.items():
+                    if any(kw in message_lower for kw in scope_keywords):
+                        matched_server_ids.add(server_id)
+                logger.debug(f"[ToolSelect] matched scopes: {matched_server_ids or 'none'} (message: {message[:50]!r})")
+
+            # Search and rank MCP tools from matched servers
+            if matched_server_ids:
+                search_results = self.tools.search_tools(message, self._mcp_server_scopes, max_results=remaining_slots)
+                for schema in search_results:
+                    tool_name = schema.get("function", {}).get("name", "")
+                    parts = tool_name.split("_", 2)
+                    if len(parts) >= 2 and parts[1] in matched_server_ids:
+                        mcp_selected.append(tool_name)
+                logger.debug(f"[ToolSelect] MCP search: search_results={len(search_results)}, selected={len(mcp_selected)}")
+        else:
+            if tool_mode == "disable":
+                logger.debug("[ToolSelect] MCP tools disabled by user")
+
+        # Step 3: Built-in keyword-matched tools
+        builtin_selected: list[str] = []
+        slots_left = remaining_slots - len(mcp_selected)
+        # In specified mode: include all keyword-matched built-ins (no slot limit)
+        # Otherwise: only fill remaining slots after MCP tools
+        builtin_scored: list[tuple[int, str]] = []
         for tool_name, keywords in TOOL_KEYWORDS.items():
-            if tool_name in selected_names:
+            if tool_name in essential_names:
                 continue
-            if any(kw in message_lower for kw in keywords):
-                selected_names.add(tool_name)
-                if len(selected_names) >= max_tools:
-                    break
+            match_count = sum(1 for kw in keywords if kw in message_lower)
+            if match_count > 0:
+                builtin_scored.append((match_count, tool_name))
+        builtin_scored.sort(key=lambda x: x[0], reverse=True)
+        if tool_mode == "specified":
+            builtin_selected = [name for _, name in builtin_scored]
+        elif slots_left > 0:
+            builtin_selected = [name for _, name in builtin_scored[:slots_left]]
+
+        # Merge: essential + MCP + built-in
+        final_names = list(essential_names) + mcp_selected + builtin_selected
+        logger.debug(f"[ToolSelect] final: essential={len(essential_names)}, mcp={len(mcp_selected)}, builtin={len(builtin_selected)}, total={len(final_names)}")
 
         definitions = []
-        for name in selected_names:
+        # In specified mode: include all MCP tools without truncation; otherwise apply max_tools limit
+        tool_limit = None if tool_mode == "specified" else max_tools
+        for name in final_names[:tool_limit]:
             tool = self.tools.get(name)
-            if tool:
-                definitions.append(tool.to_schema())
+            if not tool:
+                continue
+            schema = tool.to_schema()
+            # Deferred MCP tools: inject placeholder (no parameter schema exposed to LLM)
+            # to avoid token bloat. The full schema is loaded on first call.
+            if tool.deferred and name not in self.tools._loaded_deferred_tools:
+                func = schema.setdefault("function", {})
+                func["description"] = f"[Deferred MCP tool] {func.get('description', '')} Call this tool to load its full schema."
+                func["parameters"] = {"type": "object", "properties": {}}
+            definitions.append(schema)
 
         return definitions
 
@@ -1089,7 +1163,9 @@ class AgentLoop:
 
     async def _init_mcp_loader(self) -> None:
         """Initialize MCP tool loader from config - 按需加载模式。"""
-        logger.debug(f"[MCP] _init_mcp_loader starting, self.id={id(self)}, tools.id={id(self.tools)}")
+        import asyncio as _asyncio
+        _loop_id = id(_asyncio.get_running_loop())
+        logger.debug(f"[MCP] _init_mcp_loader starting, loop_id={_loop_id}, _mcp_loaded={self._mcp_loaded}, _mcp_loop_id={self._mcp_loop_id}, tools_mcp_count={len([n for n in self.tools.tool_names if n.startswith('mcp_')])}")
         self.mcp_loader = None
         self._mcp_loaded = False  # 标记：是否已完成按需加载
         self._mcp_loop_id = None
@@ -1115,11 +1191,17 @@ class AgentLoop:
 
                 server_id = getattr(mcp_cfg, "id", "") or self._safe_mcp_id(getattr(mcp_cfg, "name", "mcp"))
 
+                # 注册该 MCP server 的 scope 关键词（用于工具选择时过滤）
+                scope = getattr(mcp_cfg, "scope", None) or []
+                if scope:
+                    self._mcp_server_scopes[server_id] = [s.lower() for s in scope]
+
                 # 获取该 MCP 的工具列表（从配置中）
                 # 由于是懒加载，我们不知道具体有哪些工具
                 # 所以我们需要一个通用的方法来获取工具列表
                 # 这里我们先尝试获取，如果失败则注册一个通用代理
                 tools = getattr(mcp_cfg, "tools", None) or []
+                logger.debug(f"[MCP] _init_mcp_loader_inner: server={server_id}, yaml_tools={len(tools)}, mcps_total={len(mcps)}")
 
                 if tools:
                     # 如果配置中指定了工具列表，直接注册
@@ -1145,40 +1227,89 @@ class AgentLoop:
                         logger.debug(f"[Tools] Registered MCP tool '{tool_name}' to registry id={id(self.tools)}, total now={len(self.tools.tool_names)}")
 
                     logger.info(f"MCP {server_id}: registered {len(lazy_tools)} lazy tools (will connect on first call)")
+                    self._mcp_loaded = True
                 else:
                     # 配置中没有声明工具列表，尝试一次连接获取工具列表（一次性，之后懒加载）
+                    discovered = []
                     try:
                         discovered = await self._discover_mcp_tools(server_id, mcp_cfg)
-                        if discovered:
-                            # 将发现的工具保存到配置中，供前端展示
-                            mcp_cfg.tools = discovered
-                            try:
-                                from nanobot.config.loader import save_config
-                                save_config(config)
-                                logger.info(f"MCP {server_id}: discovered and saved {len(discovered)} tools to config")
-                            except Exception as save_err:
-                                logger.warning(f"MCP {server_id}: failed to save discovered tools to config: {save_err}")
-
-                            # 将发现的工具注册为懒加载适配器
-                            from nanobot.agent.tools.mcp import McpLazyToolAdapter
-                            lazy_tools: dict[str, McpLazyToolAdapter] = {}
-                            for tool_spec in discovered:
-                                tool_name = tool_spec["name"]
-                                adapter = McpLazyToolAdapter(
-                                    server_id=server_id,
-                                    tool_name=tool_name,
-                                    description=tool_spec.get("description") or f"MCP tool {tool_name}",
-                                    parameters=tool_spec.get("parameters") or {"type": "object", "properties": {}},
-                                    mcp_loader=self.mcp_loader,
-                                    lazy_tools=lazy_tools,
-                                )
-                                lazy_tools[tool_name] = adapter
-                                self.tools.register(adapter)
-                            logger.info(f"MCP {server_id}: discovered {len(lazy_tools)} tools, registered as lazy")
-                        else:
-                            logger.debug(f"MCP {server_id}: no tools discovered, skipping registration")
                     except Exception as e:
-                        logger.warning(f"MCP {server_id}: tool discovery failed: {e}")
+                        logger.warning(f"MCP {server_id}: tool discovery error: {e}")
+
+                    if discovered:
+                        # 将发现的工具保存到 YAML 配置（供前端展示）和 SQLite（跨进程持久化）
+                        mcp_cfg.tools = discovered
+                        try:
+                            from nanobot.config.loader import save_config, get_config_repository
+                            save_config(config)
+                            # 同时写入 SQLite（跨重启持久化，discover_mcp_tools 也用这个路径）
+                            repo = get_config_repository()
+                            repo.set_mcp(
+                                mcp_id=mcp_cfg.id,
+                                name=getattr(mcp_cfg, "name", "") or "",
+                                transport=getattr(mcp_cfg, "transport", "stdio") or "stdio",
+                                command=getattr(mcp_cfg, "command", None),
+                                args=getattr(mcp_cfg, "args", None) or [],
+                                url=getattr(mcp_cfg, "url", None),
+                                enabled=getattr(mcp_cfg, "enabled", True),
+                                env=dict(getattr(mcp_cfg, "env", None) or {}),
+                                headers=dict(getattr(mcp_cfg, "headers", None) or {}),
+                                scope=list(getattr(mcp_cfg, "scope", None) or []),
+                                tools=discovered,
+                            )
+                            logger.info(f"MCP {server_id}: discovered and saved {len(discovered)} tools to config + SQLite")
+                        except Exception as save_err:
+                            logger.warning(f"MCP {server_id}: failed to persist tools: {save_err}")
+
+                        # 将发现的工具注册为懒加载适配器
+                        from nanobot.agent.tools.mcp import McpLazyToolAdapter
+                        lazy_tools: dict[str, McpLazyToolAdapter] = {}
+                        for tool_spec in discovered:
+                            tool_name = tool_spec["name"]
+                            adapter = McpLazyToolAdapter(
+                                server_id=server_id,
+                                tool_name=tool_name,
+                                description=tool_spec.get("description") or f"MCP tool {tool_name}",
+                                parameters=tool_spec.get("parameters") or {"type": "object", "properties": {}},
+                                mcp_loader=self.mcp_loader,
+                                lazy_tools=lazy_tools,
+                            )
+                            lazy_tools[tool_name] = adapter
+                            self.tools.register(adapter)
+                        logger.info(f"MCP {server_id}: discovered {len(lazy_tools)} tools, registered as lazy")
+                        self._mcp_loaded = True
+                    else:
+                        # Discovery 失败：从 SQLite 读取已保存的工具（跨重启持久化）
+                        try:
+                            from nanobot.config.loader import get_config_repository
+                            repo = get_config_repository()
+                            stored = repo.get_mcp(mcp_cfg.id)
+                            stored_tools = (stored.get("tools") or []) if stored else []
+                            if stored_tools:
+                                logger.info(f"MCP {server_id}: discovery failed, loading {len(stored_tools)} tools from SQLite")
+                                mcp_cfg.tools = stored_tools
+                                from nanobot.agent.tools.mcp import McpLazyToolAdapter
+                                lazy_tools: dict[str, McpLazyToolAdapter] = {}
+                                for tool_spec in stored_tools:
+                                    tool_name = tool_spec.get("name")
+                                    if not tool_name:
+                                        continue
+                                    adapter = McpLazyToolAdapter(
+                                        server_id=server_id,
+                                        tool_name=tool_name,
+                                        description=tool_spec.get("description") or f"MCP tool {tool_name}",
+                                        parameters=tool_spec.get("parameters") or {"type": "object", "properties": {}},
+                                        mcp_loader=self.mcp_loader,
+                                        lazy_tools=lazy_tools,
+                                    )
+                                    lazy_tools[tool_name] = adapter
+                                    self.tools.register(adapter)
+                                logger.info(f"MCP {server_id}: loaded {len(lazy_tools)} tools from SQLite fallback")
+                                self._mcp_loaded = True
+                            else:
+                                logger.debug(f"MCP {server_id}: no tools discovered and no SQLite fallback, skipping registration")
+                        except Exception as fallback_err:
+                            logger.debug(f"MCP {server_id}: SQLite fallback error: {fallback_err}")
 
                 # 汇总日志（for 循环外部，但仍在外层 try 内）
             mcp_tool_names = [n for n in self.tools.tool_names if n.startswith("mcp_")]
@@ -1187,6 +1318,16 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"MCP loader init skipped: {e}", exc_info=True)
         finally:
+            import asyncio as _asyncio
+            try:
+                _loop_id = id(_asyncio.get_running_loop())
+            except RuntimeError:
+                _loop_id = 0
+            _mcp_count = len([n for n in self.tools.tool_names if n.startswith('mcp_')])
+            # Record the loop where MCP tools were loaded (used by reload check in _process_message)
+            if self._mcp_loaded:
+                self._mcp_loop_id = _loop_id
+            logger.info(f"[MCP] _init_mcp_loader done, loop={_loop_id}, _mcp_loaded={self._mcp_loaded}, mcp_tools={_mcp_count}")
             self._mcp_init_event.set()
 
     async def _discover_mcp_tools(self, server_id: str, mcp_cfg: Any) -> list[dict[str, Any]]:
@@ -1228,16 +1369,31 @@ class AgentLoop:
         Reload MCP config and tools (hot-add). Call after MCP create/update/delete.
         使用懒加载模式：重新注册工具代理。
         """
+        import asyncio as _asyncio
+        _loop_id = id(_asyncio.get_running_loop()) if hasattr(_asyncio, 'get_running_loop') else 0
+        logger.info(f"[MCP] reload_mcp_config called, current_loop={_loop_id}, _mcp_loop_id={self._mcp_loop_id}, _mcp_loaded={self._mcp_loaded}")
         # Unregister existing MCP tools
         removed = self.tools.unregister_by_prefix("mcp_")
         if removed:
             logger.debug(f"MCP: unregistered {removed} tools for reload")
+
+        # 关闭旧的 loader（在同一 async context 中，避免 "different task" 错误）
+        old_loader = self.mcp_loader
+        self.mcp_loader = None
 
         # 重置状态
         self._mcp_loaded = False
         self._mcp_loop_id = None
         self._mcp_fail_time = 0.0
         self._mcp_init_event.clear()  # 重置事件，等待新加载完成
+
+        # 先关闭旧 sessions，再初始化新的
+        if old_loader:
+            try:
+                await old_loader.close()
+                logger.debug("[MCP] Old loader sessions closed")
+            except Exception as e:
+                logger.debug(f"[MCP] Error closing old loader: {e}")
 
         # 重新初始化（会注册新的懒加载工具）
         await self._init_mcp_loader()
@@ -1697,6 +1853,21 @@ class AgentLoop:
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
 
+        # Restore tool mode from session metadata if not set on this message
+        # (tool_mode is only passed on the FIRST message of a session;
+        # subsequent messages must read it from session to keep the same selection)
+        msg_tool_mode = msg.metadata.get("tool_mode") if msg.metadata else None
+        msg_selected_mcp = msg.metadata.get("selected_mcp_servers") if msg.metadata else None
+        if msg_tool_mode:
+            # First message in session: persist tool selection to session
+            session.metadata["tool_mode"] = msg_tool_mode
+            session.metadata["selected_mcp_servers"] = msg_selected_mcp
+            self.sessions.save(session)
+        else:
+            # Subsequent message: restore from session
+            msg_tool_mode = session.metadata.get("tool_mode")
+            msg_selected_mcp = session.metadata.get("selected_mcp_servers")
+
         # Update tool contexts
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
@@ -1731,6 +1902,8 @@ class AgentLoop:
             current_loop_id = id(asyncio.get_running_loop())
         except RuntimeError:
             current_loop_id = None
+        _reload_reason = f"mcp_loader={'Y' if self.mcp_loader else 'N'}, _mcp_loaded={'Y' if self._mcp_loaded else 'N'}, _mcp_loop_id={self._mcp_loop_id}, current_loop={current_loop_id}, reload={'Y' if (self.mcp_loader and self._mcp_loaded and self._mcp_loop_id is not None and current_loop_id != self._mcp_loop_id) else 'N'}"
+        logger.debug(f"[MCP] reload check: {_reload_reason}")
         if self.mcp_loader and self._mcp_loaded and self._mcp_loop_id is not None and current_loop_id != self._mcp_loop_id:
             logger.debug("Event loop changed, reloading MCP for fresh connections")
             await self.reload_mcp_config()
@@ -1950,7 +2123,9 @@ class AgentLoop:
             # Call LLM（单次最长 120 秒，等待期间每 2 秒检查一次取消）
             _LLM_CALL_TIMEOUT = 120
             _CANCEL_CHECK_INTERVAL = 2.0
-            selected_tools = self._select_tools_for_message(msg.content)
+            tool_mode = msg_tool_mode
+            selected_mcp_servers = msg_selected_mcp
+            selected_tools = self._select_tools_for_message(msg.content, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
             try:
                 llm_task = asyncio.create_task(
                     self.provider.chat(
@@ -2711,6 +2886,10 @@ class AgentLoop:
             usage_acc["completion_tokens"] += max(0, int(usage.get("completion_tokens", 0) or 0))
             usage_acc["total_tokens"] += max(0, int(usage.get("total_tokens", 0) or 0))
 
+        # Use tool mode already resolved from msg.metadata / session.metadata
+        tool_mode = msg_tool_mode
+        selected_mcp_servers = msg_selected_mcp
+
         while iteration < self.max_iterations:
             iteration += 1
             
@@ -2722,7 +2901,7 @@ class AgentLoop:
                     logger.info("System msg: max execution time %ds reached", self.max_execution_time)
                     break
 
-            selected_tools = self._select_tools_for_message(msg.content)
+            selected_tools = self._select_tools_for_message(msg.content, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
             # 与主流程一致：LLM 调用期间每 2 秒轮询取消
             _LLM_CALL_TIMEOUT = 120
             _CANCEL_CHECK_INTERVAL = 2.0
@@ -2921,10 +3100,16 @@ class AgentLoop:
         # 这里只做安全检查（如果超时会话内有延迟，仍等待但不阻塞）
         if not self._mcp_init_event.is_set():
             logger.debug("[MCP] Web API: MCP not yet initialized, waiting...")
-            try:
-                await asyncio.wait_for(self._mcp_init_event.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("[MCP] Web API: MCP init still pending after 5s")
+            # threading.Event.wait() is blocking, run in thread pool
+            initialized = await asyncio.to_thread(self._mcp_init_event.wait, timeout=5.0)
+            if not initialized:
+                logger.warning("[MCP] Web API: MCP init still pending after 5s, triggering on-demand init")
+                # 5秒后仍未初始化，说明 run_server 的后台线程可能超时/失败
+                # 在当前事件循环中直接触发一次加载（on-demand fallback）
+                try:
+                    await self._init_mcp_loader()
+                except Exception as e:
+                    logger.warning(f"[MCP] Web API on-demand init failed: {e}")
 
         self._reset_cancel_event(session_key)
         

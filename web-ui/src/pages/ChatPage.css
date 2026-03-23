@@ -491,9 +491,17 @@
   flex-shrink: 0;
 }
 
+.chat-tool-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0 4px 0;
+  min-height: 28px;
+}
+
 .chat-input-row {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 12px;
 }
 
@@ -508,11 +516,6 @@
   min-height: 36px !important;
   line-height: 1.5;
   padding: 6px 12px;
-}
-
-.chat-token-summary {
-  font-size: 12px;
-  text-align: left;
 }
 
 .send-button {

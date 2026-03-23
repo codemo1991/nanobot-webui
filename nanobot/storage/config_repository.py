@@ -107,6 +107,22 @@ class ConfigRepository:
                     conn.commit()
             except Exception:
                 pass
+            # 迁移：已有 config_mcps 表增加 scope_json 列
+            try:
+                cols = {d[1] for d in conn.execute("PRAGMA table_info(config_mcps)").fetchall()}
+                if "scope_json" not in cols:
+                    conn.execute("ALTER TABLE config_mcps ADD COLUMN scope_json TEXT DEFAULT '[]'")
+                    conn.commit()
+            except Exception:
+                pass
+            # 迁移：已有 config_mcps 表增加 tools_json 列（存储 discover 的工具列表）
+            try:
+                cols = {d[1] for d in conn.execute("PRAGMA table_info(config_mcps)").fetchall()}
+                if "tools_json" not in cols:
+                    conn.execute("ALTER TABLE config_mcps ADD COLUMN tools_json TEXT DEFAULT '[]'")
+                    conn.commit()
+            except Exception:
+                pass
             conn.close()
             logger.debug("Base config tables initialized")
         except Exception as e:
@@ -417,6 +433,8 @@ class ConfigRepository:
                     "enabled": bool(row["enabled"]),
                     "env": json.loads(row["env_json"]) if isinstance(row["env_json"], str) else (row["env_json"] if isinstance(row["env_json"], dict) else {}),
                     "headers": json.loads(row["headers_json"]) if isinstance(row["headers_json"], str) else (row["headers_json"] if isinstance(row["headers_json"], dict) else {}),
+                    "scope": json.loads(row["scope_json"]) if isinstance(row["scope_json"], str) else (row["scope_json"] if isinstance(row["scope_json"], list) else []),
+                    "tools": json.loads(row["tools_json"]) if isinstance(row["tools_json"], str) else (row["tools_json"] if isinstance(row["tools_json"], list) else []),
                 }
         except Exception as e:
             logger.warning(f"Failed to get MCP {mcp_id}: {e}")
@@ -438,6 +456,8 @@ class ConfigRepository:
                         "enabled": bool(row["enabled"]),
                         "env": json.loads(row["env_json"]) if isinstance(row["env_json"], str) else (row["env_json"] if isinstance(row["env_json"], dict) else {}),
                         "headers": json.loads(row["headers_json"]) if isinstance(row["headers_json"], str) else (row["headers_json"] if isinstance(row["headers_json"], dict) else {}),
+                        "scope": json.loads(row["scope_json"]) if isinstance(row["scope_json"], str) else (row["scope_json"] if isinstance(row["scope_json"], list) else []),
+                        "tools": json.loads(row["tools_json"]) if isinstance(row["tools_json"], str) else (row["tools_json"] if isinstance(row["tools_json"], list) else []),
                     }
                     for row in rows
                 ]
@@ -449,11 +469,15 @@ class ConfigRepository:
                 command: str | None = None, args: list[str] | None = None,
                 url: str | None = None, enabled: bool = True,
                 env: dict[str, str] | None = None,
-                headers: dict[str, str] | None = None) -> None:
+                headers: dict[str, str] | None = None,
+                scope: list[str] | None = None,
+                tools: list[dict[str, Any]] | None = None) -> None:
         """设置 MCP 配置。"""
         args_json = json.dumps(args or [])
         env_json = json.dumps(env or {})
         headers_json = json.dumps(headers or {})
+        scope_json = json.dumps(scope or [])
+        tools_json = json.dumps(tools or [])
         updated_at = self._get_timestamp()
         created_at = updated_at
         try:
@@ -465,8 +489,8 @@ class ConfigRepository:
                     created_at = existing["created_at"]
                 conn.execute(
                     """
-                    INSERT INTO config_mcps (id, name, transport, command, args_json, url, enabled, env_json, headers_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO config_mcps (id, name, transport, command, args_json, url, enabled, env_json, headers_json, scope_json, tools_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         name=excluded.name,
                         transport=excluded.transport,
@@ -476,9 +500,11 @@ class ConfigRepository:
                         enabled=excluded.enabled,
                         env_json=excluded.env_json,
                         headers_json=excluded.headers_json,
+                        scope_json=excluded.scope_json,
+                        tools_json=excluded.tools_json,
                         updated_at=excluded.updated_at
                     """,
-                    (mcp_id, name, transport, command, args_json, url, int(enabled), env_json, headers_json, created_at, updated_at)
+                    (mcp_id, name, transport, command, args_json, url, int(enabled), env_json, headers_json, scope_json, tools_json, created_at, updated_at)
                 )
         except Exception as e:
             logger.exception(f"Failed to set MCP {mcp_id}")

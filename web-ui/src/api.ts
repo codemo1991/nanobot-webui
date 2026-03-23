@@ -91,10 +91,14 @@ export const api = {
     content: string,
     onEvent: (evt: StreamEvent) => void,
     signal?: AbortSignal,
-    images?: string[]
+    images?: string[],
+    toolMode?: 'disable' | 'auto' | 'specified',
+    selectedMcpServers?: string[]
   ): Promise<ChatResponse> {
     const body: Record<string, unknown> = { content }
     if (images && images.length > 0) body.images = images
+    if (toolMode) body.tool_mode = toolMode
+    if (selectedMcpServers && selectedMcpServers.length > 0) body.selected_mcp_servers = selectedMcpServers
     const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/messages?stream=1`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -135,7 +139,8 @@ export const api = {
               throw new Error('message' in evt ? evt.message : 'Stream error')
             }
           } catch (e) {
-            throw e  // 重抛任何异常，不吞掉非 Error 类型
+            if (e instanceof SyntaxError) continue  // 跳过格式错误的 SSE 行，不终止整个流
+            throw e
           }
         }
         if (done) break
@@ -316,6 +321,10 @@ export const api = {
 
   // MCPs
   getMcps: () => request<import('./types').McpServer[]>('/mcps'),
+
+  getMcpsWithTools: () => request<import('./types').McpServer[]>('/mcps/with-tools'),
+
+  discoverMcpTools: (mcpId: string) => request<{ tools: Array<{ name: string; description: string; parameters: Record<string, unknown> }> }>(`/mcps/${encodeURIComponent(mcpId)}/discover`, { method: 'POST' }),
   
   createMcp: (mcp: Omit<import('./types').McpServer, 'id'> & { id?: string }) =>
     request<import('./types').McpServer>('/mcps', {

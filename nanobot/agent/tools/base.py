@@ -26,7 +26,17 @@ class Tool(ABC):
     def name(self) -> str:
         """Tool name used in function calls."""
         pass
-    
+
+    @property
+    def server_id(self) -> str | None:
+        """MCP server ID for MCP tools, None for built-in tools."""
+        return None
+
+    @property
+    def deferred(self) -> bool:
+        """If True, tool schema is not injected in initial LLM context (loaded on-demand)."""
+        return False
+
     @property
     @abstractmethod
     def description(self) -> str:
