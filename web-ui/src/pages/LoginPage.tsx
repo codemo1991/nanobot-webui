@@ -6,35 +6,7 @@ import './LoginPage.css'
 
 type TabType = 'login' | 'register' | 'reset'
 
-// 获取图形验证码
-function CaptchaInput({ onSend, loading }: { onSend: (code: string) => void; loading: boolean }) {
-  const [code, setCode] = useState('')
-  const [refreshKey, setRefreshKey] = useState(0)
-
-  const src = `/api/captcha?k=${refreshKey}&t=${Date.now()}`
-
-  return (
-    <div className="captcha-row">
-      <Input
-        className="captcha-input"
-        placeholder="请输入右侧验证码"
-        value={code}
-        onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 4))}
-        maxLength={4}
-      />
-      <img
-        key={refreshKey}
-        className="captcha-img"
-        src={src}
-        alt="验证码"
-        onClick={() => setRefreshKey((k) => k + 1)}
-        title="点击刷新"
-      />
-    </div>
-  )
-}
-
-// 6位短信验证码输入
+// 6位短信验证码输入（自动聚焦、自动提交）
 function SmsCodeInput({ onComplete }: { onComplete: (code: string) => void }) {
   const [code, setCode] = useState(['', '', '', '', '', ''])
   const inputsRef = useRef<(HTMLInputElement | null)[]>([])
@@ -88,7 +60,6 @@ export default function LoginPage() {
 
   // Step2 状态
   const [step, setStep] = useState(1)
-  const [smsCode, setSmsCode] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [countdown, setCountdown] = useState(0)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -135,7 +106,6 @@ export default function LoginPage() {
       const action = tab === 'login' ? 'login' : tab === 'register' ? 'register' : 'reset'
       await api.verifySmsCode(phone, code, action)
       message.success(`${getTabLabel(tab)}成功`)
-      // 成功后跳转，可根据需求改为返回上一页或打开主界面
       navigate('/chat')
     } catch (e: unknown) {
       const err = e as { message?: string }
@@ -145,23 +115,24 @@ export default function LoginPage() {
     }
   }
 
-  // 重发
-  const handleResend = async () => {
+  // 重新获取
+  const handleResend = () => {
     if (countdown > 0) return
     setCaptchaKey((k) => k + 1)
     setCaptcha('')
     setStep(1)
   }
 
-  // 切换 tab 时重置
+  // 切换 tab 时重置状态
   const switchTab = (t: TabType) => {
     setTab(t)
     setStep(1)
     setPhone('')
     setCaptcha('')
-    setSmsCode('')
     setCountdown(0)
   }
+
+  const maskedPhone = phone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')
 
   return (
     <div className="login-page">
@@ -169,10 +140,10 @@ export default function LoginPage() {
         {/* Logo / 标题区 */}
         <div className="login-header">
           <div className="login-logo">
-            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
-              <circle cx="24" cy="24" r="24" fill="#4F46E5" />
-              <path d="M24 12c-6.627 0-12 5.373-12 12s5.373 12 12 12 12-5.373 12-12S30.627 12 24 12zm0 20c-4.418 0-8-3.582-8-8s3.582-8 8-8 8 3.582 8 8-3.582 8-8 8z" fill="white" />
-              <circle cx="24" cy="24" r="4" fill="white" />
+            <svg width="56" height="56" viewBox="0 0 56 56" fill="none">
+              <circle cx="28" cy="28" r="28" fill="#4F46E5" />
+              <path d="M28 14c-7.732 0-14 6.268-14 14s6.268 14 14 14 14-6.268 14-14-6.268-14-14-14zm0 23c-4.971 0-9-4.029-9-9s4.029-9 9-9 9 4.029 9 9-4.029 9-9 9z" fill="white" />
+              <circle cx="28" cy="28" r="4.5" fill="white" />
             </svg>
           </div>
           <h1 className="login-title">欢迎回来</h1>
@@ -203,27 +174,30 @@ export default function LoginPage() {
                 value={phone}
                 onChange={(e) => setPhone(e.target.value.replace(/\D/g, '').slice(0, 11))}
                 maxLength={11}
-                prefix={<span className="input-prefix">+86</span>}
+                prefix={<span style={{ fontSize: 14, color: '#888', marginRight: 2 }}>+86</span>}
               />
             </div>
 
             <div className="form-field">
               <label>图形验证码</label>
-              <CaptchaInput
-                onSend={setCaptcha}
-                loading={false}
-              />
-            </div>
-
-            <div className="captcha-row-login">
-              <Input
-                className="captcha-input-only"
-                placeholder="请输入图形验证码"
-                value={captcha}
-                onChange={(e) => setCaptcha(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                maxLength={4}
-                size="large"
-              />
+              <div className="captcha-row">
+                <Input
+                  className="captcha-input"
+                  placeholder="请输入图形验证码"
+                  value={captcha}
+                  onChange={(e) => setCaptcha(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  maxLength={4}
+                  size="large"
+                />
+                <img
+                  key={captchaKey}
+                  className="captcha-img"
+                  src={`/api/captcha?k=${captchaKey}&t=${Date.now()}`}
+                  alt="验证码"
+                  onClick={() => setCaptchaKey((k) => k + 1)}
+                  title="点击刷新"
+                />
+              </div>
             </div>
 
             <Button
@@ -231,7 +205,7 @@ export default function LoginPage() {
               size="large"
               block
               loading={sending}
-              disabled={!isValidPhone}
+              disabled={!isValidPhone || !isValidCaptcha}
               onClick={handleSendCode}
               className="send-code-btn"
             >
@@ -252,7 +226,7 @@ export default function LoginPage() {
             <div className="sms-header">
               <div className="sms-phone">
                 <span className="sms-label">验证码已发送至</span>
-                <span className="sms-number">+86 {phone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2')}</span>
+                <span className="sms-number">+86 {maskedPhone}</span>
               </div>
               <Button type="link" size="small" onClick={handleResend} disabled={countdown > 0}>
                 {countdown > 0 ? `${countdown}s` : '重新获取'}
