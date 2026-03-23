@@ -1207,12 +1207,17 @@ class AgentLoop:
                     # 如果配置中指定了工具列表，直接注册
                     lazy_tools: dict[str, McpLazyToolAdapter] = {}
                     for tool_cfg in tools:
-                        tool_name = getattr(tool_cfg, "name", None)
+                        # tools 字段定义为 list[dict]，用 .get() 访问；兼容 Pydantic 模型对象
+                        if isinstance(tool_cfg, dict):
+                            tool_name = tool_cfg.get("name")
+                            description = tool_cfg.get("description", "") or f"MCP tool {tool_name}"
+                            parameters = tool_cfg.get("parameters", {}) or {"type": "object", "properties": {}}
+                        else:
+                            tool_name = getattr(tool_cfg, "name", None)
+                            description = getattr(tool_cfg, "description", "") or f"MCP tool {tool_name}"
+                            parameters = getattr(tool_cfg, "parameters", {}) or {"type": "object", "properties": {}}
                         if not tool_name:
                             continue
-
-                        description = getattr(tool_cfg, "description", "") or f"MCP tool {tool_name}"
-                        parameters = getattr(tool_cfg, "parameters", {}) or {"type": "object", "properties": {}}
 
                         adapter = McpLazyToolAdapter(
                             server_id=server_id,

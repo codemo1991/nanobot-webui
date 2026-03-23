@@ -203,6 +203,8 @@ function ChatPage() {
   const isRestoringRef = useRef(false)
   // 追踪当前运行的 Claude Code 任务 ID（用于后台轮询）
   const currentTaskIdRef = useRef<string | null>(null)
+  // 追踪是否正在从 session 恢复 MCP 设置（避免触发保存）
+  const isRestoringMcpRef = useRef(false)
   // 用于驱动轮询 hook 的 state（ref 不会触发重新渲染）
   const [pollingTaskId, setPollingTaskId] = useState<string | null>(null)
 
@@ -774,7 +776,7 @@ function ChatPage() {
       const data = await api.getSessions()
       setSessions(data.items)
       if (data.items.length > 0 && !currentSession) {
-        setCurrentSession(data.items[0])
+        handleSelectSession(data.items[0])
       }
     } catch (error) {
       antMessage.error(t('chat.loadSessionsFailed'))
@@ -797,6 +799,22 @@ function ChatPage() {
   }
 
   const runningBgAgentsCount = bgAgents.filter(a => a.status === 'running').length
+
+  // 切换会话时恢复 MCP 工具设置
+  const handleSelectSession = (session: Session) => {
+    isRestoringMcpRef.current = true
+    setCurrentSession(session)
+    setToolMode(session.toolMode || 'auto')
+    setSelectedMcpServers(session.selectedMcpServers || [])
+    // 恢复完成后允许正常保存
+    setTimeout(() => { isRestoringMcpRef.current = false }, 50)
+  }
+
+  // MCP 工具设置变化时自动保存到当前会话
+  useEffect(() => {
+    if (!currentSession || isRestoringMcpRef.current) return
+    void api.updateSession(currentSession.id, toolMode, selectedMcpServers)
+  }, [toolMode, selectedMcpServers]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadMessages = async (sessionId: string) => {
     try {
@@ -822,7 +840,7 @@ function ChatPage() {
     try {
       const session = await api.createSession(t('chat.defaultTitle'))
       setSessions([session, ...sessions])
-      setCurrentSession(session)
+      handleSelectSession(session)
       setMessages([])
     } catch (error) {
       antMessage.error(t('chat.createSessionFailed'))
@@ -837,7 +855,12 @@ function ChatPage() {
       const newSessions = sessions.filter(s => s.id !== sessionId)
       setSessions(newSessions)
       if (currentSession?.id === sessionId) {
-        setCurrentSession(newSessions[0] || null)
+        const nextSession = newSessions[0]
+        if (nextSession) {
+          handleSelectSession(nextSession)
+        } else {
+          setCurrentSession(null)
+        }
       }
       antMessage.success(t('chat.sessionDeleted'))
     } catch (error) {
@@ -1064,7 +1087,7 @@ function ChatPage() {
                 <div
                   key={session.id}
                   className={`session-item ${currentSession?.id === session.id ? 'active' : ''}`}
-                  onClick={() => setCurrentSession(session)}
+                  onClick={() => handleSelectSession(session)}
                 >
                   {editingSessionId === session.id ? (
                     <Input

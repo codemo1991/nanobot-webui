@@ -648,6 +648,8 @@ class NanobotWebAPI:
                 {
                     "id": self.to_session_id(item["key"]),
                     "title": item.get("metadata", {}).get("title"),
+                    "toolMode": item.get("metadata", {}).get("tool_mode", "auto"),
+                    "selectedMcpServers": item.get("metadata", {}).get("selected_mcp_servers", []),
                     "createdAt": item["created_at"],
                     "updatedAt": item["updated_at"],
                     "lastMessageAt": item["updated_at"],
@@ -758,6 +760,28 @@ class NanobotWebAPI:
         return {
             "id": session_id,
             "title": title,
+            "updatedAt": session.updated_at.isoformat(),
+        }
+
+    def update_session(
+        self,
+        session_id: str,
+        tool_mode: str | None = None,
+        selected_mcp_servers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        key = self.to_session_key(session_id)
+        session = self.sessions.get(key)
+        if session is None:
+            raise KeyError("session not found")
+        if tool_mode is not None:
+            session.metadata["tool_mode"] = tool_mode
+        if selected_mcp_servers is not None:
+            session.metadata["selected_mcp_servers"] = selected_mcp_servers
+        self.sessions.save(session)
+        return {
+            "id": session_id,
+            "toolMode": session.metadata.get("tool_mode", "auto"),
+            "selectedMcpServers": session.metadata.get("selected_mcp_servers", []),
             "updatedAt": session.updated_at.isoformat(),
         }
 
@@ -4829,11 +4853,24 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         # PATCH /api/v1/chat/sessions/{sessionId}
         if len(parts) == 5 and parts[:4] == ["api", "v1", "chat", "sessions"]:
             body = self._read_json()
+            session_id = parts[4]
+            # MCP settings update (tool_mode, selected_mcp_servers)
+            if "tool_mode" in body or "selected_mcp_servers" in body:
+                try:
+                    data = app.update_session(
+                        session_id,
+                        tool_mode=body.get("tool_mode"),
+                        selected_mcp_servers=body.get("selected_mcp_servers"),
+                    )
+                    self._write_json(HTTPStatus.OK, _ok(data))
+                except KeyError:
+                    self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
+                return
+            # Title update (existing behavior)
             title = (body.get("title") or "").strip()
             if not title:
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "title 不能为空"))
                 return
-            session_id = parts[4]
             try:
                 data = app.rename_session(session_id, title)
                 self._write_json(HTTPStatus.OK, _ok(data))

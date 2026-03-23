@@ -1,13 +1,14 @@
-import { Outlet, NavLink } from 'react-router-dom'
+import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { Dropdown, Button } from 'antd'
 import type { MenuProps } from 'antd'
-import { GlobalOutlined } from '@ant-design/icons'
+import { GlobalOutlined, LoginOutlined } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import { SUPPORTED_LANGS, setLocale, type LocaleCode } from '../i18n'
 import './Layout.css'
 
 function Layout() {
   const { t, i18n } = useTranslation()
+  const navigate = useNavigate()
 
   const langMenuItems: MenuProps['items'] = SUPPORTED_LANGS.map(({ code, label }) => ({
     key: code,
@@ -42,6 +43,15 @@ function Layout() {
           </NavLink>
         </div>
         <div className="sidebar-footer">
+          <Button
+            type="text"
+            icon={<LoginOutlined />}
+            className="lang-switcher"
+            onClick={() => navigate('/login')}
+            title={t('nav.login') ?? '登录'}
+          >
+            {t('nav.login') ?? '登录'}
+          </Button>
           <Dropdown menu={{ items: langMenuItems }} placement="topRight">
             <Button type="text" icon={<GlobalOutlined />} className="lang-switcher">
               {SUPPORTED_LANGS.find((l) => l.code === i18n.language || i18n.language?.startsWith(l.code.split('-')[0]))?.label ?? SUPPORTED_LANGS[1].label}

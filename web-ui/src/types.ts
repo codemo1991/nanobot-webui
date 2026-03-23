@@ -13,6 +13,8 @@ export interface ApiError {
 export interface Session {
   id: string
   title?: string
+  toolMode?: 'disable' | 'auto' | 'specified'
+  selectedMcpServers?: string[]
   createdAt: string
   updatedAt: string
   lastMessageAt: string

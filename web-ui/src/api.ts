@@ -57,6 +57,19 @@ export const api = {
       body: JSON.stringify({ title }),
     }),
 
+  updateSession: (
+    sessionId: string,
+    toolMode?: 'disable' | 'auto' | 'specified',
+    selectedMcpServers?: string[],
+  ) =>
+    request<{ id: string; toolMode: string; selectedMcpServers: string[]; updatedAt: string }>(
+      `/chat/sessions/${sessionId}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ tool_mode: toolMode, selected_mcp_servers: selectedMcpServers }),
+      },
+    ),
+
   // Messages
   getMessages: (sessionId: string, limit = 50, before?: number) => {
     const params = new URLSearchParams({ limit: String(limit) })
@@ -706,6 +719,22 @@ export const api = {
   deleteShangRecord: (recordId: string) =>
     request<{ deleted: boolean }>(`/mirror/shang/records/${recordId}`, {
       method: 'DELETE',
+    }),
+
+  // ==================== Auth / Login ====================
+
+  /** 发送短信验证码 */
+  sendSmsCode: (phone: string, captcha: string, captchaKey: number, action: 'login' | 'register' | 'reset') =>
+    request<{ sent: boolean }>('/auth/sms/send', {
+      method: 'POST',
+      body: JSON.stringify({ phone, captcha, captcha_key: captchaKey, action }),
+    }),
+
+  /** 验证短信验证码（登录/注册/重置密码） */
+  verifySmsCode: (phone: string, code: string, action: 'login' | 'register' | 'reset') =>
+    request<{ success: boolean; token?: string }>('/auth/sms/verify', {
+      method: 'POST',
+      body: JSON.stringify({ phone, code, action }),
     }),
 
   // ==================== Claude Code Tasks ====================

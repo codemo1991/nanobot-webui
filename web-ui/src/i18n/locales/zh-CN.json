@@ -16,7 +16,8 @@
     "calendar": "日历",
     "cron": "定时任务",
     "config": "设置",
-    "system": "系统状态"
+    "system": "系统状态",
+    "login": "登录"
   },
   "cron": {
     "title": "定时任务",

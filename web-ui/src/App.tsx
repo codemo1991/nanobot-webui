@@ -7,11 +7,13 @@ import CalendarPage from './pages/CalendarPage'
 import CronPage from './pages/CronPage'
 import ConfigPage from './pages/ConfigPage'
 import SystemPage from './pages/SystemPage'
+import LoginPage from './pages/LoginPage'
 
 function App() {
   return (
     <BrowserRouter>
       <Routes>
+        <Route path="/login" element={<LoginPage />} />
         <Route path="/" element={<Layout />}>
           <Route index element={<Navigate to="/chat" replace />} />
           <Route path="chat" element={<ChatErrorBoundary><ChatPage /></ChatErrorBoundary>} />

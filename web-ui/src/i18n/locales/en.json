@@ -16,7 +16,8 @@
     "calendar": "Calendar",
     "cron": "Cron Jobs",
     "config": "Settings",
-    "system": "System Status"
+    "system": "System Status",
+    "login": "Login"
   },
   "cron": {
     "title": "Cron Jobs",
