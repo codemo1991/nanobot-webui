@@ -1,5 +1,6 @@
 """File system tools: read, write, edit."""
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -61,8 +62,7 @@ class ReadFileTool(Tool):
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
                 return f"Error: Not a file: {path}"
-            
-            content = file_path.read_text(encoding="utf-8")
+            content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
             return content
         except PermissionError:
             return f"Error: Permission denied: {path}"
@@ -109,7 +109,7 @@ class WriteFileTool(Tool):
                 if not _check_path_in_workspace(file_path, self.workspace):
                     return f"Error: Path must be within workspace: {path}"
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(content, encoding="utf-8")
+            await asyncio.to_thread(file_path.write_text, content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {path}"
         except PermissionError:
             return f"Error: Permission denied: {path}"
@@ -161,20 +161,19 @@ class EditFileTool(Tool):
                     return f"Error: Path must be within workspace: {path}"
             if not file_path.exists():
                 return f"Error: File not found: {path}"
-            
-            content = file_path.read_text(encoding="utf-8")
-            
+
+            content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
+
             if old_text not in content:
                 return f"Error: old_text not found in file. Make sure it matches exactly."
-            
-            # Count occurrences
+
             count = content.count(old_text)
             if count > 1:
                 return f"Warning: old_text appears {count} times. Please provide more context to make it unique."
-            
+
             new_content = content.replace(old_text, new_text, 1)
-            file_path.write_text(new_content, encoding="utf-8")
-            
+            await asyncio.to_thread(file_path.write_text, new_content, encoding="utf-8")
+
             return f"Successfully edited {path}"
         except PermissionError:
             return f"Error: Permission denied: {path}"
@@ -220,15 +219,17 @@ class ListDirTool(Tool):
                 return f"Error: Directory not found: {path}"
             if not dir_path.is_dir():
                 return f"Error: Not a directory: {path}"
-            
-            items = []
-            for item in sorted(dir_path.iterdir()):
-                prefix = "📁 " if item.is_dir() else "📄 "
-                items.append(f"{prefix}{item.name}")
-            
+
+            def _list() -> list[str]:
+                items = []
+                for item in sorted(dir_path.iterdir()):
+                    prefix = "📁 " if item.is_dir() else "📄 "
+                    items.append(f"{prefix}{item.name}")
+                return items
+
+            items = await asyncio.to_thread(_list)
             if not items:
                 return f"Directory {path} is empty"
-            
             return "\n".join(items)
         except PermissionError:
             return f"Error: Permission denied: {path}"

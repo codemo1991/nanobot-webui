@@ -74,6 +74,8 @@ class NanobotWebAPI:
         self._sys = sys
         self.gateway_process = None
         self.start_time = time.time()
+        # core_loop 由 run_server() 的 core_thread 启动后赋值，用于 chat_stream Gateway 模式
+        self.core_loop: asyncio.AbstractEventLoop | None = None
         # Logging configured by setup_logging() in CLI main callback
         config = ensure_initial_config()
 
@@ -314,7 +316,16 @@ class NanobotWebAPI:
     def _reload_mcp(self) -> None:
         """Hot-reload MCP config so new/updated MCPs take effect without restart."""
         try:
-            asyncio.run(self.agent.reload_mcp_config())
+            core_loop = self.core_loop
+            if core_loop and core_loop.is_running():
+                # 在 core_loop 中执行，保持 MCP session 绑定到正确的 event loop
+                future = asyncio.run_coroutine_threadsafe(
+                    self.agent.reload_mcp_config(), core_loop
+                )
+                future.result(timeout=30)
+            else:
+                # 降级：core_loop 未就绪时新建临时 loop
+                asyncio.run(self.agent.reload_mcp_config())
         except Exception as e:
             logger.warning(f"MCP reload failed: {e}", exc_info=True)
 
@@ -855,21 +866,15 @@ class NanobotWebAPI:
         if session_type == "bian" and session.metadata.get("attack_level"):
             attack_level = session.metadata["attack_level"]
         extra_metadata = {"attack_level": attack_level} if attack_level else None
-        try:
-            response = await self.agent.process_direct(
-                content=content,
-                session_key=key,
-                channel="mirror",
-                chat_id=session_id,
-                progress_callback=progress_callback,
-                extra_metadata=extra_metadata,
-            )
-        finally:
-            if getattr(self.agent, "mcp_loader", None):
-                try:
-                    await self.agent.reload_mcp_config()
-                except BaseException:
-                    pass
+        # 注意：MCP 不再在这里 reload，由 core_loop 的 AgentLoop 持有稳定连接
+        response = await self.agent.process_direct(
+            content=content,
+            session_key=key,
+            channel="mirror",
+            chat_id=session_id,
+            progress_callback=progress_callback,
+            extra_metadata=extra_metadata,
+        )
         messages = self.sessions.get_messages(key=key, limit=2)
         assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
         return {
@@ -1314,15 +1319,17 @@ class NanobotWebAPI:
     def chat_stream(
         self, session_id: str, content: str, images: list[str] | None = None,
         tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
+    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread | None]:
         """
-        Run chat with progress events. Returns (event_queue, thread).
-        Caller reads from queue until {"type": "done"} or {"type": "error"}.
+        Gateway 模式：将消息发布到 core_loop 的 inbound 队列，通过 on_complete / on_progress
+        回调将事件写入 evt_queue，供 SSE 消费端读取。
+
+        返回 (evt_queue, None)；调用方读取队列直到 {"type": "done"} 或 {"type": "error"}。
         """
         evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         media_paths = self._save_images_to_temp(images or [])
 
-        # 立即保存用户消息到数据库，确保刷新界面时能看到提问（即使 nanobot 仍在回答中）
+        # 立即保存用户消息，确保刷新界面时能看到提问（即使 nanobot 仍在回答中）
         key = self.to_session_key(session_id)
         session = self.sessions.get_or_create(key)
         user_kwargs: dict[str, Any] = {}
@@ -1333,32 +1340,99 @@ class NanobotWebAPI:
         logger.info(f"[ChatStream] User message saved immediately for session {session_id}")
 
         from nanobot.web.chat_stream_bus import ChatStreamBus
-        bus = ChatStreamBus.get()
+        stream_bus = ChatStreamBus.get()
         origin_key = f"web:{session_id}"
+        # 新对话开始，清空旧缓冲，避免与历史事件混淆
+        stream_bus.clear_buffer(origin_key)
 
         def _put_evt(evt: dict[str, Any]) -> None:
             try:
                 evt_queue.put(evt)
-                bus.push(origin_key, evt)
+                stream_bus.push(origin_key, evt)
             except Exception:
                 pass
 
         def on_progress(evt: dict[str, Any]) -> None:
             _put_evt(evt)
 
-        def run_agent() -> None:
-            # 新对话开始，清空该 session 的缓冲，避免与旧事件混淆
-            bus.clear_buffer(origin_key)
-            # 首先发送一个开始事件，确认线程已启动
-            try:
-                _put_evt({"type": "start", "session_id": session_id})
-            except Exception:
-                pass
+        def on_complete(response_content: str, error: str | None = None) -> None:
+            """由 AgentLoop.run() 在消息处理结束后调用，触发 SSE done/error 事件。"""
+            for p in media_paths:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if error:
+                _put_evt({"type": "error", "message": error})
+                return
+            _put_evt({
+                "type": "done",
+                "content": response_content,
+                "assistantMessage": self._build_assistant_message(session_id, key),
+            })
 
-            logger.info(f"Chat stream thread running for session {session_id}, content: {content[:50] if content else ''}")
+        # 发送 start 事件（与旧实现一致，使前端知道流已建立）
+        _put_evt({"type": "start", "session_id": session_id})
+
+        _extra: dict[str, Any] = {"user_message_saved": True}
+        if tool_mode:
+            _extra["tool_mode"] = tool_mode
+        if selected_mcp_servers:
+            _extra["selected_mcp_servers"] = selected_mcp_servers
+
+        from nanobot.bus.events import InboundMessage as _InboundMessage
+        inbound_msg = _InboundMessage(
+            channel="web",
+            sender_id="user",
+            chat_id=session_id,
+            content=content or "",
+            metadata={
+                "progress_callback": on_progress,
+                "on_complete": on_complete,
+                **_extra,
+            },
+            media=media_paths,
+        )
+
+        core_loop = self.core_loop
+        if core_loop is None or not core_loop.is_running():
+            logger.error("[ChatStream] core_loop not ready, falling back to legacy thread mode")
+            # 降级：使用旧线程模式（兼容 core_loop 未就绪的情况）
+            return self._chat_stream_legacy(
+                session_id, content, images, tool_mode, selected_mcp_servers,
+                evt_queue=evt_queue, media_paths=media_paths,
+                on_progress=on_progress, key=key,
+            )
+
+        ok = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
+        if not ok:
+            logger.warning(f"[ChatStream] inbound queue full for session {session_id}")
+            on_complete("", error="服务繁忙，请稍后重试（消息队列已满）")
+
+        logger.info(f"[ChatStream] Message enqueued to core_loop for session {session_id}")
+        return evt_queue, None
+
+    def _chat_stream_legacy(
+        self,
+        session_id: str,
+        content: str,
+        images: list[str] | None,
+        tool_mode: str | None,
+        selected_mcp_servers: list[str] | None,
+        evt_queue: "queue.Queue[dict[str, Any]]",
+        media_paths: list[str],
+        on_progress: Any,
+        key: str,
+    ) -> tuple["queue.Queue[dict[str, Any]]", threading.Thread]:
+        """
+        降级回退：当 core_loop 未就绪时，沿用旧的 threading.Thread + new_event_loop 模式。
+        正常运行时不应进入此路径。
+        """
+        logger.warning("[ChatStream] Using legacy thread mode (core_loop unavailable)")
+
+        def run_agent() -> None:
             loop = None
             try:
-                # 创建新的事件循环（避免与主线程冲突）
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 _extra = {"user_message_saved": True}
@@ -1372,30 +1446,23 @@ class NanobotWebAPI:
                         extra_metadata=_extra,
                     )
                 )
-                logger.debug(f"Chat stream completed with result: {result}")
-                _put_evt({"type": "done", **result})
+                evt_queue.put({"type": "done", **result})
             except asyncio.CancelledError:
-                logger.debug("Chat stream cancelled")
-                _put_evt({"type": "error", "message": "cancelled"})
+                evt_queue.put({"type": "error", "message": "cancelled"})
             except Exception as e:
-                logger.exception(f"Chat stream failed: {e}")
-                _put_evt({"type": "error", "message": str(e)})
+                logger.exception(f"[ChatStream] legacy mode failed: {e}")
+                evt_queue.put({"type": "error", "message": str(e)})
             finally:
-                logger.debug("Chat stream thread ending")
-                # 等待事件循环内未完成的任务（含微内核），避免 loop.close() 导致 Task was destroyed / coroutine ignored GeneratorExit
                 if loop:
                     try:
-                        current = asyncio.current_task()
-                        pending = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not current]
+                        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
                         if pending:
-                            logger.info(f"[ChatStream] Waiting for {len(pending)} pending tasks (incl. microkernel) before closing loop")
                             try:
                                 loop.run_until_complete(asyncio.wait_for(
                                     asyncio.gather(*pending, return_exceptions=True),
                                     timeout=130,
                                 ))
                             except asyncio.TimeoutError:
-                                logger.warning("[ChatStream] Pending tasks timed out after 130s, cancelling")
                                 for t in pending:
                                     if not t.done():
                                         t.cancel()
@@ -1420,53 +1487,23 @@ class NanobotWebAPI:
         media: list[str] | None = None,
         extra_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Internal: run chat with optional progress callback. Used by chat() and chat_stream."""
+        """Internal: run chat with optional progress callback. Used by chat() and legacy mode."""
         key = self.to_session_key(session_id)
         self.sessions.get_or_create(key)
-        try:
-            response = await self.agent.process_direct(
-                content=content,
-                session_key=key,
-                channel="web",
-                chat_id=session_id,
-                progress_callback=progress_callback,
-                media=media or [],
-                extra_metadata=extra_metadata,
-            )
-        finally:
-            if getattr(self.agent, "mcp_loader", None):
-                try:
-                    await self.agent.reload_mcp_config()
-                except BaseException:
-                    pass
-        messages = self.sessions.get_messages(key=key, limit=2)
-        assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+        # 注意：MCP 不再在这里 reload。Gateway 模式下 core_loop 持有稳定的 MCP 连接；
+        # 降级线程模式下保持原有行为（由 loop.py 的 loop-id 检测触发按需 reload）。
+        response = await self.agent.process_direct(
+            content=content,
+            session_key=key,
+            channel="web",
+            chat_id=session_id,
+            progress_callback=progress_callback,
+            media=media or [],
+            extra_metadata=extra_metadata,
+        )
         return {
             "content": response,
-            "assistantMessage": (
-                {
-                    "id": f"msg_{assistant['sequence']}",
-                    "sessionId": session_id,
-                    "role": assistant["role"],
-                    "content": assistant["content"],
-                    "createdAt": assistant["timestamp"],
-                    "sequence": assistant["sequence"],
-                    **({"toolSteps": assistant["tool_steps"]} if assistant.get("tool_steps") else {}),
-                    **(
-                        {
-                            "tokenUsage": {
-                                "promptTokens": int(assistant["token_usage"].get("prompt_tokens", 0) or 0),
-                                "completionTokens": int(assistant["token_usage"].get("completion_tokens", 0) or 0),
-                                "totalTokens": int(assistant["token_usage"].get("total_tokens", 0) or 0),
-                            }
-                        }
-                        if assistant.get("token_usage")
-                        else {}
-                    ),
-                }
-                if assistant
-                else None
-            ),
+            "assistantMessage": self._build_assistant_message(session_id, key),
         }
 
     def chat_stream_resume(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
@@ -1519,6 +1556,115 @@ class NanobotWebAPI:
                     Path(p).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def _build_assistant_message(self, session_id: str, key: str) -> dict[str, Any] | None:
+        """从 session 记录中构造 assistantMessage 字典（供 done 事件和 chat_sync 共用）。"""
+        messages = self.sessions.get_messages(key=key, limit=2)
+        assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+        if not assistant:
+            return None
+        return {
+            "id": f"msg_{assistant['sequence']}",
+            "sessionId": session_id,
+            "role": assistant["role"],
+            "content": assistant["content"],
+            "createdAt": assistant["timestamp"],
+            "sequence": assistant["sequence"],
+            **({"toolSteps": assistant["tool_steps"]} if assistant.get("tool_steps") else {}),
+            **(
+                {
+                    "tokenUsage": {
+                        "promptTokens": int(assistant["token_usage"].get("prompt_tokens", 0) or 0),
+                        "completionTokens": int(assistant["token_usage"].get("completion_tokens", 0) or 0),
+                        "totalTokens": int(assistant["token_usage"].get("total_tokens", 0) or 0),
+                    }
+                }
+                if assistant.get("token_usage")
+                else {}
+            ),
+        }
+
+    def chat_sync(
+        self,
+        session_id: str,
+        content: str,
+        images: list[str] | None = None,
+        tool_mode: str | None = None,
+        selected_mcp_servers: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        非流式 Gateway 模式：HTTP handler 线程调用，阻塞至 core_loop 处理完成。
+
+        消息入队到 core_loop.bus.inbound，通过 on_complete 回调将结果写入
+        concurrent.futures.Future，最长等待 message_timeout + 60 秒。
+        """
+        import concurrent.futures
+
+        media_paths = self._save_images_to_temp(images or [])
+        key = self.to_session_key(session_id)
+        session = self.sessions.get_or_create(key)
+        user_kwargs: dict[str, Any] = {}
+        if images:
+            user_kwargs["images"] = images
+        session.add_message("user", content or "[图片]", **user_kwargs)
+        self.sessions.save(session)
+
+        result_future: concurrent.futures.Future[dict[str, Any]] = concurrent.futures.Future()
+
+        def on_complete(response_content: str, error: str | None = None) -> None:
+            for p in media_paths:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if result_future.done():
+                return
+            if error:
+                result_future.set_exception(RuntimeError(error))
+                return
+            result_future.set_result({
+                "content": response_content,
+                "assistantMessage": self._build_assistant_message(session_id, key),
+            })
+
+        _extra: dict[str, Any] = {"user_message_saved": True}
+        if tool_mode:
+            _extra["tool_mode"] = tool_mode
+        if selected_mcp_servers:
+            _extra["selected_mcp_servers"] = selected_mcp_servers
+
+        from nanobot.bus.events import InboundMessage as _InboundMessage
+        inbound_msg = _InboundMessage(
+            channel="web",
+            sender_id="user",
+            chat_id=session_id,
+            content=content or "",
+            metadata={"on_complete": on_complete, **_extra},
+            media=media_paths,
+        )
+
+        core_loop = self.core_loop
+        if core_loop is None or not core_loop.is_running():
+            # 降级：core_loop 未就绪时使用 asyncio.run
+            logger.warning("[chat_sync] core_loop not ready, falling back to asyncio.run")
+            for p in media_paths:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return asyncio.run(self._chat_with_progress(
+                session_id, content, progress_callback=None, media=[], extra_metadata=_extra or None,
+            ))
+
+        ok = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
+        if not ok:
+            raise RuntimeError("服务繁忙，请稍后重试（消息队列已满）")
+
+        timeout = getattr(self.agent, "message_timeout", 300.0) + 60
+        try:
+            return result_future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise RuntimeError(f"处理超时（>{timeout}s）")
 
     def get_config(self) -> dict[str, Any]:
         """Get all configuration data."""
@@ -3276,9 +3422,13 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
         logger.info(f"Starting chat stream for session {session_id}")
         evt_queue, thread = app.chat_stream(session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-        logger.info(f"Chat stream thread created: {thread}")
-        thread.start()
-        logger.info(f"Chat stream thread started: {thread.is_alive()}")
+        # thread=None 表示 Gateway 模式（消息已发布到 core_loop），thread!=None 为降级线程模式
+        if thread is not None:
+            logger.info(f"Chat stream thread created: {thread}")
+            thread.start()
+            logger.info(f"Chat stream thread started: {thread.is_alive()}")
+        else:
+            logger.info(f"Chat stream running in Gateway mode for session {session_id}")
 
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -3287,8 +3437,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-        heartbeat_interval = 30  # 心跳间隔（秒）
+        heartbeat_interval = 30
         last_heartbeat = time.time()
+        stream_start = time.time()
+        # Gateway 模式总超时 = message_timeout + 60s 缓冲，防止 on_complete 永久不触发
+        total_timeout = getattr(app.agent, "message_timeout", 300.0) + 60.0
 
         try:
             loop_count = 0
@@ -3301,9 +3454,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                         logger.debug(f"Got event: {evt.get('type')}")
                 except queue.Empty:
                     now = time.time()
-                    if not thread.is_alive():
-                        # 线程已结束，尝试非阻塞获取可能存在的最后一事件（如 done）
-                        # 避免 evt_queue.empty() 竞态导致 done 事件丢失（多轮对话场景）
+                    # Gateway 模式总超时保护：防止 core_loop 异常后 SSE 永久挂起
+                    if thread is None and (now - stream_start) > total_timeout:
+                        logger.warning(
+                            f"[ChatStream] SSE total timeout ({total_timeout}s) for session {session_id}"
+                        )
+                        try:
+                            self.wfile.write('data: {"type":"error","message":"处理超时"}\n\n'.encode("utf-8"))
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        break
+                    # 降级线程模式：线程已结束时尝试获取最后一个事件
+                    if thread is not None and not thread.is_alive():
                         try:
                             evt = evt_queue.get_nowait()
                         except queue.Empty:
@@ -3316,7 +3479,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                 last_heartbeat = now
                                 logger.debug("SSE heartbeat sent")
                             except (BrokenPipeError, ConnectionResetError, OSError):
-                                logger.debug("Client disconnected, stopping stream")
+                                logger.debug("Client disconnected (heartbeat), cancelling session")
+                                app.agent.cancel_current_request(channel="web", session_id=session_id)
                                 break
                         continue
                 try:
@@ -3329,18 +3493,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self.wfile.write(line.encode("utf-8"))
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
-                    logger.debug("Client disconnected during stream")
+                    logger.debug("Client disconnected during stream, cancelling session")
+                    # 客户端断开：通知 core_loop 取消正在处理的任务
+                    app.agent.cancel_current_request(channel="web", session_id=session_id)
                     break
                 if evt.get("type") in ("done", "error"):
                     break
-            thread.join(timeout=1.0)
+            if thread is not None:
+                thread.join(timeout=1.0)
         except Exception as e:
             logger.warning("Chat stream write error: %s", e)
         finally:
-            if thread.is_alive():
+            if thread is not None and thread.is_alive():
                 logger.warning("Chat stream thread still running after response end, attempting to cancel...")
-                # 尝试取消线程（通过设置取消标志）
-                # 注意：线程可能无法被强制终止，这是最后的警告
                 thread.join(timeout=0.5)
                 if thread.is_alive():
                     logger.error("Chat stream thread failed to terminate, possible resource leak")
@@ -3519,7 +3684,14 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             app = self.server.app
 
             if path == "/api/v1/health":
-                self._write_json(HTTPStatus.OK, _ok({"status": "ok"}))
+                core_loop = app.core_loop
+                mcp_count = len([n for n in app.agent.tools.tool_names if n.startswith("mcp_")])
+                self._write_json(HTTPStatus.OK, _ok({
+                    "status": "ok",
+                    "core_loop_alive": core_loop is not None and core_loop.is_running(),
+                    "inbound_queue_depth": app.agent.bus.inbound_size,
+                    "mcp_tools_loaded": mcp_count,
+                }))
                 return
 
             # 执行链路监控 API
@@ -4190,48 +4362,12 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                data = asyncio.run(app.chat(session_id=session_id, content=content, images=images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers))
+                # Gateway 模式：消息入队到 core_loop，避免 asyncio.run 创建新 loop 触发 MCP reload
+                data = app.chat_sync(
+                    session_id=session_id, content=content, images=images,
+                    tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers,
+                )
                 self._write_json(HTTPStatus.OK, _ok(data))
-            except RuntimeError as exc:
-                # MCP streamable_http + anyio: "cancel scope in different task" can occur
-                # during asyncio.run() shutdown (modelcontextprotocol/python-sdk#521).
-                # Chat usually completed; rebuild response from session.
-                msg = str(exc)
-                if "cancel scope" in msg and "different task" in msg:
-                    logger.debug("MCP shutdown noise (expected): %s", msg[:80])
-                    key = app.to_session_key(session_id)
-                    messages = app.sessions.get_messages(key=key, limit=2)
-                    assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
-                    data = {
-                        "content": assistant["content"] if assistant else "",
-                        "assistantMessage": (
-                            {
-                                "id": f"msg_{assistant['sequence']}",
-                                "sessionId": session_id,
-                                "role": assistant["role"],
-                                "content": assistant["content"],
-                                "createdAt": assistant["timestamp"],
-                                "sequence": assistant["sequence"],
-                                **({"toolSteps": assistant["tool_steps"]} if assistant.get("tool_steps") else {}),
-                                **(
-                                    {
-                                        "tokenUsage": {
-                                            "promptTokens": int(assistant["token_usage"].get("prompt_tokens", 0) or 0),
-                                            "completionTokens": int(assistant["token_usage"].get("completion_tokens", 0) or 0),
-                                            "totalTokens": int(assistant["token_usage"].get("total_tokens", 0) or 0),
-                                        }
-                                    }
-                                    if assistant.get("token_usage")
-                                    else {}
-                                ),
-                            }
-                            if assistant
-                            else None
-                        ),
-                    }
-                    self._write_json(HTTPStatus.OK, _ok(data))
-                else:
-                    raise
             except Exception as exc:
                 logger.exception("Chat request failed")
                 self._write_json(
@@ -5356,12 +5492,46 @@ def _run_cron_in_thread(app: "NanobotWebAPI") -> tuple["threading.Thread", async
     return t, loop_ref[0] if loop_ref else None
 
 
+async def _core_main(app: "NanobotWebAPI") -> None:
+    """统一执行核主协程：AgentLoop.run() 负责 inbound 消费和 MCP 初始化。"""
+    await app.agent.run()
+
+
 def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | None = None) -> None:
     """Run the web API server."""
     import threading
+    import signal
     app = NanobotWebAPI()
 
-    # 在独立线程中启动 cron 服务，保持 event loop 常驻
+    # ── ① 统一执行核线程（持有 core_loop，AgentLoop.run() 在此循环中消费 inbound 消息）──
+    # AgentLoop.run() 内部会完成 MCP 一次性初始化（替代旧的 _mcp_init_thread）
+    core_ready = threading.Event()
+    core_thread: threading.Thread | None = None
+
+    def _core_thread_target() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        app.core_loop = loop
+        core_ready.set()
+        try:
+            loop.run_until_complete(_core_main(app))
+        except Exception as e:
+            logger.error(f"[Core] Core loop crashed: {e}", exc_info=True)
+        finally:
+            app.core_loop = None
+            loop.close()
+            logger.info("[Core] Core loop exited")
+
+    core_thread = threading.Thread(target=_core_thread_target, daemon=False, name="nanobot-core")
+    core_thread.start()
+
+    # 等待 core_loop 就绪（最多 5 秒）
+    if core_ready.wait(timeout=5):
+        logger.info("[WebAPI] Core loop started successfully")
+    else:
+        logger.warning("[WebAPI] Core loop did not become ready within 5s, continuing anyway")
+
+    # ── ② Cron 服务（独立线程，保持现状）──
     cron_thread: threading.Thread | None = None
     cron_loop: asyncio.AbstractEventLoop | None = None
     try:
@@ -5369,34 +5539,8 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
     except Exception as e:
         logger.warning(f"Failed to start cron service: {e}")
 
-    # 在独立线程中启动 MCP 工具加载（等待完成，最多30秒）
-    mcp_init_done = threading.Event()
-    mcp_error: list[str] = []
-
-    def _mcp_init_thread_target() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(app.agent._init_mcp_loader())
-        except Exception as e:
-            mcp_error.append(str(e))
-        finally:
-            loop.close()
-            mcp_init_done.set()
-
-    mcp_init_thread = threading.Thread(target=_mcp_init_thread_target, daemon=True)
-    mcp_init_thread.start()
-    mcp_init_thread.join(timeout=30)
-    if mcp_init_done.is_set():
-        logger.info(f"[WebAPI] MCP tools loaded successfully, {len([n for n in app.agent.tools.tool_names if n.startswith('mcp_')])} MCP tools available")
-    elif mcp_error:
-        logger.warning(f"[WebAPI] MCP tools failed to load: {mcp_error[0]}")
-    else:
-        logger.warning("[WebAPI] MCP tools timed out after 30s, will load lazily on first message")
-
-    # Determine static directory
+    # ── ③ 确定静态文件目录 ──
     if static_dir is None:
-        # Try to find built web-ui
         import os
         env_static = os.environ.get("NANOBOT_STATIC_DIR", "").strip()
         possible_locations = [
@@ -5409,12 +5553,12 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
             if loc.exists() and (loc / "index.html").exists():
                 static_dir = loc
                 break
-    
-    # Try to bind to the requested port, with fallback
+
+    # ── ④ 绑定端口（自动尝试备用端口）──
     original_port = port
     max_attempts = 10
     server = None
-    
+
     for attempt in range(max_attempts):
         try:
             server = NanobotHTTPServer((host, port), app, static_dir=static_dir)
@@ -5427,10 +5571,10 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
                 logger.error(f"Failed to bind to any port from {original_port} to {port}")
                 logger.error("Try specifying a different port with --port, e.g.: nanobot web-ui --port 8080")
                 raise RuntimeError(f"Could not bind to any port in range {original_port}-{port}") from e
-    
+
     if server is None:
         raise RuntimeError("Failed to create server")
-    
+
     actual_port = server.server_address[1]
     logger.info(f"Web API running at http://{host}:{actual_port}")
     if actual_port != original_port:
@@ -5442,13 +5586,18 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
     else:
         logger.info("No static files found (frontend not built). Run 'cd web-ui && npm install && npm run build' to build the frontend.")
     logger.info("Press Ctrl+C to stop")
-    
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("\nStopping web API server...")
-    finally:
-        # Stop cron service（停止 loop 以结束 cron 线程）
+
+    def _graceful_shutdown(signum=None, frame=None) -> None:
+        """优雅关闭：停止 AgentLoop → 等待 core_thread → 停止 Cron → 关 HTTP。"""
+        logger.info("Initiating graceful shutdown...")
+        # 1. 发哨兵，让 AgentLoop.run() 退出 while 循环
+        app.agent.stop()
+        # 2. 等当前正在处理的消息完成（最多 30s）
+        if core_thread and core_thread.is_alive():
+            core_thread.join(timeout=30)
+            if core_thread.is_alive():
+                logger.warning("[Core] Core thread did not exit within 30s")
+        # 3. 停止 Cron
         if cron_loop and cron_loop.is_running():
             cron_loop.call_soon_threadsafe(cron_loop.stop)
         try:
@@ -5457,5 +5606,20 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
             logger.warning(f"Error stopping cron service: {e}")
         if cron_thread and cron_thread.is_alive():
             cron_thread.join(timeout=3)
+        # 4. 关其他资源
         app.shutdown()
+        logger.info("Graceful shutdown complete")
+
+    # 注册 SIGTERM 处理（适配 Docker / systemd 等容器化部署）
+    try:
+        signal.signal(signal.SIGTERM, _graceful_shutdown)
+    except (OSError, ValueError):
+        pass  # 非主线程时 signal.signal 会失败，忽略
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("\nStopping web API server...")
+    finally:
+        _graceful_shutdown()
         server.server_close()

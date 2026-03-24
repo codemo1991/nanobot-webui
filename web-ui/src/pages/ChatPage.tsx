@@ -189,7 +189,7 @@ function ChatPage() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [currentModelName, setCurrentModelName] = useState<string>('')
   // 工具模式选择
-  const [toolMode, setToolMode] = useState<'disable' | 'auto' | 'specified'>('auto')
+  const [toolMode, setToolMode] = useState<'disable' | 'auto' | 'specified'>('disable')
   const [selectedMcpServers, setSelectedMcpServers] = useState<string[]>([])
   const [availableMcps, setAvailableMcps] = useState<McpServer[]>([])
   // 使用 ref 来跟踪是否需要轮询（避免 useEffect 依赖问题）
@@ -804,7 +804,7 @@ function ChatPage() {
   const handleSelectSession = (session: Session) => {
     isRestoringMcpRef.current = true
     setCurrentSession(session)
-    setToolMode(session.toolMode || 'auto')
+    setToolMode(session.toolMode || 'disable')
     setSelectedMcpServers(session.selectedMcpServers || [])
     // 恢复完成后允许正常保存
     setTimeout(() => { isRestoringMcpRef.current = false }, 50)
@@ -840,6 +840,9 @@ function ChatPage() {
     try {
       const session = await api.createSession(t('chat.defaultTitle'))
       setSessions([session, ...sessions])
+      // 新建会话时默认禁用 MCP 工具
+      setToolMode('disable')
+      setSelectedMcpServers([])
       handleSelectSession(session)
       setMessages([])
     } catch (error) {

@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -75,6 +76,18 @@ CONTINUE_KEYWORDS = {
 # 用户回复"扩容"时，自动扩大本轮工具调用上限 20% 并继续执行
 EXPAND_KEYWORDS = {"扩容", "扩大容量", "增加工具数", "扩大工具上限"}
 EXPAND_RATIO = 1.2
+
+# 哨兵：推入 inbound 队列使 run() 的 await get() 立即返回，从而干净退出循环
+_STOP_SENTINEL = object()
+
+
+@dataclass
+class _CancelProbe:
+    """
+    取消探针：cancel_current_request() 推入队列，唤醒正在阻塞于 get() 的 run()，
+    使其能立即感知并清理对应 session 的取消标记，避免下一条消息被错误跳过。
+    """
+    session_key: str
 
 
 class AgentLoop:
@@ -266,6 +279,7 @@ class AgentLoop:
             self.subagents.model = subagent_model
 
         self._running = False
+        self._loop: asyncio.AbstractEventLoop | None = None  # 由 run() 启动时赋值
         self._mcp_loaded = False
         self._mcp_loop_id: int | None = None
         self._mcp_fail_time: float = 0.0
@@ -1671,88 +1685,116 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
+        self._loop = asyncio.get_running_loop()
         logger.info("Agent loop started")
 
-        # 直接 await MCP 加载（最多30秒，超时则继续启动，MCP 工具懒加载）
-        try:
-            await asyncio.wait_for(self._init_mcp_loader(), timeout=30.0)
-        except asyncio.TimeoutError:
-            logger.warning("MCP init timed out after 30s, continuing without MCP tools")
-        except Exception as e:
-            logger.warning(f"MCP init failed: {e}")
+        # MCP 初始化延迟到第一条 tool_mode != 'disable' 的消息到来时执行，
+        # 避免用户全程使用 disable 模式时浪费 30s 启动时间。
+        # _ensure_mcp_loaded() 保证只初始化一次。
 
         while self._running:
+            # 使用哨兵替代 1s 超时轮询：无消息时完全阻塞，CPU 占用接近 0
+            raw = await self.bus.inbound.get()
+            if raw is _STOP_SENTINEL:
+                break
+            if isinstance(raw, _CancelProbe):
+                # 探针：若对应 session 的取消标记已被清理（即消息已开始处理），
+                # 则此探针无需任何操作；否则移除孤立的取消标记。
+                self._cancelled_sessions.discard(raw.session_key)
+                logger.debug(f"[AgentLoop] 取消探针已处理: {raw.session_key}")
+                continue
+            msg: InboundMessage = raw
+
+            # 取出 on_complete 回调（Web Gateway 模式下由 chat_stream() 注入）
+            on_complete = msg.metadata.get("on_complete") if msg.metadata else None
+
             try:
-                # Wait for next message
-                msg = await asyncio.wait_for(
-                    self.bus.consume_inbound(),
-                    timeout=1.0
+                response = await asyncio.wait_for(
+                    self._process_message(msg),
+                    timeout=self.message_timeout,
                 )
-                
-                # Process it (with overall timeout to prevent hanging)
+                if on_complete:
+                    try:
+                        on_complete(response.content if response else "")
+                    except Exception as _e:
+                        logger.warning(f"[AgentLoop] on_complete callback failed: {_e}")
+                elif response:
+                    logger.info(
+                        "[AgentLoop] Publishing reply to %s:%s (content_len=%d)",
+                        response.channel, response.chat_id, len(response.content or ""),
+                    )
+                    await self.bus.publish_outbound(response)
+                else:
+                    logger.warning(
+                        "[AgentLoop] _process_message returned None, no reply for %s:%s",
+                        msg.channel, msg.chat_id,
+                    )
+            except asyncio.CancelledError:
+                raise  # 向上传播，干净关闭
+            except asyncio.TimeoutError:
                 try:
-                    response = await asyncio.wait_for(
-                        self._process_message(msg),
-                        timeout=self.message_timeout,
-                    )
-                    if response:
-                        logger.info(
-                            "[AgentLoop] Publishing reply to %s:%s (content_len=%d)",
-                            response.channel, response.chat_id, len(response.content or ""),
-                        )
-                        await self.bus.publish_outbound(response)
-                    else:
-                        logger.warning(
-                            "[AgentLoop] _process_message returned None, no reply for %s:%s",
-                            msg.channel, msg.chat_id,
-                        )
-                except asyncio.CancelledError:
-                    raise  # Propagate for clean shutdown
-                except asyncio.TimeoutError:
+                    self._chain_monitor.end_chain(status="timeout")
+                except Exception as _e:
+                    logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
+                logger.warning(f"Message processing timed out after {self.message_timeout}s")
+                timeout_text = (
+                    "⏳ 当前任务处理时间较长。"
+                    "如有 Claude Code 任务正在执行，它将继续在后台运行，"
+                    "完成后会自动通知您结果。\n\n"
+                    "您也可以继续提问，我会记住本次对话上下文。"
+                )
+                # 保存会话历史，确保超时后上下文不丢失
+                try:
+                    session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
+                    session = self.sessions.get_or_create(session_key)
+                    session.add_message("user", msg.content)
+                    session.add_message("assistant", timeout_text)
+                    self.sessions.save(session)
+                except Exception as _e:
+                    logger.warning(f"Failed to save session on timeout: {_e}")
+                if on_complete:
                     try:
-                        self._chain_monitor.end_chain(status="timeout")
+                        on_complete("", error=timeout_text)
                     except Exception as _e:
-                        logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
-                    logger.warning(f"Message processing timed out after {self.message_timeout}s")
-                    timeout_text = (
-                        "⏳ 当前任务处理时间较长。"
-                        "如有 Claude Code 任务正在执行，它将继续在后台运行，"
-                        "完成后会自动通知您结果。\n\n"
-                        "您也可以继续提问，我会记住本次对话上下文。"
-                    )
-                    # 保存会话历史，确保超时后上下文不丢失
-                    try:
-                        session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
-                        session = self.sessions.get_or_create(session_key)
-                        session.add_message("user", msg.content)
-                        session.add_message("assistant", timeout_text)
-                        self.sessions.save(session)
-                    except Exception as _e:
-                        logger.warning(f"Failed to save session on timeout: {_e}")
+                        logger.warning(f"[AgentLoop] on_complete (timeout) failed: {_e}")
+                else:
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
                         content=timeout_text,
                     ))
-                except Exception as e:
+            except Exception as e:
+                try:
+                    self._chain_monitor.end_chain(status="failed")
+                except Exception as _e:
+                    logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
+                logger.exception("Error processing message")
+                error_text = f"Sorry, I encountered an error: {str(e)}"
+                if on_complete:
                     try:
-                        self._chain_monitor.end_chain(status="failed")
+                        on_complete("", error=error_text)
                     except Exception as _e:
-                        logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
-                    logger.exception("Error processing message")
+                        logger.warning(f"[AgentLoop] on_complete (error) failed: {_e}")
+                else:
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
+                        content=error_text,
                     ))
-            except asyncio.TimeoutError:
-                # From consume_inbound (1s poll), not message timeout
-                continue
-    
+
+        logger.info("Agent loop stopped")
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+        if self._loop and self._loop.is_running():
+            # 推入哨兵，唤醒正在 await inbound.get() 的 run()，使其干净退出
+            asyncio.run_coroutine_threadsafe(
+                self.bus.inbound.put(_STOP_SENTINEL), self._loop
+            )
+            # 停止 dispatch_outbound 协程（若已启动）
+            self.bus.stop_dispatch(self._loop)
 
     def cancel_current_request(self, channel: str = "web", session_id: str | None = None) -> None:
         """Cancel the current running request for the given session."""
@@ -1760,6 +1802,12 @@ class AgentLoop:
             origin_key = f"{channel}:{session_id}"
             self._cancelled_sessions.add(origin_key)
             logger.info(f"Agent cancellation requested for session {origin_key}")
+            # 推入探针唤醒可能正阻塞于 inbound.get() 的 run()，使其立即检测到取消状态
+            if self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self.bus.inbound.put(_CancelProbe(session_key=origin_key)),
+                    self._loop,
+                )
         else:
             self._cancel_event.set()
             logger.info("Agent cancellation requested (all sessions, backward compat)")
@@ -1873,6 +1921,16 @@ class AgentLoop:
             msg_tool_mode = session.metadata.get("tool_mode")
             msg_selected_mcp = session.metadata.get("selected_mcp_servers")
 
+        # 按需 MCP 初始化：仅当本消息不禁用 MCP 且尚未加载时才执行，
+        # 避免默认 disable 模式下浪费启动时间。
+        if msg_tool_mode != "disable" and not self._mcp_loaded:
+            try:
+                await asyncio.wait_for(self._init_mcp_loader(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("[MCP] 按需初始化超时（30s），继续处理（无 MCP 工具）")
+            except Exception as e:
+                logger.warning(f"[MCP] 按需初始化失败: {e}")
+
         # Update tool contexts
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
@@ -1910,11 +1968,13 @@ class AgentLoop:
         _reload_reason = f"mcp_loader={'Y' if self.mcp_loader else 'N'}, _mcp_loaded={'Y' if self._mcp_loaded else 'N'}, _mcp_loop_id={self._mcp_loop_id}, current_loop={current_loop_id}, reload={'Y' if (self.mcp_loader and self._mcp_loaded and self._mcp_loop_id is not None and current_loop_id != self._mcp_loop_id) else 'N'}"
         logger.debug(f"[MCP] reload check: {_reload_reason}")
         if self.mcp_loader and self._mcp_loaded and self._mcp_loop_id is not None and current_loop_id != self._mcp_loop_id:
-            logger.debug("Event loop changed, reloading MCP for fresh connections")
+            # Gateway 架构下此分支理论上不再触发（core_loop 全程稳定），
+            # 仅作为降级保护：若意外切换 loop（如 asyncio.run() 调用路径），
+            # 重建 MCP session 避免跨 loop 使用旧连接导致 ClosedResourceError。
+            logger.warning(f"[MCP] event loop changed ({self._mcp_loop_id} -> {current_loop_id}), reloading MCP")
             await self.reload_mcp_config()
-        # 按需加载模式：不再在这里预加载 MCP
-        # MCP 工具已作为懒加载代理注册，会在首次被调用时建立连接
-        # 见 McpLazyToolAdapter 类
+        # 懒加载模式：MCP 工具以 McpLazyToolAdapter 注册，首次调用时才建立 server 连接；
+        # McpLazyToolAdapter.execute() 内置断线重连逻辑，无需在此处预热连接。
 
         # Detect "继续" / "continue" / "扩容" command after a limit-reached pause..
         # If the last assistant message has the LIMIT_REACHED_MARKER and the user

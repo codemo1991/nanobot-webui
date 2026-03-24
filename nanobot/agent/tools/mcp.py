@@ -165,29 +165,48 @@ class McpLazyToolAdapter(Tool):
                 logger.warning(f"MCP {self._server_id}: connection error on first call: {e}")
                 return False
 
-    async def execute(self, **kwargs: Any) -> str:
-        """执行 MCP 工具（懒加载）。"""
-        try:
-            # 确保连接已建立
-            if not await self._ensure_connected():
-                return f"MCP {self._server_id}: failed to connect to server. Please check MCP configuration."
+    def _reset_session(self) -> None:
+        """重置本 server 所有懒加载工具的 session（用于断线重连）。"""
+        for t in self._lazy_tools.values():
+            t._session = None
 
-            # 调用工具
-            result = await self._session.call_tool(self._tool_name, kwargs)
-            if getattr(result, "isError", False):
-                return f"MCP error: {getattr(result, 'content', result)}"
-            content = getattr(result, "content", None)
-            if content:
-                parts = []
-                for block in content:
-                    text = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else None)
-                    if text:
-                        parts.append(str(text))
-                return "\n".join(parts) if parts else "(no output)"
-            return "(no output)"
-        except Exception as e:
-            logger.exception(f"MCP tool error: {self._server_id}/{self._tool_name}")
-            return f"MCP tool error: {e}"
+    async def execute(self, **kwargs: Any) -> str:
+        """执行 MCP 工具（懒加载，自动重连一次）。"""
+        for attempt in range(2):
+            try:
+                if not await self._ensure_connected():
+                    return f"MCP {self._server_id}: 连接失败，请检查 MCP 配置。"
+
+                result = await self._session.call_tool(self._tool_name, kwargs)
+                if getattr(result, "isError", False):
+                    return f"MCP error: {getattr(result, 'content', result)}"
+                content = getattr(result, "content", None)
+                if content:
+                    parts = []
+                    for block in content:
+                        text = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else None)
+                        if text:
+                            parts.append(str(text))
+                    return "\n".join(parts) if parts else "(no output)"
+                return "(no output)"
+
+            except Exception as e:
+                # 判断是否为连接断开类错误（MCP server 重启 / 网络抖动）
+                _err_type = type(e).__name__
+                _is_conn_error = any(
+                    kw in _err_type or kw in str(e).lower()
+                    for kw in ("ClosedResource", "EOF", "ConnectionReset", "BrokenPipe", "anyio")
+                )
+                if _is_conn_error and attempt == 0:
+                    logger.warning(
+                        f"[MCP] {self._server_id}/{self._tool_name}: 连接断开（{_err_type}），尝试重连…"
+                    )
+                    self._reset_session()
+                    continue  # 重试一次
+                logger.exception(f"MCP tool error: {self._server_id}/{self._tool_name}")
+                return f"MCP tool error: {e}"
+
+        return f"MCP {self._server_id}: 重连后仍失败，工具暂不可用"
 
     def dispose(self) -> None:
         """标记该工具已废弃（配置删除时调用）。"""
