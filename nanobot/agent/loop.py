@@ -1730,7 +1730,40 @@ class AgentLoop:
                         msg.channel, msg.chat_id,
                     )
             except asyncio.CancelledError:
-                raise  # 向上传播，干净关闭
+                # 区分两种来源：
+                # 1. stop() → _running=False + _STOP_SENTINEL（不走此路径，sentinel 在 get() 处拦截）
+                # 2. cancel_current_request() → _check_cancelled() 在处理中途抛出
+                #    此时 _running 仍为 True，应通知前端后继续循环，而不是杀死整个 AgentLoop
+                if not self._running:
+                    raise  # 真正的全局关闭信号，退出循环
+                # 用户主动停止当前 session：结束链路监控、通知前端、保存会话记录，然后继续
+                logger.info("[AgentLoop] 当前请求被用户取消，AgentLoop 继续运行")
+                try:
+                    self._chain_monitor.end_chain(status="cancelled")
+                except Exception as _e:
+                    logger.error(f"[ExecutionChain] Failed to end chain on cancel: {_e}")
+                # 保存一条"已停止"的 assistant 记录，避免 LLM 下次看到孤立的用户消息
+                try:
+                    _sk = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
+                    _sess = self.sessions.get_or_create(_sk)
+                    _sess.add_message("assistant", "[已停止]")
+                    self.sessions.save(_sess)
+                except Exception as _e:
+                    logger.warning(f"[AgentLoop] Failed to save cancel placeholder: {_e}")
+                if on_complete:
+                    try:
+                        on_complete("", error="已停止")
+                    except Exception as _e:
+                        logger.warning(f"[AgentLoop] on_complete (cancelled) failed: {_e}")
+                else:
+                    try:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="[已停止]",
+                        ))
+                    except Exception as _e:
+                        logger.warning(f"[AgentLoop] publish_outbound (cancelled) failed: {_e}")
             except asyncio.TimeoutError:
                 try:
                     self._chain_monitor.end_chain(status="timeout")

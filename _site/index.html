@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>nanobot-webui 技术博客</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+            line-height: 1.8;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem;
+            color: #24292e;
+            background: #f6f8fa;
+        }
+        .container {
+            background: white;
+            border-radius: 8px;
+            padding: 3rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        h1 {
+            font-size: 2rem;
+            border-bottom: 3px solid #0366d6;
+            padding-bottom: 0.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .blog-list {
+            list-style: none;
+            padding: 0;
+        }
+        .blog-item {
+            padding: 1.5rem;
+            border: 1px solid #d0d7de;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            transition: box-shadow 0.2s;
+        }
+        .blog-item:hover {
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .blog-item h2 {
+            margin: 0 0 0.5rem 0;
+            font-size: 1.3rem;
+        }
+        .blog-item h2 a {
+            color: #0366d6;
+            text-decoration: none;
+        }
+        .blog-item h2 a:hover {
+            text-decoration: underline;
+        }
+        .blog-meta {
+            color: #6e7781;
+            font-size: 0.9rem;
+            margin-bottom: 0.5rem;
+        }
+        .blog-desc {
+            color: #57606a;
+        }
+        .blog-tag {
+            display: inline-block;
+            background: #ddf4ff;
+            color: #0969da;
+            padding: 0.2em 0.6em;
+            border-radius: 1em;
+            font-size: 0.8rem;
+            margin-right: 0.5rem;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 2rem;
+            color: #6e7781;
+            font-size: 0.9rem;
+        }
+        .footer a {
+            color: #0366d6;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>nanobot-webui 技术博客</h1>
+
+        <ul class="blog-list">
+            <li class="blog-item">
+                <h2><a href="blog-gateway-unified-agentloop.html">Gateway 统一执行核：nanobot-webui 架构升级</a></h2>
+                <div class="blog-meta">
+                    <span class="blog-tag">架构</span>
+                    <span class="blog-tag">性能优化</span>
+                    发布于 2026-03-24
+                </div>
+                <p class="blog-desc">
+                    本次更新实现了 Gateway 统一执行核架构，彻底重构了 Web 渠道的消息处理方式，解决了长期困扰的高并发场景下 MCP 重复初始化问题。
+                </p>
+            </li>
+        </ul>
+
+        <div class="footer">
+            <p>
+                <a href="https://github.com/codemo1991/nanobot-webui">项目主页</a> |
+                <a href="https://github.com/codemo1991/nanobot-webui/tree/main/docs">文档目录</a>
+            </p>
+            <p>nanobot-webui &copy; 2026 | 基于 nanobot 构建</p>
+        </div>
+    </div>
+</body>
+</html>

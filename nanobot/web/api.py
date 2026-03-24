@@ -1457,16 +1457,16 @@ class NanobotWebAPI:
                     try:
                         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
                         if pending:
+                            # 立即 cancel，给 3s 收尾（MCP 连接关闭等），避免线程长时间残留
+                            for t in pending:
+                                t.cancel()
                             try:
                                 loop.run_until_complete(asyncio.wait_for(
                                     asyncio.gather(*pending, return_exceptions=True),
-                                    timeout=130,
+                                    timeout=3.0,
                                 ))
-                            except asyncio.TimeoutError:
-                                for t in pending:
-                                    if not t.done():
-                                        t.cancel()
-                                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                            except (asyncio.TimeoutError, Exception):
+                                pass
                         loop.close()
                     except Exception as e:
                         logger.debug("Loop close error (ignored): %s", e)
@@ -3500,15 +3500,17 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 if evt.get("type") in ("done", "error"):
                     break
             if thread is not None:
-                thread.join(timeout=1.0)
+                # legacy 模式：等线程清理完 pending tasks（最多 3s）再加 2s 缓冲
+                thread.join(timeout=5.0)
         except Exception as e:
             logger.warning("Chat stream write error: %s", e)
         finally:
             if thread is not None and thread.is_alive():
-                logger.warning("Chat stream thread still running after response end, attempting to cancel...")
-                thread.join(timeout=0.5)
+                # 正常情况不应到达此处（线程 finally 最多耗时 3s，join 给了 5s）
+                logger.warning("Chat stream thread still running after response end (legacy mode), waiting 3s more...")
+                thread.join(timeout=3.0)
                 if thread.is_alive():
-                    logger.error("Chat stream thread failed to terminate, possible resource leak")
+                    logger.error("Chat stream legacy thread failed to terminate within 8s, possible resource leak")
 
     def _handle_subagent_progress_stream(
         self, app: "NanobotWebAPI", session_id: str
@@ -5492,8 +5494,14 @@ def _run_cron_in_thread(app: "NanobotWebAPI") -> tuple["threading.Thread", async
     return t, loop_ref[0] if loop_ref else None
 
 
-async def _core_main(app: "NanobotWebAPI") -> None:
-    """统一执行核主协程：AgentLoop.run() 负责 inbound 消费和 MCP 初始化。"""
+async def _core_main(app: "NanobotWebAPI", core_ready: "threading.Event") -> None:
+    """
+    统一执行核主协程：在 event loop 真正跑起来后才触发 core_ready，
+    确保 HTTP 层拿到的 core_loop.is_running() 始终为 True。
+    """
+    # 此处已在 run_until_complete 内部执行，is_running() 此时为 True
+    app.core_loop = asyncio.get_running_loop()
+    core_ready.set()
     await app.agent.run()
 
 
@@ -5504,32 +5512,33 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
     app = NanobotWebAPI()
 
     # ── ① 统一执行核线程（持有 core_loop，AgentLoop.run() 在此循环中消费 inbound 消息）──
-    # AgentLoop.run() 内部会完成 MCP 一次性初始化（替代旧的 _mcp_init_thread）
+    # core_ready 在 loop 真正运行后（_core_main 内）触发，保证 is_running()=True
     core_ready = threading.Event()
     core_thread: threading.Thread | None = None
 
     def _core_thread_target() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        app.core_loop = loop
-        core_ready.set()
         try:
-            loop.run_until_complete(_core_main(app))
+            loop.run_until_complete(_core_main(app, core_ready))
         except Exception as e:
             logger.error(f"[Core] Core loop crashed: {e}", exc_info=True)
         finally:
             app.core_loop = None
-            loop.close()
+            try:
+                loop.close()
+            except Exception:
+                pass
             logger.info("[Core] Core loop exited")
 
     core_thread = threading.Thread(target=_core_thread_target, daemon=False, name="nanobot-core")
     core_thread.start()
 
-    # 等待 core_loop 就绪（最多 5 秒）
-    if core_ready.wait(timeout=5):
+    # 等待 core_loop 就绪（loop 真正运行后才会 set，最多等 10s）
+    if core_ready.wait(timeout=10):
         logger.info("[WebAPI] Core loop started successfully")
     else:
-        logger.warning("[WebAPI] Core loop did not become ready within 5s, continuing anyway")
+        logger.warning("[WebAPI] Core loop did not become ready within 10s, continuing anyway")
 
     # ── ② Cron 服务（独立线程，保持现状）──
     cron_thread: threading.Thread | None = None

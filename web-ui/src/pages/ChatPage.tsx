@@ -205,6 +205,13 @@ function ChatPage() {
   const currentTaskIdRef = useRef<string | null>(null)
   // 追踪是否正在从 session 恢复 MCP 设置（避免触发保存）
   const isRestoringMcpRef = useRef(false)
+  // 已处理过的 subagent_summary message_id 集合，防止 replay 时重复插入消息
+  // （loadMessages 会将 id 从 "msg_subagent_xxx" 替换为 "msg_{seq}"，导致朴素 id 比对失效）
+  const seenSummaryIdsRef = useRef<Set<string>>(new Set())
+  // 已发送过浏览器通知的 task_id，防止 replay 时重复通知
+  const notifiedTasksRef = useRef<Set<string>>(new Set())
+  // bgAgent stream 是否已干净结束（收到 stream_done），用于避免切 tab 时无效重连
+  const bgAgentsStreamFinishedRef = useRef(false)
   // 用于驱动轮询 hook 的 state（ref 不会触发重新渲染）
   const [pollingTaskId, setPollingTaskId] = useState<string | null>(null)
 
@@ -260,6 +267,8 @@ function ChatPage() {
       bgAgentsAbortRef.current.abort()
       bgAgentsAbortRef.current = null
     }
+    // 新连接开始，重置 finished 标志
+    bgAgentsStreamFinishedRef.current = false
     // 清理旧会话的 bgAgents 状态，防止内存泄漏
     setBgAgents([])
     console.log('[BgAgent] Starting subagent progress stream for session:', sessionId)
@@ -340,12 +349,20 @@ function ChatPage() {
             result: currentResult,
           }]
         })
-        // 发送浏览器通知提醒用户
-        if (currentStatus === 'ok' && currentResult) {
+        // 发送浏览器通知（用 ref 去重，避免 replay 时重复通知）
+        if (currentStatus === 'ok' && currentResult && !notifiedTasksRef.current.has(currentTaskId)) {
+          notifiedTasksRef.current.add(currentTaskId)
           notifyTaskComplete(currentTaskId, currentResult)
         }
         console.log('[BgAgent] Current bgAgents after subagent_end:', JSON.stringify(bgAgents))
       } else if (evt.type === 'subagent_summary') {
+        // seenSummaryIdsRef 去重：loadMessages 会把 id 从 "msg_subagent_xxx" 换成 "msg_{seq}"，
+        // 导致朴素的 m.id 比对在 tab 切回 replay 时失效，必须用独立 ref 记录已处理过的 message_id
+        if (seenSummaryIdsRef.current.has(evt.message_id)) {
+          console.log('[BgAgent] Skipping duplicate subagent_summary:', evt.message_id)
+          return
+        }
+        seenSummaryIdsRef.current.add(evt.message_id)
         // 将 LLM 总结追加为主对话中的 assistant 消息
         const summaryMsg: import('../types').Message = {
           id: evt.message_id,
@@ -356,7 +373,7 @@ function ChatPage() {
           sequence: Date.now(),
         }
         setMessages(prev => {
-          // 避免重复插入（SSE replay 场景）
+          // 双重保险：若 messages 中已有相同 id（loadMessages 前后 id 一致的情况）也跳过
           if (prev.some(m => m.id === summaryMsg.id)) return prev
           return [...prev, summaryMsg]
         })
@@ -372,6 +389,7 @@ function ChatPage() {
         bgAgentsSessionRef.current = null
       } else if (evt.type === 'stream_done') {
         console.log('[BgAgent] All subagents finished, stream closed')
+        bgAgentsStreamFinishedRef.current = true  // 标记已干净结束，切 tab 时不再重连
         bgAgentsAbortRef.current = null
         bgAgentsSessionRef.current = null
       }
@@ -526,6 +544,10 @@ function ChatPage() {
       }
       setBgAgents([])
     }
+    // 切换会话时清空跨会话的去重 ref，避免旧会话的 id 集合影响新会话
+    seenSummaryIdsRef.current.clear()
+    notifiedTasksRef.current.clear()
+    bgAgentsStreamFinishedRef.current = false
   }, [currentSession?.id])
 
   // 工具模式切换到 specified 时加载 MCP 列表
@@ -603,9 +625,14 @@ function ChatPage() {
           }, 500) // 延迟检查，让 finally 块有机会先执行
         }
 
-        // 页面重新可见时，重新建立 subagent 进度流连接
-        // 这样可以从 buffer 中 replay 之前未接收的事件
-        startBgAgentStream(currentSession.id)
+        // 页面重新可见时，仅在以下情况重连 subagent 进度流：
+        // 1. stream 未干净结束（bgAgentsStreamFinishedRef=false）：可能有未接收的事件
+        // 2. 有已断线的 agent：用户需要重新拉取结果
+        // 避免 stream 已完成时无意义重连触发 buffer replay 导致消息重复
+        const hasDisconnectedAgents = bgAgents.some(a => a.disconnected)
+        if (!bgAgentsStreamFinishedRef.current || hasDisconnectedAgents) {
+          startBgAgentStream(currentSession.id)
+        }
       }
     }
 
@@ -886,10 +913,14 @@ function ChatPage() {
   }
 
   const handleStop = async () => {
+    // 无论 abortController 是否存在，都清除 loading 状态，避免恢复场景下卡住
+    const hadStream = abortControllerRef.current !== null
     if (abortControllerRef.current) {
       abortControllerRef.current.abort()
       abortControllerRef.current = null
-      setLoading(false)
+    }
+    setLoading(false)
+    if (hadStream) {
       antMessage.info(t('chat.generationStopped'))
     }
     try {
