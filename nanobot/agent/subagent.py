@@ -110,6 +110,48 @@ class SubagentManager:
         self._chain_monitor = ExecutionChainMonitor.get_instance()
         self._subagent_nodes: dict[str, str] = {}  # task_id -> node_id
 
+        # 主事件循环引用，用于后台线程中线程安全地发布 inbound 消息
+        self._main_loop: asyncio.AbstractEventLoop | None = None
+
+    def set_main_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """设置主事件循环引用，用于后台线程中线程安全地发布消息。"""
+        self._main_loop = loop
+
+    def _publish_inbound_safe(self, msg: "InboundMessage") -> None:
+        """
+        线程安全地将消息发布到 inbound 队列。
+
+        兼容两种调用场景：
+        - 后台线程（spawn 子 agent）：通过 call_soon_threadsafe 唤醒主循环 I/O selector
+        - 主事件循环：直接 put_nowait（由调用方的 await 上下文保证安全）
+
+        注意：put_nowait 在队列满（maxsize=200）时会抛 QueueFull，
+        此处静默记录日志以避免整个后台线程崩溃。
+        """
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        main_loop = self._main_loop
+
+        def _safe_put(m: "InboundMessage") -> None:
+            try:
+                self.bus.inbound.put_nowait(m)
+            except asyncio.QueueFull:
+                logger.warning(
+                    "[SubagentBus] inbound queue full, announce message dropped "
+                    "(channel=%s, chat_id=%s)",
+                    getattr(m, "channel", "?"), getattr(m, "chat_id", "?"),
+                )
+
+        if main_loop is not None and current_loop is not main_loop:
+            # 后台线程路径：call_soon_threadsafe 写入 self-pipe，确保主循环从 I/O selector 中唤醒
+            main_loop.call_soon_threadsafe(_safe_put, msg)
+        else:
+            # 主循环路径：直接同步 put（调用方应在协程中调用）
+            _safe_put(msg)
+
     def _complete_subagent_node(self, task_id: str, status: str, result: str = None, error: str = None):
         """完成子 Agent 执行节点"""
         node_id = self._subagent_nodes.pop(task_id, None)
@@ -830,16 +872,24 @@ class SubagentManager:
                     if len(batch_task_ids) > 1:
                         await self._deliver_batch_complete(batch_id, batch_task_ids, origin)
                     else:
-                        # vision/voice 模板：web 渠道也走 _announce_result
-                        if template in ("vision", "voice") and origin.get("channel") == "web":
+                        # voice 模板：已在上面通过 _inject_voice_as_user_message 注入转写文本，
+                        # 不再走 announce，避免触发第二次 LLM 处理导致重复回答
+                        if template == "voice" and origin.get("channel") != "web":
+                            logger.info(f"Subagent [{task_id}] voice result injected via _inject_voice_as_user_message, skipping announce")
+                        # vision 模板：web 渠道走 _announce_result
+                        elif template in ("vision", "voice") and origin.get("channel") == "web":
                             await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                         elif origin.get("channel") == "web":
                             await self._generate_and_push_summary(task_id, label, task, final_result, origin)
                         else:
                             await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                 else:
-                    # vision/voice 模板：web 渠道也走 _announce_result
-                    if template in ("vision", "voice") and origin.get("channel") == "web":
+                    # voice 模板：已在上面通过 _inject_voice_as_user_message 注入转写文本，
+                    # 不再走 announce，避免触发第二次 LLM 处理导致重复回答
+                    if template == "voice" and origin.get("channel") != "web":
+                        logger.info(f"Subagent [{task_id}] voice result injected via _inject_voice_as_user_message, skipping announce")
+                    # vision 模板：web 渠道走 _announce_result
+                    elif template in ("vision", "voice") and origin.get("channel") == "web":
                         await self._announce_result(task_id, label, task, final_result, origin, "ok", template=template)
                     elif origin.get("channel") == "web":
                         await self._generate_and_push_summary(task_id, label, task, final_result, origin)
@@ -1529,7 +1579,7 @@ class SubagentManager:
             chat_id=f"{origin['channel']}:{origin['chat_id']}",
             content=content,
         )
-        await self.bus.publish_inbound(msg)
+        self._publish_inbound_safe(msg)
         logger.debug(f"[SubagentBatch] Announced batch result to {origin['channel']}:{origin['chat_id']}")
 
     def _build_full_summary_content(self, label: str, task: str, result: str, brief_summary: str) -> str:
@@ -1688,11 +1738,8 @@ class SubagentManager:
             chat_id=origin["chat_id"],
             content=transcribed_text.strip() or "[语音转写为空]",
         )
-        try:
-            await self.bus.publish_inbound(msg)
-            logger.info(f"[Voice] Injected transcription as user message to {origin['channel']}:{origin['chat_id']}")
-        except Exception as e:
-            logger.error(f"[Voice] publish_inbound failed (possible cross-loop issue): {e}")
+        self._publish_inbound_safe(msg)
+        logger.info(f"[Voice] Injected transcription as user message to {origin['channel']}:{origin['chat_id']}")
 
     async def _announce_result(
         self,
@@ -1705,6 +1752,12 @@ class SubagentManager:
         template: str = "",
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
+        # 内联 vision 分析（run_vision_analysis 调用）：结果由调用方直接使用，不需要 announce。
+        # 若触发 announce 会导致主 agent 在原始回复之后再次生成一次相同回复（重复消息 Bug）。
+        if task_id.startswith("vision-inline-"):
+            logger.debug(f"[SubagentAnnounce] Skipping announce for inline vision task: {task_id}")
+            return
+
         # voice 模板在非 web 渠道：转写结果作为用户指令注入，主 agent 直接执行
         if template == "voice" and origin.get("channel") != "web" and status == "ok":
             await self._inject_voice_as_user_message(origin, result)
@@ -1752,7 +1805,7 @@ class SubagentManager:
             content=announce_content,
         )
 
-        await self.bus.publish_inbound(msg)
+        self._publish_inbound_safe(msg)
         logger.info(f"[SubagentAnnounce] Published to bus, origin={origin['channel']}:{origin['chat_id']}")
 
     def _create_tools_for_template(self, template: str) -> ToolRegistry:
