@@ -280,11 +280,6 @@
       "claudeCodePermissionModeHelp": "auto: 逐项确认。bypassPermissions: 自动批准所有工具（读/写/执行），无需确认",
       "enableParallelTools": "启用并行工具调用",
       "enableSubagentParallel": "启用子Agent并行执行",
-      "enableSmartParallel": "启用智能并行判断",
-      "enableSmartParallelHelp": "使用LLM判断工具是否可以并行执行",
-      "smartParallelModel": "智能并行判断模型",
-      "smartParallelModelHelp": "留空使用默认轻量模型",
-      "smartParallelModelPlaceholder": "留空使用默认模型",
       "saveSuccess": "并发配置已更新",
       "saveFailed": "保存失败"
     },

@@ -1,108 +1,49 @@
-"""智能并行度判断服务 - 使用 LLM 决定工具是否适合并行执行."""
+"""并行度判断服务（纯规则，零延迟）。
 
-import json
+历史背景：
+  原版使用二级 LLM（claude-haiku）做并行判断，已废弃。
+  废弃原因：
+    1. 主 LLM 在单次响应中批量返回多个 tool_calls，已经过完整上下文推理，隐含「可并行」判断；
+    2. 二级 LLM 只拿到工具名（use_simple_prompt=True 时甚至不含参数），信息量远少于主 LLM；
+    3. LLM roundtrip（300–800ms）通常超过轻量工具并行化带来的收益，造成净负优化；
+    4. LLM 调用失败时原来的 fallback 方向错误（默认 parallel=True），可能引发数据竞争。
+
+现在仅做静态规则分析（parallel_dependency_analyzer），零延迟且可预测。
+保留 async 接口以维持 loop.py 中 `await decider.should_parallel(...)` 的调用兼容性。
+"""
+
 from typing import Any
 
 from loguru import logger
 
-from nanobot.providers.base import LLMProvider
-
-
-# 轻量级提示词，用于快速判断
-PARALLEL_DECISION_PROMPT = """你是一个工具并行执行顾问。请判断以下工具调用是否可以并行执行。
-
-要求：
-1. 如果工具之间没有依赖关系（不共享参数、不需要彼此的输出），可以并行
-2. 如果工具会修改相同文件或资源，必须串行
-3. 如果工具需要用户交互（如 message 工具），应该串行
-4. 如果工具是 CPU 密集型（如 exec 执行复杂计算），可以并行
-
-返回 JSON 格式：
-{{
-  "parallel": true/false,
-  "groups": [["tool1", "tool2"], ["tool3"]],  // 分组串行执行的工具
-  "reason": "简短原因"
-}}
-
-工具调用列表：
-{tool_calls}
-
-只返回 JSON，不要其他内容。"""
-
-# 更简单的判断提示词（更少 token）
-SIMPLE_PARALLEL_PROMPT = """判断这些工具能否并行执行。
-
-工具列表：{tool_names}
-
-规则：
-- 读文件(read_file)之间可以并行
-- 写文件(write_file)与读文件可并行
-- 相同文件的写操作必须串行
-- exec/spawn 建议并行
-- message 必须串行
-
-JSON: {{"parallel": bool, "reason": "..."}}"""
-
 
 class SmartParallelDecider:
     """
-    智能并行度判断器。
+    并行度判断器（纯规则，零延迟）。
 
-    使用 LLM 轻量级判断工具调用是否适合并行执行。
+    构造参数 provider / model / use_simple_prompt 已废弃，
+    保留仅为兼容旧调用方，传入后会打印警告并忽略。
     """
 
     def __init__(
         self,
-        provider: LLMProvider,
+        provider=None,
         model: str | None = None,
         use_simple_prompt: bool = True,
     ):
-        """
-        初始化智能并行度判断器。
+        if provider is not None or model is not None:
+            logger.debug(
+                "[SmartParallelDecider] provider/model 参数已废弃，"
+                "不再使用 LLM 判断并行度，参数将被忽略"
+            )
 
-        Args:
-            provider: LLM Provider
-            model: 使用的模型（默认使用轻量模型）
-            use_simple_prompt: 是否使用简单提示词（更少 token）
+    async def should_parallel(self, tool_calls: list) -> dict[str, Any]:
         """
-        self.provider = provider
-        self.model = model or "anthropic/claude-haiku-4-20250307"  # 使用轻量快速模型
-        self.use_simple_prompt = use_simple_prompt
-
-    def _build_tool_description(self, tool_calls: list) -> str:
-        """
-        构建工具描述。
-
-        Args:
-            tool_calls: 工具调用列表
+        判断工具调用是否应该并行执行（纯规则，零延迟）。
 
         Returns:
-            工具描述字符串
+            {"parallel": bool, "groups": list, "reason": str}
         """
-        descriptions = []
-        for i, tc in enumerate(tool_calls):
-            name = tc.name if hasattr(tc, 'name') else tc.get('name', 'unknown')
-            args = tc.arguments if hasattr(tc, 'arguments') else tc.get('arguments', {})
-            descriptions.append(f"{i+1}. {name}({json.dumps(args)[:100]})")
-        return "\n".join(descriptions)
-
-    async def should_parallel(
-        self,
-        tool_calls: list,
-    ) -> dict[str, Any]:
-        """
-        判断工具调用是否应该并行执行。
-
-        Args:
-            tool_calls: 工具调用列表
-
-        Returns:
-            判断结果字典，包含：
-            - parallel: 是否并行
-            - groups: 分组（用于串行执行）
-            - reason: 原因
-        """
-        # 单个工具直接返回串行（不需要判断）
         if len(tool_calls) <= 1:
             return {
                 "parallel": False,
@@ -110,138 +51,10 @@ class SmartParallelDecider:
                 "reason": "单个工具无需并行",
             }
 
-        # 规则优先：使用并行依赖分析器
-        from nanobot.services.parallel_dependency_analyzer import analyze as analyze_dependencies
-        rule_result = analyze_dependencies(tool_calls)
-        if not rule_result.get("need_llm", True):
-            return {
-                "parallel": rule_result["can_parallel"],
-                "groups": rule_result["groups"],
-                "reason": rule_result["reason"],
-            }
-
-        # 原有 message 检查
-        tool_names = [tc.name if hasattr(tc, 'name') else tc.get('name', '') for tc in tool_calls]
-
-        # message 工具必须串行
-        if 'message' in tool_names:
-            return {
-                "parallel": False,
-                "groups": [tool_calls],
-                "reason": "message 工具需要用户交互",
-            }
-
-        # 快速启发式判断（不调用 LLM）
-        if self._quick_check_parallel(tool_calls):
-            return {
-                "parallel": True,
-                "groups": [tool_calls],
-                "reason": "快速判断：工具之间无依赖",
-            }
-
-        # 调用 LLM 进行智能判断
-        try:
-            return await self._llm_decide(tool_calls)
-        except Exception as e:
-            logger.warning(f"LLM parallel decision failed, using default: {e}")
-            # 默认返回并行（激进策略）
-            return {
-                "parallel": True,
-                "groups": [tool_calls],
-                "reason": f"LLM 调用失败，默认并行: {str(e)[:50]}",
-            }
-
-    def _quick_check_parallel(self, tool_calls: list) -> bool:
-        """
-        快速启发式判断（无需 LLM）。
-
-        Args:
-            tool_calls: 工具调用列表
-
-        Returns:
-            是否可以并行
-        """
-        # 提取工具名和参数
-        tools_info = []
-        for tc in tool_calls:
-            name = tc.name if hasattr(tc, 'name') else tc.get('name', '')
-            args = tc.arguments if hasattr(tc, 'arguments') else tc.get('arguments', {})
-            tools_info.append((name, args))
-
-        # 检查是否有写操作
-        write_tools = {'write_file', 'edit_file', 'exec', 'spawn', 'cron'}
-        read_tools = {'read_file', 'list_dir', 'web_search', 'web_fetch'}
-
-        has_write = any(name in write_tools for name, _ in tools_info)
-        has_read = any(name in read_tools for name, _ in tools_info)
-
-        # 如果只有读操作，可以并行
-        if has_read and not has_write:
-            return True
-
-        # 如果都是 exec/spawn，可以并行
-        all_background = all(
-            name in {'exec', 'spawn', 'web_search', 'web_fetch', 'read_file', 'list_dir'}
-            for name, _ in tools_info
-        )
-        if all_background:
-            return True
-
-        return False
-
-    async def _llm_decide(self, tool_calls: list) -> dict[str, Any]:
-        """
-        使用 LLM 判断并行度。
-
-        Args:
-            tool_calls: 工具调用列表
-
-        Returns:
-            判断结果
-        """
-        # 构建工具描述
-        tool_names = [tc.name if hasattr(tc, 'name') else tc.get('name', '') for tc in tool_calls]
-        tool_desc = self._build_tool_description(tool_calls)
-
-        # 选择提示词
-        if self.use_simple_prompt:
-            prompt = SIMPLE_PARALLEL_PROMPT.format(tool_names=", ".join(tool_names))
-        else:
-            prompt = PARALLEL_DECISION_PROMPT.format(tool_calls=tool_desc)
-
-        # 调用 LLM
-        response = await self.provider.chat(
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
-            model=self.model,
-            max_tokens=300,
-            temperature=0.3,
-        )
-
-        # 解析响应
-        content = response.content.strip()
-
-        # 尝试提取 JSON
-        try:
-            # 尝试直接解析
-            result = json.loads(content)
-            return result
-        except json.JSONDecodeError:
-            # 尝试从文本中提取 JSON
-            import re
-            json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group())
-                    return result
-                except json.JSONDecodeError:
-                    pass
-
-        # 解析失败，默认并行
-        logger.warning(f"Failed to parse LLM response: {content[:200]}")
+        from nanobot.services.parallel_dependency_analyzer import analyze
+        result = analyze(tool_calls)
         return {
-            "parallel": True,
-            "groups": [tool_calls],
-            "reason": "LLM 响应解析失败，默认并行",
+            "parallel": result["can_parallel"],
+            "groups": result["groups"],
+            "reason": result["reason"],
         }

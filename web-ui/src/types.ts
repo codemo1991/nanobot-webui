@@ -254,8 +254,6 @@ export interface ConcurrencyConfig {
   enable_subagent_parallel: boolean
   claude_code_max_concurrent: number
   claude_code_permission_mode: string
-  enable_smart_parallel: boolean
-  smart_parallel_model: string
 }
 
 // 前端格式的并发配置
@@ -267,8 +265,6 @@ export interface WebConcurrencyConfig {
   enableSubagentParallel: boolean
   claudeCodeMaxConcurrent: number
   claudeCodePermissionMode: string
-  enableSmartParallel: boolean
-  smartParallelModel: string
 }
 
 // 监控指标类型

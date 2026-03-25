@@ -23,7 +23,7 @@ from uuid import uuid4
 from loguru import logger
 
 from nanobot.agent.loop import AgentLoop
-from nanobot.agentloop.db import connect_chat, connect_system, init_chat_schema, init_system_schema
+from nanobot.agentloop.db import connect_chat, connect_system, get_thread_chat_conn, init_chat_schema, init_system_schema
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.bus.queue import MessageBus
 from nanobot.config.defaults import init_default_profiles, init_default_agent_config
@@ -47,6 +47,18 @@ def _ok(data: Any) -> dict[str, Any]:
 
 def _err(code: str, message: str, details: Any = None) -> dict[str, Any]:
     return {"success": False, "data": None, "error": {"code": code, "message": message, "details": details}}
+
+
+def _sse_json_dumps(evt: dict[str, Any]) -> str:
+    """SSE data 行 JSON 序列化；避免 datetime/非标准 float 等导致 dumps 失败、流无法结束。"""
+
+    def _default(o: Any) -> Any:
+        if isinstance(o, float):
+            if o != o or o in (float("inf"), float("-inf")):
+                return None
+        return str(o)
+
+    return json.dumps(evt, ensure_ascii=False, default=_default)
 
 
 def _sync_smart_profile_default_model(repo: "ConfigRepository", model_id: str) -> None:
@@ -2141,7 +2153,6 @@ class NanobotWebAPI:
         Get MCP list from config, discover tools for each server (connects, lists, disconnects).
         Returns MCP configs enriched with tools information.
         """
-        import asyncio
         from nanobot.config.loader import load_config
         from nanobot.mcp.loader import McpToolLoader, _safe_id
 
@@ -2169,15 +2180,11 @@ class NanobotWebAPI:
                 "tools": [],
             }
 
-            # Try to discover tools (connect, list, disconnect)
+            # Try to discover tools（完整关闭 session + transport，避免 streamable_http 泄漏）
             server_id = mcp_dict["id"] or mcp_dict["name"]
             try:
-                result = await asyncio.wait_for(
-                    loader.connect_lazy(server_id, timeout=10.0),
-                    timeout=15.0,
-                )
-                if result:
-                    session, tools = result
+                tools = await loader.list_tools_ephemeral(server_id, timeout=12.0)
+                if tools:
                     mcp_dict["tools"] = [
                         {
                             "name": t.name,
@@ -2185,10 +2192,6 @@ class NanobotWebAPI:
                         }
                         for t in tools
                     ]
-                    try:
-                        await session.__aexit__(None, None, None)
-                    except BaseException:
-                        pass
 
                     # Persist discovered tools to SQLite
                     if mcp_dict["tools"]:
@@ -2209,7 +2212,7 @@ class NanobotWebAPI:
                             )
                         except Exception as e:
                             logger.warning(f"Failed to persist tools for {mcp_cfg.id}: {e}")
-            except (asyncio.TimeoutError, Exception) as e:
+            except Exception as e:
                 logger.debug(f"MCP {server_id}: tool discovery skipped: {e}")
 
             results.append(mcp_dict)
@@ -2222,7 +2225,6 @@ class NanobotWebAPI:
         Returns list of tool schemas [{name, description, parameters}, ...].
         Saves discovered tools to database for persistence.
         """
-        import asyncio
         from nanobot.config.loader import load_config
         from nanobot.mcp.loader import McpToolLoader, _safe_id
         from nanobot.config.loader import get_config_repository
@@ -2238,12 +2240,8 @@ class NanobotWebAPI:
 
         discovered_tools: list[dict[str, Any]] = []
         try:
-            result = await asyncio.wait_for(
-                loader.connect_lazy(server_id, timeout=10.0),
-                timeout=15.0,
-            )
-            if result:
-                _, tools = result
+            tools = await loader.list_tools_ephemeral(server_id, timeout=12.0)
+            if tools:
                 discovered_tools = [
                     {
                         "name": t.name,
@@ -2252,8 +2250,6 @@ class NanobotWebAPI:
                     }
                     for t in tools
                 ]
-        except asyncio.TimeoutError:
-            logger.warning(f"MCP {server_id}: tool discovery timeout")
         except Exception as e:
             logger.warning(f"MCP {server_id}: tool discovery failed: {e}")
 
@@ -2472,16 +2468,14 @@ class NanobotWebAPI:
             "enableSubagentParallel": "enable_subagent_parallel",
             "claudeCodeMaxConcurrent": "claude_code_max_concurrent",
             "claudeCodePermissionMode": "claude_code_permission_mode",
-            "enableSmartParallel": "enable_smart_parallel",
-            "smartParallelModel": "smart_parallel_model",
         }
 
         config = {}
         for web_key, db_key in config_map.items():
             if web_key in data and data[web_key] is not None:
-                if web_key in ("enableParallelTools", "enableSubagentParallel", "enableSmartParallel"):
+                if web_key in ("enableParallelTools", "enableSubagentParallel"):
                     config[db_key] = bool(data[web_key])
-                elif web_key in ("smartParallelModel", "claudeCodePermissionMode"):
+                elif web_key in ("claudeCodePermissionMode",):
                     config[db_key] = str(data[web_key])
                 else:
                     config[db_key] = int(data[web_key])
@@ -2497,11 +2491,6 @@ class NanobotWebAPI:
                 self.agent._enable_parallel_tools = bool(data["enableParallelTools"])
             if "threadPoolSize" in data and data["threadPoolSize"] is not None:
                 self.agent._thread_pool_size = int(data["threadPoolSize"])
-            if "enableSmartParallel" in data and data["enableSmartParallel"] is not None:
-                self.agent._enable_smart_parallel = bool(data["enableSmartParallel"])
-            if "smartParallelModel" in data and data["smartParallelModel"] is not None:
-                self.agent._smart_parallel_model = str(data["smartParallelModel"])
-
         return self.get_concurrency_config()
 
     def get_metrics(self) -> dict[str, Any]:
@@ -3402,8 +3391,9 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                             break
                     continue
                 try:
-                    payload = json.dumps(evt, ensure_ascii=False)
-                except (TypeError, ValueError):
+                    payload = _sse_json_dumps(evt)
+                except (TypeError, ValueError, OverflowError) as e:
+                    logger.warning("Chat stream resume SSE serialization failed: %s", e)
                     continue
                 try:
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
@@ -3414,6 +3404,10 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     break
         except Exception as e:
             logger.warning("Chat stream resume error: %s", e)
+        finally:
+            # 退订 ChatStreamBus，防止已消费完毕的 Queue 对象在订阅者列表中无限累积
+            from nanobot.web.chat_stream_bus import ChatStreamBus
+            ChatStreamBus.get().unsubscribe(f"web:{session_id}", evt_queue)
 
     def _handle_chat_stream(
         self, app: "NanobotWebAPI", session_id: str, content: str, images: list[str] | None = None,
@@ -3442,6 +3436,10 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         stream_start = time.time()
         # Gateway 模式总超时 = message_timeout + 60s 缓冲，防止 on_complete 永久不触发
         total_timeout = getattr(app.agent, "message_timeout", 300.0) + 60.0
+
+        # 追踪流是否干净结束（done/error 事件已成功送达客户端）
+        # 干净结束时可以安全清理 ChatStreamBus 缓冲；客户端断开则保留以便 resume 重连
+        stream_ended_cleanly = False
 
         try:
             loop_count = 0
@@ -3484,10 +3482,32 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                 break
                         continue
                 try:
-                    payload = json.dumps(evt, ensure_ascii=False)
-                except (TypeError, ValueError) as e:
-                    logger.warning("SSE event not JSON-serializable: %s", e)
-                    continue
+                    payload = _sse_json_dumps(evt)
+                except (TypeError, ValueError, OverflowError) as e:
+                    logger.warning("SSE event serialization failed: %s", e)
+                    if evt.get("type") in ("done", "error"):
+                        try:
+                            if evt.get("type") == "done":
+                                payload = json.dumps(
+                                    {
+                                        "type": "done",
+                                        "content": str(evt.get("content") or ""),
+                                        "assistantMessage": None,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            else:
+                                payload = json.dumps(
+                                    {
+                                        "type": "error",
+                                        "message": str(evt.get("message") or "响应序列化失败"),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                    else:
+                        continue
                 line = f"data: {payload}\n\n"
                 try:
                     self.wfile.write(line.encode("utf-8"))
@@ -3498,6 +3518,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     app.agent.cancel_current_request(channel="web", session_id=session_id)
                     break
                 if evt.get("type") in ("done", "error"):
+                    stream_ended_cleanly = True
                     break
             if thread is not None:
                 # legacy 模式：等线程清理完 pending tasks（最多 3s）再加 2s 缓冲
@@ -3511,6 +3532,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 thread.join(timeout=3.0)
                 if thread.is_alive():
                     logger.error("Chat stream legacy thread failed to terminate within 8s, possible resource leak")
+            # 流正常结束时主动清理 ChatStreamBus 缓冲，防止长期运行内存积累；
+            # 客户端中途断开则保留缓冲，resume 重连时可回放
+            if stream_ended_cleanly:
+                from nanobot.web.chat_stream_bus import ChatStreamBus
+                ChatStreamBus.get().close_session(f"web:{session_id}")
 
     def _handle_subagent_progress_stream(
         self, app: "NanobotWebAPI", session_id: str
@@ -3562,8 +3588,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     continue
 
                 try:
-                    payload = json.dumps(evt, ensure_ascii=False)
-                except (TypeError, ValueError) as e:
+                    payload = _sse_json_dumps(evt)
+                except (TypeError, ValueError, OverflowError) as e:
                     logger.warning(f"[SubagentProgress] Failed to serialize event: {e}, event: {evt}")
                     continue
 
@@ -3627,9 +3653,9 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                 break
                         continue
                 try:
-                    payload = json.dumps(evt, ensure_ascii=False)
-                except (TypeError, ValueError) as e:
-                    logger.warning(f"[ChatStream] Failed to serialize event: {e}")
+                    payload = _sse_json_dumps(evt)
+                except (TypeError, ValueError, OverflowError) as e:
+                    logger.warning(f"[ChatStream] Failed to serialize mirror event: {e}")
                     continue
                 line = f"data: {payload}\n\n"
                 try:
@@ -4631,7 +4657,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                     continue
                             if evt is None:
                                 continue
-                            payload = json.dumps(evt, ensure_ascii=False)
+                            payload = _sse_json_dumps(evt)
                             self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                             self.wfile.flush()
                             if evt.get("type") in ("done", "error"):
@@ -4707,7 +4733,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                     continue
                             if evt is None:
                                 continue
-                            payload = json.dumps(evt, ensure_ascii=False)
+                            payload = _sse_json_dumps(evt)
                             self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                             self.wfile.flush()
                             if evt.get("type") in ("done", "error"):
@@ -5547,6 +5573,25 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
         cron_thread, cron_loop = _run_cron_in_thread(app)
     except Exception as e:
         logger.warning(f"Failed to start cron service: {e}")
+
+    # ── ② Cron ChatStreamBus 过期会话 TTL 清理（每小时一次）──
+    # 对于客户端中途断开、从未触发 close_session 的 session，每小时清理一次无活跃订阅且超时的缓冲
+    def _stream_bus_cleanup_loop() -> None:
+        from nanobot.web.chat_stream_bus import ChatStreamBus
+        while True:
+            time.sleep(3600)
+            try:
+                n = ChatStreamBus.get().cleanup_stale_sessions()
+                if n:
+                    logger.debug("[ChatStreamBus] 清理了 %d 个过期会话缓冲", n)
+            except Exception as _e:
+                logger.warning("[ChatStreamBus] cleanup error: %s", _e)
+
+    threading.Thread(
+        target=_stream_bus_cleanup_loop,
+        daemon=True,
+        name="stream-bus-cleanup",
+    ).start()
 
     # ── ③ 确定静态文件目录 ──
     if static_dir is None:

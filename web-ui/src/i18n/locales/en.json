@@ -280,11 +280,6 @@
       "claudeCodePermissionModeHelp": "auto: confirm each action. bypassPermissions: auto-approve all tools (read/write/exec)",
       "enableParallelTools": "Enable Parallel Tool Calls",
       "enableSubagentParallel": "Enable Subagent Parallel Execution",
-      "enableSmartParallel": "Enable Smart Parallel Decision",
-      "enableSmartParallelHelp": "Use LLM to decide if tools can run in parallel",
-      "smartParallelModel": "Smart Parallel Model",
-      "smartParallelModelHelp": "Leave empty to use default lightweight model",
-      "smartParallelModelPlaceholder": "Leave empty to use default model",
       "saveSuccess": "Concurrency config updated",
       "saveFailed": "Save failed"
     },

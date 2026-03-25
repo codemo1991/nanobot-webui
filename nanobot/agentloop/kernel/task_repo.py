@@ -7,56 +7,51 @@ from nanobot.agentloop.kernel.ids import now_ts
 
 
 def lease_one_ready_task(conn, lease_owner: str, lease_seconds: int = 30) -> dict | None:
-    """领取一个 READY 且依赖满足的任务，返回任务 dict 或 None。"""
+    """领取一个 READY 且依赖满足的任务，返回任务 dict 或 None。
+
+    Fix #11: 使用 UPDATE...RETURNING 将原先三次查询（SELECT id → UPDATE → SELECT *）
+    合并为一次原子操作，减少 DB round-trip。
+    需要 SQLite >= 3.35（Python 3.11+ 默认满足）。
+    """
     now = now_ts()
     lease_until = now + lease_seconds
 
     with tx(conn, immediate=True):
-        row = conn.execute(
-            """
-            SELECT t.task_id
-            FROM agentloop_tasks t
-            WHERE t.state = 'READY'
-              AND (t.lease_until IS NULL OR t.lease_until < ?)
-              AND (t.deadline_ts IS NULL OR t.deadline_ts > ?)
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM agentloop_task_artifact_deps d
-                  JOIN agentloop_artifacts a ON a.artifact_id = d.artifact_id
-                  WHERE d.task_id = t.task_id
-                    AND d.mode = 'READ'
-                    AND d.required = 1
-                    AND a.status <> 'READY'
-              )
-            ORDER BY t.priority ASC, t.depth ASC, t.created_at ASC
-            LIMIT 1
-            """,
-            (now, now),
-        ).fetchone()
-
-        if not row:
-            return None
-
-        task_id = row["task_id"]
         cur = conn.execute(
             """
             UPDATE agentloop_tasks
-            SET state = 'LEASED',
+            SET state      = 'LEASED',
                 lease_owner = ?,
                 lease_until = ?,
-                updated_at = ?
-            WHERE task_id = ?
-              AND state = 'READY'
-              AND (lease_until IS NULL OR lease_until < ?)
+                updated_at  = ?
+            WHERE task_id = (
+                SELECT t.task_id
+                FROM agentloop_tasks t
+                WHERE t.state = 'READY'
+                  AND (t.lease_until IS NULL OR t.lease_until < ?)
+                  AND (t.deadline_ts IS NULL OR t.deadline_ts > ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM agentloop_task_artifact_deps d
+                      JOIN agentloop_artifacts a ON a.artifact_id = d.artifact_id
+                      WHERE d.task_id = t.task_id
+                        AND d.mode = 'READ'
+                        AND d.required = 1
+                        AND a.status <> 'READY'
+                  )
+                ORDER BY t.priority ASC, t.depth ASC, t.created_at ASC
+                LIMIT 1
+            )
+            AND state = 'READY'
+            AND (lease_until IS NULL OR lease_until < ?)
+            RETURNING *
             """,
-            (lease_owner, lease_until, now, task_id, now),
+            (lease_owner, lease_until, now, now, now, now),
         )
-
-        if cur.rowcount != 1:
+        row = cur.fetchone()
+        if not row:
             return None
-
-        task = conn.execute("SELECT * FROM agentloop_tasks WHERE task_id = ?", (task_id,)).fetchone()
-        return dict(task)
+        return dict(row)
 
 
 def mark_task_running(conn, task_id: str) -> None:
@@ -66,7 +61,7 @@ def mark_task_running(conn, task_id: str) -> None:
         conn.execute(
             """
             UPDATE agentloop_tasks
-            SET state = 'RUNNING',
+            SET state      = 'RUNNING',
                 started_at = COALESCE(started_at, ?),
                 updated_at = ?,
                 attempt_no = attempt_no + 1
@@ -79,13 +74,12 @@ def mark_task_running(conn, task_id: str) -> None:
         ).fetchone()
         if row is None:
             return
-        trace_id = row["trace_id"]
         conn.execute(
             """
             INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
             VALUES (?, ?, NULL, 'TASK_START', ?, ?)
             """,
-            (trace_id, task_id, "{}", ts),
+            (row["trace_id"], task_id, "{}", ts),
         )
 
 
@@ -102,12 +96,12 @@ def mark_task_done(conn, task_id: str, artifact_id: str | None) -> None:
         conn.execute(
             """
             UPDATE agentloop_tasks
-            SET state = 'DONE',
+            SET state             = 'DONE',
                 result_artifact_id = ?,
-                finished_at = ?,
-                updated_at = ?,
-                lease_owner = NULL,
-                lease_until = NULL
+                finished_at        = ?,
+                updated_at         = ?,
+                lease_owner        = NULL,
+                lease_until        = NULL
             WHERE task_id = ?
             """,
             (artifact_id, ts, ts, task_id),
@@ -117,14 +111,15 @@ def mark_task_done(conn, task_id: str, artifact_id: str | None) -> None:
             INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
             VALUES (?, ?, ?, 'TASK_DONE', ?, ?)
             """,
-            (row["trace_id"], task_id, row["parent_task_id"], json.dumps({"artifact_id": artifact_id}), ts),
+            (row["trace_id"], task_id, row["parent_task_id"],
+             json.dumps({"artifact_id": artifact_id}), ts),
         )
         if row["parent_task_id"]:
             conn.execute(
                 """
                 UPDATE agentloop_tasks
                 SET finished_children = finished_children + 1,
-                    updated_at = ?
+                    updated_at        = ?
                 WHERE task_id = ?
                 """,
                 (ts, row["parent_task_id"]),
@@ -149,11 +144,11 @@ def mark_task_failed(conn, task_id: str, error_code: str, error_message: str) ->
         conn.execute(
             """
             UPDATE agentloop_tasks
-            SET state = 'FAILED',
-                error_code = ?,
+            SET state       = 'FAILED',
+                error_code  = ?,
                 error_message = ?,
                 finished_at = ?,
-                updated_at = ?,
+                updated_at  = ?,
                 lease_owner = NULL,
                 lease_until = NULL
             WHERE task_id = ?
@@ -221,12 +216,12 @@ def mark_task_waiting_children(
         conn.execute(
             """
             UPDATE agentloop_tasks
-            SET state = 'WAITING_CHILDREN',
+            SET state             = 'WAITING_CHILDREN',
                 result_artifact_id = ?,
-                expected_children = ?,
-                updated_at = ?,
-                lease_owner = NULL,
-                lease_until = NULL
+                expected_children  = ?,
+                updated_at         = ?,
+                lease_owner        = NULL,
+                lease_until        = NULL
             WHERE task_id = ?
             """,
             (artifact_id, expected_children, ts, task_id),
@@ -246,8 +241,8 @@ def mark_task_waiting_artifacts(conn, task_id: str, wait_for_artifacts: list[str
         conn.execute(
             """
             UPDATE agentloop_tasks
-            SET state = 'WAITING_ARTIFACTS',
-                updated_at = ?,
+            SET state       = 'WAITING_ARTIFACTS',
+                updated_at  = ?,
                 lease_owner = NULL,
                 lease_until = NULL
             WHERE task_id = ?
@@ -297,7 +292,10 @@ def fulfill_pending_deps_for_artifact(conn, artifact_id: str) -> None:
 def mark_waiting_artifacts_tasks_ready(conn, artifact_id: str) -> None:
     """
     当 artifact 变为 READY 时，检查依赖该 artifact 的 WAITING_ARTIFACTS 任务，
-    若其所有 required READ 依赖已满足，则推进为 READY。
+    若其所有 required READ 依赖已满足，则批量推进为 READY。
+
+    Fix #7: 原实现对每个可推进的任务单独开事务（N 个事务），
+    改为先收集所有可推进任务 ID，再在一个事务内批量更新，减少写锁争用。
     """
     ts = now_ts()
     rows = conn.execute(
@@ -312,6 +310,11 @@ def mark_waiting_artifacts_tasks_ready(conn, artifact_id: str) -> None:
         (artifact_id,),
     ).fetchall()
 
+    if not rows:
+        return
+
+    # 检查哪些任务的所有 required 依赖已全部就绪
+    promotable: list[str] = []
     for row in rows:
         task_id = row["task_id"]
         unmet = conn.execute(
@@ -328,64 +331,87 @@ def mark_waiting_artifacts_tasks_ready(conn, artifact_id: str) -> None:
             (task_id,),
         ).fetchone()
         if not unmet:
-            with tx(conn, immediate=True):
-                conn.execute(
-                    """
-                    UPDATE agentloop_tasks
-                    SET state = 'READY', updated_at = ?
-                    WHERE task_id = ? AND state = 'WAITING_ARTIFACTS'
-                    """,
-                    (ts, task_id),
-                )
+            promotable.append(task_id)
 
+    if not promotable:
+        return
 
-def _mark_task_reducing_impl(conn, parent_task_id: str, trace_id: str, ts: int) -> None:
-    """mark_task_reducing 内部实现，避免递归时嵌套事务。"""
-    parent_row = conn.execute(
-        "SELECT parent_task_id FROM agentloop_tasks WHERE task_id = ?", (parent_task_id,)
-    ).fetchone()
-
-    conn.execute(
-        """
-        UPDATE agentloop_tasks
-        SET state = 'DONE', finished_at = ?, updated_at = ?,
-            lease_owner = NULL, lease_until = NULL
-        WHERE task_id = ?
-        """,
-        (ts, ts, parent_task_id),
-    )
-    if parent_row and parent_row["parent_task_id"] is None:
-        conn.execute(
-            """
-            UPDATE agentloop_traces SET status = 'DONE', finished_at = ?, updated_at = ?
-            WHERE trace_id = ? AND status = 'RUNNING'
-            """,
-            (ts, ts, trace_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
-            VALUES (?, ?, NULL, 'TRACE_DONE', '{}', ?)
-            """,
-            (trace_id, parent_task_id, ts),
-        )
-    else:
-        grandparent_id = parent_row["parent_task_id"] if parent_row else None
-        if grandparent_id:
+    # 一个事务内批量推进，减少写锁争用
+    with tx(conn, immediate=True):
+        for task_id in promotable:
             conn.execute(
                 """
                 UPDATE agentloop_tasks
-                SET finished_children = finished_children + 1, updated_at = ?
-                WHERE task_id = ?
+                SET state = 'READY', updated_at = ?
+                WHERE task_id = ? AND state = 'WAITING_ARTIFACTS'
                 """,
-                (ts, grandparent_id),
+                (ts, task_id),
             )
-            gp = conn.execute(
-                "SELECT state, expected_children, finished_children FROM agentloop_tasks WHERE task_id = ?",
-                (grandparent_id,),
-            ).fetchone()
-            if gp and gp["state"] == "WAITING_CHILDREN" and gp["finished_children"] >= gp["expected_children"]:
-                _mark_task_reducing_impl(conn, grandparent_id, trace_id, ts)
+
+
+def _mark_task_reducing_impl(conn, start_task_id: str, trace_id: str, ts: int) -> None:
+    """将父任务从 WAITING_CHILDREN 推进到 DONE，循环向上直至根任务。
+
+    Fix #6: 原实现为递归，大型任务树可能触发 Python RecursionError。
+    改为迭代（while 循环 + 显式向上遍历）。
+    """
+    current_id = start_task_id
+    while current_id:
+        parent_row = conn.execute(
+            "SELECT parent_task_id FROM agentloop_tasks WHERE task_id = ?", (current_id,)
+        ).fetchone()
+
+        conn.execute(
+            """
+            UPDATE agentloop_tasks
+            SET state       = 'DONE',
+                finished_at = ?,
+                updated_at  = ?,
+                lease_owner = NULL,
+                lease_until = NULL
+            WHERE task_id = ?
+            """,
+            (ts, ts, current_id),
+        )
+
+        parent_id = parent_row["parent_task_id"] if parent_row else None
+        if parent_id is None:
+            # 已到根任务，标记 trace DONE
+            conn.execute(
+                """
+                UPDATE agentloop_traces
+                SET status = 'DONE', finished_at = ?, updated_at = ?
+                WHERE trace_id = ? AND status = 'RUNNING'
+                """,
+                (ts, ts, trace_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
+                VALUES (?, ?, NULL, 'TRACE_DONE', '{}', ?)
+                """,
+                (trace_id, current_id, ts),
+            )
+            break
+
+        # 计入祖父的 finished_children，判断是否继续向上传播
+        conn.execute(
+            """
+            UPDATE agentloop_tasks
+            SET finished_children = finished_children + 1, updated_at = ?
+            WHERE task_id = ?
+            """,
+            (ts, parent_id),
+        )
+        gp = conn.execute(
+            "SELECT state, expected_children, finished_children FROM agentloop_tasks WHERE task_id = ?",
+            (parent_id,),
+        ).fetchone()
+
+        if gp and gp["state"] == "WAITING_CHILDREN" and gp["finished_children"] >= gp["expected_children"]:
+            current_id = parent_id  # 继续向上传播
+        else:
+            break
 
 
 def mark_task_reducing(conn, parent_task_id: str, trace_id: str) -> None:
@@ -402,12 +428,12 @@ def reset_task_for_retry(conn, task_id: str, error_code: str, error_message: str
         conn.execute(
             """
             UPDATE agentloop_tasks
-            SET state = 'READY',
-                error_code = ?,
+            SET state         = 'READY',
+                error_code    = ?,
                 error_message = ?,
-                lease_owner = NULL,
-                lease_until = NULL,
-                updated_at = ?
+                lease_owner   = NULL,
+                lease_until   = NULL,
+                updated_at    = ?
             WHERE task_id = ?
             """,
             (error_code, error_message, ts, task_id),
@@ -417,47 +443,62 @@ def reset_task_for_retry(conn, task_id: str, error_code: str, error_message: str
 def _propagate_failure_to_ancestor(
     conn, task_id: str, trace_id: str, ts: int, error_code: str, error_message: str
 ) -> None:
-    """递归向上传播 FAILED，直至根任务，并将 trace 标记为 FAILED。"""
-    row = conn.execute(
-        "SELECT parent_task_id FROM agentloop_tasks WHERE task_id = ?", (task_id,)
-    ).fetchone()
+    """循环向上传播 FAILED，直至根任务，并将 trace 标记为 FAILED。
 
-    conn.execute(
-        """
-        UPDATE agentloop_tasks
-        SET state = 'FAILED', error_code = ?, error_message = ?,
-            finished_at = ?, updated_at = ?, lease_owner = NULL, lease_until = NULL
-        WHERE task_id = ? AND state NOT IN ('FAILED', 'DONE', 'CANCELED')
-        """,
-        (error_code, error_message, ts, ts, task_id),
-    )
-    conn.execute(
-        """
-        INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
-        VALUES (?, ?, NULL, 'TASK_FAIL', ?, ?)
-        """,
-        (trace_id, task_id, json.dumps({"error_code": error_code, "propagated": True}), ts),
-    )
+    Fix #6: 原实现为递归，深树时可能触发 Python RecursionError。
+    改为迭代（while 循环 + 显式向上遍历）。
+    """
+    current_id = task_id
+    while current_id:
+        row = conn.execute(
+            "SELECT parent_task_id FROM agentloop_tasks WHERE task_id = ?", (current_id,)
+        ).fetchone()
 
-    parent_id = row["parent_task_id"] if row else None
-    if parent_id is None:
-        # 已到根任务，标记 trace FAILED
         conn.execute(
             """
-            UPDATE agentloop_traces SET status = 'FAILED', finished_at = ?, updated_at = ?
-            WHERE trace_id = ? AND status = 'RUNNING'
+            UPDATE agentloop_tasks
+            SET state         = 'FAILED',
+                error_code    = ?,
+                error_message = ?,
+                finished_at   = ?,
+                updated_at    = ?,
+                lease_owner   = NULL,
+                lease_until   = NULL
+            WHERE task_id = ? AND state NOT IN ('FAILED', 'DONE', 'CANCELED')
             """,
-            (ts, ts, trace_id),
+            (error_code, error_message, ts, ts, current_id),
         )
         conn.execute(
             """
             INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
-            VALUES (?, NULL, NULL, 'TRACE_FAIL', ?, ?)
+            VALUES (?, ?, NULL, 'TASK_FAIL', ?, ?)
             """,
-            (trace_id, json.dumps({"error_code": error_code, "error_message": error_message}), ts),
+            (trace_id, current_id,
+             json.dumps({"error_code": error_code, "propagated": True}), ts),
         )
-    else:
-        # 继续向上传播：计入祖父的 finished_children
+
+        parent_id = row["parent_task_id"] if row else None
+        if parent_id is None:
+            # 已到根任务，标记 trace FAILED
+            conn.execute(
+                """
+                UPDATE agentloop_traces
+                SET status = 'FAILED', finished_at = ?, updated_at = ?
+                WHERE trace_id = ? AND status = 'RUNNING'
+                """,
+                (ts, ts, trace_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO agentloop_events(trace_id, task_id, parent_task_id, event_type, event_payload, created_at)
+                VALUES (?, NULL, NULL, 'TRACE_FAIL', ?, ?)
+                """,
+                (trace_id,
+                 json.dumps({"error_code": error_code, "error_message": error_message}), ts),
+            )
+            break
+
+        # 继续向上：计入祖父的 finished_children
         conn.execute(
             "UPDATE agentloop_tasks SET finished_children = finished_children + 1, updated_at = ? WHERE task_id = ?",
             (ts, parent_id),
@@ -467,11 +508,15 @@ def _propagate_failure_to_ancestor(
             (parent_id,),
         ).fetchone()
         if gp and gp["state"] == "WAITING_CHILDREN" and gp["finished_children"] >= gp["expected_children"]:
-            _propagate_failure_to_ancestor(conn, parent_id, trace_id, ts, error_code, error_message)
+            current_id = parent_id
+        else:
+            break
 
 
 def recover_stale_tasks(conn, stale_seconds: int = 300) -> int:
     """将长期停留在 RUNNING 状态（可能因进程崩溃而僵死）的任务恢复调度。
+
+    注意：任务执行期间应通过心跳定期更新 updated_at，否则合法的长时间任务也可能被判为僵死。
     - 还有重试机会：重置为 READY
     - 已无重试：标记为 FAILED 并传播
     返回恢复的任务数。

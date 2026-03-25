@@ -89,12 +89,20 @@ CREATE TABLE IF NOT EXISTS agentloop_task_artifact_deps (
     required INTEGER NOT NULL DEFAULT 1 CHECK(required IN (0, 1)),
     alias TEXT,
     created_at INTEGER NOT NULL,
-    UNIQUE(task_id, artifact_id, mode, alias),
+    -- 注意：不在表定义中使用 UNIQUE(alias)，因为 SQLite UNIQUE 约束对 NULL 不去重
+    -- 改用下方两个局部唯一索引代替
     FOREIGN KEY(task_id) REFERENCES agentloop_tasks(task_id),
     FOREIGN KEY(artifact_id) REFERENCES agentloop_artifacts(artifact_id)
 );
 CREATE INDEX IF NOT EXISTS idx_agentloop_deps_task ON agentloop_task_artifact_deps(task_id);
 CREATE INDEX IF NOT EXISTS idx_agentloop_deps_artifact ON agentloop_task_artifact_deps(artifact_id);
+-- 局部唯一索引：alias 有值时按四元组去重，alias 为 NULL 时按三元组去重（修复 NULL != NULL 问题）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agentloop_deps_unique_aliased
+    ON agentloop_task_artifact_deps(task_id, artifact_id, mode, alias)
+    WHERE alias IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agentloop_deps_unique_no_alias
+    ON agentloop_task_artifact_deps(task_id, artifact_id, mode)
+    WHERE alias IS NULL;
 
 -- 待满足依赖：WAITING_ARTIFACTS 任务等待的、尚未创建的 artifact_id（无 FK，因 artifact 可能尚未存在）
 CREATE TABLE IF NOT EXISTS agentloop_task_pending_deps (
@@ -119,3 +127,5 @@ CREATE TABLE IF NOT EXISTS agentloop_events (
     FOREIGN KEY(parent_task_id) REFERENCES agentloop_tasks(task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_agentloop_events_trace ON agentloop_events(trace_id, created_at);
+-- 按 task_id 查询事件（调试/溯源）时避免全表扫描
+CREATE INDEX IF NOT EXISTS idx_agentloop_events_task ON agentloop_events(task_id);

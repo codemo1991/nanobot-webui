@@ -1,5 +1,6 @@
 """Runtime：执行任务、构建 context、spawn、写 artifact。"""
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Callable
@@ -22,6 +23,9 @@ from nanobot.agentloop.kernel.task_repo import (
     reset_task_for_retry,
 )
 
+# 心跳更新间隔（秒）：定期刷新 RUNNING 任务的 updated_at，防止被误判为僵死
+_HEARTBEAT_INTERVAL = 60.0
+
 
 class Runtime:
     """任务执行运行时。"""
@@ -31,10 +35,16 @@ class Runtime:
         self.registry = registry
         self.workspace = workspace
         self._done_callback: Callable | None = None
+        # Fix #4: 任务就绪通知回调，由 Kernel 注入，新 READY 任务出现时触发
+        self._task_ready_callback: Callable | None = None
 
     def set_done_callback(self, callback: Callable) -> None:
-        """注册 trace 完成通知回调（由 Kernel 注入，trace 变为 DONE/FAILED 时调用）。"""
+        """注册 trace 完成通知回调（trace 变为 DONE/FAILED 时调用）。"""
         self._done_callback = callback
+
+    def set_task_ready_callback(self, callback: Callable) -> None:
+        """注册任务就绪通知回调（新 READY 任务出现时调用，用于唤醒 worker）。"""
+        self._task_ready_callback = callback
 
     def _notify_if_trace_done(self, trace_id: str) -> None:
         """检查 trace 状态，若已终结则触发回调通知等待方。"""
@@ -46,25 +56,39 @@ class Runtime:
         if row and row["status"] in ("DONE", "FAILED", "CANCELED"):
             self._done_callback()
 
-    def _load_artifact_payload(self, row) -> dict | None:
-        """从 artifact 行加载 payload，支持 INLINE/FILE，含 JSON 异常处理。"""
+    def _notify_task_ready(self) -> None:
+        """通知 worker 有新的 READY 任务。"""
+        if self._task_ready_callback:
+            self._task_ready_callback()
+
+    def _load_artifact_payload_safe(self, artifact_id: str) -> dict | None:
+        """加载 artifact payload，支持 INLINE/FILE，含 JSON 异常处理。
+
+        Fix #12: build_context 原先在 JOIN 中取出 payload_text 再通过 _load_artifact_payload
+        做第二次 SELECT（双重加载），现统一走 get_artifact_payload 单次读取。
+        """
         try:
-            return get_artifact_payload(self.conn, row["artifact_id"])
+            return get_artifact_payload(self.conn, artifact_id)
         except json.JSONDecodeError as e:
-            logger.warning("Artifact payload JSON 解析失败: %s", e)
+            logger.warning("Artifact %s payload JSON 解析失败: %s", artifact_id, e)
         return None
 
     def build_context(self, task_id: str) -> dict:
-        """构建任务执行上下文（含所需 artifacts）。"""
+        """构建任务执行上下文（含所需 artifacts）。
+
+        Fix #12: 依赖查询不再 JOIN 取 payload_text/payload_path（避免大 payload
+        全量加载进内存），改为单独调用 get_artifact_payload 按需读取。
+        """
         task = self.conn.execute(
             "SELECT * FROM agentloop_tasks WHERE task_id = ?", (task_id,)
         ).fetchone()
         if not task:
             return {}
 
+        # 只取元信息，不取 payload 字段，减少内存占用
         deps = self.conn.execute(
             """
-            SELECT d.mode, d.alias, a.artifact_type, a.artifact_id, a.storage_kind, a.payload_text, a.payload_path
+            SELECT d.alias, a.artifact_type, a.artifact_id
             FROM agentloop_task_artifact_deps d
             JOIN agentloop_artifacts a ON a.artifact_id = d.artifact_id
             WHERE d.task_id = ?
@@ -78,7 +102,8 @@ class Runtime:
         artifact_list: dict = {}
 
         for row in deps:
-            payload = self._load_artifact_payload(row)
+            # 按需加载 payload（支持 INLINE 和 FILE 两种存储）
+            payload = self._load_artifact_payload_safe(row["artifact_id"])
             if payload is None:
                 payload = {}
             artifact_type = row["artifact_type"]
@@ -122,6 +147,8 @@ class Runtime:
         )
         fulfill_pending_deps_for_artifact(self.conn, artifact_id)
         mark_waiting_artifacts_tasks_ready(self.conn, artifact_id)
+        # Fix #4: artifact 就绪后可能有 WAITING_ARTIFACTS 任务变为 READY
+        self._notify_task_ready()
         return artifact_id
 
     def spawn_children(
@@ -186,7 +213,6 @@ class Runtime:
                     ),
                 )
 
-                # 为需要父产出的子任务注入 READ 依赖
                 if parent_artifact_id and parent_artifact_type and spec.input_schema:
                     add_read_dep(
                         self.conn,
@@ -195,6 +221,9 @@ class Runtime:
                         alias=parent_artifact_type,
                         required=True,
                     )
+
+        # Fix #4: 子任务已 READY，通知 worker 立即检查
+        self._notify_task_ready()
 
     def _inject_sibling_deps(
         self, task: dict, artifact_id: str, artifact_type: str | None
@@ -216,7 +245,6 @@ class Runtime:
         with tx(self.conn, immediate=True):
             for sib in siblings:
                 if sib["state"] in ("READY", "WAITING_ARTIFACTS") and sib["input_schema"]:
-                    # search_result_v1 为列表，用 alias=None 进入 artifact_list；其余用 type 作 alias
                     alias = None if "search_result" in artifact_type else artifact_type
                     add_read_dep(self.conn, sib["task_id"], artifact_id, alias=alias, required=True)
 
@@ -229,7 +257,6 @@ class Runtime:
 
         parent_id = task.get("parent_task_id")
         if not parent_id:
-            # 根任务直接返回 DONE（未经 WAITING_CHILDREN 路径），需主动标记 trace DONE
             ts = now_ts()
             with tx(self.conn, immediate=True):
                 self.conn.execute(
@@ -265,6 +292,22 @@ class Runtime:
         ):
             mark_task_reducing(self.conn, parent_id, task["trace_id"])
 
+    async def _heartbeat_task_running(self, task_id: str) -> None:
+        """Fix #5: 心跳协程，定期刷新 RUNNING 任务的 updated_at。
+
+        防止 recover_stale_tasks 将合法的长时间运行任务（如大型 LLM 调用）
+        错误地判定为僵死并触发重试，避免同一任务并发执行两次。
+        """
+        try:
+            while True:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL)
+                self.conn.execute(
+                    "UPDATE agentloop_tasks SET updated_at = ? WHERE task_id = ? AND state = 'RUNNING'",
+                    (now_ts(), task_id),
+                )
+        except asyncio.CancelledError:
+            pass
+
     async def execute_task(self, task: dict) -> None:
         """执行单个任务。"""
         try:
@@ -291,7 +334,13 @@ class Runtime:
 
         context = self.build_context(task["task_id"])
 
-        result = await capability.invoke(request, context)
+        # Fix #5: 启动心跳任务，防止合法长时间运行的任务被 recover_stale_tasks 误杀
+        heartbeat = asyncio.create_task(self._heartbeat_task_running(task["task_id"]))
+        try:
+            result = await capability.invoke(request, context)
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
         if result.status == "DONE":
             artifact_id = self.write_output_artifact(task, result.output_artifact)
@@ -331,7 +380,6 @@ class Runtime:
                 result.error_message or "Unknown error",
             )
 
-        # 任务执行后通知等待方（trace 可能已完成）
         self._notify_if_trace_done(task["trace_id"])
 
     def handle_task_exception(self, task: dict, exc: Exception) -> None:
@@ -351,6 +399,8 @@ class Runtime:
                 "RETRYABLE_ERROR",
                 str(exc),
             )
+            # Fix #4: 重置为 READY 后通知 worker
+            self._notify_task_ready()
         else:
             mark_task_failed(self.conn, task["task_id"], "FAILED", str(exc))
 

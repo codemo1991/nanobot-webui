@@ -88,10 +88,6 @@ class AgentDefaults(BaseModel):
     enable_parallel_tools: bool = True  # 是否启用并行工具调用
     thread_pool_size: int = 4  # 线程池大小（用于CPU密集型任务）
     thread_pool_tools: list[str] = Field(default_factory=lambda: ["exec", "spawn"])  # 线程池执行的工具列表
-    # 智能并行配置
-    enable_smart_parallel: bool = True  # 是否启用智能并行判断
-    smart_parallel_model: str = ""  # 智能并行判断使用的模型（留空使用默认轻量模型）
-
     # 微内核委托配置
     microkernel_escalation_enabled: bool = True  # 是否启用阈值切换，默认开启
     microkernel_escalation_threshold: int = 10  # 中等工具阈值（向后兼容）

@@ -173,6 +173,8 @@ function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  // 正在流式传输的会话 ID 集合（支持并行多会话独立流式）
+  const [streamingSessionIds, setStreamingSessionIds] = useState<Set<string>>(new Set())
   const [loadingSessions, setLoadingSessions] = useState(true)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editTitle, setEditTitle] = useState('')
@@ -196,6 +198,12 @@ function ChatPage() {
   const pollingEnabledRef = useRef(true)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const abortControllerRef = useRef<AbortController | null>(null)
+  // 当前会话 ID 的 ref（供异步流式回调路由使用，避免闭包捕获过期值）
+  const currentSessionIdRef = useRef<string | null>(null)
+  // 每个会话独立的 AbortController（支持并行多会话各自停止）
+  const perSessionAbortControllers = useRef<Map<string, AbortController>>(new Map())
+  // 后台会话的流式 UI 状态缓存（切换回来时恢复 toolSteps/thinking/progress）
+  const bgSessionStatesRef = useRef<Map<string, { toolSteps: ToolStep[], thinking: boolean, progress: string }>>(new Map())
   const imageInputRef = useRef<HTMLInputElement>(null)
   // 追踪是否有活跃的流式请求
   const isStreamingRef = useRef(false)
@@ -419,22 +427,70 @@ function ChatPage() {
     })
   }, [])
 
-  // 流式事件处理（供 handleSend 和 SSE 重连共用）
-  const handleStreamEvent = useCallback((evt: StreamEvent) => {
+  // 同步 currentSessionIdRef，供异步流式回调判断事件归属
+  useEffect(() => {
+    currentSessionIdRef.current = currentSession?.id ?? null
+  }, [currentSession])
+
+  // 流式事件处理工厂（按会话 ID 路由：当前会话更新 UI，后台会话更新缓存）
+  const makeStreamEventHandler = useCallback((sessionId: string) => (evt: StreamEvent) => {
+    const isCurrent = sessionId === currentSessionIdRef.current
+
     if (evt.type === 'done') {
-      // 收到 done 时立即清除流式状态，避免页面卡在「正在思考/调用工具」
-      setStreamingThinking(false)
-      setStreamingToolSteps([])
-      setClaudeCodeProgress('')
-    } else if (evt.type === 'thinking') {
+      bgSessionStatesRef.current.delete(sessionId)
+      if (isCurrent) {
+        setStreamingThinking(false)
+        setStreamingToolSteps([])
+        setClaudeCodeProgress('')
+      }
+      return
+    }
+
+    if (!isCurrent) {
+      // 后台会话：只更新状态缓存，不触发 UI 重渲染
+      const bgState = bgSessionStatesRef.current.get(sessionId) || { toolSteps: [], thinking: false, progress: '' }
+      if (evt.type === 'thinking') {
+        bgState.thinking = true
+      } else if (evt.type === 'tool_start' && evt.name) {
+        bgState.thinking = false
+        if (evt.name === 'claude_code') bgState.progress = ''
+        bgState.toolSteps = [...bgState.toolSteps, { name: evt.name, arguments: evt.arguments ?? {}, result: '' }]
+      } else if (evt.type === 'tool_end' && evt.name) {
+        const steps = [...bgState.toolSteps]
+        for (let i = steps.length - 1; i >= 0; i--) {
+          if (steps[i].name === evt.name && !steps[i].result) {
+            steps[i] = { ...steps[i], result: evt.result ?? '' }
+            break
+          }
+        }
+        bgState.toolSteps = steps
+        if (evt.name === 'claude_code') bgState.progress = ''
+      } else if (evt.type === 'claude_code_progress') {
+        const subtype = evt.subtype || 'text'
+        const content = evt.content || ''
+        let line = ''
+        if (subtype === 'tool_use') line = `[${evt.tool_name || 'Tool'}] ${content}`
+        else if (subtype === 'tool_result') line = `  -> ${content}`
+        else if (subtype === 'assistant_text') line = content.length > 120 ? content.slice(0, 120) + '...' : content
+        else line = content
+        const newText = bgState.progress ? bgState.progress + '\n' + line : line
+        const lines = newText.split('\n')
+        bgState.progress = lines.length > 30 ? lines.slice(-30).join('\n') : newText
+      }
+      bgSessionStatesRef.current.set(sessionId, bgState)
+      return
+    }
+
+    // 当前会话：正常更新 UI 状态（原 handleStreamEvent 逻辑）
+    if (evt.type === 'thinking') {
       setStreamingThinking(true)
     } else if (evt.type === 'tool_start' && evt.name) {
       setStreamingThinking(false)
       if (evt.name === 'claude_code') {
         setClaudeCodeProgress('')
       }
-      if (evt.name === 'spawn' && currentSession) {
-        startBgAgentStream(currentSession.id)
+      if (evt.name === 'spawn') {
+        startBgAgentStream(sessionId)
       }
       setStreamingToolSteps(prev => [...prev, { name: evt.name!, arguments: evt.arguments ?? {}, result: '' }])
     } else if (evt.type === 'tool_end' && evt.name) {
@@ -476,39 +532,55 @@ function ChatPage() {
         return lines.length > 30 ? lines.slice(-30).join('\n') : newText
       })
     }
-  }, [currentSession, startBgAgentStream])
+  }, [startBgAgentStream])
 
   // 尝试重连 Chat SSE（刷新/切换 tab 后继续接收推送）
   const tryReconnectChatStream = useCallback(async (sessionId: string) => {
     const ctrl = new AbortController()
-    abortControllerRef.current = ctrl
-    isStreamingRef.current = true
-    setLoading(true)
+    perSessionAbortControllers.current.set(sessionId, ctrl)
+    // 若为当前会话则同步 compat ref
+    if (sessionId === currentSessionIdRef.current) {
+      abortControllerRef.current = ctrl
+      isStreamingRef.current = true
+      setLoading(true)
+    }
+    setStreamingSessionIds(prev => new Set([...prev, sessionId]))
     try {
-      const result = await api.subscribeToChatStream(sessionId, handleStreamEvent, ctrl.signal)
-      await loadMessages(sessionId)
-      await loadSessionTokenUsage(sessionId)
+      const result = await api.subscribeToChatStream(sessionId, makeStreamEventHandler(sessionId), ctrl.signal)
+      if (sessionId === currentSessionIdRef.current) {
+        await loadMessages(sessionId)
+        await loadSessionTokenUsage(sessionId)
+      }
       void loadSessions()
-      if (result) {
+      if (result && sessionId === currentSessionIdRef.current) {
         antMessage.success(t('chat.streamReconnected'))
       }
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') return
       console.warn('Chat stream reconnect failed:', err)
     } finally {
-      isStreamingRef.current = false
-      isRestoringRef.current = false
+      perSessionAbortControllers.current.delete(sessionId)
+      setStreamingSessionIds(prev => {
+        const next = new Set(prev)
+        next.delete(sessionId)
+        return next
+      })
+      // 与 handleSend 一致：重连结束即清除 loading，避免切换会话后 ref 不匹配一直转圈
       setLoading(false)
-      setStreamingToolSteps([])
-      setStreamingThinking(false)
-      setClaudeCodeProgress('')
-      currentTaskIdRef.current = null
-      setPollingTaskId(null)
-      abortControllerRef.current = null
+      if (sessionId === currentSessionIdRef.current) {
+        isStreamingRef.current = false
+        isRestoringRef.current = false
+        setStreamingToolSteps([])
+        setStreamingThinking(false)
+        setClaudeCodeProgress('')
+        currentTaskIdRef.current = null
+        setPollingTaskId(null)
+        abortControllerRef.current = null
+      }
       clearStreamingState(sessionId)
       isRestoringRef.current = false
     }
-  }, [handleStreamEvent, t])
+  }, [makeStreamEventHandler, t])
 
   // 所有子 Agent 完成后，10 秒后自动清除面板
   // 注意：如果连接已断开，保留面板让用户手动刷新
@@ -692,54 +764,72 @@ function ChatPage() {
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [])
 
-  // Session 切换时恢复状态
+  // Session 切换时恢复状态（不中止后台流式，支持并行聊天）
   useEffect(() => {
-    // 🔧 修复1：切换 session 时中止正在进行的请求
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort()
-      abortControllerRef.current = null
-    }
+    const sessionId = currentSession?.id ?? null
 
-    // 🔧 修复2：切换 session 时清理之前的流式状态
+    // 重置当前 UI 的流式显示状态（将由目标会话状态填充）
     setStreamingToolSteps([])
     setStreamingThinking(false)
     setClaudeCodeProgress('')
-    setLoading(false)
-    isStreamingRef.current = false
 
-    if (currentSession) {
-      loadCurrentModel()
-      loadMessages(currentSession.id)
-      loadSessionTokenUsage(currentSession.id)
+    if (currentSession && sessionId) {
+      const isStreaming = streamingSessionIds.has(sessionId)
 
-      // 从 sessionStorage 恢复之前保存的状态，尝试重连 SSE
-      const sessionId = currentSession.id
-      const savedState = loadStreamingState(sessionId)
-      if (savedState) {
-        isRestoringRef.current = true
-        setStreamingToolSteps(savedState.toolSteps || [])
-        setStreamingThinking(savedState.thinking || false)
-        setClaudeCodeProgress(savedState.progress || '')
-        if (savedState.loading) setLoading(true)
-        if (savedState.taskId) {
-          currentTaskIdRef.current = savedState.taskId
-          setPollingTaskId(savedState.taskId)
+      if (isStreaming) {
+        // 目标会话正在后台流式：恢复其缓存的 UI 状态
+        const bgState = bgSessionStatesRef.current.get(sessionId)
+        if (bgState) {
+          setStreamingToolSteps(bgState.toolSteps)
+          setStreamingThinking(bgState.thinking)
+          setClaudeCodeProgress(bgState.progress)
         }
-        // 尝试重连 Chat SSE（刷新后恢复）
-        setTimeout(() => {
-          if (savedState.loading && savedState.sessionId === sessionId) {
-            void tryReconnectChatStream(sessionId)
-          } else if (!savedState.taskId) {
-            setLoading(false)
-            clearStreamingState(sessionId)
-            void loadMessages(sessionId)
+        setLoading(true)
+        isStreamingRef.current = true
+        abortControllerRef.current = perSessionAbortControllers.current.get(sessionId) || null
+      } else {
+        // 目标会话没有进行流式：清除 loading
+        setLoading(false)
+        isStreamingRef.current = false
+        abortControllerRef.current = null
+      }
+
+      loadCurrentModel()
+      loadMessages(sessionId)
+      loadSessionTokenUsage(sessionId)
+
+      // 非流式进行中时，尝试从 sessionStorage 恢复（用于页面刷新后恢复）
+      if (!isStreaming) {
+        const savedState = loadStreamingState(sessionId)
+        if (savedState) {
+          isRestoringRef.current = true
+          setStreamingToolSteps(savedState.toolSteps || [])
+          setStreamingThinking(savedState.thinking || false)
+          setClaudeCodeProgress(savedState.progress || '')
+          if (savedState.loading) setLoading(true)
+          if (savedState.taskId) {
+            currentTaskIdRef.current = savedState.taskId
+            setPollingTaskId(savedState.taskId)
           }
-        }, 300)
+          // 尝试重连 Chat SSE（刷新后恢复）
+          setTimeout(() => {
+            if (savedState.loading && savedState.sessionId === sessionId) {
+              void tryReconnectChatStream(sessionId)
+            } else if (!savedState.taskId) {
+              setLoading(false)
+              clearStreamingState(sessionId)
+              void loadMessages(sessionId)
+            }
+          }, 300)
+        }
       }
     } else {
+      setLoading(false)
+      isStreamingRef.current = false
+      abortControllerRef.current = null
       setSessionTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 })
     }
-  }, [currentSession, tryReconnectChatStream, loadCurrentModel])
+  }, [currentSession, tryReconnectChatStream, loadCurrentModel, streamingSessionIds])
 
   // 监听路由变化，当从其他页面切回聊天页面时恢复状态
   useEffect(() => {
@@ -913,13 +1003,25 @@ function ChatPage() {
   }
 
   const handleStop = async () => {
-    // 无论 abortController 是否存在，都清除 loading 状态，避免恢复场景下卡住
-    const hadStream = abortControllerRef.current !== null
-    if (abortControllerRef.current) {
+    const sessionId = currentSession?.id
+    // 停止当前会话的独立 AbortController
+    const ctrl = sessionId ? perSessionAbortControllers.current.get(sessionId) : null
+    const hadStream = ctrl !== null || abortControllerRef.current !== null
+    if (ctrl) {
+      ctrl.abort()
+      if (sessionId) perSessionAbortControllers.current.delete(sessionId)
+    } else if (abortControllerRef.current) {
       abortControllerRef.current.abort()
-      abortControllerRef.current = null
     }
+    abortControllerRef.current = null
     setLoading(false)
+    if (sessionId) {
+      setStreamingSessionIds(prev => {
+        const next = new Set(prev)
+        next.delete(sessionId)
+        return next
+      })
+    }
     if (hadStream) {
       antMessage.info(t('chat.generationStopped'))
     }
@@ -934,7 +1036,8 @@ function ChatPage() {
   const handleSend = useCallback(async () => {
     if (!currentSession) return
     if (!input.trim() && !pendingImages.length) return
-    if (loading) {
+    // 若当前会话已在流式中则转为停止操作
+    if (streamingSessionIds.has(currentSession.id)) {
       handleStop()
       return
     }
@@ -958,6 +1061,9 @@ function ChatPage() {
       if (!confirmed) return
     }
 
+    // 捕获当前会话 ID，避免闭包中使用过期值
+    const sessionId = currentSession.id
+
     const userMessage = input.trim()
     const imagesToSend = [...pendingImages]
     setInput('')
@@ -967,15 +1073,17 @@ function ChatPage() {
     setStreamingToolSteps([])
     setStreamingThinking(false)
     setClaudeCodeProgress('')
-    // 标记开始流式传输
+    // 将此会话加入流式集合（支持并行多会话）
+    setStreamingSessionIds(prev => new Set([...prev, sessionId]))
     isStreamingRef.current = true
 
     const controller = new AbortController()
+    perSessionAbortControllers.current.set(sessionId, controller)
     abortControllerRef.current = controller
 
     const tempUserMsg: Message = {
       id: `temp-${Date.now()}`,
-      sessionId: currentSession.id,
+      sessionId,
       role: 'user',
       content: userMessage,
       createdAt: new Date().toISOString(),
@@ -992,15 +1100,15 @@ function ChatPage() {
 
     try {
       await api.sendMessageStream(
-        currentSession.id,
+        sessionId,
         userMessage,
-        handleStreamEvent,
+        makeStreamEventHandler(sessionId),
         controller.signal,
         imagesToSend.length > 0 ? imagesToSend : undefined,
         toolMode,
         toolMode === 'specified' ? selectedMcpServers : undefined,
       )
-      if (imagesToSend.length > 0) {
+      if (imagesToSend.length > 0 && sessionId === currentSessionIdRef.current) {
         setImageSendStatus(prev => {
           const newStatus = { ...prev }
           Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'sent' })
@@ -1008,20 +1116,19 @@ function ChatPage() {
         })
       }
 
-      // 页面恢复时，也需要调用 loadMessages 获取最新消息
-      // 但需要先恢复流式状态（visibilitychange 中已处理），再获取消息
-      await loadMessages(currentSession.id)
-
-      // 恢复完成后清除恢复状态
-      if (isRestoringRef.current) {
-        isRestoringRef.current = false
-        clearStreamingState(currentSession.id)
+      // 仅当仍为当前会话时更新 UI 消息列表
+      if (sessionId === currentSessionIdRef.current) {
+        await loadMessages(sessionId)
+        if (isRestoringRef.current) {
+          isRestoringRef.current = false
+          clearStreamingState(sessionId)
+        }
+        await loadSessionTokenUsage(sessionId)
       }
-      await loadSessionTokenUsage(currentSession.id)
       void loadSessions()
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') return
-      if (imagesToSend.length > 0) {
+      if (imagesToSend.length > 0 && sessionId === currentSessionIdRef.current) {
         setImageSendStatus(prev => {
           const newStatus = { ...prev }
           Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'error' })
@@ -1030,44 +1137,45 @@ function ChatPage() {
       }
       antMessage.error(t('chat.sendFailed'))
       if (err instanceof Error) console.error(err)
-      setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
+      if (sessionId === currentSessionIdRef.current) {
+        setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
+      }
     } finally {
-      // 标记流式传输结束
-      isStreamingRef.current = false
+      // 从并行流式集合移除该会话
+      perSessionAbortControllers.current.delete(sessionId)
+      setStreamingSessionIds(prev => {
+        const next = new Set(prev)
+        next.delete(sessionId)
+        return next
+      })
+      bgSessionStatesRef.current.delete(sessionId)
 
-      // 如果页面正在恢复（可见性变化导致的状态恢复），统一清理所有状态后返回
-      // 无论 savedState.loading 是什么值，handleSend 的 finally 代表流已结束，必须清除 loading
-      if (isRestoringRef.current && currentSession) {
-        clearStreamingState(currentSession.id)
-        isRestoringRef.current = false
-        setLoading(false)
-        abortControllerRef.current = null
-        currentTaskIdRef.current = null
-        setPollingTaskId(null)
+      // 流结束始终清除 loading：若用户在请求完成前切换了会话，仅匹配 currentSessionIdRef 会漏清导致一直「请求中」
+      setLoading(false)
+
+      if (sessionId === currentSessionIdRef.current) {
+        isStreamingRef.current = false
+        if (isRestoringRef.current && currentSession) {
+          clearStreamingState(sessionId)
+          isRestoringRef.current = false
+          abortControllerRef.current = null
+          currentTaskIdRef.current = null
+          setPollingTaskId(null)
+          setStreamingToolSteps([])
+          setStreamingThinking(false)
+          setClaudeCodeProgress('')
+          return
+        }
         setStreamingToolSteps([])
         setStreamingThinking(false)
         setClaudeCodeProgress('')
-        return
+        currentTaskIdRef.current = null
+        setPollingTaskId(null)
+        clearStreamingState(sessionId)
+        abortControllerRef.current = null
       }
-
-      // 正常完成时清除流式状态和 taskId
-      setStreamingToolSteps([])
-      setStreamingThinking(false)
-      setClaudeCodeProgress('')
-      currentTaskIdRef.current = null
-      setPollingTaskId(null)
-
-      // 清除 sessionStorage 中的状态
-      if (currentSession) {
-        clearStreamingState(currentSession.id)
-      }
-
-      // 直接清除 loading 状态，无需条件检查
-      // 避免竞态条件：visibilitychange 恢复时 tryReconnectChatStream 可能已覆盖 abortControllerRef
-      setLoading(false)
-      abortControllerRef.current = null
     }
-  }, [input, loading, messages, currentSession, pendingImages.length, t, handleStreamEvent])
+  }, [input, loading, messages, currentSession, pendingImages.length, t, makeStreamEventHandler])
 
   const handleImageSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
@@ -1135,9 +1243,14 @@ function ChatPage() {
                   ) : (
                     <>
                       <div className="session-info">
-                        <Text ellipsis className="session-title" style={{ display: 'block', marginBottom: 4 }}>
-                          {session.title || t('chat.defaultTitle')}
-                        </Text>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 4 }}>
+                          {streamingSessionIds.has(session.id) && (
+                            <SyncOutlined spin style={{ fontSize: 12, color: '#1890ff', flexShrink: 0 }} />
+                          )}
+                          <Text ellipsis className="session-title" style={{ display: 'block' }}>
+                            {session.title || t('chat.defaultTitle')}
+                          </Text>
+                        </div>
                         <Text type="secondary" className="session-meta" style={{ display: 'block', fontSize: 12 }}>
                           {session.messageCount}{t('chat.messages')}
                         </Text>

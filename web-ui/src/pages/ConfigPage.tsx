@@ -505,8 +505,6 @@ function SystemConfig() {
         enableSubagentParallel: data.enable_subagent_parallel !== false,
         claudeCodeMaxConcurrent: data.claude_code_max_concurrent || 3,
         claudeCodePermissionMode: data.claude_code_permission_mode || 'auto',
-        enableSmartParallel: data.enable_smart_parallel !== false,
-        smartParallelModel: data.smart_parallel_model || '',
       })
     } catch (error) {
       console.error(error)
@@ -566,8 +564,6 @@ function SystemConfig() {
         enableSubagentParallel: values.enableSubagentParallel,
         claudeCodeMaxConcurrent: Number(values.claudeCodeMaxConcurrent),
         claudeCodePermissionMode: values.claudeCodePermissionMode || 'auto',
-        enableSmartParallel: values.enableSmartParallel,
-        smartParallelModel: values.smartParallelModel || undefined,
       })
       message.success(t('config.saveSuccess'))
     } catch (error) {
@@ -739,15 +735,6 @@ function SystemConfig() {
                   <Switch />
                 </Form.Item>
               </Col>
-              <Col span={8}>
-                <Form.Item
-                  name="enableSmartParallel"
-                  label={t('config.concurrency.enableSmartParallel') || '启用智能并行'}
-                  valuePropName="checked"
-                >
-                  <Switch />
-                </Form.Item>
-              </Col>
             </Row>
             <Row gutter={16}>
               <Col span={12}>
@@ -775,16 +762,6 @@ function SystemConfig() {
                     ]}
                     placeholder={t('config.concurrency.claudeCodePermissionMode')}
                   />
-                </Form.Item>
-              </Col>
-            </Row>
-            <Row gutter={16}>
-              <Col span={12}>
-                <Form.Item
-                  name="smartParallelModel"
-                  label={t('config.concurrency.smartParallelModel') || '智能并行模型'}
-                >
-                  <Input placeholder={t('config.concurrency.smartParallelModelPlaceholder') || '留空使用默认模型'} />
                 </Form.Item>
               </Col>
             </Row>

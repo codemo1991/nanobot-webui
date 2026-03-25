@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from nanobot.agentloop.kernel.kernel import create_kernel
+from nanobot.agentloop.kernel.artifact_repo import get_artifact_payload
 
 
 async def main(user_input: str = "设计 agentloop 微内核", workspace: Path | None = None) -> str | None:
@@ -15,11 +16,13 @@ async def main(user_input: str = "设计 agentloop 微内核", workspace: Path |
 
     await kernel.run_until_done(trace_id, worker_count=4, timeout_seconds=30)
 
+    # Fix #8: 先查 result_artifact_id，再通过 get_artifact_payload 读取 payload。
+    # 原实现直接 JOIN 读 payload_text，当 artifact 超过 64KB 落盘（storage_kind='FILE'）
+    # 时 payload_text 为 NULL，会静默丢失结果。
     row = kernel.conn.execute(
         """
-        SELECT a.payload_text
+        SELECT t.result_artifact_id
         FROM agentloop_tasks t
-        JOIN agentloop_artifacts a ON a.artifact_id = t.result_artifact_id
         WHERE t.trace_id = ?
           AND t.output_schema = 'final_result_v1'
           AND t.state = 'DONE'
@@ -29,8 +32,10 @@ async def main(user_input: str = "设计 agentloop 微内核", workspace: Path |
         (trace_id,),
     ).fetchone()
 
-    if row:
-        return row["payload_text"]
+    if row and row["result_artifact_id"]:
+        payload = get_artifact_payload(kernel.conn, row["result_artifact_id"])
+        if payload is not None:
+            return json.dumps(payload, ensure_ascii=False)
     return None
 
 
