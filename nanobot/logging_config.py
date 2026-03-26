@@ -27,16 +27,22 @@ LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
     "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+    "<level>{extra[trace_id]}</level>"
     "<level>{message}</level>"
 )
 
 def _buffer_sink(message: Any) -> None:
-    """将日志写入内存缓冲，供 get_buffered_logs 读取，避免读文件占用导致轮换失败。"""
+    """将日志写入内存缓冲，供 get_buffered_logs 读取，避免读文件占用导致轮换失败。
+
+    Adds a trace_id prefix when a trace context is active (from nanobot.tracing).
+    """
     try:
         r = message.record
         t = r["time"].strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         lv = r["level"].name if hasattr(r["level"], "name") else str(r["level"])
-        line = f"{t} | {lv:8} | {r['name']}:{r['function']}:{r['line']} | {r['message']}"
+        trace_id = r.get("extra", {}).get("trace_id", "")
+        trace_prefix = f"[{trace_id}] " if trace_id else ""
+        line = f"{t} | {lv:8} | {r['name']}:{r['function']}:{r['line']} | {trace_prefix}{r['message']}"
         _LOG_BUFFER.append(line)
     except Exception:
         pass

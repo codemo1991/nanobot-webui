@@ -9,6 +9,7 @@ from loguru import logger
 from litellm import acompletion
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.tracing import span
 
 # 单条消息内容在日志中的最大长度，超出则截断
 _LLM_LOG_CONTENT_MAX = 1500
@@ -370,48 +371,63 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             logger.debug("  工具数量: {}", len(tools))
         
-        try:
-            response = await acompletion(**kwargs)
-            result = self._parse_response(response)
-            
-            # DEBUG 级别输出 LLM 响应日志
-            usage = result.usage or {}
-            if result.tool_calls:
-                tc_names = [tc.name for tc in result.tool_calls]
-                logger.debug("LLM 响应: tool_calls={}, usage={}", tc_names, usage)
-                for tc in result.tool_calls:
-                    args_preview = json.dumps(tc.arguments, ensure_ascii=False)
-                    if len(args_preview) > 300:
-                        args_preview = args_preview[:300] + "..."
-                    logger.debug("  -> {}({})", tc.name, args_preview)
-            else:
-                content_preview = (result.content or "")[:800]
-                if len(result.content or "") > 800:
-                    content_preview += f"... (共 {len(result.content)} 字)"
-                logger.debug("LLM 响应: content={}, usage={}", content_preview, usage)
-            
-            return result
-        except Exception as e:
-            logger.exception("LLM API call failed")
-            # 不返回详细错误信息给用户，避免技术细节泄露
-            # 返回通用错误，让上层处理
-            error_msg = str(e)
-            # 检查是否是常见的可处理错误
-            if "tool call and result not match" in error_msg:
-                user_message = "工具执行结果与请求不匹配，请重试"
-            elif "authentication" in error_msg.lower() or "401" in error_msg:
-                user_message = "认证失败，请检查 API 配置"
-            elif "rate_limit" in error_msg.lower() or "429" in error_msg:
-                user_message = "请求过于频繁，请稍后再试"
-            elif "timeout" in error_msg.lower():
-                user_message = "请求超时，请重试"
-            else:
-                user_message = "服务暂时不可用，请稍后再试"
+        async with span(
+            "llm.call",
+            attrs={
+                "model": model,
+                "provider": getattr(self, "provider_id", ""),
+                "num_messages": len(messages),
+                "num_tools": len(tools) if tools else 0,
+            },
+        ) as s:
+            try:
+                response = await acompletion(**kwargs)
+                result = self._parse_response(response)
 
-            return LLMResponse(
-                content=user_message,
-                finish_reason="error",
-            )
+                # DEBUG 级别输出 LLM 响应日志
+                usage = result.usage or {}
+                if result.tool_calls:
+                    tc_names = [tc.name for tc in result.tool_calls]
+                    logger.debug("LLM 响应: tool_calls={}, usage={}", tc_names, usage)
+                    for tc in result.tool_calls:
+                        args_preview = json.dumps(tc.arguments, ensure_ascii=False)
+                        if len(args_preview) > 300:
+                            args_preview = args_preview[:300] + "..."
+                        logger.debug("  -> {}({})", tc.name, args_preview)
+                else:
+                    content_preview = (result.content or "")[:800]
+                    if len(result.content or "") > 800:
+                        content_preview += f"... (共 {len(result.content)} 字)"
+                    logger.debug("LLM 响应: content={}, usage={}", content_preview, usage)
+
+                s.set_attr("finish_reason", result.finish_reason or "")
+                if result.usage:
+                    s.set_attr("usage", result.usage)
+
+                return result
+            except Exception as e:
+                s.set_attr("error_type", type(e).__name__)
+                s.set_attr("error_msg", str(e)[:500])
+                logger.exception("LLM API call failed")
+                # 不返回详细错误信息给用户，避免技术细节泄露
+                # 返回通用错误，让上层处理
+                error_msg = str(e)
+                # 检查是否是常见的可处理错误
+                if "tool call and result not match" in error_msg:
+                    user_message = "工具执行结果与请求不匹配，请重试"
+                elif "authentication" in error_msg.lower() or "401" in error_msg:
+                    user_message = "认证失败，请检查 API 配置"
+                elif "rate_limit" in error_msg.lower() or "429" in error_msg:
+                    user_message = "请求过于频繁，请稍后再试"
+                elif "timeout" in error_msg.lower():
+                    user_message = "请求超时，请重试"
+                else:
+                    user_message = "服务暂时不可用，请稍后再试"
+
+                return LLMResponse(
+                    content=user_message,
+                    finish_reason="error",
+                )
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

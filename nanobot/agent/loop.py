@@ -34,7 +34,7 @@ from nanobot.agent.tools.delegate_microkernel import DelegateMicrokernelTool
 from nanobot.agent.tool_errors import format_tool_error
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
-from nanobot.utils.helpers import parse_session_key
+from nanobot.tracing import span, trace_context
 
 # Forward declaration to avoid circular imports
 SystemStatusService = "SystemStatusService"
@@ -1121,23 +1121,33 @@ class AgentLoop:
         tool_start_time = time.time()
         tool_execution_error = None
 
-        # 检查是否需要在线程池中执行
-        try:
-            use_thread_pool = tool_call.name in self._thread_pool_tools
-            if use_thread_pool and self._thread_pool_executor:
-                result = await self.tools.execute_in_thread_pool(
-                    tool_call.name,
-                    tool_call.arguments,
-                    self._thread_pool_executor
-                )
-            else:
-                result = await self.tools.execute(tool_call.name, tool_call.arguments)
-        except Exception as e:
-            tool_execution_error = e
-            result = f"Error: {str(e)}"
+        tool_name = tool_call.name
+        sanitized_args = {k: v for k, v in (tool_call.arguments or {}).items()
+                         if k not in ("api_key", "password", "secret", "token")}
+        async with span("tool.execute", attrs={
+            "tool_name": tool_name,
+            "arguments": sanitized_args,
+        }) as tool_span:
+            # 检查是否需要在线程池中执行
+            try:
+                use_thread_pool = tool_name in self._thread_pool_tools
+                if use_thread_pool and self._thread_pool_executor:
+                    result = await self.tools.execute_in_thread_pool(
+                        tool_name,
+                        tool_call.arguments,
+                        self._thread_pool_executor
+                    )
+                else:
+                    result = await self.tools.execute(tool_name, tool_call.arguments)
+            except Exception as e:
+                tool_execution_error = e
+                result = f"Error: {str(e)}"
+                tool_span.set_attr("error", type(e).__name__)
 
-        # 记录工具执行指标
+        # execution_time 计算在 span 外，以便后续日志和指标记录使用
         execution_time = time.time() - tool_start_time
+        tool_span.set_attr("duration_s", round(execution_time, 3))
+        tool_span.set_attr("result_preview", str(result)[:200] if result else None)
         logger.info(f"[ToolExecution] Tool '{tool_call.name}' completed in {execution_time:.2f}s, error: {tool_execution_error is not None}")
         if self._status_service:
             try:
@@ -1764,112 +1774,119 @@ class AgentLoop:
             # 取出 on_complete 回调（Web Gateway 模式下由 chat_stream() 注入）
             on_complete = msg.metadata.get("on_complete") if msg.metadata else None
 
-            try:
-                response = await asyncio.wait_for(
-                    self._process_message(msg),
-                    timeout=self.message_timeout,
-                )
-                if on_complete:
-                    try:
-                        on_complete(response.content if response else "")
-                    except Exception as _e:
-                        logger.warning(f"[AgentLoop] on_complete callback failed: {_e}")
-                elif response:
-                    logger.info(
-                        "[AgentLoop] Publishing reply to %s:%s (content_len=%d)",
-                        response.channel, response.chat_id, len(response.content or ""),
-                    )
-                    await self.bus.publish_outbound(response)
-                else:
-                    logger.warning(
-                        "[AgentLoop] _process_message returned None, no reply for %s:%s",
-                        msg.channel, msg.chat_id,
-                    )
-            except asyncio.CancelledError:
-                # 区分两种来源：
-                # 1. stop() → _running=False + _STOP_SENTINEL（不走此路径，sentinel 在 get() 处拦截）
-                # 2. cancel_current_request() → _check_cancelled() 在处理中途抛出
-                #    此时 _running 仍为 True，应通知前端后继续循环，而不是杀死整个 AgentLoop
-                if not self._running:
-                    raise  # 真正的全局关闭信号，退出循环
-                # 用户主动停止当前 session：结束链路监控、通知前端、保存会话记录，然后继续
-                logger.info("[AgentLoop] 当前请求被用户取消，AgentLoop 继续运行")
+            async with trace_context(
+                msg.session_key,
+                "agent.turn",
+                attrs={
+                    "session_key": msg.session_key,
+                    "channel": msg.channel,
+                    "chat_id": msg.chat_id,
+                },
+            ):
                 try:
-                    self._chain_monitor.end_chain(status="cancelled")
-                except Exception as _e:
-                    logger.error(f"[ExecutionChain] Failed to end chain on cancel: {_e}")
-                # 保存一条"已停止"的 assistant 记录，避免 LLM 下次看到孤立的用户消息
-                try:
-                    _sk = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
-                    _sess = self.sessions.get_or_create(_sk)
-                    _sess.add_message("assistant", "[已停止]")
-                    self.sessions.save(_sess)
-                except Exception as _e:
-                    logger.warning(f"[AgentLoop] Failed to save cancel placeholder: {_e}")
-                if on_complete:
+                    response = await asyncio.wait_for(
+                        self._process_message(msg),
+                        timeout=self.message_timeout,
+                    )
+                    if on_complete:
+                        try:
+                            on_complete(response.content if response else "")
+                        except Exception as _e:
+                            logger.warning(f"[AgentLoop] on_complete callback failed: {_e}")
+                    elif response:
+                        logger.info(
+                            "[AgentLoop] Publishing reply to %s:%s (content_len=%d)",
+                            response.channel, response.chat_id, len(response.content or ""),
+                        )
+                        await self.bus.publish_outbound(response)
+                    else:
+                        logger.warning(
+                            "[AgentLoop] _process_message returned None, no reply for %s:%s",
+                            msg.channel, msg.chat_id,
+                        )
+                except asyncio.CancelledError:
+                    # 区分两种来源：
+                    # 1. stop() → _running=False + _STOP_SENTINEL（不走此路径，sentinel 在 get() 处拦截）
+                    # 2. cancel_current_request() → _check_cancelled() 在处理中途抛出
+                    #    此时 _running 仍为 True，应通知前端后继续循环，而不是杀死整个 AgentLoop
+                    if not self._running:
+                        raise  # 真正的全局关闭信号，退出循环
+                    # 用户主动停止当前 session：结束链路监控、通知前端、保存会话记录，然后继续
+                    logger.info("[AgentLoop] 当前请求被用户取消，AgentLoop 继续运行")
                     try:
-                        on_complete("", error="已停止")
+                        self._chain_monitor.end_chain(status="cancelled")
                     except Exception as _e:
-                        logger.warning(f"[AgentLoop] on_complete (cancelled) failed: {_e}")
-                else:
+                        logger.error(f"[ExecutionChain] Failed to end chain on cancel: {_e}")
                     try:
+                        _sk = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
+                        _sess = self.sessions.get_or_create(_sk)
+                        _sess.add_message("assistant", "[已停止]")
+                        self.sessions.save(_sess)
+                    except Exception as _e:
+                        logger.warning(f"[AgentLoop] Failed to save cancel placeholder: {_e}")
+                    if on_complete:
+                        try:
+                            on_complete("", error="已停止")
+                        except Exception as _e:
+                            logger.warning(f"[AgentLoop] on_complete (cancelled) failed: {_e}")
+                    else:
+                        try:
+                            await self.bus.publish_outbound(OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content="[已停止]",
+                            ))
+                        except Exception as _e:
+                            logger.warning(f"[AgentLoop] publish_outbound (cancelled) failed: {_e}")
+                except asyncio.TimeoutError:
+                    try:
+                        self._chain_monitor.end_chain(status="timeout")
+                    except Exception as _e:
+                        logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
+                    logger.warning(f"Message processing timed out after {self.message_timeout}s")
+                    timeout_text = (
+                        "⏳ 当前任务处理时间较长。"
+                        "如有 Claude Code 任务正在执行，它将继续在后台运行，"
+                        "完成后会自动通知您结果。\n\n"
+                        "您也可以继续提问，我会记住本次对话上下文。"
+                    )
+                    try:
+                        session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
+                        session = self.sessions.get_or_create(session_key)
+                        session.add_message("user", msg.content)
+                        session.add_message("assistant", timeout_text)
+                        self.sessions.save(session)
+                    except Exception as _e:
+                        logger.warning(f"Failed to save session on timeout: {_e}")
+                    if on_complete:
+                        try:
+                            on_complete("", error=timeout_text)
+                        except Exception as _e:
+                            logger.warning(f"[AgentLoop] on_complete (timeout) failed: {_e}")
+                    else:
                         await self.bus.publish_outbound(OutboundMessage(
                             channel=msg.channel,
                             chat_id=msg.chat_id,
-                            content="[已停止]",
+                            content=timeout_text,
                         ))
-                    except Exception as _e:
-                        logger.warning(f"[AgentLoop] publish_outbound (cancelled) failed: {_e}")
-            except asyncio.TimeoutError:
-                try:
-                    self._chain_monitor.end_chain(status="timeout")
-                except Exception as _e:
-                    logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
-                logger.warning(f"Message processing timed out after {self.message_timeout}s")
-                timeout_text = (
-                    "⏳ 当前任务处理时间较长。"
-                    "如有 Claude Code 任务正在执行，它将继续在后台运行，"
-                    "完成后会自动通知您结果。\n\n"
-                    "您也可以继续提问，我会记住本次对话上下文。"
-                )
-                # 保存会话历史，确保超时后上下文不丢失
-                try:
-                    session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
-                    session = self.sessions.get_or_create(session_key)
-                    session.add_message("user", msg.content)
-                    session.add_message("assistant", timeout_text)
-                    self.sessions.save(session)
-                except Exception as _e:
-                    logger.warning(f"Failed to save session on timeout: {_e}")
-                if on_complete:
+                except Exception as e:
                     try:
-                        on_complete("", error=timeout_text)
+                        self._chain_monitor.end_chain(status="failed")
                     except Exception as _e:
-                        logger.warning(f"[AgentLoop] on_complete (timeout) failed: {_e}")
-                else:
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=timeout_text,
-                    ))
-            except Exception as e:
-                try:
-                    self._chain_monitor.end_chain(status="failed")
-                except Exception as _e:
-                    logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
-                logger.exception("Error processing message")
-                error_text = f"Sorry, I encountered an error: {str(e)}"
-                if on_complete:
-                    try:
-                        on_complete("", error=error_text)
-                    except Exception as _e:
-                        logger.warning(f"[AgentLoop] on_complete (error) failed: {_e}")
-                else:
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=error_text,
-                    ))
+                        logger.error(f"[ExecutionChain] Failed to end chain: {_e}")
+                    logger.exception("Error processing message")
+                    error_text = f"Sorry, I encountered an error: {str(e)}"
+                    if on_complete:
+                        try:
+                            on_complete("", error=error_text)
+                        except Exception as _e:
+                            logger.warning(f"[AgentLoop] on_complete (error) failed: {_e}")
+                    else:
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=error_text,
+                        ))
 
         logger.info("Agent loop stopped")
 
@@ -2272,53 +2289,57 @@ class AgentLoop:
             tool_mode = msg_tool_mode
             selected_mcp_servers = msg_selected_mcp
             selected_tools = self._select_tools_for_message(msg.content, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-            try:
-                llm_task = asyncio.create_task(
-                    self.provider.chat(
-                        messages=messages,
-                        tools=selected_tools,
-                        model=self.model,
+            async with span("llm.inference", attrs={"model": self.model}) as llm_span:
+                try:
+                    llm_task = asyncio.create_task(
+                        self.provider.chat(
+                            messages=messages,
+                            tools=selected_tools,
+                            model=self.model,
+                        )
                     )
-                )
-                loop_start_llm = time.monotonic()
-                while not llm_task.done():
-                    elapsed_llm = time.monotonic() - loop_start_llm
-                    remaining = _LLM_CALL_TIMEOUT - elapsed_llm
-                    if remaining <= 0:
-                        llm_task.cancel()
-                        try:
-                            await llm_task
-                        except asyncio.CancelledError:
-                            pass
-                        raise asyncio.TimeoutError()
-                    wait_time = min(_CANCEL_CHECK_INTERVAL, remaining)
-                    done, _ = await asyncio.wait(
-                        [llm_task],
-                        timeout=wait_time,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if llm_task in done:
-                        break
-                    cancelled = (sk in self._cancelled_sessions) or self._cancel_event.is_set()
-                    if cancelled:
-                        llm_task.cancel()
-                        try:
-                            await llm_task
-                        except asyncio.CancelledError:
-                            pass
-                        if sk in self._cancelled_sessions:
-                            self._cancelled_sessions.discard(sk)
-                        else:
-                            self._cancel_event.clear()
-                        raise asyncio.CancelledError("Request cancelled by user")
-                response = await llm_task
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                logger.warning("LLM call timed out after %ds, breaking agent loop", _LLM_CALL_TIMEOUT)
-                exit_reason = "time"
-                _emit({"type": "turn_end", "iteration": iteration})
-                break
+                    loop_start_llm = time.monotonic()
+                    while not llm_task.done():
+                        elapsed_llm = time.monotonic() - loop_start_llm
+                        remaining = _LLM_CALL_TIMEOUT - elapsed_llm
+                        if remaining <= 0:
+                            llm_task.cancel()
+                            try:
+                                await llm_task
+                            except asyncio.CancelledError:
+                                pass
+                            raise asyncio.TimeoutError()
+                        wait_time = min(_CANCEL_CHECK_INTERVAL, remaining)
+                        done, _ = await asyncio.wait(
+                            [llm_task],
+                            timeout=wait_time,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if llm_task in done:
+                            break
+                        cancelled = (sk in self._cancelled_sessions) or self._cancel_event.is_set()
+                        if cancelled:
+                            llm_task.cancel()
+                            try:
+                                await llm_task
+                            except asyncio.CancelledError:
+                                pass
+                            if sk in self._cancelled_sessions:
+                                self._cancelled_sessions.discard(sk)
+                            else:
+                                self._cancel_event.clear()
+                            raise asyncio.CancelledError("Request cancelled by user")
+                    response = await llm_task
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    llm_span.set_attr("exit_reason", "timeout")
+                    llm_span.end(status="error")
+                    raise
+                else:
+                    llm_span.set_attr("finish_reason", getattr(response, "finish_reason", None) or "")
+                    if getattr(response, "usage", None):
+                        llm_span.set_attr("usage", response.usage)
             _accumulate_usage(response.usage)
 
             # 细粒度事件流：message_start/end (assistant)

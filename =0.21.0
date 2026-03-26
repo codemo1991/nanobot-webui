@@ -1,0 +1,25 @@
+WARNING: Ignoring invalid distribution ~ (C:\Users\codem\anaconda3\Lib\site-packages)
+Looking in indexes: http://mirrors.aliyun.com/pypi/simple
+Collecting pytest-asyncio
+  Downloading http://mirrors.aliyun.com/pypi/packages/e5/35/f8b19922b6a25bc0880171a2f1a003eaeb93657475193ab516fd87cac9da/pytest_asyncio-1.3.0-py3-none-any.whl (15 kB)
+Collecting pytest<10,>=8.2 (from pytest-asyncio)
+  Downloading http://mirrors.aliyun.com/pypi/packages/3b/ab/b3226f0bd7cdcf710fbede2b3548584366da3b19b5021e74f5bde2a8fa3f/pytest-9.0.2-py3-none-any.whl (374 kB)
+     -------------------------------------- 374.8/374.8 kB 3.9 MB/s eta 0:00:00
+Requirement already satisfied: typing-extensions>=4.12 in c:\users\codem\anaconda3\lib\site-packages (from pytest-asyncio) (4.14.1)
+Requirement already satisfied: colorama>=0.4 in c:\users\codem\anaconda3\lib\site-packages (from pytest<10,>=8.2->pytest-asyncio) (0.4.6)
+Requirement already satisfied: iniconfig>=1.0.1 in c:\users\codem\anaconda3\lib\site-packages (from pytest<10,>=8.2->pytest-asyncio) (1.1.1)
+Requirement already satisfied: packaging>=22 in c:\users\codem\anaconda3\lib\site-packages (from pytest<10,>=8.2->pytest-asyncio) (23.2)
+Collecting pluggy<2,>=1.5 (from pytest<10,>=8.2->pytest-asyncio)
+  Downloading http://mirrors.aliyun.com/pypi/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl (20 kB)
+Requirement already satisfied: pygments>=2.7.2 in c:\users\codem\appdata\roaming\python\python312\site-packages (from pytest<10,>=8.2->pytest-asyncio) (2.18.0)
+WARNING: Ignoring invalid distribution ~ (C:\Users\codem\anaconda3\Lib\site-packages)
+Installing collected packages: pluggy, pytest, pytest-asyncio
+  Attempting uninstall: pluggy
+    Found existing installation: pluggy 1.0.0
+    Uninstalling pluggy-1.0.0:
+      Successfully uninstalled pluggy-1.0.0
+  Attempting uninstall: pytest
+    Found existing installation: pytest 7.4.4
+    Uninstalling pytest-7.4.4:
+      Successfully uninstalled pytest-7.4.4
+Successfully installed pluggy-1.6.0 pytest-9.0.2 pytest-asyncio-1.3.0

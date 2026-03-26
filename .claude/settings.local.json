@@ -25,5 +25,13 @@
       "Bash(cd /Users/linhome/.nanobot/web-ui/nanobot-webui/web-ui && npm run build 2>&1 | head -50)",
       "Bash(cd /Users/linhome/.nanobot/web-ui/nanobot-webui/web-ui && npm run build 2>&1)"
     ]
+  },
+  "extraKnownMarketplaces": {
+    "custom-agents": {
+      "source": {
+        "source": "directory",
+        "path": "/c/Users/codem/.agents/skills"
+      }
+    }
   }
 }

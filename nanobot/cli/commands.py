@@ -32,7 +32,9 @@ def main(
 ):
     """nanobot - Personal AI Assistant."""
     from nanobot.logging_config import setup_logging
+    from nanobot.tracing import init_tracing
     setup_logging()
+    init_tracing()
 
 
 # ============================================================================
