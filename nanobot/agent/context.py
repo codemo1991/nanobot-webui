@@ -28,7 +28,8 @@ You are nanobot, a helpful AI assistant.
 
 - Be helpful, accurate, and concise
 - Use tools when needed, explain what you're doing
-- When user says "记住/remember", call the remember tool to persist the information
+- When user says "记住/remember", call the remember tool to persist the information (global long-term memory)
+- After self-improving-agent / retrospective: you MUST call **persist_self_improvement** for each lesson to store in SQLite (scope=self_improve); editing skill JSON alone does not write to DB
 - For normal conversation, respond with text directly. Only use the 'message' tool for cross-channel messaging.
 
 ## When to Use spawn (Subagent)
@@ -39,6 +40,7 @@ You are nanobot, a helpful AI assistant.
 - **Task description**: When spawning with images, keep the task description brief and aligned with user's original intent. Do NOT re-describe the image; simply pass the user's request as-is (e.g., if user says "describe this image in mermaid", use exactly that as the task)
 - **Non-blocking**: After spawning, immediately return the result to the user. Do NOT wait or poll - the subagent will notify you when complete via a system message.
 - **Handle subagent results**: When you receive a system message with subagent results, synthesize them into your reply to the user.
+- **Self-improvement (optional)**: After a long or skill-heavy task, if the user wants repeatable lessons captured, you may briefly suggest the **self-improving-agent** skill (paths in Skills) — do not block the main answer on this.
 
 ## Subagent Templates
 
@@ -128,13 +130,20 @@ class ContextBuilder:
         always_skills_budget = budget - current_tokens - self.token_budget["skills"]
         always_skills = self.skills.get_always_skills()
         if always_skills and always_skills_budget > 0:
+            always_index = self.skills.build_skill_paths_index(always_skills)
             always_content = self.skills.load_skills_for_context(always_skills)
-            if always_content:
-                always_tokens = estimate_tokens(always_content)
+            if always_index or always_content:
+                blocks: list[str] = []
+                if always_index:
+                    blocks.append("### Skill paths\n\n" + always_index)
+                if always_content:
+                    blocks.append(always_content)
+                merged = "\n\n---\n\n".join(blocks)
+                always_tokens = estimate_tokens(merged)
                 if always_tokens > always_skills_budget:
-                    always_content = truncate_to_token_limit(always_content, always_skills_budget)
-                    always_tokens = estimate_tokens(always_content)
-                parts.append(f"# Active Skills\n\n{always_content}")
+                    merged = truncate_to_token_limit(merged, always_skills_budget)
+                    always_tokens = estimate_tokens(merged)
+                parts.append(f"# Active Skills\n\n{merged}")
                 current_tokens += always_tokens
         
         skills_budget = min(
@@ -154,6 +163,7 @@ class ContextBuilder:
                 parts.append(f"""# Skills
 
 Skills extend your capabilities. To use a skill, read its SKILL.md file with read_file tool.
+Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `references/`, etc.).
 (✓ = available, ✗ = missing dependencies)
 
 {skills_summary}""")
@@ -197,9 +207,10 @@ Skills extend your capabilities. To use a skill, read its SKILL.md file with rea
 
 ## Workspace
 {workspace_path}
-- 长期记忆与日程笔记：存储在 {workspace_path}/.nanobot/chat.db（SQLite），使用 remember 工具写入
+- 长期记忆与日程笔记：存储在 {workspace_path}/.nanobot/chat.db（SQLite），使用 remember 工具写入（scope=global）
+- 自我改进可检索结论：同一数据库 memory_entries，scope=self_improve，使用 persist_self_improvement 工具写入（与 global 记忆总结互不覆盖）
 - User skills: {workspace_path}/skills/
-- Skill paths: see Skills section below (each entry shows the exact SKILL.md path)
+- Skill paths: see Skills section below (`SKILL.md` path and **dir** = skill root next to it)
 {template_info}
 """
         # 1. 优先从 SQLite 读取用户可视化配置

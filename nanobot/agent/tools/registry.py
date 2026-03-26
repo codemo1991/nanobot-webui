@@ -31,7 +31,14 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         """Register a tool."""
         self._tools[tool.name] = tool
-    
+
+    def copy(self) -> "ToolRegistry":
+        """Shallow copy for per-run tools (e.g. subagent) without mutating a shared cache."""
+        reg = ToolRegistry(thread_pool_executor=self._thread_pool_executor)
+        reg._tools = dict(self._tools)
+        reg._loaded_deferred_tools = set(self._loaded_deferred_tools)
+        return reg
+
     def unregister(self, name: str) -> None:
         """Unregister a tool by name."""
         self._tools.pop(name, None)

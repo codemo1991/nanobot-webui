@@ -1,0 +1,14 @@
+{
+  "id": "ep-2026-03-26-001",
+  "timestamp": "2026-03-26T17:15:00+08:00",
+  "skill": "mcp_ai-table-query",
+  "situation": "用户要求查询'版本管理->云端版本管理'中 V2.12.9 的 commit 号",
+  "root_cause": "版本管理 Base 下有多个表（版本管理、云端版本管理、睿评版本管理），我没有先确认具体是哪个表就直接查询，导致在错误表中查不到数据后盲目重试",
+  "solution": "先调用 get_base 获取所有表名，确认目标表是'云端版本管理'后再调用 query_records",
+  "lesson": "多表 Base 必须先确认表名，再查数据",
+  "related_pattern": "multi_table_base_confirmation",
+  "user_feedback": {
+    "rating": 8,
+    "comments": "总结教训"
+  }
+}

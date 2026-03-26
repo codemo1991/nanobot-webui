@@ -14,6 +14,20 @@ from loguru import logger
 # Migration tracking
 MIGRATION_KEY = "memory_migration_v1"
 
+# Self-improvement: separate scope so MemoryMaintenance.replace_memories(scope=global) never deletes these rows
+SCOPE_SELF_IMPROVE = "self_improve"
+
+SELF_IMPROVE_SOURCE_TYPES = frozenset(
+    {
+        "self_improve_episode",
+        "self_improve_pattern",
+        "self_improve_correction",
+    }
+)
+
+# 单次自我改进写入正文上限（与 global MEMORY 上限量级一致，防止撑爆 DB / 上下文）
+SELF_IMPROVE_CONTENT_MAX_CHARS = 16 * 1024
+
 
 def _entry_size(d: str, c: str) -> int:
     """Calculate entry size for limit checking."""
@@ -284,6 +298,98 @@ class MemoryRepository:
             logger.exception(f"Failed to append memory: {e}")
             raise
 
+    def upsert_self_improve_memory(
+        self,
+        content: str,
+        source_type: str,
+        source_id: str,
+        agent_id: str | None = None,
+    ) -> int:
+        """
+        Insert or replace one self-improvement row (scope=self_improve).
+        Uniqueness: (source_id, source_type, agent_id); preserves earliest created_at on update.
+        Safe from global memory summarization.
+        """
+        if source_type not in SELF_IMPROVE_SOURCE_TYPES:
+            raise ValueError(
+                f"source_type must be one of {sorted(SELF_IMPROVE_SOURCE_TYPES)}"
+            )
+        text = (content or "").strip()
+        if not text:
+            raise ValueError("content must be non-empty")
+        if len(text) > SELF_IMPROVE_CONTENT_MAX_CHARS:
+            raise ValueError(
+                f"content exceeds max length {SELF_IMPROVE_CONTENT_MAX_CHARS} characters"
+            )
+        sid = (source_id or "").strip()
+        if not sid:
+            raise ValueError("source_id must be non-empty")
+
+        now = datetime.now()
+        entry_date = now.strftime("%Y-%m-%d")
+        entry_time = now.strftime("%H:%M")
+        updated_at = now.isoformat()
+
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    SELECT id, created_at FROM memory_entries
+                    WHERE scope = ? AND source_id = ? AND source_type = ?
+                      AND (agent_id = ? OR (? IS NULL AND agent_id IS NULL))
+                    """,
+                    (SCOPE_SELF_IMPROVE, sid, source_type, agent_id, agent_id),
+                )
+                rows_old = cur.fetchall()
+                old_ids = [r["id"] for r in rows_old]
+                preserve_created_at: str | None = None
+                if rows_old:
+                    preserve_created_at = min(
+                        str(r["created_at"])
+                        for r in rows_old
+                        if r["created_at"] is not None
+                    )
+
+                if self._fts5_available and old_ids:
+                    for mid in old_ids:
+                        conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (mid,))
+
+                for mid in old_ids:
+                    conn.execute("DELETE FROM memory_entries WHERE id = ?", (mid,))
+
+                created_at = preserve_created_at or updated_at
+
+                cursor = conn.execute(
+                    """
+                    INSERT INTO memory_entries
+                    (agent_id, scope, content, source_type, source_id, entry_date, entry_time, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        agent_id,
+                        SCOPE_SELF_IMPROVE,
+                        text,
+                        source_type,
+                        sid,
+                        entry_date,
+                        entry_time,
+                        created_at,
+                        updated_at,
+                    ),
+                )
+                memory_id = cursor.lastrowid
+
+                if self._fts5_available:
+                    conn.execute(
+                        "INSERT INTO memory_fts (rowid, content) VALUES (?, ?)",
+                        (memory_id, text),
+                    )
+
+                return int(memory_id)
+        except Exception as e:
+            logger.exception(f"Failed to upsert self-improve memory: {e}")
+            raise
+
     def append_memories(
         self,
         entries: list[tuple[str, str]],
@@ -511,60 +617,70 @@ class MemoryRepository:
             raise
 
     def search_memories(
-        self, query: str, scope: str | None = None, limit: int = 10
+        self,
+        query: str,
+        scope: str | None = None,
+        limit: int = 10,
+        agent_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search memories using FTS5 or fallback to LIKE."""
+        """Search memories using FTS5 or fallback to LIKE. Optional agent_id isolates per-subagent rows."""
+        agent_clause = "AND (m.agent_id = ? OR (? IS NULL AND m.agent_id IS NULL))"
+        agent_clause_plain = "AND (agent_id = ? OR (? IS NULL AND agent_id IS NULL))"
         try:
             with self._connect() as conn:
                 if self._fts5_available:
                     if scope:
                         rows = conn.execute(
-                            """
+                            f"""
                             SELECT m.id, m.agent_id, m.scope, m.content, m.entry_date, m.entry_time
                             FROM memory_entries m
                             JOIN memory_fts fts ON m.id = fts.rowid
                             WHERE memory_fts MATCH ? AND m.scope = ?
+                            {agent_clause}
                             ORDER BY rank
                             LIMIT ?
                             """,
-                            (query, scope, limit),
+                            (query, scope, agent_id, agent_id, limit),
                         ).fetchall()
                     else:
                         rows = conn.execute(
-                            """
+                            f"""
                             SELECT m.id, m.agent_id, m.scope, m.content, m.entry_date, m.entry_time
                             FROM memory_entries m
                             JOIN memory_fts fts ON m.id = fts.rowid
                             WHERE memory_fts MATCH ?
+                            {agent_clause}
                             ORDER BY rank
                             LIMIT ?
                             """,
-                            (query, limit),
+                            (query, agent_id, agent_id, limit),
                         ).fetchall()
                 else:
                     # Fallback to LIKE search
                     like_query = f"%{query}%"
                     if scope:
                         rows = conn.execute(
-                            """
+                            f"""
                             SELECT id, agent_id, scope, content, entry_date, entry_time
                             FROM memory_entries
                             WHERE content LIKE ? AND scope = ?
+                            {agent_clause_plain}
                             ORDER BY created_at DESC
                             LIMIT ?
                             """,
-                            (like_query, scope, limit),
+                            (like_query, scope, agent_id, agent_id, limit),
                         ).fetchall()
                     else:
                         rows = conn.execute(
-                            """
+                            f"""
                             SELECT id, agent_id, scope, content, entry_date, entry_time
                             FROM memory_entries
                             WHERE content LIKE ?
+                            {agent_clause_plain}
                             ORDER BY created_at DESC
                             LIMIT ?
                             """,
-                            (like_query, limit),
+                            (like_query, agent_id, agent_id, limit),
                         ).fetchall()
 
                 return [

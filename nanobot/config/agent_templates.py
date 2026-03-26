@@ -502,10 +502,20 @@ class AgentTemplateManager:
 
         if template.skills:
             from nanobot.agent.skills import SkillsLoader
+
             skills_loader = SkillsLoader(Path(workspace))
+            chunks: list[str] = []
+            path_index = skills_loader.build_skill_paths_index(template.skills)
+            if path_index:
+                chunks.append(
+                    "### 技能路径（read_file 用下列路径；`dir` 下含 memory/、references/ 等）\n\n"
+                    + path_index
+                )
             skills_content = skills_loader.load_skills_for_context(template.skills)
             if skills_content:
-                base_prompt += f"\n\n## 参考 Skills\n\n{skills_content}"
+                chunks.append(skills_content)
+            if chunks:
+                base_prompt += "\n\n## 参考 Skills\n\n" + "\n\n---\n\n".join(chunks)
 
         return base_prompt
 

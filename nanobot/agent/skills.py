@@ -50,6 +50,42 @@ class SkillsLoader:
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
         self._metadata_cache: dict[str, SkillMetadata] = {}
         self._cache_valid = False
+
+    @staticmethod
+    def skill_resource_dir(skill_md_path: str) -> str:
+        """Directory that contains SKILL.md; siblings include memory/, references/, templates/, etc."""
+        if not skill_md_path:
+            return ""
+        return str(Path(skill_md_path).parent)
+
+    def _format_skill_paths_for_summary(self, meta: SkillMetadata) -> str:
+        """SKILL.md path plus parent dir; use paths relative to workspace when under workspace (shorter)."""
+        if not meta.path:
+            return ""
+        root = self.skill_resource_dir(meta.path)
+        if not root:
+            return f"`{meta.path}`"
+
+        ws = self.workspace.expanduser().resolve()
+        try:
+            rel_skill = Path(meta.path).resolve().relative_to(ws)
+            rel_root = Path(root).resolve().relative_to(ws)
+            return f"`{rel_skill.as_posix()}` | dir: `{rel_root.as_posix()}`"
+        except ValueError:
+            return f"`{meta.path}` | dir: `{root}`"
+
+    def build_skill_paths_index(self, names: list[str]) -> str:
+        """Markdown lines: skill name, SKILL.md path, and dir (for subagent / always-loaded skills)."""
+        self._ensure_cache()
+        lines: list[str] = []
+        for name in names:
+            meta = self._metadata_cache.get(name)
+            if not meta or not meta.path:
+                continue
+            status = "✓" if meta.available else "✗"
+            paths = self._format_skill_paths_for_summary(meta)
+            lines.append(f"- **{name}** ({status}): {paths}")
+        return "\n".join(lines)
     
     def _ensure_cache(self) -> None:
         """Build metadata cache if not valid."""
@@ -306,13 +342,14 @@ class SkillsLoader:
         for name, meta in sorted_skills:
             status = "✓" if meta.available else "✗"
             emoji = f"{meta.emoji} " if meta.emoji else ""
+            paths = self._format_skill_paths_for_summary(meta)
             
             if level == 0:
-                line = f"- **{name}**: {meta.short_description} ({status}) — `{meta.path}`"
+                line = f"- **{name}**: {meta.short_description} ({status}) — {paths}"
             elif level == 1:
-                line = f"- **{emoji}{name}**: {meta.description} ({status}) — `{meta.path}`"
+                line = f"- **{emoji}{name}**: {meta.description} ({status}) — {paths}"
             else:
-                line = f"- **{emoji}{name}**: {meta.description} ({status}) — `{meta.path}`"
+                line = f"- **{emoji}{name}**: {meta.description} ({status}) — {paths}"
             
             if not meta.available and meta.missing_requirements:
                 line += f" — requires: {meta.missing_requirements}"
@@ -359,7 +396,8 @@ class SkillsLoader:
             
             status = "✓" if meta.available else "✗"
             emoji = f"{meta.emoji} " if meta.emoji else ""
-            line = f"- **{emoji}{name}**: {meta.description} ({status}) — `{meta.path}`"
+            paths = self._format_skill_paths_for_summary(meta)
+            line = f"- **{emoji}{name}**: {meta.description} ({status}) — {paths}"
             lines.append(line)
             shown_count += 1
         
@@ -373,7 +411,8 @@ class SkillsLoader:
                 break
             
             status = "✓" if meta.available else "✗"
-            line = f"- **{name}**: {meta.short_description} ({status}) — `{meta.path}`"
+            paths = self._format_skill_paths_for_summary(meta)
+            line = f"- **{name}**: {meta.short_description} ({status}) — {paths}"
             lines.append(line)
             shown_count += 1
         
