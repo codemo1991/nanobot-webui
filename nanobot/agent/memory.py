@@ -1,12 +1,12 @@
 """Memory system for persistent agent memory."""
 
-import re
 from pathlib import Path
 from datetime import datetime
 from typing import Any
 
 from nanobot.utils.helpers import ensure_dir, today_date, estimate_tokens, truncate_to_token_limit
 from nanobot.storage.memory_repository import (
+    SCOPE_SELF_IMPROVE,
     get_memory_repository,
     parse_memory_entries_with_dates as _parse_entries,
     entries_to_text_preserve_dates as _entries_to_text,
@@ -22,8 +22,38 @@ MEMORY_READ_MAX_CHARS = 25 * 1024  # 25KB
 MEMORY_READ_KEEP_HEAD = 30  # 截断时保留最旧条数
 MEMORY_READ_KEEP_TAIL = 50  # 截断时保留最新条数
 
+SELF_IMPROVE_CONTEXT_MAX_ENTRIES = 15
+SELF_IMPROVE_CONTEXT_MAX_CHARS = 6000
 
-def _entry_size(d: str, c: str) -> int:
+_MEMORY_CONTEXT_SHRINK_ROUNDS = 12
+
+
+def _memory_context_apply_max_tokens(
+    long_term_block: str,
+    self_improve_block: str,
+    today_block: str,
+    max_tokens: int,
+) -> str:
+    """优先压缩长期记忆，其次今日笔记，最后自我改进段落。"""
+    lt, si, td = long_term_block, self_improve_block, today_block
+    for _ in range(_MEMORY_CONTEXT_SHRINK_ROUNDS):
+        parts = [p for p in (lt, si, td) if p]
+        result = "\n\n".join(parts)
+        total = estimate_tokens(result)
+        if total <= max_tokens:
+            return result
+        over = total - max_tokens
+        if lt and estimate_tokens(lt) > 100:
+            lt = truncate_to_token_limit(lt, max(100, estimate_tokens(lt) - over - 10))
+            continue
+        if td and estimate_tokens(td) > 40:
+            td = truncate_to_token_limit(td, max(40, estimate_tokens(td) - over - 10))
+            continue
+        if si and estimate_tokens(si) > 50:
+            si = truncate_to_token_limit(si, max(50, estimate_tokens(si) - over - 10))
+            continue
+        return truncate_to_token_limit(result, max_tokens)
+    return truncate_to_token_limit("\n\n".join(p for p in (lt, si, td) if p), max_tokens)
     return len(d) + len(c) + 20
 
 
@@ -215,9 +245,9 @@ class MemoryStore:
             Memory context string.
         - 若 MEMORY 条数≤80 且≤25KB：全量读取
         - 否则：取前30条（最旧）+ 后50条（最新），兼顾首尾
+        - 若有 max_tokens：优先压缩长期记忆 → 今日笔记 → 自我改进（最后动）
         """
-        parts = []
-
+        long_term_block = ""
         entries = self._repo.get_memories_for_summarize(
             agent_id=self.agent_id,
             scope="global"
@@ -235,21 +265,52 @@ class MemoryStore:
                 merged = head + entries[tail_start:]
                 long_term = entries_to_text_preserve_dates(merged)
 
-            parts.append("## Long-term Memory\n" + long_term)
+            long_term_block = "## Long-term Memory\n" + long_term
 
+        si_block = ""
+        si_rows = self._repo.get_memories(
+            agent_id=self.agent_id,
+            scope=SCOPE_SELF_IMPROVE,
+            limit=SELF_IMPROVE_CONTEXT_MAX_ENTRIES,
+            offset=0,
+        )
+        if si_rows:
+            lines_si: list[str] = ["## 自我改进沉淀（SQLite scope=self_improve）"]
+            used_chars = len(lines_si[0])
+            for row in si_rows:
+                st = row.get("source_type") or ""
+                sid = row.get("source_id") or ""
+                ed = row.get("entry_date") or ""
+                et = row.get("entry_time") or ""
+                ct = (row.get("content") or "").strip()
+                line = f"- [{ed} {et}] ({st}/{sid}) {ct}"
+                extra = len(line) + 1
+                if used_chars + extra > SELF_IMPROVE_CONTEXT_MAX_CHARS:
+                    break
+                lines_si.append(line)
+                used_chars += extra
+            if len(lines_si) > 1:
+                si_block = "\n".join(lines_si)
+
+        today_block = ""
         today_note = self._repo.get_daily_note(
             note_date=today_date(),
             agent_id=self.agent_id,
             scope="global"
         )
         if today_note:
-            parts.append("## Today's Notes\n# " + today_date() + "\n\n" + today_note)
+            today_block = "## Today's Notes\n# " + today_date() + "\n\n" + today_note
 
-        result = "\n\n".join(parts) if parts else ""
-        
+        if not (long_term_block or si_block or today_block):
+            return ""
+
+        result = "\n\n".join(p for p in (long_term_block, si_block, today_block) if p)
+
         if max_tokens and estimate_tokens(result) > max_tokens:
-            result = truncate_to_token_limit(result, max_tokens)
-        
+            result = _memory_context_apply_max_tokens(
+                long_term_block, si_block, today_block, max_tokens
+            )
+
         return result
 
     # ========== New methods for direct repository access ==========
@@ -259,9 +320,27 @@ class MemoryStore:
         return self._repo
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
-        """Search memories using full-text search."""
-        return self._repo.search_memories(
+        """Search global + self_improve with agent isolation (FTS / LIKE)."""
+        g = self._repo.search_memories(
             query=query,
             scope="global",
-            limit=limit
+            limit=limit,
+            agent_id=self.agent_id,
         )
+        si = self._repo.search_memories(
+            query=query,
+            scope=SCOPE_SELF_IMPROVE,
+            limit=limit,
+            agent_id=self.agent_id,
+        )
+        seen: set[int] = set()
+        out: list[dict[str, Any]] = []
+        for row in g + si:
+            rid = row["id"]
+            if rid in seen:
+                continue
+            seen.add(rid)
+            out.append(row)
+            if len(out) >= limit:
+                break
+        return out

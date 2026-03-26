@@ -1126,7 +1126,15 @@ class SubagentManager:
         })
 
         try:
-            tools = self._create_tools_for_template(template)
+            tools = self._create_tools_for_template(template).copy()
+            from nanobot.agent.tools.persist_self_improvement import PersistSelfImprovementTool
+
+            tools.register(
+                PersistSelfImprovementTool(
+                    workspace=str(self.workspace),
+                    agent_id=task_id if enable_memory else None,
+                )
+            )
 
             from nanobot.agent.memory import MemoryStore
             if enable_memory:

@@ -23,3 +23,4 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `tmux` | Remote-control tmux sessions |
 | `skill-creator` | Create new skills |
 | `code-review-expert` | Expert code review: SOLID, security, performance, error handling (from [sanyuan0704/code-review-expert](https://github.com/sanyuan0704/code-review-expert)) |
+| `self-improving-agent` | Lifelong learning from skill use: semantic/episodic memory, pattern extraction, skill updates with evolution markers ([discussion](https://medium.com/@nomannayeem/lets-build-a-self-improving-ai-agent-that-learns-from-your-feedback-722d2ce9c2d9)); `LICENSE` in skill dir; optional Claude Code hooks (`hooks/*.sh`, needs bash) |

@@ -23,6 +23,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.memory import RememberTool
+from nanobot.agent.tools.persist_self_improvement import PersistSelfImprovementTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
@@ -50,6 +51,25 @@ TOOL_KEYWORDS = {
     "web_fetch": ["网页", "url", "http", "fetch", "获取网页"],
     "message": ["发送消息", "通知", "message", "send"],
     "remember": ["记住", "remember", "记忆"],
+    "persist_self_improvement": [
+        "自我改进",
+        "自我进化",
+        "self-improve",
+        "self_improve",
+        "self-improving",
+        "self-improving-agent",
+        "improving-agent",
+        "沉淀结论",
+        "总结教训",
+        "总结经验",
+        "从经验中学习",
+        "分析今天的经验",
+        "复盘",
+        "回顾",
+        "自我完善",
+        "技能总结",
+        "retrospective",
+    ],
     "spawn": [],
     "cron": ["定时", "计划", "cron", "schedule"],
     "self_update": ["自更新", "自我更新", "self-update", "self_update", "evolve", "自我进化", "更新自己", "更新nanobot", "重启nanobot", "拉取最新", "更新并重启", "git pull", "git push"],
@@ -58,11 +78,31 @@ TOOL_KEYWORDS = {
 for tool, keywords in TOOL_KEYWORDS.items():
     TOOL_KEYWORDS[tool] = [kw.lower() for kw in keywords]
 
-ESSENTIAL_TOOLS = ["read_file", "write_file", "exec", "remember", "spawn"]
+# persist_self_improvement：始终注入，避免仅依赖关键词时 self-improving 流程结束却未写入 SQLite
+ESSENTIAL_TOOLS = [
+    "read_file",
+    "write_file",
+    "exec",
+    "remember",
+    "spawn",
+    "persist_self_improvement",
+]
 
 # 工具复杂度分类：用于动态阈值
 TOOLS_SIMPLE = frozenset({"read_file", "list_dir"})
-TOOLS_MEDIUM = frozenset({"exec", "web_search", "web_fetch", "write_file", "edit_file", "remember", "message", "cron", "voice_transcribe", "get_subagent_results"})
+TOOLS_MEDIUM = frozenset({
+    "exec",
+    "web_search",
+    "web_fetch",
+    "write_file",
+    "edit_file",
+    "remember",
+    "persist_self_improvement",
+    "message",
+    "cron",
+    "voice_transcribe",
+    "get_subagent_results",
+})
 TOOLS_COMPLEX = frozenset({"spawn"})
 
 # Marker embedded in assistant reply when limits are hit.
@@ -1700,7 +1740,8 @@ class AgentLoop:
         
         # Memory tool (用户说「记住」时必须调用，否则不会真正写入)
         self.tools.register(RememberTool(workspace=ws))
-        
+        self.tools.register(PersistSelfImprovementTool(workspace=ws))
+
         # Shell tool
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
