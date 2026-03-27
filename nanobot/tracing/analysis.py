@@ -64,6 +64,21 @@ class SpanMetrics:
     p99_duration_ms: float | None = None
     grouped: dict[str, "SpanMetrics"] = field(default_factory=dict)
 
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-serializable dict."""
+        return {
+            "count": self.count,
+            "ok_count": self.ok_count,
+            "error_count": self.error_count,
+            "success_rate": self.success_rate,
+            "error_rate": self.error_rate,
+            "avg_duration_ms": self.avg_duration_ms,
+            "p50_duration_ms": self.p50_duration_ms,
+            "p95_duration_ms": self.p95_duration_ms,
+            "p99_duration_ms": self.p99_duration_ms,
+            "grouped": {k: v.to_dict() for k, v in self.grouped.items()},
+        }
+
 
 @dataclass
 class AggregatedMetrics:
@@ -81,6 +96,15 @@ class AggregatedMetrics:
     by_type: dict[str, SpanMetrics] = field(default_factory=dict)
     by_template: dict[str, SpanMetrics] = field(default_factory=dict)
     by_tool: dict[str, SpanMetrics] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-serializable dict."""
+        return {
+            "total_spans": self.total_spans,
+            "by_type": {k: v.to_dict() for k, v in self.by_type.items()},
+            "by_template": {k: v.to_dict() for k, v in self.by_template.items()},
+            "by_tool": {k: v.to_dict() for k, v in self.by_tool.items()},
+        }
 
 
 # ---------------------------------------------------------------------------

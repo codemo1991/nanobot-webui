@@ -948,6 +948,85 @@ def cron_run(
 
 
 # ============================================================================
+# Trace Analysis Commands
+# ============================================================================
+
+
+trace_app = typer.Typer(help="Trace analysis commands")
+app.add_typer(trace_app, name="trace")
+
+
+@trace_app.command("analyze")
+def trace_analyze(
+    date_from: str | None = typer.Option(
+        None,
+        "--date-from",
+        help="Start date (YYYY-MM-DD). Default: 7 days ago",
+    ),
+    date_to: str | None = typer.Option(
+        None,
+        "--date-to",
+        help="End date (YYYY-MM-DD). Default: today",
+    ),
+    memory: bool = typer.Option(
+        False,
+        "--memory/--no-memory",
+        help="Persist findings to memory (default: --no-memory, print report only)",
+    ),
+    error_rate: float | None = typer.Option(
+        None,
+        "--error-rate",
+        help="Override anomaly error_rate threshold (e.g. 0.1 = 10%)",
+    ),
+    latency_ms: float | None = typer.Option(
+        None,
+        "--latency-ms",
+        help="Override anomaly latency p95 threshold in ms (e.g. 5000)",
+    ),
+    success_rate: float | None = typer.Option(
+        None,
+        "--success-rate",
+        help="Override anomaly success_rate threshold (e.g. 0.8 = 80%)",
+    ),
+):
+    """Run trace analysis and print an AnalysisReport."""
+    from datetime import date, timedelta
+
+    from nanobot.tracing.anomaly import AnomalyConfig
+    from nanobot.tracing.service import TraceAnalysisService
+
+    # Apply defaults for date range
+    today = date.today().isoformat()
+    if date_to is None:
+        date_to = today
+    if date_from is None:
+        date_from = (date.today() - timedelta(days=7)).isoformat()
+
+    config = AnomalyConfig(
+        error_rate_threshold=error_rate if error_rate is not None else 0.10,
+        latency_p95_threshold_ms=latency_ms if latency_ms is not None else 5000.0,
+        success_rate_threshold=success_rate if success_rate is not None else 0.80,
+    )
+
+    service = TraceAnalysisService(
+        date_from=date_from,
+        date_to=date_to,
+        anomaly_config=config,
+    )
+
+    if memory:
+        report, result = service.run_with_memory()
+        console.print(str(report))
+        if result.success:
+            console.print(f"[green]Memory written.[/green]")
+        else:
+            console.print(f"[yellow]Memory partial failure: {result.error}[/yellow]")
+    else:
+        report = service.run()
+        console.print(str(report))
+
+
+# ============================================================================
 # AgentLoop 微内核
 # ============================================================================
 
