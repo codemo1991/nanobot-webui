@@ -97,8 +97,13 @@ def _safe_filename(name: str, max_len: int = 100) -> str:
     Returns:
         A filesystem-safe filename string (empty if name contains only slashes).
     """
-    safe = name.replace("/", "_").replace("\\", "_").strip().strip("_")
+    safe = name.replace("/", "_").replace("\\", "_").strip().rstrip("_")
     return safe[:max_len] if safe else safe
+
+
+def _frontmatter(name: str, description: str, mem_type: str) -> str:
+    """Return a memory file frontmatter block."""
+    return f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n"
 
 
 def _write_memory_file(path: Path, content: str) -> MemoryWriteResult:
@@ -181,7 +186,7 @@ class TraceMemoryWriter:
 
         name_field = f"{tool_name} error pattern"
         desc_field = f"{error_rate:.1%} error rate across {span_count} spans"
-        body = f"---\nname: {name_field}\ndescription: {desc_field}\ntype: feedback\n---\n\n{suggestion}\n"
+        body = _frontmatter(name_field, desc_field, "feedback") + suggestion + "\n"
 
         return _write_memory_file(path, body)
 
@@ -227,7 +232,7 @@ class TraceMemoryWriter:
 
         name_field = f"{name} latency"
         desc_field = f"p95={p95_ms:.0f}ms across {span_count} spans"
-        body = f"---\nname: {name_field}\ndescription: {desc_field}\ntype: reference\n---\n\nObserved p95 latency for {name}: {p95_ms:.0f}ms over {span_count} spans.\n"
+        body = _frontmatter(name_field, desc_field, "reference") + f"Observed p95 latency for {name}: {p95_ms:.0f}ms over {span_count} spans.\n"
 
         return _write_memory_file(path, body)
 
@@ -279,8 +284,7 @@ class TraceMemoryWriter:
         desc_field = f"{metrics.total_spans} spans across {len(metrics.by_type)} types"
 
         lines: list[str] = [
-            f"---\nname: {name_field}\ndescription: {desc_field}\ntype: reference\n---",
-            "",
+            _frontmatter(name_field, desc_field, "reference"),
             "## Metrics by Type",
             "",
             *rows,
@@ -341,6 +345,6 @@ class TraceMemoryWriter:
 
         name_field = key
         desc_field = reason
-        body = f"---\nname: {name_field}\ndescription: {desc_field}\ntype: project\n---\n\n{value}\n"
+        body = _frontmatter(name_field, desc_field, "project") + value + "\n"
 
         return _write_memory_file(path, body)

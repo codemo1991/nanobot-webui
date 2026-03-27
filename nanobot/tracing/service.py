@@ -171,31 +171,23 @@ class TraceAnalysisService:
             Passed directly to ``read_spans``.
         date_to: Optional end date in "YYYY-MM-DD" format (inclusive).
             Passed directly to ``read_spans``.
-        trace_dir: Optional directory containing trace JSONL files.
-            Defaults to ``~/.nanobot/traces``.
         memory_dir: Optional directory for memory persistence.
             Defaults to ``~/.claude/projects/E--workSpace-nanobot-webui/memory/``.
         anomaly_config: Optional anomaly detection configuration.
             Uses sensible defaults when None.
-        severity_threshold: Minimum severity score to trigger an evolution
-            recommendation (default 0.5).
     """
 
     def __init__(
         self,
         date_from: str | None = None,
         date_to: str | None = None,
-        trace_dir: str | None = None,
         memory_dir: str | None = None,
         anomaly_config: AnomalyConfig | None = None,
-        severity_threshold: float = 0.5,
     ) -> None:
         self.date_from = date_from
         self.date_to = date_to
-        self.trace_dir = trace_dir
         self.memory_dir = memory_dir
         self.anomaly_config = anomaly_config
-        self.severity_threshold = severity_threshold
 
     def run(self) -> AnalysisReport:
         """
@@ -221,13 +213,14 @@ class TraceAnalysisService:
         detector = AnomalyDetector(config=self.anomaly_config)
         anomalies = detector.detect(metrics)
 
-        # Step 4: generate recommendation
-        trigger = EvolutionTrigger()
-        recommendation = trigger.recommend(anomalies)
+        # Step 4: generate recommendation (its top_anomaly already carries max_severity)
+        recommendation = EvolutionTrigger().recommend(anomalies)
 
-        # Step 5: select top 5 anomalies by severity
-        scored = [(a, trigger.classify_severity(a)) for a in anomalies]
-        top_anomalies = [a for a, _ in sorted(scored, key=lambda x: x[1], reverse=True)[:5]]
+        # Step 5: select top 5 anomalies by severity (reuse scores already computed above)
+        top_anomalies = [a for a, _ in sorted(
+            [(a, EvolutionTrigger().classify_severity(a)) for a in anomalies],
+            key=lambda x: x[1], reverse=True
+        )[:5]]
 
         return AnalysisReport(
             date_from=self.date_from,
@@ -269,40 +262,40 @@ class TraceAnalysisService:
 
         # Collect all file write results
         all_files: list[str] = list(summary_result.files_written)
-        errors: list[str] = []
+        memory_errors: list[str] = []
         if not summary_result.success and summary_result.error:
-            errors.append(f"write_summary: {summary_result.error}")
+            memory_errors.append(f"write_summary: {summary_result.error}")
 
         # Persist each top anomaly
         anomaly_results: list[MemoryWriteResult] = []
         for anomaly in report.top_anomalies:
-            if anomaly.span_type == "tool":
+            if anomaly.anomaly_type == "latency_spike":
+                result = writer.write_latency_insight(
+                    tool_name=anomaly.group_key if anomaly.span_type == "tool" else None,
+                    template=anomaly.group_key if anomaly.span_type == "subagent" else None,
+                    p95_ms=anomaly.actual_value,
+                    span_count=anomaly.span_count,
+                )
+            else:
+                # error_rate / low_success_rate anomalies
                 result = writer.write_error_pattern(
                     tool_name=anomaly.group_key,
                     error_rate=anomaly.actual_value,
                     span_count=anomaly.span_count,
                     suggestion=anomaly.suggestion,
                 )
-            else:
-                # span_type == "subagent" (template)
-                result = writer.write_latency_insight(
-                    tool_name=None,
-                    template=anomaly.group_key,
-                    p95_ms=anomaly.actual_value,
-                    span_count=anomaly.span_count,
-                )
 
             anomaly_results.append(result)
             all_files.extend(result.files_written)
             if not result.success and result.error:
-                errors.append(f"{anomaly.span_type}/{anomaly.group_key}: {result.error}")
+                memory_errors.append(f"{anomaly.span_type}/{anomaly.group_key}: {result.error}")
 
         # Combine into a single MemoryWriteResult
         all_ok = summary_result.success and all(r.success for r in anomaly_results)
         memory_result = MemoryWriteResult(
             success=all_ok,
             files_written=all_files,
-            error="; ".join(errors) if errors else None,
+            error="; ".join(memory_errors) if memory_errors else None,
         )
 
         return report, memory_result

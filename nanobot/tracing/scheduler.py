@@ -17,6 +17,7 @@ Exit codes:
 
 from __future__ import annotations
 
+import argparse
 import sys
 from datetime import date, timedelta
 
@@ -46,11 +47,12 @@ def run_analysis(
         0 on success, 1 on error.
     """
     # Apply date defaults
-    today = date.today().isoformat()
+    today_dt = date.today()
+    today = today_dt.isoformat()
     if date_to is None:
         date_to = today
     if date_from is None:
-        date_from = (date.today() - timedelta(days=7)).isoformat()
+        date_from = (today_dt - timedelta(days=7)).isoformat()
 
     try:
         from nanobot.tracing.anomaly import AnomalyConfig

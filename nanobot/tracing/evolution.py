@@ -20,15 +20,10 @@ Example::
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-
-# ---------------------------------------------------------------------------
-# Types (imported for reference; avoid circular imports)
-# ---------------------------------------------------------------------------
-
-# The Anomaly type is defined in nanobot.tracing.anomaly and referenced
-# only via docstrings / type annotations below to avoid circular imports.
-# Code that uses this module should import Anomaly from anomaly.py directly.
+if TYPE_CHECKING:
+    from nanobot.tracing.anomaly import Anomaly
 
 
 # ---------------------------------------------------------------------------
@@ -61,16 +56,10 @@ class EvolutionRecommendation:
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-serializable dict."""
-        from nanobot.tracing.anomaly import Anomaly as AnomalyType
-
         return {
             "should_evolve": self.should_evolve,
             "severity_threshold": self.severity_threshold,
-            "anomalies": (
-                [a.to_dict() if isinstance(a, AnomalyType) else a for a in self.anomalies]
-                if self.anomalies
-                else []
-            ),
+            "anomalies": [a.to_dict() for a in self.anomalies],
             "top_anomaly": (
                 self.top_anomaly.to_dict()
                 if self.top_anomaly is not None
@@ -87,7 +76,6 @@ class EvolutionRecommendation:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
 class EvolutionTrigger:
     """
     Decides when to trigger self-improvement based on anomalies.
@@ -203,10 +191,9 @@ class EvolutionTrigger:
         should_evolve = self.should_evolve(anomalies)
 
         # Build human-readable recommendation
-        recommendation = self._build_recommendation(
-            top_anomaly, max_severity, anomalies
-        )
-        suggested_action = self._build_action(top_anomaly, max_severity)
+        top_label = self._severity_label(max_severity)
+        recommendation = self._build_recommendation(top_anomaly, max_severity, top_label, anomalies)
+        suggested_action = self._build_action(top_anomaly, max_severity, top_label)
 
         return EvolutionRecommendation(
             should_evolve=should_evolve,
@@ -223,12 +210,11 @@ class EvolutionTrigger:
     # ------------------------------------------------------------------
 
     def _build_recommendation(
-        self, top_anomaly: "Anomaly", max_severity: float, anomalies: list  # type: ignore[name-defined]  # noqa: F821
+        self, top_anomaly: "Anomaly", max_severity: float, label: str, anomalies: list  # type: ignore[name-defined]  # noqa: F821
     ) -> str:
         """Build a one-line human-readable recommendation string."""
         count = len(anomalies)
         a = top_anomaly
-        label = self._severity_label(max_severity)
 
         if a.anomaly_type == "high_error_rate":
             return (
@@ -254,10 +240,9 @@ class EvolutionTrigger:
             f"{a.suggestion} ({count} total anomaly(ies))."
         )
 
-    def _build_action(self, top_anomaly: "Anomaly", max_severity: float) -> str:  # type: ignore[name-defined]  # noqa: F821
+    def _build_action(self, top_anomaly: "Anomaly", max_severity: float, label: str) -> str:  # type: ignore[name-defined]  # noqa: F821
         """Build a more specific suggested-action string."""
         a = top_anomaly
-        label = self._severity_label(max_severity)
 
         if a.anomaly_type == "high_error_rate":
             return (
