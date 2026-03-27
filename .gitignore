@@ -18,3 +18,4 @@ __pycache__/
 .trae
 *.db
 .gitnexus
+.worktrees/
