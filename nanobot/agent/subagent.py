@@ -418,6 +418,14 @@ class SubagentManager:
         semaphore = self._subagent_semaphore
         running_tasks_ref = self._running_tasks
 
+        # Capture parent span for tracing before starting thread
+        parent_span_id = None
+        try:
+            from nanobot.tracing.context import get_current_span_id
+            parent_span_id = get_current_span_id()
+        except Exception:
+            pass  # Tracing not available, proceed without parent span
+
         def run_in_thread():
             """在独立线程的事件循环中运行子代理任务"""
             loop = asyncio.new_event_loop()
@@ -431,6 +439,7 @@ class SubagentManager:
                         template=template, session_id=session_id,
                         enable_memory=enable_memory, media=media,
                         backend=resolved_backend, batch_id=batch_id,
+                        parent_span_id=parent_span_id,
                     )
                 )
                 logger.info(f"[SubagentProgress] Thread-based subagent task {task_id} completed successfully")
@@ -1064,8 +1073,47 @@ class SubagentManager:
         media: list[str] | None = None,
         backend: str = "native",
         batch_id: str | None = None,
+        parent_span_id: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
+
+        # Create subagent span for tracing
+        from nanobot.tracing.spans import span as _span
+        async with _span(
+            "subagent.spawn",
+            parent_id=parent_span_id,
+            attrs={
+                "subagent_id": task_id,
+                "subagent_label": label,
+                "template": template,
+                "backend": backend,
+                "memory_enabled": enable_memory,
+            }
+        ) as subagent_span:
+            subagent_span.mark_subagent_span(task_id, label)
+            await self._run_subagent_impl(
+                task_id, task, label, origin,
+                template=template, session_id=session_id,
+                enable_memory=enable_memory, media=media,
+                backend=backend, batch_id=batch_id,
+                subagent_span=subagent_span,
+            )
+
+    async def _run_subagent_impl(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        template: str = "minimal",
+        session_id: str | None = None,
+        enable_memory: bool = False,
+        media: list[str] | None = None,
+        backend: str = "native",
+        batch_id: str | None = None,
+        subagent_span=None,
+    ) -> None:
+        """Internal implementation of subagent execution (traced)."""
         logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, backend: {backend}, memory: {enable_memory}), manager id: {id(self)}")
 
         # Determine the effective model: template's model or fallback to self.model
@@ -1113,6 +1161,9 @@ class SubagentManager:
                 "result": "任务已被用户取消。",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
+            # Mark span as cancelled before returning — __aexit__ would end with status="ok"
+            if subagent_span is not None:
+                subagent_span.end(status="cancelled")
             return
 
         bus = SubagentProgressBus.get()
@@ -1308,6 +1359,9 @@ class SubagentManager:
 
             logger.info(f"Subagent [{task_id}] completed successfully")
             end_status = "cancelled" if cancelled_by_user else "ok"
+            # End subagent span with correct status
+            if subagent_span is not None:
+                subagent_span.end(status=end_status)
             bus.push(origin_key, {
                 "type": "subagent_end",
                 "task_id": task_id,
@@ -1375,6 +1429,12 @@ class SubagentManager:
             error_msg = f"Error: {str(e)}"
             logger.error(f"Subagent [{task_id}] failed: {e}")
             end_status = "error"
+            # Mark subagent span as errored
+            if subagent_span is not None:
+                subagent_span.set_attr("error", str(e)[:200])
+                # Do NOT call subagent_span.end() here — __aexit__ of the
+                # async with _span(...) context manager already ended the span
+                # with status="error" and set error_type/error_msg attrs.
             bus.push(origin_key, {
                 "type": "subagent_end",
                 "task_id": task_id,
