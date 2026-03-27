@@ -1110,6 +1110,18 @@ class AgentLoop:
         # 按原始顺序返回结果
         return processed_results
 
+    def _get_current_span_id(self) -> str | None:
+        """Get current span ID from tracing context"""
+        from nanobot.tracing.context import get_current_span_id
+        return get_current_span_id()
+
+    def _is_evolution_candidate(self, tool_name: str, result: Any) -> bool:
+        """Determine if tool result should be marked for pattern analysis"""
+        # Simple heuristics for now
+        if tool_name == "exec" and result:
+            return "test" in str(result).lower() or "fail" in str(result).lower()
+        return False
+
     async def _execute_single_tool(
         self,
         tool_call,
@@ -1164,10 +1176,16 @@ class AgentLoop:
         tool_name = tool_call.name
         sanitized_args = {k: v for k, v in (tool_call.arguments or {}).items()
                          if k not in ("api_key", "password", "secret", "token")}
-        async with span("tool.execute", attrs={
-            "tool_name": tool_name,
-            "arguments": sanitized_args,
-        }) as tool_span:
+        current_span_id = self._get_current_span_id()
+        async with span(
+            "tool.execute",
+            parent_id=current_span_id,
+            attrs={
+                "tool_name": tool_name,
+                "arguments": sanitized_args,
+            }
+        ) as tool_span:
+            tool_span.mark_tool_span(tool_name, tool_call.arguments)
             # 检查是否需要在线程池中执行
             try:
                 use_thread_pool = tool_name in self._thread_pool_tools
@@ -1179,6 +1197,12 @@ class AgentLoop:
                     )
                 else:
                     result = await self.tools.execute(tool_name, tool_call.arguments)
+                # Truncate result for storage
+                result_str = str(result)[:500] if result else None
+                tool_span.set_tool_result("success", result_str)
+                # Check for evolution candidate patterns
+                if self._is_evolution_candidate(tool_name, result):
+                    tool_span.mark_evolution_candidate([tool_name, "pattern_detected"])
             except Exception as e:
                 tool_execution_error = e
                 result = f"Error: {str(e)}"
