@@ -8,11 +8,26 @@ Spans form a tree rooted at the agent.turn span.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+
+
+def hash_args(args: dict) -> str:
+    """Generate hash for args deduplication"""
+    args_str = json.dumps(args, sort_keys=True, default=str)
+    return hashlib.md5(args_str.encode()).hexdigest()[:12]
+
+
+def truncate(s: str, max_len: int) -> str:
+    """Truncate string to max length"""
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + f"... (truncated, {len(s)} chars)"
 
 from loguru import logger
 
@@ -49,6 +64,15 @@ class Span:
         status: "running" | "ok" | "error".
         attrs: Arbitrary key-value attributes (session_key, model, tool_name, etc.).
         events: Inner events (log lines within the span).
+        span_type: Type of span (tool/subagent/llm/agent).
+        tool_name: Name of the tool being executed.
+        tool_args: Arguments passed to the tool.
+        tool_result: Result of the tool execution.
+        subagent_id: ID of the spawned subagent.
+        subagent_intent: Intent/purpose of the subagent.
+        child_trace_id: Trace ID for child trace.
+        evolution_candidate: Whether this span is a candidate for pattern analysis.
+        pattern_tags: Tags for pattern analysis.
     """
 
     trace_id: str
@@ -62,6 +86,19 @@ class Span:
     attrs: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
     seq: int = 0
+    span_type: str = ""
+    tool_name: str = ""
+    tool_args: dict | None = None
+    tool_result: dict | None = None
+    subagent_id: str = ""
+    subagent_intent: str = ""
+    child_trace_id: str = ""
+    evolution_candidate: bool = False
+    pattern_tags: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.pattern_tags is None:
+            self.pattern_tags = []
 
     def set_attr(self, key: str, value: Any) -> None:
         """Set or update a span attribute."""
@@ -84,6 +121,40 @@ class Span:
         elif self.status == "running":
             self.status = "ok"
 
+    def mark_tool_span(self, tool_name: str, args: dict | None = None) -> None:
+        """Mark this span as a tool execution"""
+        self.span_type = "tool"
+        self.tool_name = tool_name
+        self.tool_args = args
+        self.set_attr("tool_name", tool_name)
+        if args:
+            self.set_attr("tool_args_hash", hash_args(args))
+
+    def mark_subagent_span(self, subagent_id: str, intent: str) -> None:
+        """Mark this span as a subagent spawn"""
+        self.span_type = "subagent"
+        self.subagent_id = subagent_id
+        self.subagent_intent = intent
+        self.set_attr("subagent_id", subagent_id)
+        self.set_attr("subagent_intent", intent)
+
+    def set_tool_result(self, status: str, result: Any = None, error: str = None) -> None:
+        """Set tool execution result"""
+        from nanobot.tracing.types import RESULT_PREVIEW_MAX_LEN
+        self.tool_result = {
+            "status": status,
+            "result": truncate(str(result), RESULT_PREVIEW_MAX_LEN) if result else None,
+            "error": error[:200] if error else None,
+        }
+        self.set_attr("tool_result_status", status)
+
+    def mark_evolution_candidate(self, tags: list[str]) -> None:
+        """Mark this span as a candidate for pattern analysis"""
+        self.evolution_candidate = True
+        self.pattern_tags = tags
+        self.set_attr("evolution_candidate", True)
+        self.set_attr("pattern_tags", tags)
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a dict for JSONL emission."""
         return {
@@ -100,6 +171,15 @@ class Span:
             "attrs": self.attrs,
             "events": self.events,
             "seq": self.seq,
+            "span_type": self.span_type,
+            "tool_name": self.tool_name,
+            "tool_args": self.tool_args,
+            "tool_result": self.tool_result,
+            "subagent_id": self.subagent_id,
+            "subagent_intent": self.subagent_intent,
+            "child_trace_id": self.child_trace_id,
+            "evolution_candidate": self.evolution_candidate,
+            "pattern_tags": self.pattern_tags,
         }
 
 
