@@ -27,9 +27,15 @@ LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
     "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-    "<level>{extra[trace_id]}</level>"
-    "<level>{message}</level>"
+    "{extra[trace_id]}"
+    "{message}"
 )
+
+
+def _ensure_trace_id(record: dict[str, Any]) -> None:
+    """Inject trace_id='' into extra so LOG_FORMAT never gets KeyError."""
+    record.setdefault("extra", {})  # defensive: ensure extra dict exists
+    record["extra"].setdefault("trace_id", "")
 
 def _buffer_sink(message: Any) -> None:
     """将日志写入内存缓冲，供 get_buffered_logs 读取，避免读文件占用导致轮换失败。
@@ -88,6 +94,7 @@ def setup_logging(
         format=LOG_FORMAT,
         level=level,
         colorize=True,
+        filter=_ensure_trace_id,
     )
 
     # File: DEBUG and above (capture all for debugging), with rotation
@@ -105,10 +112,11 @@ def setup_logging(
             retention="5 days",
             encoding="utf-8",
             enqueue=_USE_ENQUEUE,  # Windows 下避免轮换时 PermissionError [WinError 32]
+            filter=_ensure_trace_id,
         )
     except Exception as e:
         logger.warning(f"Could not add log file sink to {log_path}: {e}")
-    logger.add(_buffer_sink, level="DEBUG")  # 内存缓冲，get_logs 不读文件
+    logger.add(_buffer_sink, level="DEBUG", filter=_ensure_trace_id)  # 内存缓冲，get_logs 不读文件
 
     if capture_unhandled:
         sys.excepthook = _excepthook
@@ -136,6 +144,7 @@ def reconfigure_logging(level: str) -> None:
         format=LOG_FORMAT,
         level=level,
         colorize=True,
+        filter=_ensure_trace_id,
     )
 
     # Re-add file sink (always DEBUG)
@@ -148,8 +157,9 @@ def reconfigure_logging(level: str) -> None:
             retention="5 days",
             encoding="utf-8",
             enqueue=_USE_ENQUEUE,
+            filter=_ensure_trace_id,
         )
-        logger.add(_buffer_sink, level="DEBUG")
+        logger.add(_buffer_sink, level="DEBUG", filter=_ensure_trace_id)
     except Exception:
         pass  # 文件 sink 可能已存在，忽略错误
 
