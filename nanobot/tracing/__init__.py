@@ -22,6 +22,12 @@ Quick start::
     logger.info("processing...")  # logged as [abc123] processing...
 """
 
+from nanobot.tracing.analysis import (
+    AggregatedMetrics,
+    SpanMetrics,
+    aggregate_spans,
+    read_spans,
+)
 from nanobot.tracing.context import (
     get_current_trace_id,
     get_current_span_id,
@@ -42,6 +48,11 @@ __all__ = [
     "get_emitter",
     "set_emitter",
     "TraceEmitter",
+    # Analysis
+    "read_spans",
+    "aggregate_spans",
+    "SpanMetrics",
+    "AggregatedMetrics",
 ]
 
 # Module-level emitter instance (lazy, set by init_tracing)
