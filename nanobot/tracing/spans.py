@@ -96,10 +96,6 @@ class Span:
     evolution_candidate: bool = False
     pattern_tags: list[str] = field(default_factory=list)
 
-    def __post_init__(self) -> None:
-        if self.pattern_tags is None:
-            self.pattern_tags = []
-
     def set_attr(self, key: str, value: Any) -> None:
         """Set or update a span attribute."""
         self.attrs[key] = value
@@ -144,7 +140,7 @@ class Span:
         self.tool_result = {
             "status": status,
             "result": truncate(str(result), RESULT_PREVIEW_MAX_LEN) if result else None,
-            "error": error[:200] if error else None,
+            "error": str(error)[:200] if error else None,
         }
         self.set_attr("tool_result_status", status)
 
