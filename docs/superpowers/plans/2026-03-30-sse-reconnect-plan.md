@@ -1,6 +1,6 @@
 # SSE 自动重连实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 在前端 SSE 方法中添加自动重连机制，提升连接稳定性
 
@@ -15,11 +15,11 @@
 **Files:**
 - Modify: `web-ui/src/api.ts:168-214`
 
-- [ ] **Step 1: 读取现有代码**
+- [x] **Step 1: 读取现有代码**
 
 确认 `subscribeToChatStream` 方法的当前实现。
 
-- [ ] **Step 2: 添加重连逻辑**
+- [x] **Step 2: 添加重连逻辑**
 
 将现有的 `subscribeToChatStream` 方法替换为带有重连功能的版本：
 
@@ -112,13 +112,13 @@ async subscribeToChatStream(
 }
 ```
 
-- [ ] **Step 3: 验证 TypeScript 编译**
+- [x] **Step 3: 验证 TypeScript 编译**
 
 ```bash
 cd web-ui && npx tsc --noEmit
 ```
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add web-ui/src/api.ts
@@ -132,11 +132,11 @@ git commit -m "feat(api): add auto-retry to subscribeToChatStream"
 **Files:**
 - Modify: `web-ui/src/api.ts:830-865`
 
-- [ ] **Step 1: 读取现有代码**
+- [x] **Step 1: 读取现有代码**
 
 确认 `subscribeTraceStream` 方法的当前实现。
 
-- [ ] **Step 2: 添加重连逻辑**
+- [x] **Step 2: 添加重连逻辑**
 
 ```typescript
 /** 订阅 Trace SSE 流 */
@@ -206,13 +206,13 @@ async subscribeTraceStream(
 }
 ```
 
-- [ ] **Step 3: 验证 TypeScript 编译**
+- [x] **Step 3: 验证 TypeScript 编译**
 
 ```bash
 cd web-ui && npx tsc --noEmit
 ```
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add web-ui/src/api.ts
@@ -223,13 +223,13 @@ git commit -m "feat(api): add auto-retry to subscribeTraceStream"
 
 ## Task 3: 验证
 
-- [ ] **Step 1: 测试编译**
+- [x] **Step 1: 测试编译**
 
 ```bash
 cd web-ui && npx tsc --noEmit
 ```
 
-- [ ] **Step 2: 提交所有变更**
+- [x] **Step 2: 提交所有变更**
 
 ```bash
 git status

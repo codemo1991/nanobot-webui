@@ -236,8 +236,7 @@ export const api = {
         // 不重连的情况
         if (signal?.aborted) throw lastError
         const httpStatus = (lastError as Error & { status?: number }).status
-        if ((httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500) ||
-            lastError.message.includes('Stream cancelled')) {
+        if (httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500) {
           throw lastError
         }
 
@@ -871,35 +870,65 @@ export const api = {
     onEvent: (evt: { type: string; data: any }) => void,
     signal?: AbortSignal
   ): Promise<void> {
-    const res = await fetch(`${API_BASE}/traces/stream`, {
-      headers: { Accept: 'text/event-stream' },
-      signal,
-    })
-    if (!res.ok) throw new Error('Trace stream failed')
-    const reader = res.body?.getReader()
-    if (!reader) throw new Error('Stream not supported')
-    const dec = new TextDecoder()
-    let buf = ''
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += dec.decode(value, { stream: true })
-        const lines = buf.split('\n\n')
-        buf = lines.pop() ?? ''
-        for (const line of lines) {
-          const dataLine = line.split('\n').find(l => l.startsWith('data:'))
-          if (!dataLine) continue
-          const dataStr = dataLine.slice(5).trim()
-          if (!dataStr) continue
-          try {
-            const evt = JSON.parse(dataStr)
-            onEvent(evt)
-          } catch { /* skip */ }
+    const MAX_RETRIES = 3
+    const RETRY_DELAYS = [1000, 2000, 3000]
+
+    const doSubscribe = async () => {
+      const res = await fetch(`${API_BASE}/traces/stream`, {
+        headers: { Accept: 'text/event-stream' },
+        signal,
+      })
+      if (!res.ok) {
+        const err = new Error(`Trace stream failed: HTTP ${res.status}`) as Error & { status?: number }
+        err.status = res.status
+        throw err
+      }
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('Stream not supported')
+      const dec = new TextDecoder()
+      let buf = ''
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += dec.decode(value, { stream: true })
+          const lines = buf.split('\n\n')
+          buf = lines.pop() ?? ''
+          for (const line of lines) {
+            const dataLine = line.split('\n').find(l => l.startsWith('data:'))
+            if (!dataLine) continue
+            const dataStr = dataLine.slice(5).trim()
+            if (!dataStr) continue
+            try {
+              const evt = JSON.parse(dataStr)
+              onEvent(evt)
+            } catch { /* skip */ }
+          }
+        }
+      } finally {
+        reader.releaseLock()
+      }
+    }
+
+    // 重连循环
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      if (signal?.aborted) throw new Error('Stream cancelled')
+      try {
+        await doSubscribe()
+        return
+      } catch (e) {
+        const err = e instanceof Error ? e : new Error(String(e))
+        if (signal?.aborted) throw err
+        const httpStatus = (err as Error & { status?: number }).status
+        if (httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500) {
+          throw err
+        }
+        if (attempt < MAX_RETRIES - 1) {
+          console.warn(`[TraceStream] Connection failed (attempt ${attempt + 1}/${MAX_RETRIES}), retrying...`)
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt]))
         }
       }
-    } finally {
-      reader.releaseLock()
     }
+    throw new Error('Trace stream failed after all retries')
   },
 }
