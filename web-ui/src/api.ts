@@ -1,5 +1,5 @@
 import i18n from './i18n'
-import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, SubagentProgressEvent, TokenUsage, Task, TaskListResponse } from './types'
+import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, SubagentProgressEvent, TokenUsage, Task, TaskListResponse, TraceSummary, RecentSpan, TraceDetail, Anomaly } from './types'
 
 const API_BASE = '/api/v1'
 
@@ -806,6 +806,57 @@ export const api = {
           } catch {
             // 跳过非 JSON 行
           }
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+  },
+
+  // ==================== Trace APIs ====================
+
+  getTraceSummary: () =>
+    request<TraceSummary>('/traces/summary'),
+
+  getTraceRecent: (limit = 50) =>
+    request<RecentSpan[]>(`/traces/recent?limit=${limit}`),
+
+  getTraceDetail: (traceId: string) =>
+    request<TraceDetail>(`/traces/${traceId}`),
+
+  getTraceAnomalies: () =>
+    request<Anomaly[]>('/traces/anomalies'),
+
+  /** 订阅 Trace SSE 流 */
+  async subscribeTraceStream(
+    onEvent: (evt: { type: string; data: any }) => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const res = await fetch(`${API_BASE}/traces/stream`, {
+      headers: { Accept: 'text/event-stream' },
+      signal,
+    })
+    if (!res.ok) throw new Error('Trace stream failed')
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('Stream not supported')
+    const dec = new TextDecoder()
+    let buf = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n\n')
+        buf = lines.pop() ?? ''
+        for (const line of lines) {
+          const dataLine = line.split('\n').find(l => l.startsWith('data:'))
+          if (!dataLine) continue
+          const dataStr = dataLine.slice(5).trim()
+          if (!dataStr) continue
+          try {
+            const evt = JSON.parse(dataStr)
+            onEvent(evt)
+          } catch { /* skip */ }
         }
       }
     } finally {
