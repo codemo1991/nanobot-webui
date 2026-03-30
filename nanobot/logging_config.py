@@ -32,10 +32,11 @@ LOG_FORMAT = (
 )
 
 
-def _ensure_trace_id(record: dict[str, Any]) -> None:
+def _ensure_trace_id(record: dict[str, Any]) -> bool:
     """Inject trace_id='' into extra so LOG_FORMAT never gets KeyError."""
     record.setdefault("extra", {})  # defensive: ensure extra dict exists
     record["extra"].setdefault("trace_id", "")
+    return True
 
 def _buffer_sink(message: Any) -> None:
     """将日志写入内存缓冲，供 get_buffered_logs 读取，避免读文件占用导致轮换失败。

@@ -36,6 +36,7 @@ from nanobot.agent.tool_errors import format_tool_error
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.tracing import span, trace_context
+from nanobot.utils.helpers import parse_session_key
 
 # Forward declaration to avoid circular imports
 SystemStatusService = "SystemStatusService"
