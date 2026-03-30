@@ -3722,7 +3722,121 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 }))
                 return
 
-            # 执行链路监控 API
+            # ==================== Trace API ====================
+
+            # GET /api/v1/traces/summary - 聚合指标摘要
+            if path == "/api/v1/traces/summary":
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+                summary = emitter.get_summary()
+                self._write_json(HTTPStatus.OK, _ok(summary))
+                return
+
+            # GET /api/v1/traces/recent - 最近的 spans
+            if path == "/api/v1/traces/recent":
+                limit = int(query.get("limit", ["50"])[0])
+                limit = max(1, min(limit, 200))
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+                spans = emitter.get_recent_spans(limit)
+                result = [{
+                    "trace_id": s.get("trace_id", ""),
+                    "span_id": s.get("span_id", ""),
+                    "name": s.get("name", ""),
+                    "span_type": s.get("span_type", ""),
+                    "status": s.get("status", "ok"),
+                    "duration_ms": s.get("duration_ms"),
+                    "created_at": s.get("start_ms"),
+                } for s in spans]
+                self._write_json(HTTPStatus.OK, _ok(result))
+                return
+
+            # GET /api/v1/traces/{trace_id} - 单个 trace 详情
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "traces" and parts[3]:
+                trace_id = parts[3]
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+                spans = emitter.query_by_trace_id(trace_id, limit=200)
+                self._write_json(HTTPStatus.OK, _ok({
+                    "trace_id": trace_id,
+                    "spans": spans,
+                }))
+                return
+
+            # GET /api/v1/traces/anomalies - 异常告警
+            if path == "/api/v1/traces/anomalies":
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+                spans = emitter.get_recent_spans(limit=1000)
+                from nanobot.tracing.analysis import aggregate_spans
+                metrics = aggregate_spans(spans)
+                from nanobot.tracing.anomaly import AnomalyDetector
+                detector = AnomalyDetector()
+                anomalies = detector.detect(metrics)
+                result = [a.to_dict() for a in anomalies]
+                self._write_json(HTTPStatus.OK, _ok(result))
+                return
+
+            # GET /api/v1/traces/stream - SSE 实时推送
+            if path == "/api/v1/traces/stream":
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                evt_queue = queue.Queue()
+
+                def observer(span: dict[str, Any]) -> None:
+                    evt_queue.put({"type": "span", "data": span})
+
+                emitter.add_observer(observer)
+
+                try:
+                    heartbeat_interval = 30
+                    last_heartbeat = time.time()
+                    while True:
+                        try:
+                            evt = evt_queue.get(timeout=1.0)
+                            payload = _sse_json_dumps(evt)
+                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                        except queue.Empty:
+                            now = time.time()
+                            if now - last_heartbeat >= heartbeat_interval:
+                                try:
+                                    self.wfile.write(b": heartbeat\n\n")
+                                    self.wfile.flush()
+                                    last_heartbeat = now
+                                except (BrokenPipeError, ConnectionResetError, OSError):
+                                    break
+                except Exception as e:
+                    logger.warning("Trace stream error: %s", e)
+                finally:
+                    emitter.remove_observer(observer)
+                return
+
+            # ==================== 执行链路监控 API ====================
+
             if path == "/api/v1/monitoring/chains":
                 # 查询链路列表
                 session_key = query.get("sessionKey", [None])[0]
