@@ -588,3 +588,51 @@ export interface AgentTemplate {
   created_at?: string
   updated_at?: string
 }
+
+// ==================== Trace Types ====================
+
+export interface SpanMetrics {
+  count: number
+  ok_count: number
+  error_count: number
+  success_rate: number
+  error_rate: number
+  avg_duration_ms: number | null
+  p50_duration_ms: number | null
+  p95_duration_ms: number | null
+  p99_duration_ms: number | null
+}
+
+export interface TraceSummary {
+  total_spans: number
+  by_type: Record<string, SpanMetrics>
+  by_tool: Record<string, SpanMetrics>
+  recent_success_rate: number
+  recent_avg_duration_ms: number
+}
+
+export interface RecentSpan {
+  trace_id: string
+  span_id: string
+  name: string
+  span_type: string
+  status: 'ok' | 'error' | 'running'
+  duration_ms: number | null
+  created_at: number
+}
+
+export interface TraceDetail {
+  trace_id: string
+  spans: any[]
+}
+
+export interface Anomaly {
+  anomaly_type: string
+  span_type: string
+  group_key: string
+  actual_value: number
+  threshold: number
+  severity: number
+  suggestion: string
+  span_count: number
+}
