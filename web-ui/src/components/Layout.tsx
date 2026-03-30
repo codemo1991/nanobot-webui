@@ -38,6 +38,9 @@ function Layout() {
           <NavLink to="/config" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
             ⚙️ {t('nav.config')}
           </NavLink>
+          <NavLink to="/trace" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
+            🔍 {t('nav.trace')}
+          </NavLink>
           <NavLink to="/system" className={({ isActive }) => isActive ? 'nav-item active' : 'nav-item'}>
             📊 {t('nav.system')}
           </NavLink>
