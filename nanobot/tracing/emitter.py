@@ -15,7 +15,7 @@ import time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -208,6 +208,46 @@ class TraceEmitter:
 
         return results[:limit]
 
+    def get_recent_spans(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return the most recent spans from the buffer."""
+        with self._lock:
+            return list(self._buffer)[-limit:]
+
+    def get_summary(self) -> dict[str, Any]:
+        """Return aggregated metrics summary from the buffer."""
+        with self._lock:
+            spans = list(self._buffer)
+
+        if not spans:
+            return {
+                "total_spans": 0,
+                "by_type": {},
+                "by_tool": {},
+                "recent_success_rate": 1.0,
+                "recent_avg_duration_ms": 0.0,
+            }
+
+        from nanobot.tracing.analysis import aggregate_spans
+
+        metrics = aggregate_spans(spans)
+
+        # Calculate success rate for the most recent 100 spans
+        recent = spans[-100:] if len(spans) > 100 else spans
+        recent_ok = sum(1 for s in recent if s.get("status") == "ok")
+        recent_success_rate = recent_ok / len(recent) if recent else 1.0
+
+        # Calculate average duration
+        durations = [s.get("duration_ms") for s in recent if s.get("duration_ms")]
+        avg_duration = sum(durations) / len(durations) if durations else 0.0
+
+        return {
+            "total_spans": len(spans),
+            "by_type": {k: v.to_dict() for k, v in metrics.by_type.items()},
+            "by_tool": {k: v.to_dict() for k, v in metrics.by_tool.items()},
+            "recent_success_rate": recent_success_rate,
+            "recent_avg_duration_ms": avg_duration,
+        }
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -251,6 +291,7 @@ class TraceEmitter:
             line_count = 0
             with open(fpath, mode, encoding="utf-8") as f:
                 for record in batch:
+                    self._notify_observers(record)
                     # Remove internal field before writing
                     rec = {k: v for k, v in record.items() if k != "_emit_ts"}
                     f.write(_safe_json_dumps(rec) + "\n")
@@ -295,6 +336,28 @@ class TraceEmitter:
                     logger.debug(f"[Tracing] Deleted old trace file: {fpath.name}")
         except Exception as e:
             logger.warning(f"[Tracing] Failed to cleanup old files: {e}")
+
+    def add_observer(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Register a callback to be invoked for every new span."""
+        with self._lock:
+            if not hasattr(self, "_observers"):
+                self._observers: list[Callable[[dict[str, Any]], None]] = []
+            self._observers.append(callback)
+
+    def remove_observer(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Unregister a previously added observer callback."""
+        with self._lock:
+            if hasattr(self, "_observers") and callback in self._observers:
+                self._observers.remove(callback)
+
+    def _notify_observers(self, span: dict[str, Any]) -> None:
+        """Invoke all registered observers with a span dict."""
+        if hasattr(self, "_observers"):
+            for cb in self._observers:
+                try:
+                    cb(span)
+                except Exception:
+                    pass
 
     @staticmethod
     def _parse_size(size_str: str) -> int:
