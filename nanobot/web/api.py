@@ -3737,7 +3737,10 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
             # GET /api/v1/traces/recent - 最近的 spans
             if path == "/api/v1/traces/recent":
-                limit = int(query.get("limit", ["50"])[0])
+                try:
+                    limit = int(query.get("limit", ["50"])[0])
+                except (ValueError, TypeError):
+                    limit = 50
                 limit = max(1, min(limit, 200))
                 from nanobot.tracing import get_emitter
                 emitter = get_emitter()
@@ -3782,10 +3785,15 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 spans = emitter.get_recent_spans(limit=1000)
                 from nanobot.tracing.analysis import aggregate_spans
                 metrics = aggregate_spans(spans)
-                from nanobot.tracing.anomaly import AnomalyDetector
-                detector = AnomalyDetector()
-                anomalies = detector.detect(metrics)
-                result = [a.to_dict() for a in anomalies]
+                try:
+                    from nanobot.tracing.anomaly import AnomalyDetector
+                    detector = AnomalyDetector()
+                    anomalies = detector.detect(metrics)
+                    result = [a.to_dict() for a in anomalies]
+                except Exception as e:
+                    logger.exception("Anomaly detection failed")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("ANOMALY_DETECTION_FAILED", str(e)))
+                    return
                 self._write_json(HTTPStatus.OK, _ok(result))
                 return
 
@@ -3804,24 +3812,35 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
 
-                evt_queue = queue.Queue()
+                evt_queue = queue.Queue(maxsize=1000)
 
                 def observer(span: dict[str, Any]) -> None:
-                    evt_queue.put({"type": "span", "data": span})
+                    try:
+                        evt_queue.put_nowait({"type": "span", "data": span})
+                    except queue.Full:
+                        pass  # drop event rather than block observer
 
                 emitter.add_observer(observer)
 
                 try:
+                    idle_timeout = 300  # 5 分钟空闲超时
                     heartbeat_interval = 30
+                    last_event = time.time()
                     last_heartbeat = time.time()
                     while True:
                         try:
                             evt = evt_queue.get(timeout=1.0)
-                            payload = _sse_json_dumps(evt)
-                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                            self.wfile.flush()
+                            last_event = time.time()
+                            try:
+                                payload = _sse_json_dumps(evt)
+                                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                break
                         except queue.Empty:
                             now = time.time()
+                            if now - last_event >= idle_timeout:
+                                break
                             if now - last_heartbeat >= heartbeat_interval:
                                 try:
                                     self.wfile.write(b": heartbeat\n\n")
