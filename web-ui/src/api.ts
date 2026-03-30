@@ -170,47 +170,86 @@ export const api = {
     onEvent: (evt: StreamEvent) => void,
     signal?: AbortSignal
   ): Promise<ChatResponse | null> {
-    const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/stream`, { signal })
-    if (!res.ok) throw new Error('Stream reconnect failed')
-    const reader = res.body?.getReader()
-    if (!reader) throw new Error('Stream not supported')
-    const dec = new TextDecoder()
-    let buf = ''
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (value) buf += dec.decode(value, { stream: true })
-        const lines = buf.split('\n\n')
-        buf = done ? '' : (lines.pop() ?? '')
-        for (const block of lines) {
-          const dataParts = block.split('\n')
-            .filter(line => line.startsWith('data:'))
-            .map(line => line.slice(5).trimStart())
-          const dataStr = dataParts.join('\n')
-          if (!dataStr || dataStr === ': heartbeat') continue
-          try {
-            const evt = JSON.parse(dataStr) as StreamEvent
-            onEvent(evt)
-            if (evt.type === 'done') {
-              return {
-                content: 'content' in evt ? evt.content ?? '' : '',
-                assistantMessage: 'assistantMessage' in evt ? evt.assistantMessage ?? null : null,
-              }
-            }
-            if (evt.type === 'error') {
-              throw new Error('message' in evt ? evt.message : 'Stream error')
-            }
-            if (evt.type === 'timeout') return null
-          } catch (e) {
-            if (e instanceof Error && e.message === 'Stream error') throw e
-          }
-        }
-        if (done) break
+    const MAX_RETRIES = 3
+    const RETRY_DELAYS = [1000, 2000, 3000] // 线性递增间隔
+
+    const doSubscribe = async (): Promise<ChatResponse | null> => {
+      const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/stream`, { signal })
+      if (!res.ok) {
+        // 附加 status 到 error 以便 retry 逻辑判断
+        const err = new Error(`Stream reconnect failed: HTTP ${res.status}`) as Error & { status?: number }
+        err.status = res.status
+        throw err
       }
-    } finally {
-      reader.releaseLock()
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('Stream not supported')
+      const dec = new TextDecoder()
+      let buf = ''
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (value) buf += dec.decode(value, { stream: true })
+          const lines = buf.split('\n\n')
+          buf = done ? '' : (lines.pop() ?? '')
+          for (const block of lines) {
+            const dataParts = block.split('\n')
+              .filter(line => line.startsWith('data:'))
+              .map(line => line.slice(5).trimStart())
+            const dataStr = dataParts.join('\n')
+            if (!dataStr || dataStr === ': heartbeat') continue
+            try {
+              const evt = JSON.parse(dataStr) as StreamEvent
+              onEvent(evt)
+              if (evt.type === 'done') {
+                return {
+                  content: 'content' in evt ? evt.content ?? '' : '',
+                  assistantMessage: 'assistantMessage' in evt ? evt.assistantMessage ?? null : null,
+                }
+              }
+              if (evt.type === 'error') {
+                throw new Error('message' in evt ? evt.message : 'Stream error')
+              }
+              if (evt.type === 'timeout') return null
+            } catch (e) {
+              if (e instanceof Error && e.message === 'Stream error') throw e
+            }
+          }
+          if (done) break
+        }
+      } finally {
+        reader.releaseLock()
+      }
+      return null
     }
-    return null
+
+    // 重连循环
+    let lastError: Error | null = null
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      // 检查是否已取消
+      if (signal?.aborted) throw new Error('Stream cancelled')
+
+      try {
+        return await doSubscribe()
+      } catch (e) {
+        lastError = e instanceof Error ? e : new Error(String(e))
+
+        // 不重连的情况
+        if (signal?.aborted) throw lastError
+        const httpStatus = (lastError as Error & { status?: number }).status
+        if ((httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500) ||
+            lastError.message.includes('Stream cancelled')) {
+          throw lastError
+        }
+
+        // 还有重试机会，等待后重试
+        if (attempt < MAX_RETRIES - 1) {
+          console.warn(`[ChatStream] Connection failed (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${RETRY_DELAYS[attempt]}ms...`, lastError.message)
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt]))
+        }
+      }
+    }
+
+    throw lastError
   },
 
   // Configuration
