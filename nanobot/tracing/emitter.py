@@ -280,7 +280,6 @@ class TraceEmitter:
         try:
             fpath = self._get_current_file()
             mode = "a"
-            open_fn = open
 
             # Check rotation
             if fpath.exists():

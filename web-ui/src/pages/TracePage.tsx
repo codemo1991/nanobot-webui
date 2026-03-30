@@ -30,7 +30,7 @@ function TracePage() {
     }
   }
 
-  // SSE 订阅
+  // SSE 订阅 - 只通过 SSE 更新 recentSpans，不触发 loadData
   const subscribeStream = () => {
     const controller = new AbortController()
     sseRef.current = controller
