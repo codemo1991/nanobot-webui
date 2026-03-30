@@ -17,7 +17,8 @@
     "cron": "定时任务",
     "config": "设置",
     "system": "系统状态",
-    "login": "登录"
+    "login": "登录",
+    "trace": "Trace 监控"
   },
   "cron": {
     "title": "定时任务",
@@ -719,5 +720,16 @@
     "paused": "任务已暂停",
     "enabled": "任务已启用",
     "triggered": "任务已触发"
+  },
+  "trace": {
+    "title": "Trace 监控",
+    "totalSpans": "总请求数",
+    "successRate": "成功率",
+    "avgLatency": "平均延迟",
+    "activeRequests": "活跃请求",
+    "overview": "概览",
+    "recentRequests": "最近请求",
+    "anomalies": "异常告警",
+    "noAnomalies": "暂无异常"
   }
 }

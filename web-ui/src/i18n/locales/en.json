@@ -17,7 +17,8 @@
     "cron": "Cron Jobs",
     "config": "Settings",
     "system": "System Status",
-    "login": "Login"
+    "login": "Login",
+    "trace": "Trace"
   },
   "cron": {
     "title": "Cron Jobs",
@@ -719,5 +720,16 @@
     "paused": "Job paused",
     "enabled": "Job enabled",
     "triggered": "Job triggered"
+  },
+  "trace": {
+    "title": "Trace Monitor",
+    "totalSpans": "Total Spans",
+    "successRate": "Success Rate",
+    "avgLatency": "Avg Latency",
+    "activeRequests": "Active",
+    "overview": "Overview",
+    "recentRequests": "Recent",
+    "anomalies": "Anomalies",
+    "noAnomalies": "No anomalies"
   }
 }
