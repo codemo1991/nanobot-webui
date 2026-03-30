@@ -19,6 +19,8 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from nanobot.tracing.analysis import aggregate_spans
+
 try:
     import fcntl
     _HAS_FCNTL = True
@@ -77,6 +79,7 @@ class TraceEmitter:
 
         self._buffer: deque[dict[str, Any]] = deque(maxlen=buffer_size * 2)
         self._lock = threading.Lock()
+        self._observers: list[Callable[[dict[str, Any]], None]] = []
         self._flush_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._current_file: Path | None = None
@@ -227,8 +230,6 @@ class TraceEmitter:
                 "recent_avg_duration_ms": 0.0,
             }
 
-        from nanobot.tracing.analysis import aggregate_spans
-
         metrics = aggregate_spans(spans)
 
         # Calculate success rate for the most recent 100 spans
@@ -340,24 +341,24 @@ class TraceEmitter:
     def add_observer(self, callback: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback to be invoked for every new span."""
         with self._lock:
-            if not hasattr(self, "_observers"):
-                self._observers: list[Callable[[dict[str, Any]], None]] = []
             self._observers.append(callback)
 
     def remove_observer(self, callback: Callable[[dict[str, Any]], None]) -> None:
         """Unregister a previously added observer callback."""
         with self._lock:
-            if hasattr(self, "_observers") and callback in self._observers:
+            if callback in self._observers:
                 self._observers.remove(callback)
 
     def _notify_observers(self, span: dict[str, Any]) -> None:
         """Invoke all registered observers with a span dict."""
-        if hasattr(self, "_observers"):
-            for cb in self._observers:
-                try:
-                    cb(span)
-                except Exception:
-                    pass
+        callbacks: list[Callable[[dict[str, Any]], None]] = []
+        with self._lock:
+            callbacks = list(self._observers)
+        for cb in callbacks:
+            try:
+                cb(span)
+            except Exception as e:
+                logger.warning(f"[Tracing] Observer callback raised: {e}")
 
     @staticmethod
     def _parse_size(size_str: str) -> int:
