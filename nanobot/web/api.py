@@ -1331,12 +1331,14 @@ class NanobotWebAPI:
     def chat_stream(
         self, session_id: str, content: str, images: list[str] | None = None,
         tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread | None]:
+    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread | None | str]:
         """
         Gateway 模式：将消息发布到 core_loop 的 inbound 队列，通过 on_complete / on_progress
         回调将事件写入 evt_queue，供 SSE 消费端读取。
 
-        返回 (evt_queue, None)；调用方读取队列直到 {"type": "done"} 或 {"type": "error"}。
+        返回 (evt_queue, None) — 正常 Gateway 模式
+              (evt_queue, threading.Thread) — 降级线程模式
+              (evt_queue, "queue_full") — 队列满，直接由调用方发送 HTTP 503
         """
         evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         media_paths = self._save_images_to_temp(images or [])
@@ -1419,7 +1421,8 @@ class NanobotWebAPI:
         ok = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
         if not ok:
             logger.warning(f"[ChatStream] inbound queue full for session {session_id}")
-            on_complete("", error="服务繁忙，请稍后重试（消息队列已满）")
+            # 不调用 on_complete：_handle_chat_stream 会直接发送 HTTP 503
+            return evt_queue, "queue_full"
 
         logger.info(f"[ChatStream] Message enqueued to core_loop for session {session_id}")
         return evt_queue, None
@@ -3415,8 +3418,19 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
         logger.info(f"Starting chat stream for session {session_id}")
-        evt_queue, thread = app.chat_stream(session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-        # thread=None 表示 Gateway 模式（消息已发布到 core_loop），thread!=None 为降级线程模式
+        result = app.chat_stream(session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
+        evt_queue = result[0]
+        thread_or_status = result[1] if len(result) > 1 else None
+        # queue_full 时直接返回 HTTP 503（由 chat_stream 返回）
+        if thread_or_status == "queue_full":
+            self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "服务繁忙，请稍后重试（消息队列已满）"}).encode("utf-8"))
+            self.wfile.flush()
+            return
+        thread = thread_or_status if isinstance(thread_or_status, threading.Thread) else None
         if thread is not None:
             logger.info(f"Chat stream thread created: {thread}")
             thread.start()
