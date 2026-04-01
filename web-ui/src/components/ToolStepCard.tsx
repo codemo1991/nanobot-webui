@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, memo } from 'react'
 import {
   Tag,
   Progress,
@@ -26,6 +26,9 @@ interface ToolStepCardProps {
   isLast: boolean
   defaultExpanded?: boolean
 }
+
+// Max output chunks to prevent memory bloat
+const MAX_OUTPUT_CHUNKS = 100
 
 const statusConfig = {
   pending: {
@@ -60,7 +63,9 @@ const statusConfig = {
   },
 }
 
-export const ToolStepCard: React.FC<ToolStepCardProps> = ({
+// Memoized component to prevent unnecessary re-renders
+// Only re-render when step data, expanded state, or isLast actually changes
+export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
   step,
   isLast,
   defaultExpanded = false,
@@ -168,7 +173,7 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = ({
             <div className="tool-step-section">
               <Text type="secondary" style={{ fontSize: 12 }}>实时输出</Text>
               <pre className="tool-step-output">
-                {step.outputChunks?.map((chunk, i) => (
+                {(step.outputChunks || []).slice(-MAX_OUTPUT_CHUNKS).map((chunk, i) => (
                   <span
                     key={i}
                     className={chunk.isError ? 'output-error' : 'output-normal'}
@@ -191,7 +196,26 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = ({
       )}
     </div>
   )
-}
+}, (prevProps, nextProps) => {
+  // Custom comparison: only re-render if these specific fields change
+  const prev = prevProps.step
+  const next = nextProps.step
+  return (
+    prev.id === next.id &&
+    prev.status === next.status &&
+    prev.result === next.result &&
+    prev.name === next.name &&
+    prev.durationMs === next.durationMs &&
+    // Shallow compare progress
+    prev.progress?.detail === next.progress?.detail &&
+    prev.progress?.percent === next.progress?.percent &&
+    prev.progress?.lastUpdate === next.progress?.lastUpdate &&
+    // Only re-render if chunk count changed significantly (not every keystroke)
+    Math.abs((prev.outputChunks?.length ?? 0) - (next.outputChunks?.length ?? 0)) < 10 &&
+    prevProps.isLast === nextProps.isLast &&
+    prevProps.defaultExpanded === nextProps.defaultExpanded
+  )
+})
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`

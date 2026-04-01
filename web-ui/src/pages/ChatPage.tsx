@@ -150,6 +150,9 @@ function ChatPage() {
   const bgAgentsStreamFinishedRef = useRef(false)
   // 用于驱动轮询 hook 的 state（ref 不会触发重新渲染）
   const [pollingTaskId, setPollingTaskId] = useState<string | null>(null)
+  // 用于批量处理 tool_stream_chunk 的 debounce refs（按 sessionId 分组，16ms 批量 flush）
+  const pendingChunksRef = useRef<Map<string, Array<{ toolId: string; chunk: string; isError: boolean; timestamp: number }>>>(new Map())
+  const chunkFlushTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
 
   // 后台子 Agent 进度状态
   const [bgAgents, setBgAgents] = useState<Array<{
@@ -360,6 +363,32 @@ function ChatPage() {
     currentSessionIdRef.current = currentSession?.id ?? null
   }, [currentSession])
 
+  // 批量 flush pending chunks 到 UI（16ms debounce ≈ 1 frame at 60fps，避免每条都重渲染）
+  const flushPendingChunks = useCallback((sessionId: string) => {
+    const pending = pendingChunksRef.current.get(sessionId)
+    if (!pending || pending.length === 0) return
+
+    setStreamingToolSteps(prev => {
+      const updated = [...prev]
+      let changed = false
+      for (const { toolId, chunk, isError, timestamp } of pending) {
+        const idx = updated.findIndex(s => s.id === toolId)
+        if (idx === -1) continue
+        const step = updated[idx]
+        const existing = step.outputChunks || []
+        // 限制 buffer 大小防止内存膨胀
+        const merged = [...existing, { chunk, isError, timestamp }].slice(-100)
+        updated[idx] = { ...step, outputChunks: merged }
+        changed = true
+      }
+      return changed ? updated : prev
+    })
+
+    pendingChunksRef.current.set(sessionId, [])
+    const timer = chunkFlushTimersRef.current.get(sessionId)
+    if (timer) { clearTimeout(timer); chunkFlushTimersRef.current.delete(sessionId) }
+  }, [])
+
   // 流式事件处理工厂（按会话 ID 路由：当前会话更新 UI，后台会话更新缓存）
   const makeStreamEventHandler = useCallback((sessionId: string) => (evt: StreamEvent) => {
     const isCurrent = sessionId === currentSessionIdRef.current
@@ -403,7 +432,7 @@ function ChatPage() {
       } else if (evt.type === 'tool_stream_chunk' && evt.tool_id) {
         bgState.toolSteps = bgState.toolSteps.map(step =>
           step.id === evt.tool_id
-            ? { ...step, outputChunks: [...(step.outputChunks || []), { chunk: evt.chunk, isError: evt.is_error || false, timestamp: Date.now() }] }
+            ? { ...step, outputChunks: [...(step.outputChunks || []), { chunk: evt.chunk, isError: evt.is_error || false, timestamp: Date.now() }].slice(-100) }
             : step
         )
       } else if (evt.type === 'tool_end' && evt.id) {
@@ -459,11 +488,20 @@ function ChatPage() {
           : step
       ))
     } else if (evt.type === 'tool_stream_chunk' && evt.tool_id) {
-      setStreamingToolSteps(prev => prev.map(step =>
-        step.id === evt.tool_id
-          ? { ...step, outputChunks: [...(step.outputChunks || []), { chunk: evt.chunk, isError: evt.is_error || false, timestamp: Date.now() }] }
-          : step
-      ))
+      // Debounce: batch chunks every 16ms instead of per-event re-render
+      if (!pendingChunksRef.current.has(sessionId)) {
+        pendingChunksRef.current.set(sessionId, [])
+      }
+      pendingChunksRef.current.get(sessionId)!.push({
+        toolId: evt.tool_id,
+        chunk: evt.chunk,
+        isError: evt.is_error || false,
+        timestamp: Date.now(),
+      })
+      if (!chunkFlushTimersRef.current.has(sessionId)) {
+        const timer = setTimeout(() => flushPendingChunks(sessionId), 16)
+        chunkFlushTimersRef.current.set(sessionId, timer)
+      }
     } else if (evt.type === 'tool_end' && evt.id) {
       setStreamingToolSteps(prev => prev.map(step =>
         (step.id === evt.id || step.name === evt.name) && step.status !== 'completed'
@@ -582,11 +620,18 @@ function ChatPage() {
       }
       setBgAgents([])
     }
-    // 切换会话时清空跨会话的去重 ref，避免旧会话的 id 集合影响新会话
-    seenSummaryIdsRef.current.clear()
-    notifiedTasksRef.current.clear()
-    bgAgentsStreamFinishedRef.current = false
   }, [currentSession?.id])
+
+  // 清理 chunk debounce timers（顶层清理，组件卸载时执行）
+  useEffect(() => {
+    return () => {
+      for (const timer of chunkFlushTimersRef.current.values()) {
+        clearTimeout(timer)
+      }
+      pendingChunksRef.current.clear()
+      chunkFlushTimersRef.current.clear()
+    }
+  }, [])
 
   // 工具模式切换到 specified 时加载 MCP 列表
   useEffect(() => {
