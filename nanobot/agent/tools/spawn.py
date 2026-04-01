@@ -38,7 +38,13 @@ class SpawnTool(Tool):
     to the main agent when complete.
     """
 
-    def __init__(self, manager: "SubagentManager"):
+    def __init__(
+        self,
+        manager: "SubagentManager",
+        progress_callback: Any = None,
+        tool_id: str | None = None,
+    ):
+        super().__init__(progress_callback=progress_callback, tool_id=tool_id)
         self._manager = manager
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
@@ -192,6 +198,9 @@ class SpawnTool(Tool):
         **kwargs: Any,
     ) -> str:
         """Spawn a subagent to execute the given task."""
+        # Report start progress
+        self.report_progress("正在启动子 Agent...", 0)
+
         # 对于 vision/voice 模板，自动强制传递媒体文件（不管 attach_media 是否显式设置）
         # 这样可以确保图片/音频正确传递给子 agent
         template_lower = template.lower()
@@ -209,6 +218,8 @@ class SpawnTool(Tool):
         if media and template == "voice" and _media_has_only_images(media):
             logger.info("[SpawnTool] Media contains only images, overriding template voice->vision")
             template = "vision"
+
+        self.report_progress(f"准备启动 {template} 子 Agent...", 30)
 
         # 强制使用用户的原始消息，而不是主 Agent 解释后的版本
         # 这样可以确保子 agent 收到用户真正的意图
@@ -228,6 +239,8 @@ class SpawnTool(Tool):
         logger.info(f"[SpawnTool] enable_memory: {enable_memory}, attach_media: {bool(media)}, media_count: {len(media) if media else 0}")
         logger.info(f"[SpawnTool] origin: {self._origin_channel}:{self._origin_chat_id}, batch_id: {self._batch_id}")
         logger.info(f"[SpawnTool] manager id: {id(self._manager)}")
+
+        self.report_progress("子 Agent 已在后台启动...", 100)
 
         return await self._manager.spawn(
             task=task,
