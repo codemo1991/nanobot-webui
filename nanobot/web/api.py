@@ -819,8 +819,8 @@ class NanobotWebAPI:
         def on_progress(evt: dict[str, Any]) -> None:
             try:
                 evt_queue.put(evt)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[MirrorChat] Failed to push event {evt.get('type')} to queue: {e}")
 
         def run_agent() -> None:
             loop = None
@@ -1338,7 +1338,7 @@ class NanobotWebAPI:
 
         返回 (evt_queue, None) — 正常 Gateway 模式
               (evt_queue, threading.Thread) — 降级线程模式
-              (evt_queue, "queue_full") — 队列满，直接由调用方发送 HTTP 503
+              (evt_queue, reason) — 入队失败，reason 见 try_publish_inbound_sync（如 queue_full、enqueue_timeout）
         """
         evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         media_paths = self._save_images_to_temp(images or [])
@@ -1356,15 +1356,18 @@ class NanobotWebAPI:
         from nanobot.web.chat_stream_bus import ChatStreamBus
         stream_bus = ChatStreamBus.get()
         origin_key = f"web:{session_id}"
-        # 新对话开始，清空旧缓冲，避免与历史事件混淆
-        stream_bus.clear_buffer(origin_key)
+        # 如果有活跃的 SSE 订阅者（旧连接还在等待 done 事件），不清空缓冲，
+        # 让旧 SSE 自然结束；新事件会累积到新的 evt_queue 供新 SSE 消费。
+        # 这样避免 clear_buffer 把旧 SSE 的 pending done 事件也清掉，导致挂起。
+        if not stream_bus.has_active_subscribers(origin_key):
+            stream_bus.clear_buffer(origin_key)
 
         def _put_evt(evt: dict[str, Any]) -> None:
             try:
                 evt_queue.put(evt)
                 stream_bus.push(origin_key, evt)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[ChatStream] Failed to push event {evt.get('type')} to queue: {e}")
 
         def on_progress(evt: dict[str, Any]) -> None:
             _put_evt(evt)
@@ -1379,10 +1382,15 @@ class NanobotWebAPI:
             if error:
                 _put_evt({"type": "error", "message": error})
                 return
+            try:
+                assistant_msg = self._build_assistant_message(session_id, key)
+            except Exception as e:
+                logger.warning(f"[ChatStream] 构造 assistantMessage 失败，仍将下发 done: {e}")
+                assistant_msg = None
             _put_evt({
                 "type": "done",
                 "content": response_content,
-                "assistantMessage": self._build_assistant_message(session_id, key),
+                "assistantMessage": assistant_msg,
             })
 
         # 发送 start 事件（与旧实现一致，使前端知道流已建立）
@@ -1418,11 +1426,13 @@ class NanobotWebAPI:
                 on_progress=on_progress, key=key,
             )
 
-        ok = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
+        ok, inbound_reason = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
         if not ok:
-            logger.warning(f"[ChatStream] inbound queue full for session {session_id}")
-            # 不调用 on_complete：_handle_chat_stream 会直接发送 HTTP 503
-            return evt_queue, "queue_full"
+            logger.warning(
+                f"[ChatStream] inbound 入队失败 session={session_id} reason={inbound_reason} "
+                f"inbound_depth={self.agent.bus.inbound_size}"
+            )
+            return evt_queue, inbound_reason
 
         logger.info(f"[ChatStream] Message enqueued to core_loop for session {session_id}")
         return evt_queue, None
@@ -1516,9 +1526,14 @@ class NanobotWebAPI:
             media=media or [],
             extra_metadata=extra_metadata,
         )
+        try:
+            assistant_msg = self._build_assistant_message(session_id, key)
+        except Exception as e:
+            logger.warning(f"[_chat_with_progress] 构造 assistantMessage 失败: {e}")
+            assistant_msg = None
         return {
             "content": response,
-            "assistantMessage": self._build_assistant_message(session_id, key),
+            "assistantMessage": assistant_msg,
         }
 
     def chat_stream_resume(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
@@ -1637,9 +1652,14 @@ class NanobotWebAPI:
             if error:
                 result_future.set_exception(RuntimeError(error))
                 return
+            try:
+                assistant_msg = self._build_assistant_message(session_id, key)
+            except Exception as e:
+                logger.warning(f"[chat_sync] 构造 assistantMessage 失败: {e}")
+                assistant_msg = None
             result_future.set_result({
                 "content": response_content,
-                "assistantMessage": self._build_assistant_message(session_id, key),
+                "assistantMessage": assistant_msg,
             })
 
         _extra: dict[str, Any] = {"user_message_saved": True}
@@ -1671,9 +1691,19 @@ class NanobotWebAPI:
                 session_id, content, progress_callback=None, media=[], extra_metadata=_extra or None,
             ))
 
-        ok = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
+        ok, inbound_reason = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
         if not ok:
-            raise RuntimeError("服务繁忙，请稍后重试（消息队列已满）")
+            _sync_inbound_msgs = {
+                "queue_full": "服务繁忙，请稍后重试（消息队列已满）",
+                "enqueue_timeout": "执行核暂时无法接收消息，请稍后重试（可能被长任务或阻塞占用）",
+                "loop_none": "执行核未就绪，请稍后重试",
+                "loop_not_running": "执行核未运行，请稍后重试",
+                "loop_status_error": "执行核状态异常，请稍后重试",
+                "enqueue_error": "消息入队失败，请稍后重试",
+            }
+            raise RuntimeError(
+                _sync_inbound_msgs.get(inbound_reason, "服务繁忙，请稍后重试")
+            )
 
         timeout = getattr(self.agent, "message_timeout", 300.0) + 60
         try:
@@ -2155,6 +2185,8 @@ class NanobotWebAPI:
         """
         Get MCP list from config, discover tools for each server (connects, lists, disconnects).
         Returns MCP configs enriched with tools information.
+
+        Note: Uses asyncio.gather to process MCPs in parallel to avoid blocking web service.
         """
         from nanobot.config.loader import load_config
         from nanobot.mcp.loader import McpToolLoader, _safe_id
@@ -2167,8 +2199,8 @@ class NanobotWebAPI:
         workspace = config.workspace_path
         loader = McpToolLoader(mcps, workspace)
 
-        results = []
-        for mcp_cfg in mcps:
+        async def _discover_one(mcp_cfg: Any) -> dict[str, Any]:
+            """Discover tools for a single MCP server."""
             mcp_dict = {
                 "id": getattr(mcp_cfg, "id", "") or "",
                 "name": getattr(mcp_cfg, "name", "") or "",
@@ -2183,7 +2215,6 @@ class NanobotWebAPI:
                 "tools": [],
             }
 
-            # Try to discover tools（完整关闭 session + transport，避免 streamable_http 泄漏）
             server_id = mcp_dict["id"] or mcp_dict["name"]
             try:
                 tools = await loader.list_tools_ephemeral(server_id, timeout=12.0)
@@ -2218,9 +2249,22 @@ class NanobotWebAPI:
             except Exception as e:
                 logger.debug(f"MCP {server_id}: tool discovery skipped: {e}")
 
-            results.append(mcp_dict)
+            return mcp_dict
 
-        return results
+        # 并行处理所有 MCP 服务器，避免串行阻塞
+        tasks = [_discover_one(mcp_cfg) for mcp_cfg in mcps]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 过滤掉异常结果，只返回成功的
+        valid_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                mcp_id = getattr(mcps[i], "id", "unknown")
+                logger.warning(f"MCP {mcp_id}: discovery failed with exception: {result}")
+            else:
+                valid_results.append(result)
+
+        return valid_results
 
     async def discover_mcp_tools(self, mcp_id: str) -> list[dict[str, Any]]:
         """
@@ -3421,14 +3465,30 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         result = app.chat_stream(session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
         evt_queue = result[0]
         thread_or_status = result[1] if len(result) > 1 else None
-        # queue_full 时直接返回 HTTP 503（由 chat_stream 返回）
-        if thread_or_status == "queue_full":
+        # 入队失败时直接返回 HTTP 503（由 chat_stream 返回 reason）
+        _inbound_fail_messages: dict[str, str] = {
+            "queue_full": "服务繁忙，请稍后重试（消息队列已满）",
+            "enqueue_timeout": "服务暂时无法接收消息，请稍后重试（执行核可能被长任务阻塞）",
+            "loop_none": "执行核未就绪，请稍后重试",
+            "loop_not_running": "执行核未运行，请稍后重试",
+            "loop_status_error": "执行核状态异常，请稍后重试",
+            "enqueue_error": "消息入队失败，请稍后重试",
+        }
+        if isinstance(thread_or_status, str) and thread_or_status in _inbound_fail_messages:
             self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"error": "服务繁忙，请稍后重试（消息队列已满）"}).encode("utf-8"))
-            self.wfile.flush()
+            payload = {
+                "error": _inbound_fail_messages[thread_or_status],
+                "inbound_fail_reason": thread_or_status,
+            }
+            try:
+                self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # 客户端已断开（如 WinError 10053），避免抛到 do_POST 再次 _write_json 导致双次异常
+                pass
             return
         thread = thread_or_status if isinstance(thread_or_status, threading.Thread) else None
         if thread is not None:
@@ -5675,7 +5735,13 @@ async def _core_main(app: "NanobotWebAPI", core_ready: "threading.Event") -> Non
     # 此处已在 run_until_complete 内部执行，is_running() 此时为 True
     app.core_loop = asyncio.get_running_loop()
     core_ready.set()
-    await app.agent.run()
+    try:
+        await app.agent.run()
+    except Exception as e:
+        logger.error(f"[Core] Agent loop crashed unexpectedly: {e}", exc_info=True)
+        # 标记 core_loop 为不可用，防止后续请求继续尝试使用
+        app.core_loop = None
+        raise  # 重新抛出，让外层 _core_thread_target 的异常处理捕获
 
 
 def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | None = None) -> None:

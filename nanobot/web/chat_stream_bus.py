@@ -104,6 +104,12 @@ class ChatStreamBus:
         with self._lock:
             self._buffers.pop(origin_key, None)
 
+    def has_active_subscribers(self, origin_key: str) -> bool:
+        """检查是否有活跃的订阅者（正在等待事件的 SSE 连接）。"""
+        with self._lock:
+            subs = self._subscribers.get(origin_key, [])
+            return len(subs) > 0
+
     def close_session(self, origin_key: str) -> None:
         """Fix #10: 主动关闭会话，清理缓冲区、订阅者列表和活跃时间记录。
 
