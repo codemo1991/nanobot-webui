@@ -39,6 +39,9 @@ class ChatStreamBus:
         # Fix #10: 记录每个 origin_key 的最后活跃时间，用于 TTL 清理
         self._last_active: dict[str, float] = {}
         self._lock = threading.Lock()
+        # 跟踪每个 origin_key 的活跃 SSE 处理器数量（chat_stream POST 创建的私有 evt_queue）
+        # 用于判断是否有 SSE 正在等待 done 事件，避免 clear_buffer 挂死正在运行的 SSE
+        self._sse_handler_count: dict[str, int] = {}
 
     @classmethod
     def get(cls) -> "ChatStreamBus":
@@ -105,10 +108,25 @@ class ChatStreamBus:
             self._buffers.pop(origin_key, None)
 
     def has_active_subscribers(self, origin_key: str) -> bool:
-        """检查是否有活跃的订阅者（正在等待事件的 SSE 连接）。"""
+        """检查是否有活跃的 SSE 连接（POST evt_queue 或 GET subscribe 订阅者）。"""
         with self._lock:
-            subs = self._subscribers.get(origin_key, [])
-            return len(subs) > 0
+            has_subs = bool(self._subscribers.get(origin_key, []))
+            has_handlers = self._sse_handler_count.get(origin_key, 0) > 0
+            return has_subs or has_handlers
+
+    def register_sse_handler(self, origin_key: str) -> None:
+        """注册一个 SSE 处理器（来自 chat_stream POST），用于跟踪活跃的 SSE 连接。"""
+        with self._lock:
+            self._sse_handler_count[origin_key] = self._sse_handler_count.get(origin_key, 0) + 1
+
+    def unregister_sse_handler(self, origin_key: str) -> None:
+        """注销一个 SSE 处理器（其 evt_queue 已 drain 完成）。"""
+        with self._lock:
+            cnt = self._sse_handler_count.get(origin_key, 0)
+            if cnt <= 1:
+                self._sse_handler_count.pop(origin_key, None)
+            else:
+                self._sse_handler_count[origin_key] = cnt - 1
 
     def close_session(self, origin_key: str) -> None:
         """Fix #10: 主动关闭会话，清理缓冲区、订阅者列表和活跃时间记录。
@@ -120,6 +138,7 @@ class ChatStreamBus:
             self._buffers.pop(origin_key, None)
             self._subscribers.pop(origin_key, None)
             self._last_active.pop(origin_key, None)
+            self._sse_handler_count.pop(origin_key, None)
         logger.debug("[ChatStreamBus] 会话已关闭并清理: %s", origin_key)
 
     def cleanup_stale_sessions(self, ttl_seconds: float = _DEFAULT_SESSION_TTL) -> int:

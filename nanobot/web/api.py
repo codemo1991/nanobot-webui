@@ -1331,14 +1331,14 @@ class NanobotWebAPI:
     def chat_stream(
         self, session_id: str, content: str, images: list[str] | None = None,
         tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread | None | str]:
+    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread | None | str, str]:
         """
         Gateway 模式：将消息发布到 core_loop 的 inbound 队列，通过 on_complete / on_progress
         回调将事件写入 evt_queue，供 SSE 消费端读取。
 
-        返回 (evt_queue, None) — 正常 Gateway 模式
-              (evt_queue, threading.Thread) — 降级线程模式
-              (evt_queue, reason) — 入队失败，reason 见 try_publish_inbound_sync（如 queue_full、enqueue_timeout）
+        返回 (evt_queue, None, origin_key) — 正常 Gateway 模式
+              (evt_queue, threading.Thread, origin_key) — 降级线程模式
+              (evt_queue, reason, origin_key) — 入队失败，reason 见 try_publish_inbound_sync（如 queue_full、enqueue_timeout）
         """
         evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         media_paths = self._save_images_to_temp(images or [])
@@ -1368,6 +1368,9 @@ class NanobotWebAPI:
                 stream_bus.push(origin_key, evt)
             except Exception as e:
                 logger.warning(f"[ChatStream] Failed to push event {evt.get('type')} to queue: {e}")
+
+        # 注册 SSE 处理器，使 has_active_subscribers 能检测到活跃的 POST SSE
+        stream_bus.register_sse_handler(origin_key)
 
         def on_progress(evt: dict[str, Any]) -> None:
             _put_evt(evt)
@@ -1420,11 +1423,12 @@ class NanobotWebAPI:
         if core_loop is None or not core_loop.is_running():
             logger.error("[ChatStream] core_loop not ready, falling back to legacy thread mode")
             # 降级：使用旧线程模式（兼容 core_loop 未就绪的情况）
-            return self._chat_stream_legacy(
+            thread = self._chat_stream_legacy(
                 session_id, content, images, tool_mode, selected_mcp_servers,
                 evt_queue=evt_queue, media_paths=media_paths,
                 on_progress=on_progress, key=key,
             )
+            return evt_queue, thread, origin_key
 
         ok, inbound_reason = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
         if not ok:
@@ -1432,10 +1436,10 @@ class NanobotWebAPI:
                 f"[ChatStream] inbound 入队失败 session={session_id} reason={inbound_reason} "
                 f"inbound_depth={self.agent.bus.inbound_size}"
             )
-            return evt_queue, inbound_reason
+            return evt_queue, inbound_reason, origin_key
 
         logger.info(f"[ChatStream] Message enqueued to core_loop for session {session_id}")
-        return evt_queue, None
+        return evt_queue, None, origin_key
 
     def _chat_stream_legacy(
         self,
@@ -3462,9 +3466,17 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
     ) -> None:
         """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
         logger.info(f"Starting chat stream for session {session_id}")
+
+        from nanobot.web.chat_stream_bus import ChatStreamBus
+        stream_bus = ChatStreamBus.get()
+        origin_key = f"web:{session_id}"
+        # 注册 SSE 处理器，使后续 POST 能检测到活跃 SSE（避免 clear_buffer 挂死）
+        stream_bus.register_sse_handler(origin_key)
+
         result = app.chat_stream(session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
         evt_queue = result[0]
         thread_or_status = result[1] if len(result) > 1 else None
+        origin_key = result[2] if len(result) > 2 else f"web:{session_id}"
         # 入队失败时直接返回 HTTP 503（由 chat_stream 返回 reason）
         _inbound_fail_messages: dict[str, str] = {
             "queue_full": "服务繁忙，请稍后重试（消息队列已满）",
@@ -3600,6 +3612,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.warning("Chat stream write error: %s", e)
         finally:
+            # 注销 SSE 处理器计数，使后续 POST 能正确判断是否有活跃 SSE
+            stream_bus.unregister_sse_handler(origin_key)
             if thread is not None and thread.is_alive():
                 # 正常情况不应到达此处（线程 finally 最多耗时 3s，join 给了 5s）
                 logger.warning("Chat stream thread still running after response end (legacy mode), waiting 3s more...")
@@ -3609,8 +3623,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             # 流正常结束时主动清理 ChatStreamBus 缓冲，防止长期运行内存积累；
             # 客户端中途断开则保留缓冲，resume 重连时可回放
             if stream_ended_cleanly:
-                from nanobot.web.chat_stream_bus import ChatStreamBus
-                ChatStreamBus.get().close_session(f"web:{session_id}")
+                stream_bus.close_session(origin_key)
 
     def _handle_subagent_progress_stream(
         self, app: "NanobotWebAPI", session_id: str
