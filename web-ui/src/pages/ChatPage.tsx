@@ -1,13 +1,14 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useLocation } from 'react-router-dom'
 import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Tag, Modal, Popconfirm, Checkbox, Popover } from 'antd'
-import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, ToolOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, MessageOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons'
+import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, MessageOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { api } from '../api'
 import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, SubagentProgressEvent, StreamEvent, McpServer } from '../types'
+import { ToolStepsPanel } from '../components/ToolStepsPanel'
 import './ChatPage.css'
 import 'highlight.js/styles/github-dark.css'
 import { useTaskPolling } from '../hooks/useTaskPolling'
@@ -16,8 +17,6 @@ import { requestNotificationPermission, notifyTaskComplete } from '../utils/noti
 const { Header, Sider, Content } = Layout
 const { TextArea } = Input
 const { Text } = Typography
-
-const TOOL_STEPS_COLLAPSE_THRESHOLD = 5
 
 // sessionStorage key 前缀
 const STORAGE_PREFIX = 'nanobot_streaming_'
@@ -70,80 +69,6 @@ const clearStreamingState = (sessionId: string) => {
   } catch (e) {
     console.warn('Failed to clear streaming state:', e)
   }
-}
-
-function ToolStepsPanel({ steps, showRunningOnLast }: { steps: ToolStep[]; showRunningOnLast?: boolean }) {
-  const { t } = useTranslation()
-  const items = useMemo(() => {
-    if (!steps?.length) return []
-    return steps.map((step, i) => {
-    const isRunning = showRunningOnLast && i === steps.length - 1 && !step.result
-    const args = typeof step.arguments === 'string'
-      ? (() => { try { return JSON.parse(step.arguments as string) } catch { return {} } })()
-      : (step.arguments || {}) as Record<string, unknown>
-    return {
-      key: String(i),
-      label: (
-        <span className="tool-step-label">
-          <ToolOutlined style={{ marginRight: 8 }} />
-          {step.name}
-          {isRunning && <Spin size="small" style={{ marginLeft: 8 }} />}
-        </span>
-      ),
-      children: (
-        <div className="tool-step-detail">
-          {Object.keys(args).length > 0 && (
-            <div className="tool-step-section">
-              <div className="tool-step-subtitle">{t('chat.toolArguments')}</div>
-              <pre>{JSON.stringify(args, null, 2)}</pre>
-            </div>
-          )}
-          <div className="tool-step-section">
-            <div className="tool-step-subtitle">{t('chat.toolResult')}</div>
-            <pre className="tool-step-result">{isRunning ? t('chat.toolRunning') : String(step.result || '')}</pre>
-          </div>
-        </div>
-      ),
-    }
-  })
-  }, [steps, showRunningOnLast, t])
-
-  if (!items.length) return null
-
-  const innerPanel = (
-    <Collapse
-      ghost
-      size="small"
-      className="tool-steps-panel"
-      items={items}
-      defaultActiveKey={[]}
-    />
-  )
-
-  if (steps.length > TOOL_STEPS_COLLAPSE_THRESHOLD) {
-    return (
-      <Collapse
-        ghost
-        size="small"
-        className="tool-steps-outer-collapse"
-        defaultActiveKey={[]}
-        items={[
-          {
-            key: 'tools',
-            label: (
-              <span className="tool-step-label">
-                <ToolOutlined style={{ marginRight: 8 }} />
-                {t('chat.toolStepsCount', { count: steps.length })}
-              </span>
-            ),
-            children: innerPanel,
-          },
-        ]}
-      />
-    )
-  }
-
-  return innerPanel
 }
 
 function formatMessageTime(isoString: string): string {
@@ -218,6 +143,9 @@ function ChatPage() {
   const seenSummaryIdsRef = useRef<Set<string>>(new Set())
   // 已发送过浏览器通知的 task_id，防止 replay 时重复通知
   const notifiedTasksRef = useRef<Set<string>>(new Set())
+  /** 在收到 SSE done 时刷新列表（定义在下方，每轮 render 末尾更新引用） */
+  const refreshStreamDoneRef = useRef<(sessionId: string) => void>(() => {})
+  const loadSessionsRef = useRef<() => void>(() => {})
   // bgAgent stream 是否已干净结束（收到 stream_done），用于避免切 tab 时无效重连
   const bgAgentsStreamFinishedRef = useRef(false)
   // 用于驱动轮询 hook 的 state（ref 不会触发重新渲染）
@@ -442,6 +370,10 @@ function ChatPage() {
         setStreamingThinking(false)
         setStreamingToolSteps([])
         setClaudeCodeProgress('')
+        // 收到 done 立即拉消息，避免仅依赖 sendMessageStream 返回后的 loadMessages（消除竞态与遗漏）
+        refreshStreamDoneRef.current(sessionId)
+      } else {
+        loadSessionsRef.current()
       }
       return
     }
@@ -451,15 +383,35 @@ function ChatPage() {
       const bgState = bgSessionStatesRef.current.get(sessionId) || { toolSteps: [], thinking: false, progress: '' }
       if (evt.type === 'thinking') {
         bgState.thinking = true
-      } else if (evt.type === 'tool_start' && evt.name) {
+      } else if (evt.type === 'tool_start' && evt.id && evt.name) {
         bgState.thinking = false
         if (evt.name === 'claude_code') bgState.progress = ''
-        bgState.toolSteps = [...bgState.toolSteps, { name: evt.name, arguments: evt.arguments ?? {}, result: '' }]
-      } else if (evt.type === 'tool_end' && evt.name) {
+        bgState.toolSteps = [...bgState.toolSteps, {
+          id: evt.id,
+          name: evt.name,
+          arguments: evt.arguments ?? {},
+          result: '',
+          status: 'running',
+          startTime: Date.now(),
+        }]
+      } else if (evt.type === 'tool_progress' && evt.tool_id) {
+        bgState.toolSteps = bgState.toolSteps.map(step =>
+          step.id === evt.tool_id
+            ? { ...step, status: evt.status as 'running' | 'waiting', progress: { detail: evt.detail, percent: evt.progress_percent, lastUpdate: Date.now() } }
+            : step
+        )
+      } else if (evt.type === 'tool_stream_chunk' && evt.tool_id) {
+        bgState.toolSteps = bgState.toolSteps.map(step =>
+          step.id === evt.tool_id
+            ? { ...step, outputChunks: [...(step.outputChunks || []), { chunk: evt.chunk, isError: evt.is_error || false, timestamp: Date.now() }] }
+            : step
+        )
+      } else if (evt.type === 'tool_end' && evt.id) {
         const steps = [...bgState.toolSteps]
         for (let i = steps.length - 1; i >= 0; i--) {
-          if (steps[i].name === evt.name && !steps[i].result) {
-            steps[i] = { ...steps[i], result: evt.result ?? '' }
+          const step = steps[i]
+          if (step && (step.id === evt.id || step.name === evt.name) && !step.result) {
+            steps[i] = { ...step, result: evt.result ?? '', status: 'completed', endTime: Date.now(), durationMs: step.startTime ? Date.now() - step.startTime : undefined }
             break
           }
         }
@@ -484,7 +436,7 @@ function ChatPage() {
     // 当前会话：正常更新 UI 状态（原 handleStreamEvent 逻辑）
     if (evt.type === 'thinking') {
       setStreamingThinking(true)
-    } else if (evt.type === 'tool_start' && evt.name) {
+    } else if (evt.type === 'tool_start' && evt.id && evt.name) {
       setStreamingThinking(false)
       if (evt.name === 'claude_code') {
         setClaudeCodeProgress('')
@@ -492,18 +444,32 @@ function ChatPage() {
       if (evt.name === 'spawn') {
         startBgAgentStream(sessionId)
       }
-      setStreamingToolSteps(prev => [...prev, { name: evt.name!, arguments: evt.arguments ?? {}, result: '' }])
-    } else if (evt.type === 'tool_end' && evt.name) {
-      setStreamingToolSteps(prev => {
-        const next = [...prev]
-        for (let i = next.length - 1; i >= 0; i--) {
-          if (next[i].name === evt.name && !next[i].result) {
-            next[i] = { ...next[i], result: evt.result ?? '' }
-            break
-          }
-        }
-        return next
-      })
+      setStreamingToolSteps(prev => [...prev, {
+        id: evt.id,
+        name: evt.name,
+        arguments: evt.arguments ?? {},
+        result: '',
+        status: 'running',
+        startTime: Date.now(),
+      }])
+    } else if (evt.type === 'tool_progress' && evt.tool_id) {
+      setStreamingToolSteps(prev => prev.map(step =>
+        step.id === evt.tool_id
+          ? { ...step, status: evt.status as 'running' | 'waiting', progress: { detail: evt.detail, percent: evt.progress_percent, lastUpdate: Date.now() } }
+          : step
+      ))
+    } else if (evt.type === 'tool_stream_chunk' && evt.tool_id) {
+      setStreamingToolSteps(prev => prev.map(step =>
+        step.id === evt.tool_id
+          ? { ...step, outputChunks: [...(step.outputChunks || []), { chunk: evt.chunk, isError: evt.is_error || false, timestamp: Date.now() }] }
+          : step
+      ))
+    } else if (evt.type === 'tool_end' && evt.id) {
+      setStreamingToolSteps(prev => prev.map(step =>
+        (step.id === evt.id || step.name === evt.name) && step.status !== 'completed'
+          ? { ...step, result: evt.result ?? '', status: 'completed', endTime: Date.now(), durationMs: step.startTime ? Date.now() - step.startTime : undefined }
+          : step
+      ))
       if (evt.name === 'claude_code') {
         setClaudeCodeProgress('')
       }
@@ -915,7 +881,10 @@ function ChatPage() {
     }
   }
 
-  const runningBgAgentsCount = bgAgents.filter(a => a.status === 'running').length
+  // 断线后的「running」仅用于展示卡片，不应占用主发送钮：否则会一直走 handleStop，无法 POST 新消息
+  const runningBgAgentsCount = bgAgents.filter(
+    a => a.status === 'running' && !a.disconnected
+  ).length
 
   // 切换会话时恢复 MCP 工具设置
   const handleSelectSession = (session: Session) => {
@@ -951,6 +920,15 @@ function ChatPage() {
       console.error(error)
       setSessionTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 })
     }
+  }
+
+  loadSessionsRef.current = () => {
+    void loadSessions()
+  }
+  refreshStreamDoneRef.current = (sessionId: string) => {
+    void loadMessages(sessionId)
+    void loadSessionTokenUsage(sessionId)
+    void loadSessions()
   }
 
   const handleCreateSession = async () => {
@@ -1115,30 +1093,22 @@ function ChatPage() {
           return newStatus
         })
       }
-
-      // 仅当仍为当前会话时更新 UI 消息列表
-      if (sessionId === currentSessionIdRef.current) {
-        await loadMessages(sessionId)
-        if (isRestoringRef.current) {
-          isRestoringRef.current = false
-          clearStreamingState(sessionId)
-        }
-        await loadSessionTokenUsage(sessionId)
-      }
-      void loadSessions()
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') return
-      if (imagesToSend.length > 0 && sessionId === currentSessionIdRef.current) {
-        setImageSendStatus(prev => {
-          const newStatus = { ...prev }
-          Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'error' })
-          return newStatus
-        })
-      }
-      antMessage.error(t('chat.sendFailed'))
-      if (err instanceof Error) console.error(err)
-      if (sessionId === currentSessionIdRef.current) {
-        setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
+      if (err instanceof Error && err.name === 'AbortError') {
+        // 仍走 finally 从服务端拉列表，避免停止后界面停在临时消息
+      } else {
+        if (imagesToSend.length > 0 && sessionId === currentSessionIdRef.current) {
+          setImageSendStatus(prev => {
+            const newStatus = { ...prev }
+            Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'error' })
+            return newStatus
+          })
+        }
+        antMessage.error(t('chat.sendFailed'))
+        if (err instanceof Error) console.error(err)
+        if (sessionId === currentSessionIdRef.current) {
+          setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
+        }
       }
     } finally {
       // 从并行流式集合移除该会话
@@ -1164,16 +1134,22 @@ function ChatPage() {
           setStreamingToolSteps([])
           setStreamingThinking(false)
           setClaudeCodeProgress('')
-          return
+        } else {
+          setStreamingToolSteps([])
+          setStreamingThinking(false)
+          setClaudeCodeProgress('')
+          currentTaskIdRef.current = null
+          setPollingTaskId(null)
+          clearStreamingState(sessionId)
+          abortControllerRef.current = null
         }
-        setStreamingToolSteps([])
-        setStreamingThinking(false)
-        setClaudeCodeProgress('')
-        currentTaskIdRef.current = null
-        setPollingTaskId(null)
-        clearStreamingState(sessionId)
-        abortControllerRef.current = null
       }
+      // 无论是否收到 SSE done、是否 Abort，只要会话仍在前台，都用服务端数据刷新列表（修复第二次起偶发不刷新）
+      if (sessionId === currentSessionIdRef.current) {
+        void loadMessages(sessionId)
+        void loadSessionTokenUsage(sessionId)
+      }
+      void loadSessions()
     }
   }, [input, loading, messages, currentSession, pendingImages.length, t, makeStreamEventHandler])
 
