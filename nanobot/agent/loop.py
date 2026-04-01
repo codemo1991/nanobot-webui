@@ -32,7 +32,7 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.tools.get_subagent_results import GetSubagentResultsTool
 from nanobot.agent.tools.delegate_microkernel import DelegateMicrokernelTool
-from nanobot.agent.tool_errors import format_tool_error
+from nanobot.agent.tool_errors import format_tool_error, is_retryable_error
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.tracing import span, trace_context
@@ -195,11 +195,16 @@ class AgentLoop:
         self.workspace = workspace
 
         # 新架构：使用 router 获取默认模型
+        self._model_chain: list[str] = []
         if router:
             try:
                 handle = router.get(default_profile)
                 self.model = handle.model
                 self._current_handle = handle
+                # 获取 model_chain 用于运行时故障转移
+                self._model_chain = self._resolve_model_chain(router, default_profile)
+                if len(self._model_chain) > 1:
+                    logger.info(f"[ModelFailover] 启用故障转移: {self._model_chain}")
             except Exception as e:
                 logger.warning(f"Failed to resolve default profile '{default_profile}': {e}")
                 # 回退到旧方式
@@ -1159,12 +1164,15 @@ class AgentLoop:
         logger.info(f"[ToolExecution] Starting tool: {tool_call.name}")
         logger.debug(f"Executing tool: {tool_call.name} with arguments: {json.dumps(tool_call.arguments)}")
 
+        # 为工具执行生成唯一 ID（用于前端关联进度事件）
+        tool_exec_id: str | None = str(uuid.uuid4())[:8] if progress else None
+
         if progress:
             try:
-                evt = {"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments}
+                evt = {"type": "tool_start", "id": tool_exec_id, "name": tool_call.name, "arguments": tool_call.arguments}
                 progress(evt)
                 progress({**evt, "type": "tool_execution_start"})  # 细粒度事件流
-                logger.info(f"[ToolProgress] Sent tool_start event: {tool_call.name}")
+                logger.info(f"[ToolProgress] Sent tool_start event: {tool_call.name} (id={tool_exec_id})")
             except Exception:
                 pass
         else:
@@ -1232,7 +1240,7 @@ class AgentLoop:
         if progress:
             try:
                 truncated = _truncate(result)
-                evt = {"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated}
+                evt = {"type": "tool_end", "id": tool_exec_id, "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated}
                 if not is_spawn_vision:
                     progress(evt)
                 progress({**evt, "type": "tool_execution_end"})  # 细粒度事件流
@@ -2206,9 +2214,10 @@ class AgentLoop:
                 logger.info("[Image] Using vision subagent for analysis (template configurable)")
                 await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
                 progress_cb = msg.metadata.get("progress_callback")
+                img_tool_id = str(uuid.uuid4())[:8] if progress_cb else None
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_start", "name": "image_recognition", "arguments": {"images": len(image_files)}})
+                        progress_cb({"type": "tool_start", "id": img_tool_id, "name": "image_recognition", "arguments": {"images": len(image_files)}})
                     except Exception:
                         pass
                 session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
@@ -2220,7 +2229,7 @@ class AgentLoop:
                 )
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_end", "name": "image_recognition", "arguments": {}, "result": (img_desc or "")[:200]})
+                        progress_cb({"type": "tool_end", "id": img_tool_id, "name": "image_recognition", "arguments": {}, "result": (img_desc or "")[:200]})
                     except Exception:
                         pass
                 last_user = messages[-1] if messages and messages[-1].get("role") == "user" else None
@@ -2358,10 +2367,9 @@ class AgentLoop:
             async with span("llm.inference", attrs={"model": self.model}) as llm_span:
                 try:
                     llm_task = asyncio.create_task(
-                        self.provider.chat(
+                        self._call_llm_with_failover(
                             messages=messages,
                             tools=selected_tools,
-                            model=self.model,
                         )
                     )
                     loop_start_llm = time.monotonic()
@@ -2395,7 +2403,7 @@ class AgentLoop:
                             else:
                                 self._cancel_event.clear()
                             raise asyncio.CancelledError("Request cancelled by user")
-                    response = await llm_task
+                    response, _ = await llm_task
                 except asyncio.CancelledError:
                     raise
                 except asyncio.TimeoutError:
@@ -2844,10 +2852,9 @@ class AgentLoop:
                 _SYNTHESIS_TIMEOUT = 60
                 try:
                     synth_task = asyncio.create_task(
-                        self.provider.chat(
+                        self._call_llm_with_failover(
                             messages=messages,
                             tools=None,
-                            model=self.model,
                         )
                     )
                     synth_start = time.monotonic()
@@ -2875,7 +2882,7 @@ class AgentLoop:
                                 pass
                             self._cancel_event.clear()
                             raise asyncio.CancelledError("Request cancelled by user")
-                    synth = await synth_task
+                    synth, _ = await synth_task
                     _accumulate_usage(synth.usage)
                     # 记录 LLM 调用指标
                     if self._status_service and synth.usage:
@@ -2990,9 +2997,10 @@ class AgentLoop:
                 logger.info("[Image] Model didn't spawn vision subagent, using vision subagent as fallback")
                 await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
                 progress_cb = msg.metadata.get("progress_callback")
+                img_tool_id = str(uuid.uuid4())[:8] if progress_cb else None
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_start", "name": "image_recognition_fallback", "arguments": {"images": len(image_files)}})
+                        progress_cb({"type": "tool_start", "id": img_tool_id, "name": "image_recognition_fallback", "arguments": {"images": len(image_files)}})
                     except Exception:
                         pass
                 session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
@@ -3006,7 +3014,7 @@ class AgentLoop:
 
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_end", "name": "image_reccognition_fallback", "arguments": {}, "result": (img_desc or "")[:200]})
+                        progress_cb({"type": "tool_end", "id": img_tool_id, "name": "image_reccognition_fallback", "arguments": {}, "result": (img_desc or "")[:200]})
                     except Exception:
                         pass
 
@@ -3149,10 +3157,9 @@ class AgentLoop:
             _CANCEL_CHECK_INTERVAL = 2.0
             try:
                 llm_task = asyncio.create_task(
-                    self.provider.chat(
+                    self._call_llm_with_failover(
                         messages=messages,
                         tools=selected_tools,
-                        model=self.model
                     )
                 )
                 loop_start_llm = time.monotonic()
@@ -3182,7 +3189,7 @@ class AgentLoop:
                             pass
                         self._cancelled_sessions.discard(session_key)
                         raise asyncio.CancelledError("Request cancelled by user")
-                response = await llm_task
+                response, _ = await llm_task
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
@@ -3255,10 +3262,9 @@ class AgentLoop:
         if final_content is None:
             try:
                 logger.info("System msg: max iterations, requesting final synthesis (no tools)")
-                synth = await self.provider.chat(
+                synth, _ = await self._call_llm_with_failover(
                     messages=messages,
                     tools=None,
-                    model=self.model,
                 )
                 _accumulate_usage(synth.usage)
                 # 记录 LLM 调用指标
@@ -3451,3 +3457,98 @@ class AgentLoop:
                 self.sessions.save(session)
             return desc
         return "无法识别图片内容，请检查 vision 模板配置或 DashScope API Key。"
+
+    def _resolve_model_chain(self, router: ModelRouter, profile_id: str) -> list[str]:
+        """从 router 获取 profile 的 model_chain，按优先级排序。"""
+        try:
+            profile = router.repo.get_model_profile(profile_id)
+            if profile:
+                model_chain = profile.get("model_chain", "")
+                if model_chain:
+                    return [m.strip() for m in model_chain.split(",") if m.strip()]
+        except Exception as e:
+            logger.warning(f"[ModelFailover] 获取 model_chain 失败: {e}")
+
+        return [self.model] if self.model else []
+
+    async def _call_llm_with_failover(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        max_attempts_per_model: int = 2,
+    ) -> tuple[Any, str]:
+        """调用 LLM 并支持模型故障转移。返回 (response, used_model)。"""
+        from nanobot.providers.base import LLMResponse
+
+        models_to_try = self._model_chain if self._model_chain else [self.model]
+        last_error = None
+        error_messages = []
+
+        for idx, model_id in enumerate(models_to_try):
+            model_litellm = None
+            api_key = None
+            api_base = None
+
+            try:
+                if self.router:
+                    handle = self.router.get(model_id)
+                    model_litellm = handle.model
+                    api_key = handle.api_key
+                    api_base = handle.api_base
+                else:
+                    model_litellm = model_id
+            except Exception as e:
+                logger.warning(f"[ModelFailover] 解析模型 {model_id} 失败: {e}")
+                # 回退：直接使用模型 ID 作为 LiteLLM ID，使用 provider 默认配置
+                model_litellm = model_id
+                api_key = getattr(self.provider, 'api_key', None)
+                api_base = getattr(self.provider, 'api_base', None)
+                logger.debug(f"[ModelFailover] 使用回退配置: model={model_litellm}, api_base={api_base}")
+
+            for attempt in range(max_attempts_per_model):
+                try:
+                    logger.debug(f"[ModelFailover] 尝试模型 {model_id} (attempt {attempt + 1})")
+                    response = await self.provider.chat(
+                        messages=messages,
+                        tools=tools,
+                        model=model_litellm,
+                        api_key=api_key,
+                        api_base=api_base,
+                    )
+
+                    if idx > 0:
+                        logger.info(f"[ModelFailover] 故障转移成功: {models_to_try[0]} -> {model_id}")
+                    return response, model_litellm
+
+                except Exception as e:
+                    last_error = e
+
+                    if is_retryable_error(e):
+                        error_type = type(e).__name__
+                        logger.warning(
+                            f"[ModelFailover] 模型 {model_id} 失败 ({error_type}): "
+                            f"{str(e)[:100]}"
+                        )
+                        if idx == len(models_to_try) - 1 and attempt == max_attempts_per_model - 1:
+                            # 所有模型都失败，返回错误响应
+                            error_msg = f"所有模型均不可用。尝试的模型: {', '.join(models_to_try)}。错误: {str(e)[:200]}"
+                            logger.error(f"[ModelFailover] {error_msg}")
+                            return LLMResponse(
+                                content=f"模型服务暂时不可用，请检查配置或稍后重试。详情: {str(e)[:150]}",
+                                finish_reason="error",
+                            ), model_litellm or model_id
+                        break
+                    else:
+                        # 不可恢复的错误，记录并尝试下一个模型
+                        error_type = type(e).__name__
+                        logger.warning(f"[ModelFailover] 模型 {model_id} 不可恢复错误 ({error_type}): {str(e)[:100]}")
+                        error_messages.append(f"{model_id}: {e}")
+                        break
+
+        # 所有模型都无法使用，返回错误响应
+        error_summary = "; ".join(error_messages) if error_messages else str(last_error)
+        logger.error(f"[ModelFailover] 所有模型都失败: {error_summary[:200]}")
+        return LLMResponse(
+            content=f"模型服务不可用。请检查模型配置或 API 密钥。",
+            finish_reason="error",
+        ), self.model or "unknown"

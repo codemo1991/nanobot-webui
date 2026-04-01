@@ -23,9 +23,20 @@ export interface Session {
 }
 
 export interface ToolStep {
-  name: string
-  arguments: Record<string, unknown> | string
-  result: string
+  id?: string;
+  name: string;
+  arguments: Record<string, unknown> | string;
+  result: string;
+  status?: 'pending' | 'running' | 'waiting' | 'completed' | 'error';
+  progress?: {
+    detail: string;
+    percent?: number;
+    lastUpdate: number;
+  };
+  startTime?: number;
+  endTime?: number;
+  durationMs?: number;
+  outputChunks?: Array<{ chunk: string; isError: boolean; timestamp: number }>;
 }
 
 export interface TokenUsage {
@@ -61,8 +72,10 @@ export interface ChatResponse {
 export type StreamEvent =
   | { type: 'start'; session_id: string }
   | { type: 'thinking' }
-  | { type: 'tool_start'; name: string; arguments: Record<string, unknown> }
-  | { type: 'tool_end'; name: string; arguments: Record<string, unknown>; result: string }
+  | { type: 'tool_start'; id: string; name: string; arguments: Record<string, unknown> }
+  | { type: 'tool_progress'; tool_id: string; status: 'running' | 'waiting'; detail: string; progress_percent?: number }
+  | { type: 'tool_stream_chunk'; tool_id: string; chunk: string; is_error?: boolean }
+  | { type: 'tool_end'; id: string; name: string; result: string }
   | { type: 'claude_code_progress'; task_id: string; subtype: string; content: string; tool_name?: string; timestamp?: string }
   | { type: 'done'; content: string; assistantMessage: Message | null }
   | { type: 'error'; message: string }
