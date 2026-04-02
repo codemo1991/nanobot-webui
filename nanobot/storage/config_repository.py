@@ -429,6 +429,7 @@ class ConfigRepository:
                         "api_base": row["api_base"],
                         "enabled": bool(row["enabled"]),
                         "is_system": True,
+                        "sort_order": row["sort_order"],
                         "config_json": row["config_json"] or "{}",
                     }
                     for row in rows
@@ -710,6 +711,7 @@ class ConfigRepository:
             config["providers"][provider["id"]] = {
                 "apiKey": provider["api_key"],
                 "apiBase": provider["api_base"],
+                "displayName": provider["display_name"],
             }
 
         for channel_id, channel_data in self.get_all_channels().items():
@@ -780,6 +782,11 @@ class ConfigRepository:
             self.set_provider(
                 provider_id=provider_id,
                 name=provider_names.get(provider_id, provider_id),
+                display_name=provider_names.get(provider_id, provider_id),
+                provider_type="openai",
+                is_system=False,
+                sort_order=0,
+                config_json="{}",
                 api_key=api_key,
                 api_base=api_base,
                 enabled=bool(api_key),
@@ -891,6 +898,11 @@ class ConfigRepository:
                         "quality_rank": row["quality_rank"],
                         "enabled": bool(row["enabled"]),
                         "is_default": bool(row["is_default"]),
+                        "model_type": row["model_type"] or "chat",
+                        "max_tokens": row["max_tokens"],
+                        "supports_vision": bool(row["supports_vision"]),
+                        "supports_function_calling": bool(row["supports_function_calling"]),
+                        "supports_streaming": bool(row["supports_streaming"]),
                     }
                 return None
         except Exception as e:
