@@ -1,0 +1,47 @@
+export const PROVIDER_TYPE_ICONS: Record<string, string> = {
+  openai: '🤖',
+  anthropic: '🧠',
+  deepseek: '🔵',
+  azure: '☁️',
+  azure_openai: '☁️',
+  gemini: '💎',
+  ollama: '🦕',
+  vllm: '⚡',
+  new_api: '🔗',
+  openrouter: '🌐',
+  together: '🤝',
+  fireworks: '🎆',
+  default: '🔗',
+}
+
+export const PROVIDER_TYPE_COLORS: Record<string, string> = {
+  openai: '#10a37f',
+  anthropic: '#d97706',
+  deepseek: '#0066cc',
+  azure: '#0078d4',
+  azure_openai: '#0078d4',
+  gemini: '#4285f4',
+  ollama: '#883333',
+  vllm: '#ff6b00',
+  new_api: '#666666',
+  openrouter: '#7c3aed',
+  together: '#ff4d4f',
+  fireworks: '#ff9900',
+  default: '#999999',
+}
+
+export const DEFAULT_API_BASES: Record<string, string> = {
+  openai: 'https://api.openai.com/v1',
+  anthropic: 'https://api.anthropic.com',
+  deepseek: 'https://api.deepseek.com/v1',
+  gemini: 'https://generativelanguage.googleapis.com/v1beta',
+  ollama: 'http://localhost:11434',
+  vllm: 'http://localhost:8000',
+  azure: 'https://YOUR_RESOURCE.openai.azure.com',
+  azure_openai: 'https://YOUR_RESOURCE.openai.azure.com',
+  openrouter: 'https://openrouter.ai/api',
+  together: 'https://api.together.xyz/v1',
+  fireworks: 'https://api.fireworks.ai/inference/v1',
+  new_api: '',
+  default: '',
+}

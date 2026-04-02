@@ -3,36 +3,7 @@ import { List, Switch, Input, Tag, Empty, Button } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
 import { api } from '../../api'
 import type { Provider } from '../../types'
-
-const PROVIDER_TYPE_ICONS: Record<string, string> = {
-  openai: '🤖',
-  anthropic: '🧠',
-  deepseek: '🔵',
-  azure: '☁️',
-  azure_openai: '☁️',
-  gemini: '💎',
-  ollama: '🦕',
-  vllm: '⚡',
-  new_api: '🔗',
-  openrouter: '🌐',
-  together: '🤝',
-  fireworks: '🎆',
-}
-
-const PROVIDER_TYPE_COLORS: Record<string, string> = {
-  openai: '#10a37f',
-  anthropic: '#d97706',
-  deepseek: '#0066cc',
-  azure: '#0078d4',
-  azure_openai: '#0078d4',
-  gemini: '#4285f4',
-  ollama: '#883333',
-  vllm: '#ff6b00',
-  new_api: '#666666',
-  openrouter: '#7c3aed',
-  together: '#ff4d4f',
-  fireworks: '#ff9900',
-}
+import { PROVIDER_TYPE_COLORS, PROVIDER_TYPE_ICONS } from './constants'
 
 interface ProviderListProps {
   onSelect: (p: Provider) => void
@@ -51,6 +22,8 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
     try {
       const data = await api.getProviders()
       setProviders(data || [])
+    } catch {
+      message.error('加载 Provider 列表失败')
     } finally {
       setLoading(false)
     }
@@ -66,8 +39,8 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
   }
 
   const filtered = providers.filter(p => {
-    const name = (p as any).displayName || p.name || ''
-    const type = (p as any).providerType || (p as any).type || ''
+    const name = p.displayName || p.name || ''
+    const type = p.providerType || p.type || ''
     const s = search.toLowerCase()
     return name.toLowerCase().includes(s) || p.id.toLowerCase().includes(s) || type.toLowerCase().includes(s)
   })
@@ -96,7 +69,7 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
           locale={{ emptyText: <Empty description="暂无 Provider" /> }}
           dataSource={filtered}
           renderItem={(p) => {
-            const pt = (p as any).providerType || (p as any).type || 'openai'
+            const pt = p.providerType || p.type || 'openai'
             const color = PROVIDER_TYPE_COLORS[pt] || '#666'
             return (
               <List.Item
@@ -112,7 +85,7 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
                     key="sw"
                     size="small"
                     checked={p.enabled}
-                    onChange={(checked, e) => handleToggle(p, checked, e as any)}
+                    onChange={(checked, e) => handleToggle(p, checked, e)}
                   />
                 ]}
               >
@@ -124,8 +97,8 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
                   }
                   title={
                     <span>
-                      {(p as any).displayName || p.name || p.id}
-                      {(p as any).isSystem && (
+                      {p.displayName || p.name || p.id}
+                      {p.isSystem && (
                         <Tag color="blue" style={{ marginLeft: 6, fontSize: 10 }}>系统</Tag>
                       )}
                     </span>

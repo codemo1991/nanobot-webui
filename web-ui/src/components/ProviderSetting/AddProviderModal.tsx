@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { Modal, Tabs, List, Input, Form, Select, Button, message, Tag, Space } from 'antd'
 import { api } from '../../api'
 import type { Provider } from '../../types'
+import { PROVIDER_TYPE_ICONS } from './constants'
 
 const SYSTEM_PROVIDERS: Array<{
   id: string
@@ -23,19 +24,7 @@ const SYSTEM_PROVIDERS: Array<{
   { id: 'new-api', displayName: 'New API (自定义)', providerType: 'new_api', apiBase: '', description: '兼容 OpenAI API 的任意服务' },
 ]
 
-const PROVIDER_TYPE_ICONS: Record<string, string> = {
-  openai: '🤖',
-  anthropic: '🧠',
-  deepseek: '🔵',
-  azure_openai: '☁️',
-  gemini: '💎',
-  ollama: '🦕',
-  vllm: '⚡',
-  new_api: '🔗',
-  openrouter: '🌐',
-  together: '🤝',
-  fireworks: '🎆',
-}
+
 
 interface AddProviderModalProps {
   open: boolean
@@ -68,11 +57,11 @@ export const AddProviderModal: React.FC<AddProviderModalProps> = ({ open, onClos
       await api.createProvider({
         id: sp.id,
         name: sp.displayName,
-        type: sp.providerType as any,
+        type: sp.providerType,
         apiBase: sp.apiBase,
         apiKey: '',
         enabled: false,
-      } as any)
+      })
       message.success(`已添加 ${sp.displayName}`)
       onAdded()
       onClose()

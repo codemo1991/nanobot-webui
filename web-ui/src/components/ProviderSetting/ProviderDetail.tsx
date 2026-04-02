@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { Form, Input, Button, Switch, message, Tag, Radio, Card, Divider, Space, Popconfirm } from 'antd'
 import { api } from '../../api'
 import type { Provider, ModelInfo } from '../../types'
+import { DEFAULT_API_BASES } from './constants'
 
 const MODEL_TYPE_LABELS: Record<string, string> = {
   chat: '对话',
@@ -13,20 +14,7 @@ const MODEL_TYPE_LABELS: Record<string, string> = {
 }
 
 function getDefaultBase(providerType?: string): string {
-  const bases: Record<string, string> = {
-    openai: 'https://api.openai.com/v1',
-    anthropic: 'https://api.anthropic.com',
-    deepseek: 'https://api.deepseek.com/v1',
-    gemini: 'https://generativelanguage.googleapis.com/v1beta',
-    ollama: 'http://localhost:11434',
-    vllm: 'http://localhost:8000',
-    azure: 'https://YOUR_RESOURCE.openai.azure.com',
-    azure_openai: 'https://YOUR_RESOURCE.openai.azure.com',
-    openrouter: 'https://openrouter.ai/api',
-    together: 'https://api.together.xyz/v1',
-    fireworks: 'https://api.fireworks.ai/inference/v1',
-  }
-  return bases[providerType || 'openai'] || ''
+  return DEFAULT_API_BASES[providerType || 'openai'] ?? DEFAULT_API_BASES.default ?? ''
 }
 
 interface ProviderDetailProps {
@@ -43,18 +31,18 @@ export const ProviderDetail: React.FC<ProviderDetailProps> = ({ provider, onUpda
   const [discovering, setDiscovering] = useState(false)
   const [showApiKey, setShowApiKey] = useState(false)
 
-  const pt = (provider as any).providerType || (provider as any).type || 'openai'
+  const pt = provider.providerType || (provider as any).type || 'openai'
 
   useEffect(() => {
     form.setFieldsValue({
-      displayName: (provider as any).displayName || provider.name,
+      displayName: provider.displayName || provider.name,
       providerType: pt,
       apiBase: provider.apiBase || getDefaultBase(pt),
       apiKey: provider.apiKey || '',
       enabled: provider.enabled,
     })
     loadModels()
-  }, [provider.id])
+  }, [provider])
 
   const loadModels = async () => {
     try {
@@ -64,6 +52,7 @@ export const ProviderDetail: React.FC<ProviderDetailProps> = ({ provider, onUpda
       setModels(filtered)
     } catch {
       // models might use a different endpoint; silently fail
+      message.error('加载模型列表失败')
       setModels([])
     }
   }
@@ -177,11 +166,10 @@ export const ProviderDetail: React.FC<ProviderDetailProps> = ({ provider, onUpda
           <Button
             onClick={handleTest}
             loading={testing}
-            type={testingResult === 'success' ? 'default' : testingResult === 'error' ? 'default' : 'default'}
           >
             {testingResult === 'success' ? '✅ 连接成功' : testingResult === 'error' ? '❌ 连接失败' : '测试连接'}
           </Button>
-          {!((provider as any).isSystem) && (
+          {!provider.isSystem && (
             <Popconfirm
               title="确认删除此 Provider？"
               onConfirm={handleDelete}
