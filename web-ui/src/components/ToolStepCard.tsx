@@ -1,6 +1,5 @@
 import React, { useState, useMemo, memo } from 'react'
 import {
-  Tag,
   Progress,
   Space,
   Typography,
@@ -72,8 +71,61 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
 }) => {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded)
 
+  const [runningSeconds, setRunningSeconds] = useState(0)
+  const timerRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
+
+  React.useEffect(() => {
+    if (step.status === 'running') {
+      const start = step.startTime || Date.now()
+      setRunningSeconds(0)
+      timerRef.current = setInterval(() => {
+        setRunningSeconds((Date.now() - start) / 1000)
+      }, 100)
+    } else {
+      if (timerRef.current) {
+        clearInterval(timerRef.current)
+        timerRef.current = null
+      }
+    }
+    return () => { if (timerRef.current) clearInterval(timerRef.current) }
+  }, [step.status, step.startTime])
+
   const status = step.status || 'pending'
   const config = statusConfig[status]
+
+  const durationMs = step.endTime && step.startTime ? step.endTime - step.startTime : 0
+  const durationStr = durationMs > 0
+    ? durationMs < 1000
+      ? `${durationMs}ms`
+      : durationMs < 60000
+        ? `${(durationMs / 1000).toFixed(1)}s`
+        : `${(durationMs / 60000).toFixed(1)}min`
+    : null
+
+  const StatusBadge = () => {
+    if (status === 'running') {
+      return (
+        <span className="tool-status-badge running">
+          运行中 {runningSeconds.toFixed(1)}s
+        </span>
+      )
+    }
+    if (status === 'completed') {
+      return (
+        <span className="tool-status-badge done">
+          ✅ Done {durationStr ?? '--'}
+        </span>
+      )
+    }
+    if (status === 'error') {
+      return (
+        <span className="tool-status-badge error">
+          ❌ Error {durationStr ?? '--'}
+        </span>
+      )
+    }
+    return null
+  }
 
   // 自动展开运行中的步骤
   React.useEffect(() => {
@@ -127,12 +179,7 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
           </span>
           <ToolOutlined />
           <Text strong>{step.name}</Text>
-          <Tag color={config.tagColor}>{config.text}</Tag>
-          {step.durationMs && status === 'completed' && (
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              {formatDuration(step.durationMs)}
-            </Text>
-          )}
+          <StatusBadge />
         </Space>
         <Button
           type="text"
@@ -197,7 +244,6 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     </div>
   )
 }, (prevProps, nextProps) => {
-  // Custom comparison: only re-render if these specific fields change
   const prev = prevProps.step
   const next = nextProps.step
   return (
@@ -206,21 +252,14 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     prev.result === next.result &&
     prev.name === next.name &&
     prev.durationMs === next.durationMs &&
-    // Shallow compare progress
+    prev.startTime === next.startTime &&
+    prev.endTime === next.endTime &&
     prev.progress?.detail === next.progress?.detail &&
     prev.progress?.percent === next.progress?.percent &&
-    prev.progress?.lastUpdate === next.progress?.lastUpdate &&
-    // Only re-render if chunk count changed significantly (not every keystroke)
     Math.abs((prev.outputChunks?.length ?? 0) - (next.outputChunks?.length ?? 0)) < 10 &&
     prevProps.isLast === nextProps.isLast &&
     prevProps.defaultExpanded === nextProps.defaultExpanded
   )
 })
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
-  return `${(ms / 60000).toFixed(1)}min`
-}
 
 export default ToolStepCard
