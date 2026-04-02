@@ -1,5 +1,6 @@
 """Model discovery service for native SDK providers (static model lists)."""
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -48,7 +49,7 @@ class ProviderDiscovery(ABC):
             return "audio"
         if "dall" in mid.lower() or ("image" in mid.lower() and "generation" in str(caps).lower()):
             return "image"
-        if "vision" in mid.lower() or "vl-" in mid.lower() or "gpt-4o" in mid.lower():
+        if "vision" in mid.lower() or "vl-" in mid.lower() or bool(re.search(r"(^|[/-])gpt-4[ov]", mid.lower())):
             return "vision"
         return "chat"
 
@@ -58,20 +59,21 @@ class ProviderDiscovery(ABC):
         if isinstance(caps, list) and "vision" in caps:
             return True
         mid = m.get("id", "")
-        vision_ids = ["vision", "vl-", "gpt-4o", "claude-3", "claude-3.5", "claude-3.7", "claude-opus-4", "claude-sonnet-4"]
-        return any(v in mid.lower() for v in vision_ids)
+        vision_ids = ["vision", "vl-"]
+        if any(v in mid.lower() for v in vision_ids):
+            return True
+        return bool(re.search(r"(^|[/-])(gpt-4[ov]|claude-3|claude-3\.5|claude-3\.7|claude-opus-4|claude-sonnet-4)", mid.lower()))
 
     def _infer_supports_function_calling(self, m: dict) -> bool:
         """Check if model supports function calling."""
+        mid = m.get("id", "")
+        no_function_calling = ["reasoner", "-r1", "qwq", "o1-", "o2-", "o3", "o4", "sonar-reasoning", "deepseek-reasoner", "qwq-32"]
+        if any(v in mid.lower() for v in no_function_calling):
+            return False
         caps = m.get("capabilities", [])
         if isinstance(caps, list) and "tools" in caps:
             return True
-        mid = m.get("id", "")
-        # Reasoning/reasoner models don't support function calling
-        no_function_calling = ["reasoner", "-r1", "qwq", "o1-", "o2-", "o3-", "o4-", "sonar-reasoning", "deepseek-reasoner", "r1"]
-        if any(v in mid.lower() for v in no_function_calling):
-            return False
-        return True
+        return True  # default: capable
 
 
 class AnthropicDiscovery(ProviderDiscovery):
