@@ -1,0 +1,47 @@
+<h2>结果展示方式</h2>
+<p class="subtitle">工具执行完成后，结果以什么形式呈现？</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>纯文本（当前）</h3>
+      <p>JSON 字符串直接渲染，截断时显示 "…"</p>
+      <pre style="background:#f0f0f0;padding:8px;border-radius:4px;font-size:11px;margin-top:8px">{
+  "status": "ok",
+  "data": [...]
+}</pre>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>智能格式化</h3>
+      <p>自动识别 JSON/文件列表/命令输出，渲染成可读格式</p>
+      <pre style="background:#f0f0f0;padding:8px;border-radius:4px;font-size:11px;margin-top:8px">status: ✓ ok
+data: 3 项
+  ├─ src/app.py (2.1KB)
+  ├─ src/main.py (1.3KB)
+  └─ README.md (0.5KB)</pre>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>可折叠详情 + 摘要</h3>
+      <p>结果先显示摘要（如"读取了 3 个文件，共 150 行"），点开查看完整内容</p>
+      <pre style="background:#f0f0f0;padding:8px;border-radius:4px;font-size:11px;margin-top:8px">结果摘要:
+  ├─ 3 个文件
+  ├─ 150 行代码
+  └─ 包含 2 处 TODO
+
+<a href="#">展开查看完整内容 ▶</a></pre>
+    </div>
+  </div>
+</div>
+
+<p style="margin-top:12px;font-size:13px;color:#666;text-align:center">
+  当前后端已有 <code>tool_result_max_length=2000</code> 截断，问题在于结果根本没传到前端或传了但没渲染
+</p>

@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { Modal, Tabs, List, Input, Form, Select, Button, message, Tag, Space } from 'antd'
 import { api } from '../../api'
-import type { Provider } from '../../types'
 import { PROVIDER_TYPE_ICONS } from './constants'
 
 const SYSTEM_PROVIDERS: Array<{

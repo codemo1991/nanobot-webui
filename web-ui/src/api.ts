@@ -301,7 +301,7 @@ export const api = {
   // AI Providers
   getProviders: () => request<import('./types').Provider[]>('/providers'),
   
-  createProvider: (provider: Omit<import('./types').Provider, 'id'>) =>
+  createProvider: (provider: Partial<import('./types').Provider> & { id: string }) =>
     request<import('./types').Provider>('/providers', {
       method: 'POST',
       body: JSON.stringify(provider),
@@ -320,7 +320,7 @@ export const api = {
 
   // Models
   getModels: (providerId?: string) =>
-    request<import('./types').Model[]>(
+    request<import('./types').ModelInfo[]>(
       providerId ? `/models?provider_id=${encodeURIComponent(providerId)}` : '/models'
     ),
   

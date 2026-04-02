@@ -31,7 +31,7 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
 
   useEffect(() => { load() }, [])
 
-  const handleToggle = async (provider: Provider, checked: boolean, e: React.MouseEvent) => {
+  const handleToggle = async (provider: Provider, checked: boolean, e: React.BaseSyntheticEvent) => {
     e.stopPropagation()
     await api.updateProvider(provider.id, { ...provider, enabled: checked })
     await load()

@@ -1844,69 +1844,80 @@ class NanobotWebAPI:
         }
 
     def create_provider(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create/Enable a new AI provider configuration."""
-        config = load_config()
-        provider_type = data.get("type", "").lower()
+        """Create a new AI provider configuration.
 
-        if not provider_type or provider_type not in ("anthropic", "openai", "deepseek", "azure"):
-            raise ValueError(f"Invalid provider type: {provider_type}")
-
-        provider_config = getattr(config.providers, provider_type)
-        if hasattr(provider_config, "api_key"):
-            provider_config.api_key = data.get("apiKey", "")
-        if hasattr(provider_config, "api_base"):
-            provider_config.api_base = data.get("apiBase")
-        # Azure-specific fields
-        if provider_type == "azure":
-            if hasattr(provider_config, "api_version"):
-                provider_config.api_version = data.get("apiVersion", "2024-12-01-preview")
-            if hasattr(provider_config, "azure_deployment"):
-                provider_config.azure_deployment = data.get("azureDeployment", "")
-
-        from nanobot.config.loader import save_config
-        save_config(config)
-
-        # 立即热更新 provider 实例的凭据
-        if provider_config.api_key:
-            self.provider_manager.update_provider_config(
-                provider_type,
-                api_key=provider_config.api_key,
-                api_base=getattr(provider_config, "api_base", None),
-            )
-
-        # Persist new fields to the database repo
+        For built-in types (anthropic, openai, deepseek, azure): writes to YAML config.
+        For arbitrary IDs (custom/system): writes directly to SQLite.
+        """
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
-        enabled = bool(getattr(provider_config, "api_key", None))
+
+        provider_id = data.get("id", "")
+        if not provider_id:
+            raise ValueError("Provider 'id' is required")
+
+        builtin_types = {"anthropic", "openai", "deepseek", "azure"}
+
+        if provider_id in builtin_types:
+            # Builtin: write to YAML config
+            config = load_config()
+            provider_type = provider_id
+            provider_config = getattr(config.providers, provider_type)
+            if hasattr(provider_config, "api_key") and "apiKey" in data:
+                provider_config.api_key = data["apiKey"]
+            if hasattr(provider_config, "api_base") and "apiBase" in data:
+                provider_config.api_base = data["apiBase"]
+            if provider_type == "azure":
+                if hasattr(provider_config, "api_version") and "apiVersion" in data:
+                    provider_config.api_version = data["apiVersion"]
+                if hasattr(provider_config, "azure_deployment") and "azureDeployment" in data:
+                    provider_config.azure_deployment = data["azureDeployment"]
+            from nanobot.config.loader import save_config
+            save_config(config)
+            enabled = bool(getattr(provider_config, "api_key", None))
+            yaml_api_key = getattr(provider_config, "api_key", "") or ""
+            yaml_api_base = getattr(provider_config, "api_base", None)
+            # Hot-update
+            if yaml_api_key:
+                self.provider_manager.update_provider_config(
+                    provider_id,
+                    api_key=yaml_api_key,
+                    api_base=yaml_api_base,
+                    provider_type=data.get("providerType"),
+                )
+        else:
+            # Custom/system: write directly to SQLite
+            enabled = data.get("enabled", False)
+            yaml_api_key = ""
+            yaml_api_base = data.get("apiBase")
+
         repo.set_provider(
-            provider_id=provider_type,
-            name=data.get("displayName", data.get("name", provider_type.capitalize())),
-            api_key=getattr(provider_config, "api_key", "") or "",
-            api_base=getattr(provider_config, "api_base", None),
+            provider_id=provider_id,
+            name=data.get("displayName", data.get("name", provider_id.capitalize())),
+            display_name=data.get("displayName", data.get("name", provider_id.capitalize())),
+            provider_type=data.get("providerType", provider_id),
+            api_key=data.get("apiKey", "") if provider_id not in builtin_types else yaml_api_key,
+            api_base=data.get("apiBase") if provider_id not in builtin_types else yaml_api_base,
             enabled=enabled,
-            display_name=data.get("displayName", data.get("name", provider_type.capitalize())),
-            provider_type=data.get("providerType", provider_type),
+            priority=data.get("priority", 0),
             is_system=data.get("isSystem", False),
             sort_order=data.get("sortOrder", 0),
             config_json=data.get("configJson", "{}"),
         )
-        result = {
-            "id": provider_type,
-            "name": data.get("name", provider_type.capitalize()),
-            "type": provider_type,
-            "apiBase": getattr(provider_config, "api_base", None),
-            "apiKey": getattr(provider_config, "api_key", None) or None,
+
+        return {
+            "id": provider_id,
+            "name": data.get("displayName", data.get("name", provider_id.capitalize())),
+            "type": provider_id,
+            "apiKey": data.get("apiKey") or None,
+            "apiBase": data.get("apiBase"),
             "enabled": enabled,
-            "displayName": data.get("displayName", data.get("name", provider_type.capitalize())),
-            "providerType": data.get("providerType", provider_type),
+            "displayName": data.get("displayName", data.get("name", provider_id.capitalize())),
+            "providerType": data.get("providerType", provider_id),
             "isSystem": data.get("isSystem", False),
             "sortOrder": data.get("sortOrder", 0),
             "configJson": data.get("configJson", "{}"),
         }
-        if provider_type == "azure":
-            result["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
-            result["azureDeployment"] = getattr(provider_config, "azure_deployment", "")
-        return result
 
     def update_provider(self, provider_id: str, data: dict[str, Any]) -> dict[str, Any]:
         """Update AI provider configuration."""

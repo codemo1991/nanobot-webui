@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { Form, Input, Button, Switch, message, Tag, Radio, Card, Divider, Space, Popconfirm } from 'antd'
+import { Form, Input, Button, Switch, message, Tag, Radio, Card, Divider, Popconfirm } from 'antd'
 import { api } from '../../api'
 import type { Provider, ModelInfo } from '../../types'
 import { DEFAULT_API_BASES } from './constants'
