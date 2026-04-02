@@ -96,18 +96,14 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
                     </span>
                   }
                   title={
-                    <span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                       {p.displayName || p.name || p.id}
-                      {p.isSystem && (
-                        <Tag color="blue" style={{ marginLeft: 6, fontSize: 10 }}>系统</Tag>
-                      )}
+                      {p.isSystem && <Tag color="blue" style={{ fontSize: 10, margin: 0 }}>系统</Tag>}
+                      {!p.enabled && <Tag color="default" style={{ fontSize: 10, margin: 0 }}>已禁用</Tag>}
                     </span>
                   }
                   description={
-                    <span style={{ fontSize: 11, color: '#999' }}>
-                      <span style={{ color }}>{pt}</span>
-                      {!p.enabled && <Tag style={{ marginLeft: 4, fontSize: 10 }}>已禁用</Tag>}
-                    </span>
+                    <span style={{ fontSize: 11, color: '#999' }}>{pt}</span>
                   }
                 />
               </List.Item>
