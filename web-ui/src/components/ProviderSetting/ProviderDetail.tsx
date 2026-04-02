@@ -60,11 +60,11 @@ export const ProviderDetail: React.FC<ProviderDetailProps> = ({ provider, onUpda
   const handleSave = async (values: any) => {
     setSaving(true)
     try {
-      const pt = values.providerType || pt
+      const ptype = values.providerType || pt
       await api.updateProvider(provider.id, {
         ...values,
         enabled: values.enabled,
-        type: pt, // backend uses `type` field
+        type: ptype, // backend uses `type` field
       })
       message.success('保存成功')
       onUpdate()
