@@ -123,6 +123,36 @@ class ConfigRepository:
                     conn.commit()
             except Exception:
                 pass
+            # 迁移：扩展 config_providers 表
+            for col, col_type, default in [
+                ("display_name", "TEXT", "''"),
+                ("provider_type", "TEXT", "'openai'"),
+                ("is_system", "INTEGER", "0"),
+                ("sort_order", "INTEGER", "0"),
+                ("config_json", "TEXT", "'{}'"),
+            ]:
+                try:
+                    cols = {d[1] for d in conn.execute("PRAGMA table_info(config_providers)").fetchall()}
+                    if col not in cols:
+                        conn.execute(f"ALTER TABLE config_providers ADD COLUMN {col} {col_type} DEFAULT {default}")
+                        conn.commit()
+                except Exception:
+                    pass
+            # 迁移：扩展 config_models 表
+            for col, col_type, default in [
+                ("model_type", "TEXT", "'chat'"),
+                ("max_tokens", "INTEGER", "4096"),
+                ("supports_vision", "INTEGER", "0"),
+                ("supports_function_calling", "INTEGER", "1"),
+                ("supports_streaming", "INTEGER", "1"),
+            ]:
+                try:
+                    cols = {d[1] for d in conn.execute("PRAGMA table_info(config_models)").fetchall()}
+                    if col not in cols:
+                        conn.execute(f"ALTER TABLE config_models ADD COLUMN {col} {col_type} DEFAULT {default}")
+                        conn.commit()
+                except Exception:
+                    pass
             conn.close()
             logger.debug("Base config tables initialized")
         except Exception as e:
@@ -300,6 +330,10 @@ class ConfigRepository:
                     "api_base": row["api_base"],
                     "enabled": bool(row["enabled"]),
                     "priority": row["priority"],
+                    "display_name": row["display_name"] or row["name"],
+                    "provider_type": row["provider_type"] or "openai",
+                    "is_system": bool(row["is_system"]),
+                    "sort_order": row["sort_order"],
                 }
         except Exception as e:
             logger.warning(f"Failed to get provider {provider_id}: {e}")
@@ -320,6 +354,10 @@ class ConfigRepository:
                         "api_base": row["api_base"],
                         "enabled": bool(row["enabled"]),
                         "priority": row["priority"],
+                        "display_name": row["display_name"] or row["name"],
+                        "provider_type": row["provider_type"] or "openai",
+                        "is_system": bool(row["is_system"]),
+                        "sort_order": row["sort_order"],
                     }
                     for row in rows
                 ]
@@ -329,28 +367,71 @@ class ConfigRepository:
 
     def set_provider(self, provider_id: str, name: str, api_key: str = "",
                      api_base: str | None = None, enabled: bool = False,
-                     priority: int = 0) -> None:
+                     priority: int = 0, display_name: str = "",
+                     provider_type: str = "openai", is_system: bool = False,
+                     sort_order: int = 0) -> None:
         """设置 Provider 配置。"""
         updated_at = self._get_timestamp()
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         name=excluded.name,
                         api_key=excluded.api_key,
                         api_base=excluded.api_base,
                         enabled=excluded.enabled,
                         priority=excluded.priority,
-                        updated_at=excluded.updated_at
+                        updated_at=excluded.updated_at,
+                        display_name=excluded.display_name,
+                        provider_type=excluded.provider_type,
+                        is_system=excluded.is_system,
+                        sort_order=excluded.sort_order
                     """,
-                    (provider_id, name, api_key, api_base, int(enabled), priority, updated_at)
+                    (provider_id, name, api_key, api_base, int(enabled), priority, updated_at, display_name, provider_type, int(is_system), sort_order)
                 )
         except Exception as e:
             logger.exception(f"Failed to set provider {provider_id}")
             raise
+
+    def delete_provider(self, provider_id: str) -> bool:
+        """删除 Provider（系统预置不可删除）。"""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM config_providers WHERE id = ? AND is_system = 0",
+                    (provider_id,)
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.warning(f"Failed to delete provider {provider_id}: {e}")
+            return False
+
+    def get_system_providers(self) -> list[dict[str, Any]]:
+        """获取所有系统预置 Provider。"""
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM config_providers WHERE is_system = 1 ORDER BY sort_order, name"
+                ).fetchall()
+                return [
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "display_name": row["display_name"] or row["name"],
+                        "provider_type": row["provider_type"] or "openai",
+                        "api_key": "",
+                        "api_base": row["api_base"],
+                        "enabled": bool(row["enabled"]),
+                        "is_system": True,
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.warning(f"Failed to get system providers: {e}")
+            return []
 
     def get_channel(self, channel_id: str) -> dict[str, Any] | None:
         """获取 Channel 配置。"""
@@ -771,6 +852,11 @@ class ConfigRepository:
                     "quality_rank": row["quality_rank"],
                     "enabled": bool(row["enabled"]),
                     "is_default": bool(row["is_default"]),
+                    "model_type": row["model_type"] or "chat",
+                    "max_tokens": row["max_tokens"],
+                    "supports_vision": bool(row["supports_vision"]),
+                    "supports_function_calling": bool(row["supports_function_calling"]),
+                    "supports_streaming": bool(row["supports_streaming"]),
                 }
         except Exception as e:
             logger.warning(f"Failed to get model {model_id}: {e}")
@@ -834,6 +920,11 @@ class ConfigRepository:
                         "quality_rank": row["quality_rank"],
                         "enabled": bool(row["enabled"]),
                         "is_default": bool(row["is_default"]),
+                        "model_type": row["model_type"] or "chat",
+                        "max_tokens": row["max_tokens"],
+                        "supports_vision": bool(row["supports_vision"]),
+                        "supports_function_calling": bool(row["supports_function_calling"]),
+                        "supports_streaming": bool(row["supports_streaming"]),
                     }
                     for row in rows
                 ]
@@ -866,6 +957,11 @@ class ConfigRepository:
                         "quality_rank": row["quality_rank"],
                         "enabled": True,
                         "is_default": bool(row["is_default"]),
+                        "model_type": row["model_type"] or "chat",
+                        "max_tokens": row["max_tokens"],
+                        "supports_vision": bool(row["supports_vision"]),
+                        "supports_function_calling": bool(row["supports_function_calling"]),
+                        "supports_streaming": bool(row["supports_streaming"]),
                     }
                     for row in rows
                 ]
@@ -892,7 +988,11 @@ class ConfigRepository:
     def set_model(self, model_id: str, provider_id: str, name: str, litellm_id: str,
                   aliases: str = "", capabilities: str = "", context_window: int = 128000,
                   cost_rank: int | None = None, quality_rank: int | None = None,
-                  enabled: bool = True, is_default: bool = False) -> None:
+                  enabled: bool = True, is_default: bool = False,
+                  model_type: str = "chat", max_tokens: int = 4096,
+                  supports_vision: bool = False,
+                  supports_function_calling: bool = True,
+                  supports_streaming: bool = True) -> None:
         """设置模型配置。"""
         updated_at = self._get_timestamp()
         try:
@@ -901,8 +1001,9 @@ class ConfigRepository:
                     """
                     INSERT INTO config_models (id, provider_id, name, litellm_id, aliases,
                         capabilities, context_window, cost_rank, quality_rank, enabled,
-                        is_default, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        is_default, updated_at, model_type, max_tokens,
+                        supports_vision, supports_function_calling, supports_streaming)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         provider_id=excluded.provider_id,
                         name=excluded.name,
@@ -914,11 +1015,18 @@ class ConfigRepository:
                         quality_rank=excluded.quality_rank,
                         enabled=excluded.enabled,
                         is_default=excluded.is_default,
-                        updated_at=excluded.updated_at
+                        updated_at=excluded.updated_at,
+                        model_type=excluded.model_type,
+                        max_tokens=excluded.max_tokens,
+                        supports_vision=excluded.supports_vision,
+                        supports_function_calling=excluded.supports_function_calling,
+                        supports_streaming=excluded.supports_streaming
                     """,
                     (model_id, provider_id, name, litellm_id, aliases, capabilities,
                      context_window, cost_rank, quality_rank, int(enabled), int(is_default),
-                     updated_at)
+                     updated_at, model_type, max_tokens,
+                     int(supports_vision), int(supports_function_calling),
+                     int(supports_streaming))
                 )
         except Exception as e:
             logger.exception(f"Failed to set model {model_id}")
