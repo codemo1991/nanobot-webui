@@ -82,3 +82,155 @@
 .output-normal {
   color: #d4d4d4;
 }
+
+/* ── Animation keyframes ──────────────────────────────── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+@keyframes blink-cursor {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes output-grow {
+  from { opacity: 0.5; }
+  to { opacity: 1; }
+}
+
+/* ── Status badge ──────────────────────────────────────── */
+.tool-status-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 500;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.tool-status-badge.running {
+  background: #eff6ff;
+  color: #3b82f6;
+}
+.tool-status-badge.done {
+  background: #ecfdf5;
+  color: #10b981;
+}
+.tool-status-badge.error {
+  background: #fef2f2;
+  color: #ef4444;
+}
+
+/* ── Output preview ───────────────────────────────────── */
+.tool-output-wrap {
+  position: relative;
+}
+.tool-output-collapsed {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+  animation: output-grow 0.15s ease-out;
+}
+.tool-output-expanded {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 400px;
+  overflow-y: auto;
+}
+.output-hidden-anchor {
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 11px;
+  padding: 3px 12px;
+  cursor: pointer;
+  border-top: 1px solid #fde68a;
+}
+.output-hidden-anchor:hover {
+  background: #fef3c7;
+}
+.output-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.output-action-btn {
+  background: none;
+  border: none;
+  color: #3b82f6;
+  cursor: pointer;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+}
+.output-action-btn:hover {
+  text-decoration: underline;
+}
+.output-action-btn.copied {
+  color: #10b981;
+}
+
+/* ── Params section ───────────────────────────────────── */
+.tool-params-section {
+  margin-top: 8px;
+}
+.params-toggle-btn {
+  background: none;
+  border: none;
+  color: #9ca3af;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0;
+  line-height: 1;
+}
+.params-toggle-btn:hover {
+  color: #6b7280;
+}
+.tool-params-body {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.param-row {
+  display: flex;
+  gap: 4px;
+  line-height: 1.7;
+}
+.param-key {
+  color: #6b7280;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  flex-shrink: 0;
+  user-select: none;
+}
+.param-value {
+  color: #111827;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 280px;
+}
+.param-value.overflow {
+  cursor: pointer;
+}
+.param-value.overflow:hover {
+  color: #3b82f6;
+}
