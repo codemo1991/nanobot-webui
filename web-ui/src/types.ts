@@ -154,10 +154,14 @@ export interface ChannelsConfig {
 export interface Provider {
   id: string
   name: string
-  type: 'openai' | 'anthropic' | 'deepseek' | 'azure'
+  displayName?: string
+  /** @deprecated Use providerType instead */
+  type: 'openai' | 'anthropic' | 'deepseek' | 'azure' | string
+  providerType?: string
   apiKey?: string
   apiBase?: string
   enabled: boolean
+  isSystem?: boolean
   // Azure-specific
   apiVersion?: string
   azureDeployment?: string
@@ -196,6 +200,8 @@ export interface ModelInfo {
   qualityRank?: number
   enabled: boolean
   isDefault: boolean
+  modelType?: string
+  supportsVision?: boolean
 }
 
 export interface ModelProfile {

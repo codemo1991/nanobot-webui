@@ -4,6 +4,7 @@ import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, T
 import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined, ReloadOutlined } from '@ant-design/icons'
 import { api } from '../api'
 import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig, WebConcurrencyConfig, WebMemoryConfig } from '../types'
+import { ProviderList, ProviderDetail, AddProviderModal } from '../components/ProviderSetting'
 import AgentTemplatePage from './AgentTemplatePage'
 import SystemPromptPage from './SystemPromptPage'
 import './ConfigPage.css'
@@ -284,171 +285,56 @@ function ChannelsConfig() {
 
 // --- Providers (AI) Configuration ---
 
-
 function ProvidersConfig() {
-  const { t } = useTranslation()
-  const [loading, setLoading] = useState(false)
-  const [providers, setProviders] = useState<Provider[]>([])
-  const [modalVisible, setModalVisible] = useState(false)
-  const [editingProviderId, setEditingProviderId] = useState<string | null>(null)
-  const [form] = Form.useForm()
+  const [selectedProvider, setSelectedProvider] = useState<Provider | null>(null)
+  const [addModalVisible, setAddModalVisible] = useState(false)
 
-  useEffect(() => {
-    loadProviders()
-  }, [])
-  
-  // ... (loadProviders, handleCreate, handleEdit, handleDelete same as before)
-  const loadProviders = async () => {
-    try {
-      setLoading(true)
-      const data = await api.getProviders()
-      setProviders(data)
-    } catch (error) {
-      message.error(t('config.provider.loadFailed'))
-      console.error(error)
-    } finally {
-      setLoading(false)
-    }
+  const handleRefresh = () => {
+    setSelectedProvider(null)
   }
 
-  const handleCreate = () => {
-    setEditingProviderId(null)
-    form.resetFields()
-    form.setFieldsValue({ type: 'openai' })
-    setModalVisible(true)
+  const handleSelect = (p: Provider) => {
+    setSelectedProvider(p)
   }
 
-  const handleEdit = (provider: Provider) => {
-    setEditingProviderId(provider.id)
-    form.setFieldsValue({
-      type: provider.type,
-      name: provider.name,
-      apiKey: provider.apiKey || '',
-      apiBase: provider.apiBase || '',
-      apiVersion: (provider as any).apiVersion || '2024-12-01-preview',
-      azureDeployment: (provider as any).azureDeployment || '',
-    })
-    setModalVisible(true)
+  const handleAdded = () => {
+    handleRefresh()
   }
-
-  const handleDelete = (id: string) => {
-    Modal.confirm({
-      title: t('config.provider.confirmDisable'),
-      content: t('config.provider.confirmDisableContent'),
-      onOk: async () => {
-        try {
-          await api.deleteProvider(id)
-          message.success(t('config.provider.disabled'))
-          loadProviders()
-        } catch (error) {
-          message.error(t('config.provider.opFailed'))
-        }
-      }
-    })
-  }
-
-  const handleSave = async () => {
-    try {
-      const values = await form.validateFields()
-      const providerData = {
-        ...values,
-        enabled: true
-      } as any
-      
-      if (editingProviderId) {
-        await api.updateProvider(editingProviderId, providerData)
-      } else {
-        await api.createProvider(providerData)
-      }
-      message.success(t('config.provider.saveSuccess'))
-      setModalVisible(false)
-      loadProviders()
-    } catch (error) {
-      console.error(error)
-      message.error(t('config.provider.saveFailed'))
-    }
-  }
-
-  const providerOptions = [
-    { value: 'openai', label: 'OpenAI' },
-    { value: 'anthropic', label: 'Anthropic' },
-    { value: 'deepseek', label: 'DeepSeek' },
-    { value: 'azure', label: 'Azure OpenAI' },
-  ]
 
   return (
     <div className="config-panel">
-      <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-        <Text type="secondary">支持: {providerOptions.map(p => p.label).join('、')}</Text>
-        <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>{t('config.provider.add')}</Button>
+      <div style={{ display: 'flex', height: 520 }}>
+        <div style={{ width: '38%', minWidth: 280 }}>
+          <ProviderList
+            onSelect={handleSelect}
+            selectedId={selectedProvider?.id}
+            onRefresh={handleRefresh}
+            onAddClick={() => setAddModalVisible(true)}
+          />
+        </div>
+        <div style={{ width: '62%' }}>
+          {selectedProvider ? (
+            <ProviderDetail provider={selectedProvider} onUpdate={handleRefresh} />
+          ) : (
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              height: '100%',
+              color: '#999',
+              fontSize: 14,
+            }}>
+              请从左侧选择一个 Provider
+            </div>
+          )}
+        </div>
       </div>
 
-      <List
-        grid={{ gutter: 16, column: 2 }}
-        dataSource={providers}
-        loading={loading}
-        renderItem={(item: Provider) => (
-          <List.Item>
-            <Card 
-              title={item.name} 
-              extra={
-                <Space>
-                  <Button type="text" icon={<EditOutlined />} onClick={() => handleEdit(item)} />
-                  <Button type="text" danger icon={<DeleteOutlined />} onClick={() => handleDelete(item.id)} />
-                </Space>
-              }
-            >
-              <Space direction="vertical" style={{ width: '100%' }}>
-                <Text>Type: <Tag>{item.type}</Tag></Text>
-                <Text>Status: <Tag color={item.enabled ? 'success' : 'default'}>{item.enabled ? 'Enabled' : 'Disabled'}</Tag></Text>
-                <Text type="secondary">API Key: {item.apiKey ? '已配置' : '未配置'}</Text>
-                {item.apiBase && <Text type="secondary" ellipsis>Base URL: {item.apiBase}</Text>}
-                {(item as any).azureDeployment && <Text type="secondary">Deployment: {(item as any).azureDeployment}</Text>}
-              </Space>
-            </Card>
-          </List.Item>
-        )}
+      <AddProviderModal
+        open={addModalVisible}
+        onClose={() => setAddModalVisible(false)}
+        onAdded={handleAdded}
       />
-
-      <Modal
-        title={editingProviderId ? t('config.provider.edit') : t('config.provider.add')}
-        open={modalVisible}
-        onOk={handleSave}
-        onCancel={() => setModalVisible(false)}
-      >
-        <Form form={form} layout="vertical">
-          <Form.Item name="type" label="Provider Type" rules={[{ required: true }]}>
-            <Select
-              disabled={!!editingProviderId}
-              placeholder="选择类型 (如 DeepSeek、Zhipu、Qwen)"
-              options={providerOptions}
-            />
-          </Form.Item>
-          <Form.Item name="name" label="名称">
-            <Input placeholder="例如: My OpenAI" />
-          </Form.Item>
-          <Form.Item name="apiKey" label="API Key">
-            <Input.Password placeholder="sk-..." />
-          </Form.Item>
-          <Form.Item name="apiBase" label="Base URL (可选)">
-            <Input placeholder="https://api.example.com/v1" />
-          </Form.Item>
-          <Form.Item noStyle shouldUpdate={(prev, curr) => prev.type !== curr.type}>
-            {({ getFieldValue }) =>
-              getFieldValue('type') === 'azure' && (
-                <>
-                  <Form.Item name="apiVersion" label="API Version" tooltip="Azure API 版本，如 2024-12-01-preview">
-                    <Input placeholder="2024-12-01-preview" />
-                  </Form.Item>
-                  <Form.Item name="azureDeployment" label="Azure Deployment" tooltip="Azure 部署名称，如 gpt-4o">
-                    <Input placeholder="gpt-4o" />
-                  </Form.Item>
-                </>
-              )
-            }
-          </Form.Item>
-        </Form>
-      </Modal>
     </div>
   )
 }
