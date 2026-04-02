@@ -879,4 +879,60 @@
   border: 1px solid #e8e8e8;
 }
 
+/* ── Streaming feedback enhancements ───────────────────── */
 
+/* Pulse dot for thinking state */
+.pulse-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #6366f1;
+  animation: pulse-dot 1.2s ease-in-out infinite;
+  vertical-align: middle;
+  margin-right: 6px;
+  flex-shrink: 0;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.4; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+/* Streaming cursor */
+@keyframes blink-cursor {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.stream-cursor {
+  display: inline-block;
+  color: #3b82f6;
+  font-weight: 700;
+  font-size: 14px;
+  line-height: 1;
+  animation: blink-cursor 0.6s step-end infinite;
+  vertical-align: baseline;
+  margin-left: 1px;
+}
+.stream-cursor.idle {
+  animation: blink-cursor 1.2s ease-in-out infinite;
+}
+
+/* Claude Code output lines badge */
+.claude-code-output-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.claude-code-lines-badge {
+  font-size: 10px;
+  color: #6b7280;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  background: #1e1e1e;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.claude-code-progress-inner {
+  animation: output-grow 0.15s ease-out;
+}
