@@ -126,21 +126,20 @@
   position: relative;
 }
 .tool-output-collapsed {
-  background: #1e1e1e;
+  background: #1f1f1f;
   color: #d4d4d4;
   padding: 8px 12px;
   border-radius: 6px;
   font-size: 12px;
   line-height: 1.5;
-  overflow: hidden;
+  overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;
   max-height: 200px;
-  overflow-y: auto;
   animation: output-grow 0.15s ease-out;
 }
 .tool-output-expanded {
-  background: #1e1e1e;
+  background: #1f1f1f;
   color: #d4d4d4;
   padding: 8px 12px;
   border-radius: 6px;
@@ -150,7 +149,6 @@
   white-space: pre-wrap;
   word-break: break-all;
   max-height: 400px;
-  overflow-y: auto;
 }
 .output-hidden-anchor {
   background: #fffbeb;
