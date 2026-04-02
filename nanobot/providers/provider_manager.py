@@ -80,6 +80,7 @@ class ProviderManager:
         provider_id: str,
         api_key: str | None = None,
         api_base: str | None = None,
+        provider_type: str | None = None,
     ) -> None:
         """
         Hot-update a provider's credentials.
@@ -98,8 +99,10 @@ class ProviderManager:
             provider.api_key = api_key
         if api_base is not None:
             provider.api_base = api_base
+        if provider_type is not None and hasattr(provider, "provider_type"):
+            provider.provider_type = provider_type
 
-        logger.info(f"ProviderManager: updated {provider_id} config (api_key={'set' if api_key else 'unchanged'}, api_base={'set' if api_base else 'unchanged'})")
+        logger.info(f"ProviderManager: updated {provider_id} config (api_key={'set' if api_key else 'unchanged'}, api_base={'set' if api_base else 'unchanged'}, provider_type={'set' if provider_type else 'unchanged'})")
 
     def update_model_config(
         self,

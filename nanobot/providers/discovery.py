@@ -20,6 +20,12 @@ class DiscoveredModel:
     aliases: list[str]      # Short aliases
     capabilities: list[str]  # ["tools", "vision", "thinking"]
     context_window: int
+    # NEW FIELDS:
+    model_type: str = "chat"       # "chat" | "completion" | "embedding" | "image" | "audio" | "vision"
+    max_tokens: int = 4096
+    supports_vision: bool = False
+    supports_function_calling: bool = True
+    supports_streaming: bool = True
 
 
 class ProviderDiscovery(ABC):
@@ -240,6 +246,11 @@ class ModelDiscoveryService:
                 quality_rank=self._infer_quality_rank(model.id),
                 enabled=True,
                 is_default=is_default,
+                model_type=model.model_type,
+                max_tokens=model.max_tokens,
+                supports_vision=model.supports_vision,
+                supports_function_calling=model.supports_function_calling,
+                supports_streaming=model.supports_streaming,
             )
 
         logger.info(f"Discovered and saved {len(models)} models for {provider_id}")

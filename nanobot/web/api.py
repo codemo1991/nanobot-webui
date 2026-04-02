@@ -1750,6 +1750,11 @@ class NanobotWebAPI:
                     "apiKey": provider_config.api_key or None,
                     "apiBase": provider_config.api_base,
                     "enabled": enabled,
+                    "displayName": provider_display_names.get(provider_name, provider_name.capitalize()),
+                    "providerType": provider_name,
+                    "isSystem": True,
+                    "sortOrder": 0,
+                    "configJson": "{}",
                 }
                 if provider_name == "azure":
                     entry["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
@@ -1869,6 +1874,22 @@ class NanobotWebAPI:
                 api_base=getattr(provider_config, "api_base", None),
             )
 
+        # Persist new fields to the database repo
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
+        repo.set_provider(
+            provider_id=provider_type,
+            name=data.get("displayName", data.get("name", provider_type.capitalize())),
+            api_key=getattr(provider_config, "api_key", "") or "",
+            api_base=getattr(provider_config, "api_base", None),
+            enabled=enabled,
+            display_name=data.get("displayName", data.get("name", provider_type.capitalize())),
+            provider_type=data.get("providerType", provider_type),
+            is_system=data.get("isSystem", False),
+            sort_order=data.get("sortOrder", 0),
+            config_json=data.get("configJson", "{}"),
+        )
+
         enabled = bool(getattr(provider_config, "api_key", None))
         result = {
             "id": provider_type,
@@ -1877,6 +1898,11 @@ class NanobotWebAPI:
             "apiBase": getattr(provider_config, "api_base", None),
             "apiKey": getattr(provider_config, "api_key", None) or None,
             "enabled": enabled,
+            "displayName": data.get("displayName", data.get("name", provider_type.capitalize())),
+            "providerType": data.get("providerType", provider_type),
+            "isSystem": data.get("isSystem", False),
+            "sortOrder": data.get("sortOrder", 0),
+            "configJson": data.get("configJson", "{}"),
         }
         if provider_type == "azure":
             result["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
@@ -1912,7 +1938,24 @@ class NanobotWebAPI:
                 provider_id,
                 api_key=provider_config.api_key,
                 api_base=getattr(provider_config, "api_base", None),
+                provider_type=data.get("providerType"),
             )
+
+        # Persist new fields to the database repo
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
+        repo.set_provider(
+            provider_id=provider_id,
+            name=data.get("displayName", data.get("name", provider_id.capitalize())),
+            api_key=getattr(provider_config, "api_key", "") or "",
+            api_base=getattr(provider_config, "api_base", None),
+            enabled=data.get("enabled", enabled),
+            display_name=data.get("displayName", data.get("name", provider_id.capitalize())),
+            provider_type=data.get("providerType", provider_id),
+            is_system=data.get("isSystem", False),
+            sort_order=data.get("sortOrder", 0),
+            config_json=data.get("configJson", "{}"),
+        )
 
         enabled = bool(getattr(provider_config, "api_key", None))
         result = {
@@ -1922,6 +1965,11 @@ class NanobotWebAPI:
             "apiBase": getattr(provider_config, "api_base", None),
             "apiKey": getattr(provider_config, "api_key", None) or None,
             "enabled": enabled,
+            "displayName": data.get("displayName", data.get("name", provider_id.capitalize())),
+            "providerType": data.get("providerType", provider_id),
+            "isSystem": data.get("isSystem", False),
+            "sortOrder": data.get("sortOrder", 0),
+            "configJson": data.get("configJson", "{}"),
         }
         if provider_id == "azure":
             result["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
@@ -4057,6 +4105,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     "qualityRank": m["quality_rank"],
                     "enabled": m["enabled"],
                     "isDefault": m["is_default"],
+                    "modelType": m.get("model_type", "chat"),
+                    "maxTokens": m.get("max_tokens", 4096),
+                    "supportsVision": m.get("supports_vision", False),
+                    "supportsFunctionCalling": m.get("supports_function_calling", True),
+                    "supportsStreaming": m.get("supports_streaming", True),
                 } for m in models]
                 self._write_json(HTTPStatus.OK, _ok(models_camel))
                 return
@@ -4095,6 +4148,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                         "aliases": m.aliases,
                         "capabilities": m.capabilities,
                         "contextWindow": m.context_window,
+                        "modelType": m.model_type,
+                        "maxTokens": m.max_tokens,
+                        "supportsVision": m.supports_vision,
+                        "supportsFunctionCalling": m.supports_function_calling,
+                        "supportsStreaming": m.supports_streaming,
                     } for m in models]))
                 except Exception as e:
                     logger.exception(f"Failed to discover models for {provider_id}")
@@ -4718,6 +4776,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     quality_rank=body.get("qualityRank"),
                     enabled=body.get("enabled", True),
                     is_default=is_default,
+                    model_type=body.get("modelType", "chat"),
+                    max_tokens=body.get("maxTokens", 4096),
+                    supports_vision=body.get("supportsVision", False),
+                    supports_function_calling=body.get("supportsFunctionCalling", True),
+                    supports_streaming=body.get("supportsStreaming", True),
                 )
                 self._write_json(HTTPStatus.CREATED, _ok({"success": True}))
             except Exception as e:
@@ -5416,8 +5479,10 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
         # DELETE /api/v1/providers/{providerId}
         if len(parts) == 4 and parts[:3] == ["api", "v1", "providers"]:
-            provider_id = parts[3]
-            deleted = app.delete_provider(provider_id)
+            provider_id = unquote(parts[3])
+            from nanobot.config.loader import get_config_repository
+            repo = get_config_repository()
+            deleted = repo.delete_provider(provider_id)
             if deleted:
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
@@ -5640,6 +5705,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     quality_rank=body.get("qualityRank", existing.get("quality_rank")),
                     enabled=body.get("enabled", existing.get("enabled", True)),
                     is_default=is_default,
+                    model_type=body.get("modelType", existing.get("model_type", "chat")),
+                    max_tokens=body.get("maxTokens", existing.get("max_tokens", 4096)),
+                    supports_vision=body.get("supportsVision", existing.get("supports_vision", False)),
+                    supports_function_calling=body.get("supportsFunctionCalling", existing.get("supports_function_calling", True)),
+                    supports_streaming=body.get("supportsStreaming", existing.get("supports_streaming", True)),
                 )
                 self._write_json(HTTPStatus.OK, _ok({"success": True}))
             except Exception as e:
