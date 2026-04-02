@@ -1877,6 +1877,7 @@ class NanobotWebAPI:
         # Persist new fields to the database repo
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
+        enabled = bool(getattr(provider_config, "api_key", None))
         repo.set_provider(
             provider_id=provider_type,
             name=data.get("displayName", data.get("name", provider_type.capitalize())),
@@ -1889,8 +1890,6 @@ class NanobotWebAPI:
             sort_order=data.get("sortOrder", 0),
             config_json=data.get("configJson", "{}"),
         )
-
-        enabled = bool(getattr(provider_config, "api_key", None))
         result = {
             "id": provider_type,
             "name": data.get("name", provider_type.capitalize()),
@@ -1988,6 +1987,12 @@ class NanobotWebAPI:
         provider_config.api_base = None
 
         save_config(config)
+
+        # Also remove from SQLite
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
+        repo.delete_provider(provider_id)
+
         return True
 
     def create_mcp(self, data: dict[str, Any]) -> dict[str, Any]:
