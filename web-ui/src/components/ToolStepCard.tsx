@@ -235,7 +235,7 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
                     className="params-toggle-btn"
                     onClick={(e) => { e.stopPropagation(); setParamsExpanded(true) }}
                   >
-                    [▼ {paramEntries.length}]
+                    [▼ {hiddenParamsCount}]
                   </button>
                 )}
                 {paramsExpanded && (
