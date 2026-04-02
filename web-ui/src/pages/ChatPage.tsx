@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useLocation } from 'react-router-dom'
 import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Tag, Modal, Popconfirm, Checkbox, Popover } from 'antd'
@@ -105,7 +105,14 @@ function ChatPage() {
   const [editTitle, setEditTitle] = useState('')
   const [streamingToolSteps, setStreamingToolSteps] = useState<ToolStep[]>([])
   const [streamingThinking, setStreamingThinking] = useState(false)
+  const [streamingCursorFast, setStreamingCursorFast] = useState(true)
+  const [cursorVisible, setCursorVisible] = useState(false)
+  const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [claudeCodeProgress, setClaudeCodeProgress] = useState('')
+  const claudeCodeLineCount = useMemo(
+    () => (claudeCodeProgress ? claudeCodeProgress.split('\n').length : 0),
+    [claudeCodeProgress],
+  )
   const [pendingImages, setPendingImages] = useState<string[]>([])
   const [imageSendStatus, setImageSendStatus] = useState<Record<number, 'sending' | 'sent' | 'error'>>({})
   const [sessionTokenUsage, setSessionTokenUsage] = useState<TokenUsage>({
@@ -976,6 +983,26 @@ function ChatPage() {
     void loadSessions()
   }
 
+  // Cursor blink: fast while streaming, slow after done
+  useEffect(() => {
+    if (loading && streamingThinking) {
+      setCursorVisible(true)
+      setStreamingCursorFast(true)
+    } else if (loading) {
+      // text streaming, start with fast
+      setCursorVisible(true)
+      setStreamingCursorFast(true)
+    } else {
+      // done, wait 300ms then switch to slow blink then hide
+      if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current)
+      cursorTimerRef.current = setTimeout(() => {
+        setStreamingCursorFast(false)
+        setTimeout(() => setCursorVisible(false), 1500)
+      }, 300)
+    }
+    return () => { if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current) }
+  }, [loading, streamingThinking])
+
   const handleCreateSession = async () => {
     try {
       const session = await api.createSession(t('chat.defaultTitle'))
@@ -1377,6 +1404,9 @@ function ChatPage() {
                             >
                               {message.content}
                             </ReactMarkdown>
+                            {cursorVisible && message.role === 'assistant' && loading && (
+                              <span className={`stream-cursor ${streamingCursorFast ? '' : 'idle'}`}>|</span>
+                            )}
                           </>
                         ) : (
                           <>
@@ -1420,7 +1450,11 @@ function ChatPage() {
                     <div className="message-content">
                       <div className="message-text loading-text">
                         <div className="loading-status">
-                          <Spin size="small" />
+                          {streamingThinking ? (
+                            <span className="pulse-dot" />
+                          ) : (
+                            <Spin size="small" />
+                          )}
                           <span>{streamingThinking ? t('chat.thinking') : streamingToolSteps.length > 0 ? t('chat.callingTool') : t('chat.thinkingOrTool')}</span>
                         </div>
                         {streamingToolSteps.length > 0 && (
@@ -1428,7 +1462,15 @@ function ChatPage() {
                         )}
                         {claudeCodeProgress && (
                           <div className="claude-code-progress">
-                            <pre>{claudeCodeProgress}</pre>
+                            <div className="claude-code-output-header">
+                              <span />
+                              <span className="claude-code-lines-badge">
+                                [{claudeCodeLineCount} lines]
+                              </span>
+                            </div>
+                            <div className="claude-code-progress-inner">
+                              <pre>{claudeCodeProgress}</pre>
+                            </div>
                           </div>
                         )}
                       </div>
