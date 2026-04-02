@@ -933,6 +933,10 @@
   padding: 1px 5px;
   border-radius: 3px;
 }
+@keyframes output-grow {
+  from { opacity: 0.7; }
+  to { opacity: 1; }
+}
 .claude-code-progress-inner {
   animation: output-grow 0.15s ease-out;
 }

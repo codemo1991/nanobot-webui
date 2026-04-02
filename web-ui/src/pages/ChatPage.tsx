@@ -108,6 +108,7 @@ function ChatPage() {
   const [streamingCursorFast, setStreamingCursorFast] = useState(true)
   const [cursorVisible, setCursorVisible] = useState(false)
   const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cursorHideRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [claudeCodeProgress, setClaudeCodeProgress] = useState('')
   const claudeCodeLineCount = useMemo(
     () => (claudeCodeProgress ? claudeCodeProgress.split('\n').length : 0),
@@ -995,12 +996,16 @@ function ChatPage() {
     } else {
       // done, wait 300ms then switch to slow blink then hide
       if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current)
+      if (cursorHideRef.current) clearTimeout(cursorHideRef.current)
       cursorTimerRef.current = setTimeout(() => {
         setStreamingCursorFast(false)
-        setTimeout(() => setCursorVisible(false), 1500)
+        cursorHideRef.current = setTimeout(() => setCursorVisible(false), 1500)
       }, 300)
     }
-    return () => { if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current) }
+    return () => {
+      if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current)
+      if (cursorHideRef.current) clearTimeout(cursorHideRef.current)
+    }
   }, [loading, streamingThinking])
 
   const handleCreateSession = async () => {
