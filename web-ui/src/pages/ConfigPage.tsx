@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography, Row, Col, Table, Alert, Tooltip, AutoComplete } from 'antd'
 import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined, ReloadOutlined } from '@ant-design/icons'
@@ -12,14 +12,15 @@ import './ConfigPage.css'
 const { Title, Text } = Typography
 const { TextArea } = Input
 
+const TabContentWrapper = ({ children }: { children: React.ReactNode }) => (
+  <div className="config-tab-content">{children}</div>
+)
+
 export default function ConfigPage() {
   const [activeTab, setActiveTab] = useState('providers')
 
   const { t } = useTranslation()
-  const TabContentWrapper = ({ children }: { children: React.ReactNode }) => (
-    <div className="config-tab-content">{children}</div>
-  )
-  const items = [
+  const items = useMemo(() => [
     { key: 'channels', label: t('config.channels'), children: <TabContentWrapper><ChannelsConfig /></TabContentWrapper> },
     { key: 'providers', label: t('config.providers'), children: <TabContentWrapper><ProvidersConfig /></TabContentWrapper> },
     { key: 'models', label: t('config.models'), children: <TabContentWrapper><ModelsConfig /></TabContentWrapper> },
@@ -28,7 +29,7 @@ export default function ConfigPage() {
     { key: 'agent-templates', label: 'Agent 模板', children: <TabContentWrapper><AgentTemplatePage /></TabContentWrapper> },
     { key: 'system-prompt', label: '主 Agent 提示词', children: <TabContentWrapper><SystemPromptPage /></TabContentWrapper> },
     { key: 'system', label: t('config.system'), children: <TabContentWrapper><SystemConfig /></TabContentWrapper> },
-  ]
+  ], [t])
 
   return (
     <div className="config-page">

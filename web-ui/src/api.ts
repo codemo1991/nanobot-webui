@@ -319,7 +319,10 @@ export const api = {
     }),
 
   // Models
-  getModels: () => request<import('./types').Model[]>('/models'),
+  getModels: (providerId?: string) =>
+    request<import('./types').Model[]>(
+      providerId ? `/models?provider_id=${encodeURIComponent(providerId)}` : '/models'
+    ),
   
   createModel: (model: Omit<import('./types').Model, 'id'>) =>
     request<import('./types').Model>('/models', {

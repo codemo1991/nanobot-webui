@@ -46,10 +46,8 @@ export const ProviderDetail: React.FC<ProviderDetailProps> = ({ provider, onUpda
 
   const loadModels = async () => {
     try {
-      const all = await api.getModels()
-      // Filter models for this provider; handle both old Model[] and new ModelInfo[]
-      const filtered = (all || []).filter((m: any) => m.providerId === provider.id)
-      setModels(filtered)
+      const all = await api.getModels(provider.id)
+      setModels((all || []))
     } catch {
       // models might use a different endpoint; silently fail
       message.error('加载模型列表失败')

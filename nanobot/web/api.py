@@ -4101,9 +4101,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
             if path == "/api/v1/models":
                 # New model router API - return detailed model info
+                # Supports optional provider_id filter via query param
+                provider_id = query.get("provider_id", [None])[0] if query else None
                 from nanobot.config.loader import get_config_repository
                 repo = get_config_repository()
-                models = repo.get_all_models()
+                models = repo.get_all_models(provider_id=provider_id)
                 # Convert snake_case to camelCase for frontend compatibility
                 models_camel = [{
                     "id": m["id"],

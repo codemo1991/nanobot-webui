@@ -189,65 +189,6 @@ class ConfigRepository:
             logger.exception("Failed to initialize base config tables")
             raise
 
-        # 独立初始化模型相关表，避免外键约束问题影响核心表创建
-        self._init_model_tables()
-
-    def _init_model_tables(self) -> None:
-        """初始化模型相关表（独立方法，便于错误隔离）。"""
-        try:
-            conn = self._connect()
-            cursor = conn.cursor()
-
-            # 模型元数据表
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS config_models (
-                    id TEXT PRIMARY KEY,
-                    provider_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    litellm_id TEXT NOT NULL,
-                    aliases TEXT DEFAULT '',
-                    capabilities TEXT DEFAULT '',
-                    context_window INTEGER DEFAULT 128000,
-                    cost_rank INTEGER,
-                    quality_rank INTEGER,
-                    enabled INTEGER DEFAULT 1,
-                    is_default INTEGER DEFAULT 0,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY (provider_id) REFERENCES config_providers(id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-
-            # 模型场景配置表
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS config_model_profiles (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    description TEXT,
-                    model_chain TEXT NOT NULL,
-                    rules TEXT,
-                    enabled INTEGER DEFAULT 1,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-
-            # 创建索引
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_models_provider ON config_models(provider_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_models_enabled ON config_models(enabled)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_profiles_enabled ON config_model_profiles(enabled)")
-
-            conn.commit()
-            conn.close()
-            logger.info("Model config tables initialized (config_models, config_model_profiles)")
-        except Exception as e:
-            # 模型表创建失败不应阻止应用启动，记录错误但继续
-            logger.warning(f"Failed to initialize model tables (non-critical): {e}")
-            logger.debug("Model table init error details", exc_info=True)
-
     def _get_timestamp(self) -> str:
         """获取当前时间戳。"""
         return datetime.now().isoformat()

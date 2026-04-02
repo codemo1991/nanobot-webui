@@ -57,7 +57,8 @@ export const AddProviderModal: React.FC<AddProviderModalProps> = ({ open, onClos
       await api.createProvider({
         id: sp.id,
         name: sp.displayName,
-        type: sp.providerType,
+        displayName: sp.displayName,
+        providerType: sp.providerType,
         apiBase: sp.apiBase,
         apiKey: '',
         enabled: false,
@@ -79,14 +80,12 @@ export const AddProviderModal: React.FC<AddProviderModalProps> = ({ open, onClos
       await api.createProvider({
         id: values.id || values.name.toLowerCase().replace(/\s+/g, '-'),
         name: values.name,
-        type: providerType,
         displayName: values.displayName || values.name,
         providerType,
         apiBase: values.apiBase || '',
         apiKey: values.apiKey || '',
         enabled: false,
-        isSystem: false,
-      } as any)
+      })
       message.success('已添加自定义 Provider')
       onAdded()
       onClose()
