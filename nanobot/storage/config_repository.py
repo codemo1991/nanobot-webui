@@ -712,6 +712,7 @@ class ConfigRepository:
                 "apiKey": provider["api_key"],
                 "apiBase": provider["api_base"],
                 "displayName": provider["display_name"],
+                "priority": provider["priority"],
             }
 
         for channel_id, channel_data in self.get_all_channels().items():
@@ -790,6 +791,7 @@ class ConfigRepository:
                 api_key=api_key,
                 api_base=api_base,
                 enabled=bool(api_key),
+                priority=provider_data.get("priority", 0),
             )
 
         channels_config = config_data.get("channels", {})
