@@ -12,6 +12,7 @@ from nanobot.agent.tool_errors import (
     format_invalid_params,
     format_tool_error,
     format_tool_not_found,
+    is_retryable_error,
 )
 from nanobot.agent.tools.base import Tool
 
@@ -97,6 +98,43 @@ class ToolRegistry:
         except Exception as e:
             logger.exception(f"Tool execution failed: {name}")
             return format_tool_error(name, e)
+
+    async def execute_with_retry(
+        self,
+        name: str,
+        params: dict[str, Any],
+        max_attempts: int = 3,
+    ) -> str:
+        """
+        Execute a tool with automatic retry for retryable errors.
+
+        Args:
+            name: Tool name.
+            params: Tool parameters.
+            max_attempts: Maximum retry attempts (default 3).
+
+        Returns:
+            Tool execution result as string.
+        """
+        last_result = None
+        for attempt in range(1, max_attempts + 1):
+            result = await self.execute(name, params)
+            last_result = result
+
+            # If not a retryable error, return immediately
+            if not is_retryable_result(result):
+                return result
+
+            # Last attempt - don't retry
+            if attempt >= max_attempts:
+                return result
+
+            # Retryable error - backoff and retry
+            backoff = 0.5 * attempt
+            logger.info(f"[ToolRetry] {name} failed (attempt {attempt}/{max_attempts}), retrying in {backoff}s...")
+            await asyncio.sleep(backoff)
+
+        return last_result or format_tool_not_found(name)
 
     def set_thread_pool(self, executor: ThreadPoolExecutor) -> None:
         """设置线程池执行器（用于CPU密集型任务）"""

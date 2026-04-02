@@ -19,6 +19,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.router import ModelRouter, ModelHandle
+from nanobot.providers.provider_manager import ProviderManager
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -148,6 +149,7 @@ class AgentLoop:
         bus: MessageBus,
         workspace: Path,
         provider: LLMProvider | None = None,
+        provider_manager: "ProviderManager | None" = None,
         model: str | None = None,
         subagent_model: str | None = None,
         max_iterations: int = 40,
@@ -190,6 +192,7 @@ class AgentLoop:
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
+        self.provider_manager = provider_manager
         self.router = router
         self._default_profile = default_profile
         self.workspace = workspace
@@ -208,10 +211,10 @@ class AgentLoop:
             except Exception as e:
                 logger.warning(f"Failed to resolve default profile '{default_profile}': {e}")
                 # 回退到旧方式
-                self.model = model or (provider.get_default_model() if provider else "anthropic/claude-opus-4-6")
+                self.model = model or (provider.get_default_model() if provider else "claude-opus-4-6")
                 self._current_handle = None
         else:
-            self.model = model or (provider.get_default_model() if provider else "anthropic/claude-opus-4-6")
+            self.model = model or (provider.get_default_model() if provider else "claude-opus-4-6")
             self._current_handle = None
 
         self.subagent_model = subagent_model or ""
@@ -1575,12 +1578,6 @@ class AgentLoop:
         vision_keywords = ["vision", "vl", "qwen-vl", "gpt-4v", "gpt-4o", "claude-3-opus", "claude-3-sonnet", "claude-3-5", "claude-4"]
         return any(kw in model_lower for kw in vision_keywords)
 
-    def _is_dashscope_model(self, model: str) -> bool:
-        """Check if model is DashScope/Qwen (LiteLLM has known bug #16007 that drops images)."""
-        if not model:
-            return False
-        return any(k in model.lower() for k in ("dashscope", "qwen"))
-
     def _is_image_file(self, path: str) -> bool:
         """Check if a file is an image based on extension or mime type."""
         import mimetypes
@@ -2178,8 +2175,19 @@ class AgentLoop:
 
         # Build initial messages (use get_history for LLM-formatted messages)
         mirror_attack_level = msg.metadata.get("attack_level") if msg.metadata else None
+        # Web 渠道在 chat_stream() 中已提前保存了用户消息，session.get_history() 返回的
+        # 历史已包含本条消息；而 build_messages() 还会再 append 一次 current_message，
+        # 导致末尾出现两条内容相同的用户消息。
+        # 修复：当 user_message_saved=True 时，先从历史中去掉最后那条（已保存的）
+        # 用户消息，让 build_messages 统一追加，避免重复。
+        _user_message_saved = bool(
+            (msg.metadata or {}).get("user_message_saved")
+        )
+        raw_history = session.get_history(max_messages=self.max_history_messages)
+        if _user_message_saved and raw_history and raw_history[-1].get("role") == "user":
+            raw_history = raw_history[:-1]
         messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.max_history_messages),
+            history=raw_history,
             current_message=current_message,
             media=msg.media if msg.media else None,
             channel=msg.channel,
@@ -2198,15 +2206,10 @@ class AgentLoop:
 
         if image_files:
             main_model_supports_vision = self._is_vision_model(self.model)
-            # LiteLLM 存在 Bug #16007：DashScope 图文混排时丢弃图片，仅传递文本
-            # 对 DashScope 模型强制使用 inline recognition 以 bypass LiteLLM
-            # 主模型不支持视觉 或 DashScope（LiteLLM Bug #16007 会丢图）时，用 vision 子 agent
-            use_vision_subagent = (
-                (not main_model_supports_vision)
-                or (main_model_supports_vision and self._is_dashscope_model(self.model))
-            )
+            # 原 DashScope workaround (LiteLLM Bug #16007) 已随 litellm 移除
+            use_vision_subagent = not main_model_supports_vision
 
-            if main_model_supports_vision and not self._is_dashscope_model(self.model):
+            if main_model_supports_vision:
                 # 主模型支持视觉且非 DashScope，直接发送图片
                 logger.info("[Image] Main model supports vision, letting model handle images directly")
             elif use_vision_subagent:
@@ -3485,40 +3488,35 @@ class AgentLoop:
         error_messages = []
 
         for idx, model_id in enumerate(models_to_try):
-            model_litellm = None
-            api_key = None
-            api_base = None
+            provider_instance = None
+            native_model = None
 
             try:
                 if self.router:
                     handle = self.router.get(model_id)
-                    model_litellm = handle.model
-                    api_key = handle.api_key
-                    api_base = handle.api_base
+                    provider_instance = handle.provider
+                    native_model = handle.model
                 else:
-                    model_litellm = model_id
+                    provider_instance = self.provider
+                    native_model = model_id
             except Exception as e:
                 logger.warning(f"[ModelFailover] 解析模型 {model_id} 失败: {e}")
-                # 回退：直接使用模型 ID 作为 LiteLLM ID，使用 provider 默认配置
-                model_litellm = model_id
-                api_key = getattr(self.provider, 'api_key', None)
-                api_base = getattr(self.provider, 'api_base', None)
-                logger.debug(f"[ModelFailover] 使用回退配置: model={model_litellm}, api_base={api_base}")
+                provider_instance = self.provider
+                native_model = model_id
+                logger.debug(f"[ModelFailover] 使用回退 provider: model={native_model}")
 
             for attempt in range(max_attempts_per_model):
                 try:
                     logger.debug(f"[ModelFailover] 尝试模型 {model_id} (attempt {attempt + 1})")
-                    response = await self.provider.chat(
+                    response = await provider_instance.chat(
                         messages=messages,
                         tools=tools,
-                        model=model_litellm,
-                        api_key=api_key,
-                        api_base=api_base,
+                        model=native_model,
                     )
 
                     if idx > 0:
                         logger.info(f"[ModelFailover] 故障转移成功: {models_to_try[0]} -> {model_id}")
-                    return response, model_litellm
+                    return response, native_model
 
                 except Exception as e:
                     last_error = e
@@ -3536,7 +3534,7 @@ class AgentLoop:
                             return LLMResponse(
                                 content=f"模型服务暂时不可用，请检查配置或稍后重试。详情: {str(e)[:150]}",
                                 finish_reason="error",
-                            ), model_litellm or model_id
+                            ), native_model or model_id
                         break
                     else:
                         # 不可恢复的错误，记录并尝试下一个模型

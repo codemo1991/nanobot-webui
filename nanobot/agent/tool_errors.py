@@ -24,11 +24,18 @@ def is_retryable_error(exc: BaseException) -> bool:
         return True
     # HTTP 错误（如 aiohttp.ClientResponseError）
     msg = str(exc).lower()
-    if "429" in msg or "timeout" in msg or "connection" in msg:
-        return True
-    if "503" in msg or "502" in msg or "504" in msg or "500" in msg:
-        return True
-    return False
+    error_type = type(exc).__name__.lower()
+    combined = msg + " " + error_type
+
+    # 可重试的关键字模式
+    retryable_keywords = {
+        "429", "timeout", "connection",
+        "503", "502", "504", "500",
+        "overloaded", "rate_limit", "529",
+        "unavailable", "internal_error"
+    }
+
+    return any(kw in combined for kw in retryable_keywords)
 
 
 def format_tool_error(

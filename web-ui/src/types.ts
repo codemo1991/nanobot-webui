@@ -150,14 +150,17 @@ export interface ChannelsConfig {
   dingtalk: DingTalkChannel
 }
 
-// AI Model Provider
+// AI Model Provider (native SDK: OpenAI, Anthropic, DeepSeek, Azure OpenAI)
 export interface Provider {
   id: string
   name: string
-  type: 'openai' | 'anthropic' | 'azure' | 'deepseek' | 'openrouter' | 'groq' | 'zhipu' | 'dashscope' | 'gemini' | 'vllm' | 'minimax'
+  type: 'openai' | 'anthropic' | 'deepseek' | 'azure'
   apiKey?: string
   apiBase?: string
   enabled: boolean
+  // Azure-specific
+  apiVersion?: string
+  azureDeployment?: string
 }
 
 export interface ModelParameters {

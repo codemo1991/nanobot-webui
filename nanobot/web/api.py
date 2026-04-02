@@ -29,7 +29,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.defaults import init_default_profiles, init_default_agent_config
 from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, get_system_db_path, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
-from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.providers.provider_manager import ProviderManager
 from nanobot.providers.router import ModelRouter
 from nanobot.services.mirror_service import MirrorService
 from nanobot.services.system_status_service import SystemStatusService
@@ -96,8 +96,30 @@ class NanobotWebAPI:
         init_default_profiles(repo)
         init_default_agent_config(repo)
 
+        # Initialize native SDK providers
+        from nanobot.providers.openai_provider import OpenAIProvider
+        from nanobot.providers.anthropic_provider import AnthropicProvider
+        from nanobot.providers.deepseek_provider import DeepSeekProvider
+        from nanobot.providers.azure_provider import AzureProvider
+
+        # Initialize ProviderManager - manages all native SDK provider instances
+        self.provider_manager = ProviderManager()
+
         # Initialize ModelRouter - the new unified model resolution
         self.router = ModelRouter(repo)
+
+        # Instantiate and register all native providers
+        openai_provider = OpenAIProvider()
+        anthropic_provider = AnthropicProvider()
+        deepseek_provider = DeepSeekProvider()
+        azure_provider = AzureProvider()
+
+        self.provider_manager.register_all(
+            openai=openai_provider,
+            anthropic=anthropic_provider,
+            deepseek=deepseek_provider,
+            azure=azure_provider,
+        )
 
         # Check if we have any usable models
         try:
@@ -109,18 +131,10 @@ class NanobotWebAPI:
                 f"No usable model configuration found: {e}. "
                 "Please configure providers and models via the Config page."
             )
-            # Create a dummy router that will fail gracefully
             handle = None
 
-        # 使用 ModelRouter 解析的模型，不再依赖 config.agents.defaults.model
-        model = handle.model if handle else "anthropic/claude-opus-4-6"
-        api_key = config.get_api_key(model)
-        api_base = config.get_api_base(model)
-        provider = LiteLLMProvider(
-            api_key=api_key,
-            api_base=api_base,
-            default_model=model,
-        )
+        # 使用 ModelRouter 解析的模型（原生格式，不再是 litellm 格式）
+        model = handle.model if handle else "claude-opus-4-6"
 
         # Initialize system status service first (needed by AgentLoop)
         # 优先使用 workspace 特定的数据库，否则使用默认数据库
@@ -157,14 +171,14 @@ class NanobotWebAPI:
         self.agent_template_manager = AgentTemplateManager(workspace_path)
 
         # Pre-register API keys for custom models in templates
-        self._register_template_model_keys(provider, config)
-        # 启动时将所有已配置 provider 的 api_key 注入环境变量，供 profile 解析到的模型使用
-        self._register_all_provider_keys(provider, config)
+        # 启动时从配置加载所有 provider 的 api_key
+        self.provider_manager.update_from_config(config)
+        # 注册到 router，使 router.get() 返回的 ModelHandle 携带 provider 实例
+        self.provider_manager.register_with_router(self.router)
 
         self._workspace_path = workspace_path  # 用于 web-ui 图片等文件保存到 workspace/.nanobot/media
         self.agent = AgentLoop(
             bus=MessageBus(),
-            provider=provider,
             workspace=config.workspace_path,
             model=model,
             subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
@@ -179,8 +193,9 @@ class NanobotWebAPI:
             thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
             status_service=self.status_service,
             agent_template_manager=self.agent_template_manager,
-            # 新架构：传入 ModelRouter
+            # 新架构：传入 ModelRouter + ProviderManager
             router=self.router,
+            provider_manager=self.provider_manager,
             default_profile=self.default_profile,
             # 微内核委托配置
             microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
@@ -305,7 +320,7 @@ class NanobotWebAPI:
         from nanobot.services.auto_memory_integration import AutoMemoryIntegrationService
         self.auto_memory_integration = AutoMemoryIntegrationService(
             workspace=workspace_path,
-            provider=provider,
+            provider_manager=self.provider_manager,
             model=model,
             lookback_minutes=config.memory.lookback_minutes,
             max_messages=config.memory.max_messages,
@@ -315,7 +330,7 @@ class NanobotWebAPI:
         from nanobot.services.memory_maintenance import MemoryMaintenanceService
         self.memory_maintenance = MemoryMaintenanceService(
             workspace=workspace_path,
-            provider=provider,
+            provider_manager=self.provider_manager,
             model=model,
             summarize_interval_min=config.memory.auto_integrate_interval_minutes,
             max_entries=config.memory.max_entries,
@@ -410,13 +425,13 @@ class NanobotWebAPI:
             return None
 
     def _get_effective_model(self) -> str:
-        """从 ModelRouter 解析当前生效的模型，不再使用 config.agents.defaults.model"""
+        """从 ModelRouter 解析当前生效的模型（原生格式）。"""
         if hasattr(self, "router") and hasattr(self, "default_profile"):
             try:
                 return self.router.get(self.default_profile).model
             except Exception:
                 pass
-        return "anthropic/claude-opus-4-6"
+        return "claude-opus-4-6"
 
     def _get_stored_mcp_tools(self) -> dict[str, list[dict[str, Any]]]:
         """Read stored MCP tools from SQLite database, returning a dict mapping mcp_id -> tools list."""
@@ -428,23 +443,6 @@ class NanobotWebAPI:
         """Reinitialize agent and status service with new workspace (hot reload)."""
         config = load_config()
         model = self._get_effective_model()
-        api_key = config.get_api_key(model)
-        api_base = config.get_api_base(model)
-        is_bedrock = model.startswith("bedrock/")
-        if not api_key and not is_bedrock:
-            logger.warning("No API key configured; agent will not be able to process chat until configured.")
-        provider = LiteLLMProvider(
-            api_key=api_key,
-            api_base=api_base,
-            default_model=model,
-        )
-        subagent_model_cfg = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
-        if subagent_model_cfg:
-            sa_key = config.get_api_key(subagent_model_cfg)
-            if sa_key:
-                provider.ensure_api_key_for_model(
-                    subagent_model_cfg, sa_key, config.get_api_base(subagent_model_cfg)
-                )
         # 使用 workspace 特定的数据库路径
         workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
         if workspace_db_path.exists():
@@ -463,7 +461,6 @@ class NanobotWebAPI:
 
         self.agent = AgentLoop(
             bus=self.agent.bus,
-            provider=provider,
             workspace=workspace_path,
             model=model,
             subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
@@ -476,6 +473,7 @@ class NanobotWebAPI:
             status_service=status_service,
             agent_template_manager=self.agent_template_manager,
             router=self.router,
+            provider_manager=self.provider_manager,
             default_profile=self.default_profile,
             # 微内核委托配置
             microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
@@ -580,36 +578,6 @@ class NanobotWebAPI:
             except self._subprocess.TimeoutExpired:
                 self.gateway_process.kill()
             self.gateway_process = None
-
-    def _register_template_model_keys(self, provider, config) -> None:
-        """Pre-register API keys for custom models configured in templates."""
-        try:
-            custom_models = self.agent_template_manager.get_all_custom_models()
-            for model in custom_models:
-                api_key = config.get_api_key(model)
-                api_base = config.get_api_base(model)
-                if api_key:
-                    provider.ensure_api_key_for_model(model, api_key, api_base)
-                    logger.info(f"Registered API key for template model: {model}")
-                else:
-                    logger.warning(f"No API key found for template model: {model}")
-        except Exception as e:
-            logger.warning(f"Failed to register template model keys: {e}")
-
-    def _register_all_provider_keys(self, provider, config) -> None:
-        """将所有已配置 provider 的 api_key 注入环境变量，供 profile 解析到的模型使用。"""
-        provider_ids = [
-            "anthropic", "openai", "openrouter", "deepseek", "groq",
-            "zhipu", "dashscope", "gemini", "vllm", "ollama", "minimax",
-        ]
-        for pid in provider_ids:
-            pc = getattr(config.providers, pid, None)
-            if pc and getattr(pc, "api_key", None) and hasattr(provider, "ensure_api_key_for_model"):
-                provider.ensure_api_key_for_model(
-                    f"{pid}/placeholder",
-                    pc.api_key,
-                    getattr(pc, "api_base", None),
-                )
 
     def _sync_gateway(self, restart: bool = False) -> None:
         """Start, stop, or restart gateway based on channel configuration."""
@@ -1768,30 +1736,25 @@ class NanobotWebAPI:
             "openai": "OpenAI",
             "openrouter": "OpenRouter",
             "deepseek": "DeepSeek",
-            "groq": "Groq",
-            "zhipu": "Zhipu (智谱)",
-            "dashscope": "Qwen (通义)",
-            "gemini": "Gemini",
-            "vllm": "vLLM",
-            "ollama": "Ollama",
-            "minimax": "Minimax",
+            "azure": "Azure OpenAI",
         }
         providers = []
-        for provider_name in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
+        for provider_name in ["openai", "anthropic", "deepseek", "azure"]:
             provider_config = getattr(config.providers, provider_name)
             if provider_config.api_key or provider_config.api_base:
-                # Ollama 仅需 api_base 即可启用
-                enabled = bool(provider_config.api_key) or (
-                    provider_name == "ollama" and provider_config.api_base
-                )
-                providers.append({
+                enabled = bool(provider_config.api_key)
+                entry = {
                     "id": provider_name,
                     "name": provider_display_names.get(provider_name, provider_name.capitalize()),
                     "type": provider_name,
-                    "apiKey": provider_config.api_key or None,  # 配置页需展示真实 key 以便编辑
+                    "apiKey": provider_config.api_key or None,
                     "apiBase": provider_config.api_base,
                     "enabled": enabled,
-                })
+                }
+                if provider_name == "azure":
+                    entry["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
+                    entry["azureDeployment"] = getattr(provider_config, "azure_deployment", "")
+                providers.append(entry)
         
         # Create default model entry - 使用 ModelRouter 解析的实际模型
         effective_model = self._get_effective_model()
@@ -1879,87 +1842,97 @@ class NanobotWebAPI:
         """Create/Enable a new AI provider configuration."""
         config = load_config()
         provider_type = data.get("type", "").lower()
-        
-        if not provider_type or provider_type not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
-            raise ValueError("Invalid provider type")
-        
+
+        if not provider_type or provider_type not in ("anthropic", "openai", "deepseek", "azure"):
+            raise ValueError(f"Invalid provider type: {provider_type}")
+
         provider_config = getattr(config.providers, provider_type)
-        provider_config.api_key = data.get("apiKey", "")
-        provider_config.api_base = data.get("apiBase")
-        
+        if hasattr(provider_config, "api_key"):
+            provider_config.api_key = data.get("apiKey", "")
+        if hasattr(provider_config, "api_base"):
+            provider_config.api_base = data.get("apiBase")
+        # Azure-specific fields
+        if provider_type == "azure":
+            if hasattr(provider_config, "api_version"):
+                provider_config.api_version = data.get("apiVersion", "2024-12-01-preview")
+            if hasattr(provider_config, "azure_deployment"):
+                provider_config.azure_deployment = data.get("azureDeployment", "")
+
         from nanobot.config.loader import save_config
         save_config(config)
-        
-        # 立即更新该 provider 的环境变量，供后续 chat 使用
-        if provider_config.api_key and hasattr(self.agent.provider, "ensure_api_key_for_model"):
-            self.agent.provider.ensure_api_key_for_model(
-                f"{provider_type}/placeholder",
-                provider_config.api_key,
-                provider_config.api_base,
+
+        # 立即热更新 provider 实例的凭据
+        if provider_config.api_key:
+            self.provider_manager.update_provider_config(
+                provider_type,
+                api_key=provider_config.api_key,
+                api_base=getattr(provider_config, "api_base", None),
             )
-        
-        enabled = bool(provider_config.api_key) or (
-            provider_type == "ollama" and provider_config.api_base
-        )
-        return {
+
+        enabled = bool(getattr(provider_config, "api_key", None))
+        result = {
             "id": provider_type,
             "name": data.get("name", provider_type.capitalize()),
             "type": provider_type,
-            "apiBase": provider_config.api_base,
-            "apiKey": provider_config.api_key or None,
+            "apiBase": getattr(provider_config, "api_base", None),
+            "apiKey": getattr(provider_config, "api_key", None) or None,
             "enabled": enabled,
         }
+        if provider_type == "azure":
+            result["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
+            result["azureDeployment"] = getattr(provider_config, "azure_deployment", "")
+        return result
 
     def update_provider(self, provider_id: str, data: dict[str, Any]) -> dict[str, Any]:
         """Update AI provider configuration."""
         config = load_config()
-        
-        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
-            raise KeyError("Provider not found")
-        
+
+        if provider_id not in ("anthropic", "openai", "deepseek", "azure"):
+            raise KeyError(f"Provider not found: {provider_id}")
+
         provider_config = getattr(config.providers, provider_id)
         if "apiKey" in data and data["apiKey"] != "***":
-            # 占位符 "***" 不覆盖；空串或新值则更新
-            provider_config.api_key = data["apiKey"]
-        if "apiBase" in data:
+            if hasattr(provider_config, "api_key"):
+                provider_config.api_key = data["apiKey"]
+        if "apiBase" in data and hasattr(provider_config, "api_base"):
             provider_config.api_base = data["apiBase"]
-        
+        # Azure-specific fields
+        if provider_id == "azure":
+            if "apiVersion" in data and hasattr(provider_config, "api_version"):
+                provider_config.api_version = data["apiVersion"]
+            if "azureDeployment" in data and hasattr(provider_config, "azure_deployment"):
+                provider_config.azure_deployment = data["azureDeployment"]
+
         from nanobot.config.loader import save_config
         save_config(config)
-        
-        # 始终更新该 provider 的环境变量（MINIMAX_API_KEY 等），供 LiteLLM 使用
-        # 否则当使用 profile 解析到 minimax 时，env 中无 key 会导致 401
-        if provider_config.api_key and hasattr(self.agent.provider, "ensure_api_key_for_model"):
-            self.agent.provider.ensure_api_key_for_model(
-                f"{provider_id}/placeholder",
-                provider_config.api_key,
-                provider_config.api_base,
+
+        # 热更新 provider 实例的凭据
+        if getattr(provider_config, "api_key", None):
+            self.provider_manager.update_provider_config(
+                provider_id,
+                api_key=provider_config.api_key,
+                api_base=getattr(provider_config, "api_base", None),
             )
-        # 若当前默认模型使用此 provider，热更新 agent 的 provider 实例配置
-        model_name = self._get_effective_model()
-        if model_name and model_name.split("/")[0] == provider_id:
-            if hasattr(self.agent.provider, "update_config"):
-                api_key = config.get_api_key(model_name)
-                api_base = config.get_api_base(model_name)
-                self.agent.provider.update_config(model_name, api_key, api_base)
-        
-        enabled = bool(provider_config.api_key) or (
-            provider_id == "ollama" and provider_config.api_base
-        )
-        return {
+
+        enabled = bool(getattr(provider_config, "api_key", None))
+        result = {
             "id": provider_id,
             "name": data.get("name", provider_id.capitalize()),
             "type": provider_id,
-            "apiBase": provider_config.api_base,
-            "apiKey": provider_config.api_key or None,
+            "apiBase": getattr(provider_config, "api_base", None),
+            "apiKey": getattr(provider_config, "api_key", None) or None,
             "enabled": enabled,
         }
+        if provider_id == "azure":
+            result["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
+            result["azureDeployment"] = getattr(provider_config, "azure_deployment", "")
+        return result
 
     def delete_provider(self, provider_id: str) -> bool:
         """Disable AI provider configuration."""
         config = load_config()
         
-        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
+        if provider_id not in ["openai", "anthropic", "deepseek", "azure"]:
             return False
         
         provider_config = getattr(config.providers, provider_id)
@@ -2725,14 +2698,17 @@ class NanobotWebAPI:
         save_config(config)
 
         # Hot reload: update running agent/provider without restart
-        if hasattr(self.agent.provider, "update_config"):
-            api_key = config.get_api_key(model_name)
-            api_base = config.get_api_base(model_name)
-            self.agent.provider.update_config(model_name, api_key, api_base)
-            if subagent_model and hasattr(self.agent.provider, "ensure_api_key_for_model"):
-                sa_key = config.get_api_key(subagent_model)
-                sa_base = config.get_api_base(subagent_model)
-                self.agent.provider.ensure_api_key_for_model(subagent_model, sa_key, sa_base)
+        self.provider_manager.update_model_config(
+            model_name,
+            api_key=config.get_api_key(model_name),
+            api_base=config.get_api_base(model_name),
+        )
+        if subagent_model:
+            self.provider_manager.update_model_config(
+                subagent_model,
+                api_key=config.get_api_key(subagent_model),
+                api_base=config.get_api_base(subagent_model),
+            )
         self.agent.update_model(model_name)
         if hasattr(self.agent, "update_subagent_model"):
             self.agent.update_subagent_model(subagent_model)
@@ -2950,13 +2926,13 @@ class NanobotWebAPI:
     def reload_agent_templates(self) -> dict[str, Any]:
         """热重载 Agent 模板"""
         success = self.agent_template_manager.reload()
-        # Re-register API keys for custom models after reload
+        # Re-register all provider configs after template reload
         if success:
             try:
                 config = load_config()
-                self._register_template_model_keys(self.agent.provider, config)
+                self.provider_manager.update_from_config(config)
             except Exception as e:
-                logger.warning(f"Failed to re-register template model keys on reload: {e}")
+                logger.warning(f"Failed to update provider config on template reload: {e}")
         return {"success": success}
 
     # ========== 主 Agent System Prompt API ==========
@@ -4801,15 +4777,17 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 if hasattr(app, "router") and hasattr(app.router, "clear_cache"):
                     app.router.clear_cache()
                 # 热更新 agent 的模型和 provider 的 api_key
-                if hasattr(app, "agent") and app.agent:
+                if hasattr(app, "agent") and app.agent and hasattr(app, "provider_manager"):
                     from nanobot.config.loader import load_config
                     cfg = load_config()
-                    if hasattr(app.agent.provider, "update_config"):
-                        api_key = cfg.get_api_key(model["litellm_id"])
-                        api_base = cfg.get_api_base(model["litellm_id"])
-                        app.agent.provider.update_config(model["litellm_id"], api_key, api_base)
+                    model_name = model.get("id", model.get("litellm_id", model_id))
+                    app.provider_manager.update_model_config(
+                        model_name,
+                        api_key=cfg.get_api_key(model_name),
+                        api_base=cfg.get_api_base(model_name),
+                    )
                     if hasattr(app.agent, "update_model"):
-                        app.agent.update_model(model["litellm_id"])
+                        app.agent.update_model(model_name)
             self._write_json(HTTPStatus.OK, _ok({"success": True}))
             return
 

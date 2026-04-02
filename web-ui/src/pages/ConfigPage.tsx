@@ -324,7 +324,9 @@ function ProvidersConfig() {
       type: provider.type,
       name: provider.name,
       apiKey: provider.apiKey || '',
-      apiBase: provider.apiBase
+      apiBase: provider.apiBase || '',
+      apiVersion: (provider as any).apiVersion || '2024-12-01-preview',
+      azureDeployment: (provider as any).azureDeployment || '',
     })
     setModalVisible(true)
   }
@@ -368,18 +370,10 @@ function ProvidersConfig() {
   }
 
   const providerOptions = [
-    { value: 'anthropic', label: 'Anthropic' },
     { value: 'openai', label: 'OpenAI' },
-    { value: 'openrouter', label: 'OpenRouter' },
+    { value: 'anthropic', label: 'Anthropic' },
     { value: 'deepseek', label: 'DeepSeek' },
-    { value: 'minimax', label: 'Minimax' },
-    { value: 'groq', label: 'Groq' },
-    { value: 'zhipu', label: 'Zhipu (智谱)' },
-    { value: 'dashscope', label: 'Qwen (通义 / DashScope)' },
-    { value: 'gemini', label: 'Gemini' },
-    { value: 'vllm', label: 'vLLM' },
-    { value: 'ollama', label: 'Ollama (本地)' },
-    { value: 'moonshot', label: 'Moonshot (Kimi)' },
+    { value: 'azure', label: 'Azure OpenAI' },
   ]
 
   return (
@@ -409,6 +403,7 @@ function ProvidersConfig() {
                 <Text>Status: <Tag color={item.enabled ? 'success' : 'default'}>{item.enabled ? 'Enabled' : 'Disabled'}</Tag></Text>
                 <Text type="secondary">API Key: {item.apiKey ? '已配置' : '未配置'}</Text>
                 {item.apiBase && <Text type="secondary" ellipsis>Base URL: {item.apiBase}</Text>}
+                {(item as any).azureDeployment && <Text type="secondary">Deployment: {(item as any).azureDeployment}</Text>}
               </Space>
             </Card>
           </List.Item>
@@ -437,6 +432,20 @@ function ProvidersConfig() {
           </Form.Item>
           <Form.Item name="apiBase" label="Base URL (可选)">
             <Input placeholder="https://api.example.com/v1" />
+          </Form.Item>
+          <Form.Item noStyle shouldUpdate={(prev, curr) => prev.type !== curr.type}>
+            {({ getFieldValue }) =>
+              getFieldValue('type') === 'azure' && (
+                <>
+                  <Form.Item name="apiVersion" label="API Version" tooltip="Azure API 版本，如 2024-12-01-preview">
+                    <Input placeholder="2024-12-01-preview" />
+                  </Form.Item>
+                  <Form.Item name="azureDeployment" label="Azure Deployment" tooltip="Azure 部署名称，如 gpt-4o">
+                    <Input placeholder="gpt-4o" />
+                  </Form.Item>
+                </>
+              )
+            }
           </Form.Item>
         </Form>
       </Modal>

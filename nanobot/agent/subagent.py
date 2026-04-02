@@ -477,11 +477,7 @@ class SubagentManager:
                         logger.info(f"[SubagentProgress] Pushed stream_done for origin_key: {origin_key}")
                     except Exception as e:
                         logger.warning(f"[SubagentProgress] Failed to push stream_done: {e}")
-                # 给 LiteLLM LoggingWorker 时间处理待处理日志，避免 Event loop is closed 等错误
-                try:
-                    loop.run_until_complete(asyncio.sleep(0.5))
-                except Exception:
-                    pass
+                # Close the event loop
                 loop.close()
 
         thread = threading.Thread(target=run_in_thread, daemon=True)

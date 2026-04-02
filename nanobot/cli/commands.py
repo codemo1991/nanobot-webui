@@ -8,6 +8,11 @@ from rich.console import Console
 from rich.table import Table
 
 from nanobot import __version__, __logo__
+from nanobot.providers.openai_provider import OpenAIProvider
+from nanobot.providers.anthropic_provider import AnthropicProvider
+from nanobot.providers.deepseek_provider import DeepSeekProvider
+from nanobot.providers.azure_provider import AzureProvider
+from nanobot.providers.provider_manager import ProviderManager
 
 app = typer.Typer(
     name="nanobot",
@@ -171,7 +176,11 @@ def gateway(
         load_config,
     )
     from nanobot.bus.queue import MessageBus
-    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.openai_provider import OpenAIProvider
+    from nanobot.providers.anthropic_provider import AnthropicProvider
+    from nanobot.providers.deepseek_provider import DeepSeekProvider
+    from nanobot.providers.azure_provider import AzureProvider
+    from nanobot.providers.provider_manager import ProviderManager
     from nanobot.providers.router import ModelRouter
     from nanobot.agent.loop import AgentLoop
     from nanobot.channels.manager import ChannelManager
@@ -192,29 +201,22 @@ def gateway(
     # Create components
     bus = MessageBus()
     
-    # Create provider (supports OpenRouter, Anthropic, OpenAI, Bedrock, Zhipu, etc.)
-    api_key = config.get_api_key(model)
-    api_base = config.get_api_base(model)
-    is_bedrock = model.startswith("bedrock/")
+    # Create native providers
+    openai_provider = OpenAIProvider()
+    anthropic_provider = AnthropicProvider()
+    deepseek_provider = DeepSeekProvider()
+    azure_provider = AzureProvider()
 
-    if not api_key and not is_bedrock:
-        console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one via the web UI Config page, or use: nanobot web-ui")
-        raise typer.Exit(1)
-    
-    provider = LiteLLMProvider(
-        api_key=api_key,
-        api_base=api_base,
-        default_model=model,
+    provider_manager = ProviderManager()
+    provider_manager.register_all(
+        openai=openai_provider,
+        anthropic=anthropic_provider,
+        deepseek=deepseek_provider,
+        azure=azure_provider,
     )
+    provider_manager.update_from_config(config)
 
     subagent_model = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
-    if subagent_model:
-        sa_key = config.get_api_key(subagent_model)
-        if sa_key and hasattr(provider, "ensure_api_key_for_model"):
-            provider.ensure_api_key_for_model(
-                subagent_model, sa_key, config.get_api_base(subagent_model)
-            )
     
     # Create cron service first (callback set after agent creation)
     cron = CronService(get_system_db_path())
@@ -225,7 +227,7 @@ def gateway(
     default_profile = repo.get_config_value("agent", "default_profile", "smart")
     agent = AgentLoop(
         bus=bus,
-        provider=provider,
+        provider=anthropic_provider,
         workspace=config.workspace_path,
         model=model,
         subagent_model=subagent_model or None,
@@ -247,6 +249,7 @@ def gateway(
         microkernel_threshold_simple=getattr(config.agents.defaults, "microkernel_threshold_simple", 15),
         microkernel_threshold_medium=getattr(config.agents.defaults, "microkernel_threshold_medium", 10),
         microkernel_threshold_complex=getattr(config.agents.defaults, "microkernel_threshold_complex", 5),
+        provider_manager=provider_manager,
     )
     
     # Set cron callback (needs agent)
@@ -295,7 +298,7 @@ def gateway(
 
     memory_maintenance = MemoryMaintenanceService(
         workspace=config.workspace_path,
-        provider=provider,
+        provider_manager=provider_manager,
         model=model,
     )
 
@@ -359,33 +362,54 @@ def mirror_seal_stale(
 ):
     """封存非当日、未封存的悟/辩会话。建议通过 crontab 每日 0 点执行。"""
     from nanobot.config.loader import get_effective_model, load_config
-    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.openai_provider import OpenAIProvider
+    from nanobot.providers.anthropic_provider import AnthropicProvider
+    from nanobot.providers.deepseek_provider import DeepSeekProvider
+    from nanobot.providers.azure_provider import AzureProvider
+    from nanobot.providers.provider_manager import ProviderManager
     from nanobot.session.manager import SessionManager
     from nanobot.services.mirror_seal_stale import seal_stale_sessions
 
     config = load_config()
     model = get_effective_model()
-    api_key = config.get_api_key(model)
-    api_base = config.get_api_base(model)
 
-    if not api_key:
-        console.print("[red]Error: No API key configured. Set providers.*.apiKey in config.[/red]")
-        raise typer.Exit(1)
+    openai_p = OpenAIProvider()
+    anthropic_p = AnthropicProvider()
+    deepseek_p = DeepSeekProvider()
+    azure_p = AzureProvider()
+    pm = ProviderManager()
+    pm.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p)
+    pm.update_from_config(config)
 
-    provider = LiteLLMProvider(
-        api_key=api_key,
-        api_base=api_base,
-        default_model=model,
-    )
     sessions = SessionManager(config.workspace_path)
 
-    async def llm_chat(messages, model=None, max_tokens=800, temperature=0.3):
-        return await provider.chat(
-            messages,
-            model=model or get_effective_model(),
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+    async def llm_chat(messages, model_id=None, max_tokens=800, temperature=0.3):
+        m = model_id or get_effective_model()
+        # Resolve model to get the provider instance
+        from nanobot.providers.router import ModelRouter
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
+        router = ModelRouter(repo)
+        router.register_providers(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p)
+        router.update_from_config(config)
+        try:
+            handle = router.get(m)
+            resp = await handle.provider.chat(
+                messages=messages,
+                model=handle.model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return resp
+        except Exception:
+            # Fallback: try anthropic provider directly
+            resp = await anthropic_p.chat(
+                messages=messages,
+                model=m,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return resp
 
     sealed = seal_stale_sessions(
         workspace=config.workspace_path,
@@ -517,33 +541,36 @@ def agent(
     """Interact with the agent directly."""
     from nanobot.config.loader import get_config_repository, get_effective_model, load_config
     from nanobot.bus.queue import MessageBus
-    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.openai_provider import OpenAIProvider
+    from nanobot.providers.anthropic_provider import AnthropicProvider
+    from nanobot.providers.deepseek_provider import DeepSeekProvider
+    from nanobot.providers.azure_provider import AzureProvider
+    from nanobot.providers.provider_manager import ProviderManager
     from nanobot.providers.router import ModelRouter
     from nanobot.agent.loop import AgentLoop
     
     config = load_config()
     model = get_effective_model()
-    api_key = config.get_api_key(model)
-    api_base = config.get_api_base(model)
-    is_bedrock = model.startswith("bedrock/")
 
-    if not api_key and not is_bedrock:
-        console.print("[red]Error: No API key configured.[/red]")
-        raise typer.Exit(1)
+    openai_p = OpenAIProvider()
+    anthropic_p = AnthropicProvider()
+    deepseek_p = DeepSeekProvider()
+    azure_p = AzureProvider()
+    pm = ProviderManager()
+    pm.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p)
+    pm.update_from_config(config)
 
     bus = MessageBus()
-    provider = LiteLLMProvider(
-        api_key=api_key,
-        api_base=api_base,
-        default_model=model
-    )
-    
+    provider = anthropic_p
+
     repo = get_config_repository()
     router = ModelRouter(repo)
+    router.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p)
+    router.update_from_config(config)
     default_profile = repo.get_config_value("agent", "default_profile", "smart")
     agent_loop = AgentLoop(
         bus=bus,
-        provider=provider,
+        provider=anthropic_p,
         workspace=config.workspace_path,
         model=model,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -563,6 +590,7 @@ def agent(
         microkernel_threshold_simple=getattr(config.agents.defaults, "microkernel_threshold_simple", 15),
         microkernel_threshold_medium=getattr(config.agents.defaults, "microkernel_threshold_medium", 10),
         microkernel_threshold_complex=getattr(config.agents.defaults, "microkernel_threshold_complex", 5),
+        provider_manager=pm,
     )
     
     if message:

@@ -1,22 +1,24 @@
-"""Model Router: Unified model resolution and provider routing."""
+"""Model Router: Unified model resolution and provider routing with native SDK instances."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 if TYPE_CHECKING:
+    from nanobot.providers.base import LLMProvider
     from nanobot.storage.config_repository import ConfigRepository
 
 
 @dataclass(frozen=True)
 class ModelHandle:
-    """Model call handle containing all necessary information for LLM invocation."""
+    """Model call handle containing the provider instance and native model ID."""
 
-    model: str              # LiteLLM model ID, e.g., "anthropic/claude-opus-4-6"
+    model: str              # Native model ID, e.g. "claude-opus-4-6" (not "anthropic/claude-opus-4-6")
     api_key: str
     api_base: str | None
-    provider_id: str        # For error tracking and health checks
+    provider: "LLMProvider"  # The provider instance to call
+    provider_id: str        # "openai" | "anthropic" | "deepseek" | "azure"
     capabilities: set[str]  # {"tools", "vision", "thinking", ...}
     context_window: int
 
@@ -31,6 +33,12 @@ class ModelRouter:
 
     Usage:
         router = ModelRouter(repo)
+        router.register_providers(
+            openai=OpenAIProvider(...),
+            anthropic=AnthropicProvider(...),
+            deepseek=DeepSeekProvider(...),
+            azure=AzureProvider(...),
+        )
 
         # By profile (recommended)
         handle = router.get("smart")      # Deep thinking
@@ -39,12 +47,77 @@ class ModelRouter:
 
         # By model ID or alias (fallback)
         handle = router.get("claude-opus-4-6")
-        handle = router.get("opus")
+        handle = router.get("gpt-4o")
     """
 
     def __init__(self, repo: "ConfigRepository"):
         self.repo = repo
         self._cache: dict[str, ModelHandle] = {}
+        self._providers: dict[str, "LLMProvider"] = {}
+
+    def register_providers(
+        self,
+        openai: "LLMProvider | None" = None,
+        anthropic: "LLMProvider | None" = None,
+        deepseek: "LLMProvider | None" = None,
+        azure: "LLMProvider | None" = None,
+    ) -> None:
+        """Register native provider instances for routing."""
+        if openai:
+            self._providers["openai"] = openai
+        if anthropic:
+            self._providers["anthropic"] = anthropic
+        if deepseek:
+            self._providers["deepseek"] = deepseek
+        if azure:
+            self._providers["azure"] = azure
+        self.clear_cache()
+        logger.debug("ModelRouter: providers registered")
+
+    def register_all(
+        self,
+        openai: "LLMProvider | None" = None,
+        anthropic: "LLMProvider | None" = None,
+        deepseek: "LLMProvider | None" = None,
+        azure: "LLMProvider | None" = None,
+    ) -> None:
+        """Register all native provider instances. Convenience alias for register_providers."""
+        self.register_providers(openai=openai, anthropic=anthropic, deepseek=deepseek, azure=azure)
+
+    def update_from_config(self, config: Any) -> None:
+        """
+        Update provider credentials from Config object (hot-update).
+
+        Replaces litellm's _register_all_provider_keys.
+        With native providers, credentials are already set on instances at startup.
+        This method just updates them from the config object.
+        """
+        for provider_id in ("anthropic", "openai", "deepseek"):
+            pc = getattr(config.providers, provider_id, None)
+            if pc and getattr(pc, "api_key", None):
+                provider = self._providers.get(provider_id)
+                if provider:
+                    provider.api_key = pc.api_key
+                    if getattr(pc, "api_base", None):
+                        provider.api_base = pc.api_base
+        # Azure has additional fields
+        azure_pc = getattr(config.providers, "azure", None)
+        if azure_pc and getattr(azure_pc, "api_key", None):
+            azure_provider = self._providers.get("azure")
+            if azure_provider:
+                azure_provider.api_key = azure_pc.api_key
+                if azure_pc.api_base:
+                    azure_provider.api_base = azure_pc.api_base
+                if getattr(azure_pc, "api_version", None):
+                    azure_provider.api_version = azure_pc.api_version
+                if getattr(azure_pc, "azure_deployment", None):
+                    azure_provider.azure_deployment = azure_pc.azure_deployment
+        self.clear_cache()
+        logger.info("ModelRouter: providers updated from config")
+
+    def _get_provider_instance(self, provider_id: str) -> "LLMProvider | None":
+        """Get the registered provider instance for a given provider_id."""
+        return self._providers.get(provider_id)
 
     def get(self, profile_or_model: str) -> ModelHandle:
         """
@@ -59,10 +132,10 @@ class ModelRouter:
             profile_or_model: Profile ID (smart/fast/coding) or model ID/alias
 
         Returns:
-            ModelHandle with complete invocation parameters
+            ModelHandle with provider instance and native model ID
 
         Raises:
-            ModelNotFoundError: If no matching model found
+            ModelNotFoundError: If no profile or model found
             NoModelAvailableError: If matched but no enabled provider
         """
         # Check cache first
@@ -125,29 +198,36 @@ class ModelRouter:
         return None
 
     def _resolve_model(self, model: dict) -> ModelHandle | None:
-        """Resolve model dict to ModelHandle."""
+        """Resolve model dict to ModelHandle with native provider instance."""
         if not model.get("enabled"):
             return None
 
-        provider = self.repo.get_provider(model["provider_id"])
-        if not provider:
-            logger.debug(f"Provider {model['provider_id']} not found for model {model['id']}")
+        provider_id = model["provider_id"]
+        provider_instance = self._get_provider_instance(provider_id)
+        if not provider_instance:
+            logger.debug(f"No provider instance registered for {provider_id}")
             return None
 
-        if not provider.get("enabled"):
-            logger.debug(f"Provider {model['provider_id']} is disabled")
+        provider_cfg = self.repo.get_provider(provider_id)
+        if not provider_cfg:
+            logger.debug(f"Provider {provider_id} config not found")
             return None
 
-        if not provider.get("api_key"):
-            logger.debug(f"Provider {model['provider_id']} has no API key")
+        if not provider_cfg.get("enabled"):
+            logger.debug(f"Provider {provider_id} is disabled")
+            return None
+
+        if not provider_cfg.get("api_key"):
+            logger.debug(f"Provider {provider_id} has no API key")
             return None
 
         return ModelHandle(
-            model=model["litellm_id"],
-            api_key=provider["api_key"],
-            api_base=provider.get("api_base"),
-            provider_id=provider["id"],
-            capabilities=set(model.get("capabilities", "").split(",")),
+            model=model.get("id") or model.get("litellm_id", ""),  # Native model ID
+            api_key=provider_cfg["api_key"],
+            api_base=provider_cfg.get("api_base"),
+            provider=provider_instance,
+            provider_id=provider_id,
+            capabilities=set(model.get("capabilities", "").split(",")) if model.get("capabilities") else set(),
             context_window=model.get("context_window", 128000),
         )
 

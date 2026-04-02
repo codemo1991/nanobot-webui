@@ -83,7 +83,7 @@ class MemoryMaintenanceService:
     def __init__(
         self,
         workspace: Path,
-        provider: Any,
+        provider_manager: Any = None,
         model: str | None = None,
         tick_interval_min: int = 5,
         summarize_interval_min: int = 60,
@@ -91,34 +91,78 @@ class MemoryMaintenanceService:
         agent_id: str | None = None,
         max_entries: int = 200,
         max_chars: int = 200 * 1024,
+        # Legacy: provider still accepted for backward compatibility
+        provider: Any = None,
     ):
         self.workspace = Path(workspace).resolve()
-        # 使用 workspace 特定的数据库
+        # Use workspace-specific database
         self._repo = get_memory_repository(self.workspace)
-        self.provider = provider
-        self.model = model or (
-            provider.get_default_model() if hasattr(provider, "get_default_model") else "anthropic/claude-sonnet-4-5"
-        )
+        self.provider_manager = provider_manager
+        self.model = model or "claude-sonnet-4-7"
         self.tick_interval_min = tick_interval_min
         self.summarize_interval_min = summarize_interval_min
         self.scope = scope
         self.agent_id = agent_id
-        # 记忆阈值配置
+        # Memory threshold config
         self._max_entries = max_entries
         self._max_chars = max_chars
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_daily_run_date: datetime.date | None = None
         self._last_summarize_run: float = 0.0
+        self._resolved_provider: Any = None
+        self._resolved_model: str = self.model
 
     async def start(self) -> None:
         """启动维护服务。"""
         self._running = True
+        # Resolve the provider and model on startup
+        await self._resolve_provider()
         self._task = asyncio.create_task(self._loop())
         try:
             await self._tick()
         except Exception as e:
             logger.warning("Memory maintenance initial tick failed: {}", e)
+        logger.info(
+            "Memory maintenance started (scope={}, tick {} min, summarize {} min)",
+            self.scope,
+            self.tick_interval_min,
+            self.summarize_interval_min,
+        )
+
+    async def _resolve_provider(self) -> None:
+        """Resolve provider instance and model for LLM calls."""
+        if self.provider_manager:
+            try:
+                from nanobot.providers.router import ModelRouter
+                from nanobot.config.loader import load_config
+                config = load_config()
+                router = ModelRouter(self._repo)
+                if hasattr(self.provider_manager, "_providers"):
+                    router._providers = self.provider_manager._providers
+                router.update_from_config(config)
+                handle = router.get(self.model)
+                self._resolved_provider = handle.provider
+                self._resolved_model = handle.model
+                logger.info(
+                    "Memory maintenance resolved: provider={}, model={}",
+                    type(self._resolved_provider).__name__,
+                    self._resolved_model,
+                )
+                return
+            except Exception as e:
+                logger.warning("Failed to resolve provider from manager: {}", e)
+        # Fallback: use the provider_manager directly (it must be a provider instance)
+        self._resolved_provider = self.provider_manager
+        self._resolved_model = self.model
+
+    async def _llm_call(self, text: str, prompt: str) -> str | None:
+        """Call LLM with the resolved provider."""
+        if not self._resolved_provider:
+            await self._resolve_provider()
+        return await _call_llm_with_retry(
+            self._resolved_provider, self._resolved_model, text, prompt
+        )
         logger.info(
             "Memory maintenance started (scope={}, tick {} min, summarize {} min)",
             self.scope,
@@ -189,9 +233,7 @@ class MemoryMaintenanceService:
             if not raw.strip():
                 return
 
-            summarized = await _call_llm_with_retry(
-                self.provider, self.model, raw, MEMORY_SUMMARIZE_PROMPT
-            )
+            summarized = await self._llm_call(raw, MEMORY_SUMMARIZE_PROMPT)
             if not summarized:
                 return
 
@@ -235,9 +277,7 @@ class MemoryMaintenanceService:
 
         try:
             prompt = _get_daily_extract_prompt(yesterday)
-            extracted = await _call_llm_with_retry(
-                self.provider, self.model, content, prompt
-            )
+            extracted = await self._llm_call(content, prompt)
             if not extracted or not extracted.strip():
                 return
 

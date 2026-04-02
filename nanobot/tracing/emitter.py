@@ -79,6 +79,8 @@ class TraceEmitter:
 
         self._buffer: deque[dict[str, Any]] = deque(maxlen=buffer_size * 2)
         self._lock = threading.Lock()
+        # 使用独立锁保护 _observers，避免在持有 _lock 时重入死锁
+        self._observers_lock = threading.Lock()
         self._observers: list[Callable[[dict[str, Any]], None]] = []
         self._flush_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -339,19 +341,22 @@ class TraceEmitter:
 
     def add_observer(self, callback: Callable[[dict[str, Any]], None]) -> None:
         """Register a callback to be invoked for every new span."""
-        with self._lock:
+        with self._observers_lock:
             self._observers.append(callback)
 
     def remove_observer(self, callback: Callable[[dict[str, Any]], None]) -> None:
         """Unregister a previously added observer callback."""
-        with self._lock:
+        with self._observers_lock:
             if callback in self._observers:
                 self._observers.remove(callback)
 
     def _notify_observers(self, span: dict[str, Any]) -> None:
-        """Invoke all registered observers with a span dict."""
-        callbacks: list[Callable[[dict[str, Any]], None]] = []
-        with self._lock:
+        """Invoke all registered observers with a span dict.
+
+        使用独立的 _observers_lock（非 _lock），避免在 _flush_unlocked()
+        持有 _lock 时重入导致死锁。
+        """
+        with self._observers_lock:
             callbacks = list(self._observers)
         for cb in callbacks:
             try:

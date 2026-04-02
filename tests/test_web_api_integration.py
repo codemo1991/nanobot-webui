@@ -19,9 +19,8 @@ def temp_db():
 
 
 @patch("nanobot.web.api.load_config")
-@patch("nanobot.web.api.LiteLLMProvider")
 @patch("nanobot.web.api.AgentLoop")
-def test_web_api_initializes_status_service(mock_agent_loop, mock_provider, mock_load_config, temp_db):
+def test_web_api_initializes_status_service(mock_agent_loop, mock_load_config, temp_db):
     """Test that NanobotWebAPI properly initializes SystemStatusService."""
     # Mock configuration
     mock_config = MagicMock()
@@ -65,9 +64,8 @@ def test_web_api_initializes_status_service(mock_agent_loop, mock_provider, mock
 
 
 @patch("nanobot.web.api.load_config")
-@patch("nanobot.web.api.LiteLLMProvider")
 @patch("nanobot.web.api.AgentLoop")
-def test_web_api_status_service_methods_work(mock_agent_loop, mock_provider, mock_load_config, temp_db):
+def test_web_api_status_service_methods_work(mock_agent_loop, mock_load_config, temp_db):
     """Test that SystemStatusService methods work through NanobotWebAPI."""
     # Mock configuration
     mock_config = MagicMock()

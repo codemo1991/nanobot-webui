@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,9 @@ class McpToolLoader:
         self._transport_refs: list[Any] = []  # Keep transport contexts alive
         self._lazy_transport_by_server: dict[str, Any] = {}  # connect_lazy 时 server_id -> transport ctx
         self._adapters: list[Any] = []
+        # 连接缓存：减少频繁建立/断开连接的开销
+        self._connection_cache: dict[str, tuple[Any, list[Any], float]] = {}  # server_id -> (session, tools, timestamp)
+        self._cache_ttl: float = 300.0  # 5 分钟 TTL
 
     def _get_enabled_mcps(self) -> list[Any]:
         return [m for m in self.mcps_config if getattr(m, "enabled", True)]
@@ -322,8 +326,6 @@ class McpToolLoader:
             logger.warning("MCP %s: not found in config", server_id)
             return None
         transport = (getattr(mcp_cfg, "transport", "stdio") or "stdio").lower()
-        # 单 Task 内完成 connect + list + 关闭，避免嵌套 wait_for 取消错任务触发 anyio cancel scope 错误
-        budget = max(timeout + 25.0, 35.0)
 
         async def _run() -> list[Any] | None:
             session, ctx = await self._connect_one(mcp_cfg, server_id, transport)
@@ -337,9 +339,10 @@ class McpToolLoader:
 
         task = asyncio.create_task(_run())
         try:
-            return await asyncio.wait_for(task, timeout=budget)
+            # 使用传入的 timeout，不再额外增加缓冲时间
+            return await asyncio.wait_for(task, timeout=timeout)
         except asyncio.TimeoutError:
-            logger.warning("MCP %s: list_tools_ephemeral exceeded %ss", server_id, budget)
+            logger.warning("MCP %s: list_tools_ephemeral exceeded %ss", server_id, timeout)
             task.cancel()
             await self._await_cancelled_connect_task(task, server_id)
             return None
@@ -363,6 +366,17 @@ class McpToolLoader:
             logger.warning("MCP package not installed")
             return None
 
+        # 检查缓存
+        cached = self._get_cached_connection(server_id)
+        if cached is not None:
+            session, tools = cached
+            # 验证 session 仍然有效
+            if session is not None:
+                logger.debug(f"MCP {server_id}: using cached connection")
+                self._sessions[server_id] = session
+                return session, tools
+            self._connection_cache.pop(server_id, None)
+
         mcp_cfg = self._find_mcp_cfg(server_id, enabled_only=True)
         if not mcp_cfg:
             logger.warning(f"MCP {server_id}: not found in config or disabled")
@@ -384,6 +398,8 @@ class McpToolLoader:
 
             result = await session.list_tools()
             self._sessions[server_id] = session
+            # 缓存连接
+            self._cache_connection(server_id, session, list(result.tools))
             return session, result.tools
         except Exception as e:
             logger.warning(f"MCP {server_id}: lazy connection failed: {e}")
@@ -406,3 +422,34 @@ class McpToolLoader:
             except ValueError:
                 pass
         await self._safe_close_session_and_transport(session, ctx)
+
+    def _is_cache_valid(self, server_id: str) -> bool:
+        """检查缓存是否有效（未过期）。"""
+        if server_id not in self._connection_cache:
+            return False
+        _, _, timestamp = self._connection_cache[server_id]
+        return (time.time() - timestamp) < self._cache_ttl
+
+    def _get_cached_connection(self, server_id: str) -> tuple[Any, list[Any]] | None:
+        """获取缓存的连接（如果有效）。"""
+        if not self._is_cache_valid(server_id):
+            self._connection_cache.pop(server_id, None)
+            return None
+        session, tools, _ = self._connection_cache[server_id]
+        return session, tools
+
+    def _cache_connection(self, server_id: str, session: Any, tools: list[Any]) -> None:
+        """缓存连接。"""
+        self._connection_cache[server_id] = (session, tools, time.time())
+
+    def invalidate_cache(self, server_id: str | None = None) -> None:
+        """
+        使缓存失效。
+
+        Args:
+            server_id: 指定服务器，不传则全部失效
+        """
+        if server_id:
+            self._connection_cache.pop(server_id, None)
+        else:
+            self._connection_cache.clear()

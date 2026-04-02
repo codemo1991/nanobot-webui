@@ -109,19 +109,28 @@ class ProviderConfig(BaseModel):
     api_base: str | None = None
 
 
+class AzureProviderConfig(BaseModel):
+    """Azure OpenAI provider configuration."""
+    api_key: str = ""
+    api_base: str | None = None
+    api_version: str = "2024-12-01-preview"
+    azure_deployment: str = ""
+
+
 class ProvidersConfig(BaseModel):
-    """Configuration for LLM providers."""
-    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
+    """Configuration for LLM providers (native SDK + legacy for DashScope API)."""
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
-    openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
+    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
-    groq: ProviderConfig = Field(default_factory=ProviderConfig)
-    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
-    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # Qwen via Aliyun DashScope
-    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
-    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # 本地 Ollama，OpenAI 兼容 API
+    azure: AzureProviderConfig = Field(default_factory=AzureProviderConfig)
+    # Legacy providers used for API calls (DashScope for vision/ASR, etc.)
+    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
+    groq: ProviderConfig = Field(default_factory=ProviderConfig)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
 class MirrorConfig(BaseModel):

@@ -159,11 +159,55 @@ class McpLazyToolAdapter(Tool):
                     if other_tool is not self and other_tool._session is None:
                         other_tool._session = self._session
 
+                # 更新本工具的 schema（如果原来是空的）
+                self._update_schema_from_discovered(tools)
+
                 logger.info(f"MCP {self._server_id}: connected on first tool call ({len(tools)} tools available)")
                 return True
             except Exception as e:
                 logger.warning(f"MCP {self._server_id}: connection error on first call: {e}")
                 return False
+
+    def _update_schema_from_discovered(self, discovered_tools: list[dict[str, Any]]) -> None:
+        """
+        从发现阶段获取的工具列表中更新本工具的 schema。
+        当原 schema 明显为空或不完整时，从 discovery 结果中获取正确的 schema，
+        使 LLM 能正确生成参数。
+        """
+        current_params = self._parameters or {}
+        current_props = current_params.get("properties", {})
+
+        # 判断 schema 是否明显为空或很可能不完整：
+        # 1. 完全没有 properties 且没有 required
+        is_empty = not current_props and not current_params.get("required")
+
+        # 2. 有 properties 但它们都没有 description 和 type（很可能是不完整的 schema）
+        is_likely_incomplete = False
+        if current_props:
+            all_props_have_nothing = all(
+                not p.get("description") and not p.get("type")
+                for p in current_props.values()
+            )
+            is_likely_incomplete = all_props_have_nothing and len(current_props) < 3
+
+        if not (is_empty or is_likely_incomplete):
+            return  # schema 看起来有效，无需更新
+
+        # 在 discovered_tools 中找到本工具的定义
+        for tool_spec in discovered_tools:
+            if tool_spec.get("name") == self._tool_name:
+                new_params = tool_spec.get("parameters") or tool_spec.get("inputSchema") or {}
+                new_props = new_params.get("properties", {})
+
+                # 只有当新 schema 有实质内容时才更新
+                if new_props or new_params.get("required"):
+                    logger.info(
+                        f"MCP {self._server_id}/{self._tool_name}: "
+                        f"更新 schema (was {'empty' if is_empty else 'incomplete'}, "
+                        f"now has properties: {list(new_props.keys())})"
+                    )
+                    self._parameters = new_params
+                break
 
     def _reset_session(self) -> None:
         """重置本 server 所有懒加载工具的 session（用于断线重连）。"""
