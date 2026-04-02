@@ -1910,59 +1910,71 @@ class NanobotWebAPI:
 
     def update_provider(self, provider_id: str, data: dict[str, Any]) -> dict[str, Any]:
         """Update AI provider configuration."""
-        config = load_config()
-
-        if provider_id not in ("anthropic", "openai", "deepseek", "azure"):
-            raise KeyError(f"Provider not found: {provider_id}")
-
-        provider_config = getattr(config.providers, provider_id)
-        if "apiKey" in data and data["apiKey"] != "***":
-            if hasattr(provider_config, "api_key"):
-                provider_config.api_key = data["apiKey"]
-        if "apiBase" in data and hasattr(provider_config, "api_base"):
-            provider_config.api_base = data["apiBase"]
-        # Azure-specific fields
-        if provider_id == "azure":
-            if "apiVersion" in data and hasattr(provider_config, "api_version"):
-                provider_config.api_version = data["apiVersion"]
-            if "azureDeployment" in data and hasattr(provider_config, "azure_deployment"):
-                provider_config.azure_deployment = data["azureDeployment"]
-
-        from nanobot.config.loader import save_config
-        save_config(config)
-
-        # 热更新 provider 实例的凭据
-        if getattr(provider_config, "api_key", None):
-            self.provider_manager.update_provider_config(
-                provider_id,
-                api_key=provider_config.api_key,
-                api_base=getattr(provider_config, "api_base", None),
-                provider_type=data.get("providerType"),
-            )
-
-        # Persist new fields to the database repo
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
-        enabled = bool(getattr(provider_config, "api_key", None))
+
+        builtins = {"anthropic", "openai", "deepseek", "azure"}
+
+        if provider_id in builtins:
+            # Existing YAML config flow for built-in providers
+            config = load_config()
+            provider_config = getattr(config.providers, provider_id)
+            if "apiKey" in data and data["apiKey"] != "***":
+                if hasattr(provider_config, "api_key"):
+                    provider_config.api_key = data["apiKey"]
+            if "apiBase" in data and hasattr(provider_config, "api_base"):
+                provider_config.api_base = data["apiBase"]
+            if provider_id == "azure":
+                if "apiVersion" in data and hasattr(provider_config, "api_version"):
+                    provider_config.api_version = data["apiVersion"]
+                if "azureDeployment" in data and hasattr(provider_config, "azure_deployment"):
+                    provider_config.azure_deployment = data["azureDeployment"]
+            from nanobot.config.loader import save_config
+            save_config(config)
+            # Hot-update
+            if getattr(provider_config, "api_key", None):
+                self.provider_manager.update_provider_config(
+                    provider_id,
+                    api_key=provider_config.api_key,
+                    api_base=getattr(provider_config, "api_base", None),
+                    provider_type=data.get("providerType"),
+                )
+            enabled = data.get("enabled", bool(getattr(provider_config, "api_key", None)))
+        else:
+            # System/custom providers: write directly to SQLite
+            enabled = data.get("enabled", False)
+
+        # Always persist to SQLite (works for both paths)
         repo.set_provider(
             provider_id=provider_id,
-            name=data.get("displayName", data.get("name", provider_id.capitalize())),
-            api_key=getattr(provider_config, "api_key", "") or "",
-            api_base=getattr(provider_config, "api_base", None),
-            enabled=data.get("enabled", enabled),
+            name=data.get("name", data.get("displayName", provider_id.capitalize())),
             display_name=data.get("displayName", data.get("name", provider_id.capitalize())),
             provider_type=data.get("providerType", provider_id),
+            api_key=data.get("apiKey", ""),
+            api_base=data.get("apiBase"),
+            enabled=enabled,
+            priority=data.get("priority", 0),
             is_system=data.get("isSystem", False),
             sort_order=data.get("sortOrder", 0),
             config_json=data.get("configJson", "{}"),
         )
 
-        result = {
+        # Hot-update for all providers that have an instance
+        pm_provider = self.provider_manager.get(provider_id)
+        if pm_provider and data.get("apiKey"):
+            self.provider_manager.update_provider_config(
+                provider_id,
+                api_key=data.get("apiKey"),
+                api_base=data.get("apiBase"),
+                provider_type=data.get("providerType"),
+            )
+
+        return {
             "id": provider_id,
-            "name": data.get("name", provider_id.capitalize()),
+            "name": data.get("name", data.get("displayName", provider_id.capitalize())),
             "type": provider_id,
-            "apiBase": getattr(provider_config, "api_base", None),
-            "apiKey": getattr(provider_config, "api_key", None) or None,
+            "apiKey": data.get("apiKey") or None,
+            "apiBase": data.get("apiBase"),
             "enabled": enabled,
             "displayName": data.get("displayName", data.get("name", provider_id.capitalize())),
             "providerType": data.get("providerType", provider_id),
@@ -1970,30 +1982,25 @@ class NanobotWebAPI:
             "sortOrder": data.get("sortOrder", 0),
             "configJson": data.get("configJson", "{}"),
         }
-        if provider_id == "azure":
-            result["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
-            result["azureDeployment"] = getattr(provider_config, "azure_deployment", "")
-        return result
 
     def delete_provider(self, provider_id: str) -> bool:
-        """Disable AI provider configuration."""
-        config = load_config()
-        
-        if provider_id not in ["openai", "anthropic", "deepseek", "azure"]:
-            return False
-        
-        provider_config = getattr(config.providers, provider_id)
-        provider_config.api_key = ""
-        provider_config.api_base = None
-
-        save_config(config)
-
-        # Also remove from SQLite
+        """Delete/disable AI provider configuration."""
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
-        repo.delete_provider(provider_id)
 
-        return True
+        # Try to delete from SQLite (system providers are protected by is_system=0 guard)
+        deleted = repo.delete_provider(provider_id)
+
+        # For builtin providers, also clear YAML config
+        if provider_id in ["openai", "anthropic", "deepseek", "azure"]:
+            config = load_config()
+            provider_config = getattr(config.providers, provider_id)
+            provider_config.api_key = ""
+            provider_config.api_base = None
+            from nanobot.config.loader import save_config
+            save_config(config)
+
+        return deleted
 
     def create_mcp(self, data: dict[str, Any]) -> dict[str, Any]:
         """Create a new MCP server configuration.
