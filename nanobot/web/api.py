@@ -1944,6 +1944,7 @@ class NanobotWebAPI:
         # Persist new fields to the database repo
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
+        enabled = bool(getattr(provider_config, "api_key", None))
         repo.set_provider(
             provider_id=provider_id,
             name=data.get("displayName", data.get("name", provider_id.capitalize())),
@@ -1957,7 +1958,6 @@ class NanobotWebAPI:
             config_json=data.get("configJson", "{}"),
         )
 
-        enabled = bool(getattr(provider_config, "api_key", None))
         result = {
             "id": provider_id,
             "name": data.get("name", provider_id.capitalize()),
