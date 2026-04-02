@@ -41,6 +41,44 @@ def ensure_system_db_initialized() -> None:
     logger.debug("System DB initialized: %s", system_db)
 
 
+def init_system_providers(repo: "ConfigRepository") -> None:
+    """Initialize system providers (is_system=True, user cannot delete).
+
+    Each provider and its models are written using ON CONFLICT upsert,
+    so calling this function repeatedly is safe.
+    """
+    from nanobot.providers.system_providers import SYSTEM_PROVIDERS
+
+    for sp in SYSTEM_PROVIDERS:
+        repo.set_provider(
+            provider_id=sp["id"],
+            name=sp["id"],
+            display_name=sp["display_name"],
+            provider_type=sp["provider_type"],
+            api_base=sp["api_base"],
+            api_key="",
+            enabled=False,
+            is_system=True,
+            sort_order=0,
+            config_json="{}",
+        )
+        # Write default models
+        for m in sp.get("models", []):
+            repo.set_model(
+                model_id=m["id"],
+                provider_id=sp["id"],
+                name=m["name"],
+                litellm_id=m["id"],
+                model_type=m.get("model_type", "chat"),
+                context_window=m.get("context_window", 128000),
+                max_tokens=m.get("max_tokens", 4096),
+                supports_vision=m.get("supports_vision", False),
+                supports_function_calling=m.get("supports_function_calling", True),
+                supports_streaming=True,
+                is_default=(m["id"] == sp.get("default_model")),
+            )
+
+
 def ensure_initial_config() -> Config:
     """
     确保 .nanobot 目录和配置存在；若不存在则创建默认配置和工作空间。
@@ -48,6 +86,7 @@ def ensure_initial_config() -> Config:
     """
     ensure_system_db_initialized()
     repo = get_config_repository()
+    init_system_providers(repo)
 
     if not repo.has_config():
         config = Config()
