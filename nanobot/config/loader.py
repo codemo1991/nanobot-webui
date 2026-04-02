@@ -49,6 +49,8 @@ def init_system_providers(repo: "ConfigRepository") -> None:
     """
     from nanobot.providers.system_providers import SYSTEM_PROVIDERS
 
+    logger.info(f"Initializing {len(SYSTEM_PROVIDERS)} system providers...")
+    total_models = 0
     for sp in SYSTEM_PROVIDERS:
         repo.set_provider(
             provider_id=sp["id"],
@@ -77,6 +79,8 @@ def init_system_providers(repo: "ConfigRepository") -> None:
                 supports_streaming=True,
                 is_default=(m["id"] == sp.get("default_model")),
             )
+            total_models += 1
+    logger.info(f"System providers initialized: {len(SYSTEM_PROVIDERS)} providers, {total_models} models")
 
 
 def ensure_initial_config() -> Config:

@@ -32,7 +32,7 @@ SYSTEM_PROVIDERS = [
             {"id": "o4-mini", "name": "o4-mini", "model_type": "chat", "context_window": 32768, "supports_function_calling": False, "supports_vision": False, "max_tokens": 4096},
             {"id": "gpt-4.1", "name": "gpt-4.1", "model_type": "chat", "context_window": 32768, "supports_function_calling": True, "supports_vision": False, "max_tokens": 4096},
             {"id": "gpt-4o", "name": "gpt-4o", "model_type": "chat", "context_window": 32768, "supports_function_calling": True, "supports_vision": True, "max_tokens": 4096},
-            {"id": "gpt-image-1", "name": "gpt-image-1", "model_type": "image", "context_window": 32768, "supports_function_calling": True, "supports_vision": False, "max_tokens": 4096},
+            {"id": "gpt-image-1", "name": "gpt-image-1", "model_type": "image", "context_window": 32768, "supports_function_calling": False, "supports_vision": False, "max_tokens": 4096},
             {"id": "DeepSeek-V3", "name": "DeepSeek-V3", "model_type": "chat", "context_window": 32768, "supports_function_calling": True, "supports_vision": False, "max_tokens": 4096},
             {"id": "DeepSeek-R1", "name": "DeepSeek-R1", "model_type": "chat", "context_window": 32768, "supports_function_calling": False, "supports_vision": False, "max_tokens": 4096},
             {"id": "claude-sonnet-4-20250514", "name": "claude-sonnet-4-20250514", "model_type": "chat", "context_window": 32768, "supports_function_calling": True, "supports_vision": True, "max_tokens": 4096},
@@ -100,7 +100,7 @@ SYSTEM_PROVIDERS = [
             {"id": "gpt-5", "name": "GPT 5", "model_type": "chat", "context_window": 128000, "supports_function_calling": True, "supports_vision": False, "max_tokens": 4096},
             {"id": "gpt-5-pro", "name": "GPT 5 Pro", "model_type": "chat", "context_window": 128000, "supports_function_calling": True, "supports_vision": False, "max_tokens": 4096},
             {"id": "gpt-5-chat", "name": "GPT 5 Chat", "model_type": "chat", "context_window": 128000, "supports_function_calling": True, "supports_vision": False, "max_tokens": 4096},
-            {"id": "gpt-image-1", "name": "GPT Image 1", "model_type": "image", "context_window": 32768, "supports_function_calling": True, "supports_vision": False, "max_tokens": 4096},
+            {"id": "gpt-image-1", "name": "GPT Image 1", "model_type": "image", "context_window": 32768, "supports_function_calling": False, "supports_vision": False, "max_tokens": 4096},
         ],
     },
     {
@@ -285,7 +285,7 @@ SYSTEM_PROVIDERS = [
             {"id": "text-embedding-v3", "name": "text-embedding-v3", "model_type": "embedding", "context_window": 8192, "supports_function_calling": False, "supports_vision": False, "max_tokens": 8192},
             {"id": "text-embedding-v2", "name": "text-embedding-v2", "model_type": "embedding", "context_window": 8192, "supports_function_calling": False, "supports_vision": False, "max_tokens": 8192},
             {"id": "text-embedding-v1", "name": "text-embedding-v1", "model_type": "embedding", "context_window": 8192, "supports_function_calling": False, "supports_vision": False, "max_tokens": 8192},
-            {"id": "qwen3-rerank", "name": "qwen3-rerank", "model_type": "chat", "context_window": 32768, "supports_function_calling": False, "supports_vision": False, "max_tokens": 4096},
+            {"id": "qwen3-rerank", "name": "qwen3-rerank", "model_type": "embedding", "context_window": 32768, "supports_function_calling": False, "supports_vision": False, "max_tokens": 4096},
         ],
     },
     {
