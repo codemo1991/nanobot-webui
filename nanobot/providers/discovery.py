@@ -36,6 +36,43 @@ class ProviderDiscovery(ABC):
         """Discover models from provider."""
         pass
 
+    def _infer_model_type(self, m: dict) -> str:
+        """Infer model type from ID or capabilities."""
+        mid = m.get("id", "")
+        caps = m.get("capabilities", [])
+        if "embedding" in mid.lower() or "embed" in mid.lower():
+            return "embedding"
+        if "rerank" in mid.lower():
+            return "embedding"
+        if "tts" in mid.lower() or "speech" in mid.lower():
+            return "audio"
+        if "dall" in mid.lower() or ("image" in mid.lower() and "generation" in str(caps).lower()):
+            return "image"
+        if "vision" in mid.lower() or "vl-" in mid.lower() or "gpt-4o" in mid.lower():
+            return "vision"
+        return "chat"
+
+    def _infer_supports_vision(self, m: dict) -> bool:
+        """Check if model supports vision."""
+        caps = m.get("capabilities", [])
+        if isinstance(caps, list) and "vision" in caps:
+            return True
+        mid = m.get("id", "")
+        vision_ids = ["vision", "vl-", "gpt-4o", "claude-3", "claude-3.5", "claude-3.7", "claude-opus-4", "claude-sonnet-4"]
+        return any(v in mid.lower() for v in vision_ids)
+
+    def _infer_supports_function_calling(self, m: dict) -> bool:
+        """Check if model supports function calling."""
+        caps = m.get("capabilities", [])
+        if isinstance(caps, list) and "tools" in caps:
+            return True
+        mid = m.get("id", "")
+        # Reasoning/reasoner models don't support function calling
+        no_function_calling = ["reasoner", "-r1", "qwq", "o1-", "o2-", "o3-", "o4-", "sonar-reasoning", "deepseek-reasoner", "r1"]
+        if any(v in mid.lower() for v in no_function_calling):
+            return False
+        return True
+
 
 class AnthropicDiscovery(ProviderDiscovery):
     """Anthropic model discovery (static list)."""
@@ -69,10 +106,15 @@ class AnthropicDiscovery(ProviderDiscovery):
             DiscoveredModel(
                 id=m["id"],
                 name=m["name"],
-                litellm_id=m["id"],  # Native ID for DB compatibility
+                litellm_id=m["id"],
                 aliases=m["aliases"],
                 capabilities=m["capabilities"],
                 context_window=m["context_window"],
+                model_type=self._infer_model_type(m),
+                max_tokens=m.get("max_tokens", 4096),
+                supports_vision=self._infer_supports_vision(m),
+                supports_function_calling=self._infer_supports_function_calling(m),
+                supports_streaming=True,
             )
             for m in self.MODELS
         ]
@@ -121,6 +163,11 @@ class OpenAIDiscovery(ProviderDiscovery):
                 aliases=m["aliases"],
                 capabilities=m["capabilities"],
                 context_window=m["context_window"],
+                model_type=self._infer_model_type(m),
+                max_tokens=m.get("max_tokens", 4096),
+                supports_vision=self._infer_supports_vision(m),
+                supports_function_calling=self._infer_supports_function_calling(m),
+                supports_streaming=True,
             )
             for m in self.MODELS
         ]
@@ -155,6 +202,11 @@ class DeepSeekDiscovery(ProviderDiscovery):
                 aliases=m["aliases"],
                 capabilities=m["capabilities"],
                 context_window=m["context_window"],
+                model_type=self._infer_model_type(m),
+                max_tokens=m.get("max_tokens", 4096),
+                supports_vision=self._infer_supports_vision(m),
+                supports_function_calling=self._infer_supports_function_calling(m),
+                supports_streaming=True,
             )
             for m in self.MODELS
         ]
@@ -189,6 +241,11 @@ class AzureDiscovery(ProviderDiscovery):
                 aliases=m["aliases"],
                 capabilities=m["capabilities"],
                 context_window=m["context_window"],
+                model_type=self._infer_model_type(m),
+                max_tokens=m.get("max_tokens", 4096),
+                supports_vision=self._infer_supports_vision(m),
+                supports_function_calling=self._infer_supports_function_calling(m),
+                supports_streaming=True,
             )
             for m in self.MODELS
         ]
