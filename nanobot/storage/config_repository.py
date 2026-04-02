@@ -334,6 +334,7 @@ class ConfigRepository:
                     "provider_type": row["provider_type"] or "openai",
                     "is_system": bool(row["is_system"]),
                     "sort_order": row["sort_order"],
+                    "config_json": row["config_json"] or "{}",
                 }
         except Exception as e:
             logger.warning(f"Failed to get provider {provider_id}: {e}")
@@ -358,6 +359,7 @@ class ConfigRepository:
                         "provider_type": row["provider_type"] or "openai",
                         "is_system": bool(row["is_system"]),
                         "sort_order": row["sort_order"],
+                        "config_json": row["config_json"] or "{}",
                     }
                     for row in rows
                 ]
@@ -369,15 +371,15 @@ class ConfigRepository:
                      api_base: str | None = None, enabled: bool = False,
                      priority: int = 0, display_name: str = "",
                      provider_type: str = "openai", is_system: bool = False,
-                     sort_order: int = 0) -> None:
+                     sort_order: int = 0, config_json: str = "{}") -> None:
         """设置 Provider 配置。"""
         updated_at = self._get_timestamp()
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         name=excluded.name,
                         api_key=excluded.api_key,
@@ -388,9 +390,10 @@ class ConfigRepository:
                         display_name=excluded.display_name,
                         provider_type=excluded.provider_type,
                         is_system=excluded.is_system,
-                        sort_order=excluded.sort_order
+                        sort_order=excluded.sort_order,
+                        config_json=excluded.config_json
                     """,
-                    (provider_id, name, api_key, api_base, int(enabled), priority, updated_at, display_name, provider_type, int(is_system), sort_order)
+                    (provider_id, name, api_key, api_base, int(enabled), priority, updated_at, display_name, provider_type, int(is_system), sort_order, config_json)
                 )
         except Exception as e:
             logger.exception(f"Failed to set provider {provider_id}")
@@ -426,6 +429,7 @@ class ConfigRepository:
                         "api_base": row["api_base"],
                         "enabled": bool(row["enabled"]),
                         "is_system": True,
+                        "config_json": row["config_json"] or "{}",
                     }
                     for row in rows
                 ]
