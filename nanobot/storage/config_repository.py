@@ -85,9 +85,39 @@ class ConfigRepository:
                     UNIQUE(tool_type, key)
                 );
 
+                CREATE TABLE IF NOT EXISTS config_models (
+                    id TEXT PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    litellm_id TEXT NOT NULL,
+                    aliases TEXT DEFAULT '',
+                    capabilities TEXT DEFAULT '',
+                    context_window INTEGER DEFAULT 128000,
+                    cost_rank INTEGER,
+                    quality_rank INTEGER,
+                    enabled INTEGER DEFAULT 1,
+                    is_default INTEGER DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (provider_id) REFERENCES config_providers(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS config_model_profiles (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    model_chain TEXT NOT NULL,
+                    rules TEXT,
+                    enabled INTEGER DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_config_category ON config(category);
                 CREATE INDEX IF NOT EXISTS idx_config_providers_enabled ON config_providers(enabled);
                 CREATE INDEX IF NOT EXISTS idx_config_channels_enabled ON config_channels(enabled);
+                CREATE INDEX IF NOT EXISTS idx_models_provider ON config_models(provider_id);
+                CREATE INDEX IF NOT EXISTS idx_models_enabled ON config_models(enabled);
+                CREATE INDEX IF NOT EXISTS idx_profiles_enabled ON config_model_profiles(enabled);
                 """
             )
             conn.commit()
