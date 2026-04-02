@@ -28,6 +28,7 @@ interface ToolStepCardProps {
 
 // Max output chunks to prevent memory bloat
 const MAX_OUTPUT_CHUNKS = 100
+const PREVIEW_LINES = 10
 
 const statusConfig = {
   pending: {
@@ -70,6 +71,8 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
   defaultExpanded = false,
 }) => {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded)
+  const [outputExpanded, setOutputExpanded] = useState(false)
+  const [copied, setCopied] = useState(false)
 
   const [runningSeconds, setRunningSeconds] = useState(0)
   const timerRef = React.useRef<ReturnType<typeof setInterval> | null>(null)
@@ -157,8 +160,30 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     return step.arguments || {}
   }, [step.arguments])
 
+  const handleCopy = async () => {
+    const text = step.result || ''
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // clipboard not available
+    }
+  }
+
+  // Reset outputExpanded when step.result changes (new result)
+  React.useEffect(() => {
+    setOutputExpanded(false)
+  }, [step.result])
+
   const hasOutputChunks = step.outputChunks && step.outputChunks.length > 0
   const showProgress = status === 'running' && step.progress
+  const resultLines = (step.result || '').split('\n')
+  const needsOutputCollapse = resultLines.length > PREVIEW_LINES
+  const outputPreview = needsOutputCollapse && !outputExpanded
+    ? resultLines.slice(0, PREVIEW_LINES).join('\n')
+    : step.result || ''
+  const hiddenCount = resultLines.length - PREVIEW_LINES
 
   return (
     <div className={`tool-step-card ${status}`}>
@@ -219,24 +244,55 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
           {hasOutputChunks && status === 'running' && (
             <div className="tool-step-section">
               <Text type="secondary" style={{ fontSize: 12 }}>实时输出</Text>
-              <pre className="tool-step-output">
-                {(step.outputChunks || []).slice(-MAX_OUTPUT_CHUNKS).map((chunk, i) => (
-                  <span
-                    key={i}
-                    className={chunk.isError ? 'output-error' : 'output-normal'}
-                  >
-                    {chunk.chunk}
-                  </span>
-                ))}
-              </pre>
+              <div className="tool-output-wrap">
+                <pre className="tool-output-collapsed">
+                  {(step.outputChunks || []).slice(-MAX_OUTPUT_CHUNKS).map((chunk, i) => (
+                    <span
+                      key={i}
+                      className={chunk.isError ? 'output-error' : 'output-normal'}
+                    >
+                      {chunk.chunk}
+                    </span>
+                  ))}
+                </pre>
+              </div>
             </div>
           )}
 
-          {/* 结果展示 */}
+          {/* 结果展示 — 折叠预览 + 操作按钮 */}
           {step.result && status === 'completed' && (
             <div className="tool-step-section">
-              <Text type="secondary" style={{ fontSize: 12 }}>执行结果</Text>
-              <pre className="tool-step-code">{step.result}</pre>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>执行结果</Text>
+                <div className="output-actions">
+                  {needsOutputCollapse && !outputExpanded && (
+                    <button className="output-action-btn" onClick={() => setOutputExpanded(true)}>
+                      [展开全部 {resultLines.length} 行]
+                    </button>
+                  )}
+                  {outputExpanded && (
+                    <button className="output-action-btn" onClick={() => setOutputExpanded(false)}>
+                      [收起]
+                    </button>
+                  )}
+                  <button className={`output-action-btn ${copied ? 'copied' : ''}`} onClick={handleCopy}>
+                    {copied ? '[已复制 ✓]' : '[复制结果]'}
+                  </button>
+                </div>
+              </div>
+              <div className="tool-output-wrap">
+                <pre className={outputExpanded ? 'tool-output-expanded' : 'tool-output-collapsed'}>
+                  {outputPreview}
+                </pre>
+                {needsOutputCollapse && !outputExpanded && (
+                  <div
+                    className="output-hidden-anchor"
+                    onClick={() => setOutputExpanded(true)}
+                  >
+                    ⚠ {hiddenCount} hidden rows — click to expand
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
