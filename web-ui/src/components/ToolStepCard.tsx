@@ -4,6 +4,7 @@ import {
   Space,
   Typography,
   Button,
+  Tooltip,
 } from 'antd'
 import {
   CheckCircleOutlined,
@@ -72,6 +73,7 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
 }) => {
   const [isExpanded, setIsExpanded] = useState(defaultExpanded)
   const [outputExpanded, setOutputExpanded] = useState(false)
+  const [paramsExpanded, setParamsExpanded] = useState(false)
   const [copied, setCopied] = useState(false)
 
   const [runningSeconds, setRunningSeconds] = useState(0)
@@ -185,6 +187,14 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     : step.result || ''
   const hiddenCount = resultLines.length - PREVIEW_LINES
 
+  const PREVIEW_PARAMS = 5
+  const paramEntries = Object.entries(args)
+  const needsParamsCollapse = paramEntries.length > PREVIEW_PARAMS
+  const visibleParams = paramsExpanded || !needsParamsCollapse
+    ? paramEntries
+    : paramEntries.slice(0, PREVIEW_PARAMS)
+  const hiddenParamsCount = paramEntries.length - PREVIEW_PARAMS
+
   return (
     <div className={`tool-step-card ${status}`}>
       <div
@@ -218,10 +228,48 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
           {/* 参数显示 */}
           {Object.keys(args).length > 0 && (
             <div className="tool-step-section">
-              <Text type="secondary" style={{ fontSize: 12 }}>参数</Text>
-              <pre className="tool-step-code">
-                {JSON.stringify(args, null, 2)}
-              </pre>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>参数</Text>
+                {!paramsExpanded && needsParamsCollapse && (
+                  <button
+                    className="params-toggle-btn"
+                    onClick={(e) => { e.stopPropagation(); setParamsExpanded(true) }}
+                  >
+                    [▼ {paramEntries.length}]
+                  </button>
+                )}
+                {paramsExpanded && (
+                  <button
+                    className="params-toggle-btn"
+                    onClick={(e) => { e.stopPropagation(); setParamsExpanded(false) }}
+                  >
+                    [▲ 隐藏]
+                  </button>
+                )}
+              </div>
+              <div className="tool-params-body">
+                {visibleParams.map(([k, v]) => {
+                  const strV = typeof v === 'object' ? JSON.stringify(v) : String(v)
+                  return (
+                    <div key={k} className="param-row">
+                      <span className="param-key">{k}:</span>
+                      {strV.length > 80
+                        ? <Tooltip title={strV} mouseEnterDelay={0.5}><span className="param-value overflow">{truncate(strV, 80)}</span></Tooltip>
+                        : <span className="param-value">{strV}</span>
+                      }
+                    </div>
+                  )
+                })}
+                {paramsExpanded && needsParamsCollapse && (
+                  <button
+                    className="params-toggle-btn"
+                    style={{ marginTop: 4 }}
+                    onClick={(e) => { e.stopPropagation(); setParamsExpanded(false) }}
+                  >
+                    [▲ 收起 {hiddenParamsCount} 项]
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -317,5 +365,9 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     prevProps.defaultExpanded === nextProps.defaultExpanded
   )
 })
+
+function truncate(str: string, maxLen: number): string {
+  return str.length > maxLen ? str.slice(0, maxLen) + '…' : str
+}
 
 export default ToolStepCard
