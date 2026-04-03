@@ -1939,6 +1939,16 @@ class NanobotWebAPI:
             config_json=data.get("configJson", "{}"),
         )
 
+        # Create provider instance and clear router cache
+        if data.get("apiKey"):
+            self.provider_manager.register_provider(
+                provider_id=provider_id,
+                api_key=data["apiKey"],
+                api_base=data.get("apiBase"),
+                provider_type=data.get("providerType", "openai"),
+            )
+            self.router.clear_cache()
+
         return {
             "id": provider_id,
             "name": data.get("displayName", data.get("name", provider_id.capitalize())),
@@ -2004,18 +2014,14 @@ class NanobotWebAPI:
             config_json=data.get("configJson", "{}"),
         )
 
-        # Hot-update for all providers that have an instance
-        pm_provider = self.provider_manager.get(provider_id)
-        if pm_provider and data.get("apiKey"):
-            self.provider_manager.update_provider_config(
-                provider_id,
-                api_key=data.get("apiKey"),
+        # Update provider instance and clear router cache
+        if data.get("apiKey"):
+            self.provider_manager.register_provider(
+                provider_id=provider_id,
+                api_key=data["apiKey"],
                 api_base=data.get("apiBase"),
-                provider_type=data.get("providerType"),
+                provider_type=data.get("providerType", "openai"),
             )
-
-        # 清除 router 缓存，确保新 api_key 下次解析时生效
-        if hasattr(self, "router") and hasattr(self.router, "clear_cache"):
             self.router.clear_cache()
 
         return {
