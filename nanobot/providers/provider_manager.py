@@ -21,6 +21,49 @@ if TYPE_CHECKING:
     from nanobot.providers.router import ModelRouter
 
 
+def create_provider_instance(
+    provider_type: str,
+    api_key: str,
+    api_base: str | None = None,
+) -> "LLMProvider":
+    """
+    Factory function to create provider instance by type.
+
+    Args:
+        provider_type: Provider type identifier (openai, anthropic, deepseek, azure, etc.)
+        api_key: API key for the provider
+        api_base: Optional API base URL
+
+    Returns:
+        Provider instance matching the type
+    """
+    # Avoid circular imports
+    from nanobot.providers.openai_provider import OpenAIProvider
+    from nanobot.providers.anthropic_provider import AnthropicProvider
+    from nanobot.providers.deepseek_provider import DeepSeekProvider
+    from nanobot.providers.azure_provider import AzureProvider
+
+    provider_type_lower = provider_type.lower() if provider_type else ""
+
+    # OpenAI-compatible types
+    if provider_type_lower in ("", "openai", "openai-compatible", "openai-response"):
+        return OpenAIProvider(api_key=api_key, api_base=api_base)
+
+    # Native SDK providers
+    if provider_type_lower == "anthropic":
+        return AnthropicProvider(api_key=api_key)
+
+    if provider_type_lower == "deepseek":
+        return DeepSeekProvider(api_key=api_key, api_base=api_base)
+
+    if provider_type_lower == "azure":
+        return AzureProvider(api_key=api_key, api_base=api_base)
+
+    # Fallback: treat as OpenAI-compatible
+    logger.warning(f"Unknown provider type '{provider_type}', falling back to OpenAIProvider")
+    return OpenAIProvider(api_key=api_key, api_base=api_base)
+
+
 class ProviderManager:
     """
     Manages all native LLM provider instances.
