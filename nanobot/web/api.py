@@ -176,6 +176,10 @@ class NanobotWebAPI:
         # 注册到 router，使 router.get() 返回的 ModelHandle 携带 provider 实例
         self.provider_manager.register_with_router(self.router)
 
+        # Initialize dynamic providers from database
+        from nanobot.config.loader import init_dynamic_providers
+        init_dynamic_providers(repo, self.provider_manager)
+
         self._workspace_path = workspace_path  # 用于 web-ui 图片等文件保存到 workspace/.nanobot/media
         self.agent = AgentLoop(
             bus=MessageBus(),
@@ -1730,36 +1734,63 @@ class NanobotWebAPI:
             },
         }
         
-        # Providers (AI) configuration
-        provider_display_names = {
+        # Providers (AI) configuration — merge YAML builtins + SQLite system/custom providers
+        repo = get_config_repository()
+        sqlite_providers = {p["id"]: p for p in repo.get_all_providers()}
+        yaml_providers_map = {
+            name: getattr(config.providers, name)
+            for name in ["openai", "anthropic", "deepseek", "azure"]
+            if hasattr(config.providers, name)
+        }
+        yaml_display_names = {
             "anthropic": "Anthropic",
             "openai": "OpenAI",
-            "openrouter": "OpenRouter",
             "deepseek": "DeepSeek",
             "azure": "Azure OpenAI",
         }
+
         providers = []
-        for provider_name in ["openai", "anthropic", "deepseek", "azure"]:
-            provider_config = getattr(config.providers, provider_name)
-            if provider_config.api_key or provider_config.api_base:
-                enabled = bool(provider_config.api_key)
-                entry = {
-                    "id": provider_name,
-                    "name": provider_display_names.get(provider_name, provider_name.capitalize()),
-                    "type": provider_name,
-                    "apiKey": provider_config.api_key or None,
-                    "apiBase": provider_config.api_base,
-                    "enabled": enabled,
-                    "displayName": provider_display_names.get(provider_name, provider_name.capitalize()),
-                    "providerType": provider_name,
-                    "isSystem": True,
-                    "sortOrder": 0,
-                    "configJson": "{}",
-                }
-                if provider_name == "azure":
-                    entry["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
-                    entry["azureDeployment"] = getattr(provider_config, "azure_deployment", "")
-                providers.append(entry)
+        # Built-in YAML providers
+        for name, provider_config in yaml_providers_map.items():
+            yaml_key = getattr(provider_config, "api_key", None) or ""
+            yaml_base = getattr(provider_config, "api_base", None)
+            # YAML credentials override SQLite values
+            sqlite_p = sqlite_providers.get(name, {})
+            entry = {
+                "id": name,
+                "name": yaml_display_names.get(name, name.capitalize()),
+                "type": name,
+                "apiKey": yaml_key or sqlite_p.get("api_key") or None,
+                "apiBase": yaml_base or sqlite_p.get("api_base"),
+                "enabled": bool(yaml_key or sqlite_p.get("api_key")),
+                "displayName": yaml_display_names.get(name, name.capitalize()),
+                "providerType": name,
+                "isSystem": True,
+                "sortOrder": 0,
+                "configJson": "{}",
+            }
+            if name == "azure":
+                entry["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
+                entry["azureDeployment"] = getattr(provider_config, "azure_deployment", "")
+            providers.append(entry)
+            # Remove from sqlite dict so we don't emit duplicates
+            sqlite_providers.pop(name, None)
+
+        # System/custom providers from SQLite
+        for sp in sqlite_providers.values():
+            providers.append({
+                "id": sp["id"],
+                "name": sp["display_name"] or sp["name"],
+                "type": sp["provider_type"],
+                "apiKey": sp["api_key"] or None,
+                "apiBase": sp["api_base"],
+                "enabled": bool(sp["enabled"]),
+                "displayName": sp["display_name"] or sp["name"],
+                "providerType": sp["provider_type"],
+                "isSystem": bool(sp["is_system"]),
+                "sortOrder": sp.get("sort_order", 0),
+                "configJson": sp.get("config_json", "{}"),
+            })
         
         # Create default model entry - 使用 ModelRouter 解析的实际模型
         effective_model = self._get_effective_model()
@@ -1979,6 +2010,10 @@ class NanobotWebAPI:
                 api_base=data.get("apiBase"),
                 provider_type=data.get("providerType"),
             )
+
+        # 清除 router 缓存，确保新 api_key 下次解析时生效
+        if hasattr(self, "router") and hasattr(self.router, "clear_cache"):
+            self.router.clear_cache()
 
         return {
             "id": provider_id,
@@ -4787,7 +4822,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 is_default = body.get("isDefault", False)
                 if is_default:
                     repo.clear_default_for_all_models_except(model_id)
-                    repo.set_config_value("agent", "default_profile", model_id)
                     _sync_smart_profile_default_model(repo, model_id)
                 repo.set_model(
                     model_id=model_id,
@@ -4858,24 +4892,15 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     enabled=model.get("enabled", True),
                     is_default=True,
                 )
-                # 同步 agent 的 default_profile，使 router 实际使用该模型（否则会继续用 smart 等 profile）
-                repo.set_config_value("agent", "default_profile", model_id)
-                # 同步 smart 场景的 model_chain，将默认模型置于首位
+                # 同步 smart 场景的 model_chain，将默认模型置于首位（router 通过 smart profile 解析）
                 _sync_smart_profile_default_model(repo, model_id)
                 if hasattr(app, "router") and hasattr(app.router, "clear_cache"):
                     app.router.clear_cache()
                 # 热更新 agent 的模型和 provider 的 api_key
+                # update_model 传入 model_id（router 通过它查找 DB，再取 litellm_id 送 API）
                 if hasattr(app, "agent") and app.agent and hasattr(app, "provider_manager"):
-                    from nanobot.config.loader import load_config
-                    cfg = load_config()
-                    model_name = model.get("id", model.get("litellm_id", model_id))
-                    app.provider_manager.update_model_config(
-                        model_name,
-                        api_key=cfg.get_api_key(model_name),
-                        api_base=cfg.get_api_base(model_name),
-                    )
                     if hasattr(app.agent, "update_model"):
-                        app.agent.update_model(model_name)
+                        app.agent.update_model(model_id)
             self._write_json(HTTPStatus.OK, _ok({"success": True}))
             return
 
@@ -5716,7 +5741,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 is_default = body.get("isDefault", existing.get("is_default", False))
                 if is_default:
                     repo.clear_default_for_all_models_except(model_id)
-                    repo.set_config_value("agent", "default_profile", model_id)
                     _sync_smart_profile_default_model(repo, model_id)
                 repo.set_model(
                     model_id=model_id,
