@@ -44,27 +44,25 @@ def ensure_system_db_initialized() -> None:
 def init_system_providers(repo: "ConfigRepository") -> None:
     """Initialize system providers (is_system=True, user cannot delete).
 
-    Each provider and its models are written using ON CONFLICT upsert,
-    so calling this function repeatedly is safe.
+    Uses INSERT ... ON CONFLICT DO NOTHING so existing provider records
+    (including user-configured api_key / enabled) are preserved on every startup.
     """
     from nanobot.providers.system_providers import SYSTEM_PROVIDERS
 
     logger.info(f"Initializing {len(SYSTEM_PROVIDERS)} system providers...")
     total_models = 0
     for sp in SYSTEM_PROVIDERS:
-        repo.set_provider(
-            provider_id=sp["id"],
-            name=sp["id"],
-            display_name=sp["display_name"],
-            provider_type=sp["provider_type"],
-            api_base=sp["api_base"],
-            api_key="",
-            enabled=False,
-            is_system=True,
-            sort_order=0,
-            config_json="{}",
-        )
-        # Write default models
+        now = repo._get_timestamp()
+        with repo._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (sp["id"], sp["id"], "", sp["api_base"], 0, 0, now, sp["display_name"], sp["provider_type"], 1, 0, "{}"),
+            )
+        # Write default models (upsert — safe to re-run)
         for m in sp.get("models", []):
             repo.set_model(
                 model_id=m["id"],
@@ -81,6 +79,47 @@ def init_system_providers(repo: "ConfigRepository") -> None:
             )
             total_models += 1
     logger.info(f"System providers initialized: {len(SYSTEM_PROVIDERS)} providers, {total_models} models")
+
+
+def init_dynamic_providers(
+    repo: "ConfigRepository",
+    provider_manager: "ProviderManager",
+) -> None:
+    """
+    Initialize all enabled providers from database as dynamic instances.
+
+    This registers all providers (including system providers from
+    system_providers.py and user-created providers) with the
+    ProviderManager so they can be used for model routing.
+
+    Args:
+        repo: ConfigRepository instance
+        provider_manager: ProviderManager instance
+    """
+    providers = repo.get_all_providers()
+
+    for p in providers:
+        if not p.get("enabled"):
+            continue
+
+        provider_id = p["id"]
+        api_key = p.get("api_key", "")
+        api_base = p.get("api_base")
+        provider_type = p.get("provider_type", "openai")
+
+        if not api_key:
+            logger.debug(f"Skipping provider '{provider_id}': enabled but no API key set")
+            continue
+
+        provider_manager.register_provider(
+            provider_id=provider_id,
+            api_key=api_key,
+            api_base=api_base,
+            provider_type=provider_type,
+        )
+
+    count = sum(1 for p in providers if p.get("enabled") and p.get("api_key"))
+    logger.debug(f"Dynamic providers initialized from database: {count} providers")
 
 
 def ensure_initial_config() -> Config:
