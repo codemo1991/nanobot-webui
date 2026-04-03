@@ -114,6 +114,20 @@ class ProviderManager:
         )
         logger.info("ProviderManager: all providers registered with router")
 
+    def sync_with_router(self, router: "ModelRouter") -> None:
+        """
+        Sync all provider instances (including dynamic) to the router.
+
+        This ensures the router can find any provider registered with
+        ProviderManager, including dynamically registered ones.
+
+        Args:
+            router: ModelRouter instance to sync with
+        """
+        for provider_id, provider in self._providers.items():
+            router._providers[provider_id] = provider
+        logger.debug(f"ProviderManager: synced {len(self._providers)} providers to router")
+
     # -------------------------------------------------------------------------
     # Hot-update methods (replace litellm's ensure_api_key_for_model / update_config)
     # -------------------------------------------------------------------------

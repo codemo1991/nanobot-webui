@@ -180,6 +180,9 @@ class NanobotWebAPI:
         from nanobot.config.loader import init_dynamic_providers
         init_dynamic_providers(repo, self.provider_manager)
 
+        # Sync dynamic providers to router
+        self.provider_manager.sync_with_router(self.router)
+
         self._workspace_path = workspace_path  # 用于 web-ui 图片等文件保存到 workspace/.nanobot/media
         self.agent = AgentLoop(
             bus=MessageBus(),
