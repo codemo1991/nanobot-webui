@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 def create_provider_instance(
     provider_type: str,
-    api_key: str,
+    api_key: str | None,
     api_base: str | None = None,
 ) -> "LLMProvider":
     """
@@ -213,6 +213,58 @@ class ProviderManager:
     def get(self, provider_id: str) -> "LLMProvider | None":
         """Get provider instance by ID."""
         return self._providers.get(provider_id)
+
+    def register_provider(
+        self,
+        provider_id: str,
+        api_key: str | None,
+        api_base: str | None = None,
+        provider_type: str = "openai",
+    ) -> None:
+        """
+        Register or update a provider instance dynamically.
+
+        Creates a new provider instance if one doesn't exist, or updates
+        the existing instance's credentials if it does.
+
+        Args:
+            provider_id: Unique identifier for the provider
+            api_key: API key (can be None to create placeholder)
+            api_base: Optional API base URL
+            provider_type: Provider type (openai, anthropic, deepseek, azure, etc.)
+        """
+        # Check if provider already exists
+        existing = self._providers.get(provider_id)
+
+        if existing:
+            # Update existing instance credentials
+            if api_key is not None:
+                existing.api_key = api_key
+            if api_base is not None:
+                existing.api_base = api_base
+            # Update provider_type if the attribute exists
+            if provider_type is not None and hasattr(existing, "provider_type"):
+                existing.provider_type = provider_type
+            logger.debug(f"ProviderManager: updated credentials for {provider_id}")
+        else:
+            # Create new instance
+            if api_key is not None:
+                instance = create_provider_instance(
+                    provider_type=provider_type,
+                    api_key=api_key,
+                    api_base=api_base,
+                )
+                self._providers[provider_id] = instance
+                logger.debug(f"ProviderManager: registered new provider {provider_id}")
+            else:
+                # Create with None key as placeholder
+                instance = create_provider_instance(
+                    provider_type=provider_type,
+                    api_key=None,
+                    api_base=api_base,
+                )
+                self._providers[provider_id] = instance
+                logger.debug(f"ProviderManager: registered placeholder for {provider_id}")
 
     def _get_provider_for_model(self, model_name: str) -> "LLMProvider | None":
         """

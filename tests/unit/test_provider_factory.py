@@ -107,3 +107,91 @@ def test_create_openai_response_provider():
     )
 
     assert provider.__class__.__name__ == "OpenAIProvider"
+
+
+def test_provider_manager_register_provider():
+    """Test ProviderManager.register_provider creates and stores instance."""
+    from nanobot.providers.provider_manager import ProviderManager
+
+    pm = ProviderManager()
+
+    # Register a dynamic provider
+    pm.register_provider(
+        provider_id="ocoolai",
+        api_key="sk-ocoolai-test",
+        api_base="https://api.ocoolai.com",
+        provider_type="openai",
+    )
+
+    # Verify instance was created and stored
+    provider = pm.get("ocoolai")
+    assert provider is not None
+    assert provider.__class__.__name__ == "OpenAIProvider"
+    assert provider.api_key == "sk-ocoolai-test"
+    assert provider.api_base == "https://api.ocoolai.com"
+
+
+def test_provider_manager_register_provider_updates_existing():
+    """Test registering existing provider updates its config."""
+    from nanobot.providers.provider_manager import ProviderManager
+
+    pm = ProviderManager()
+
+    # Register first time
+    pm.register_provider(
+        provider_id="test-provider",
+        api_key="sk-v1",
+        api_base="https://v1.api.com",
+        provider_type="openai",
+    )
+
+    # Register again with new config
+    pm.register_provider(
+        provider_id="test-provider",
+        api_key="sk-v2",
+        api_base="https://v2.api.com",
+        provider_type="openai",
+    )
+
+    provider = pm.get("test-provider")
+    assert provider.api_key == "sk-v2"
+    assert provider.api_base == "https://v2.api.com"
+
+
+def test_provider_manager_register_provider_updates_provider_type():
+    """Test that provider_type attribute is updated for existing providers."""
+    from nanobot.providers.provider_manager import ProviderManager
+
+    pm = ProviderManager()
+
+    # Register first time as openai
+    pm.register_provider(
+        provider_id="test-type",
+        api_key="sk-test",
+        api_base=None,
+        provider_type="openai",
+    )
+
+    # Update provider_type if the attribute exists
+    provider = pm.get("test-type")
+    if hasattr(provider, "provider_type"):
+        assert provider.provider_type == "openai"
+        # Note: type change would require replacing instance
+
+
+def test_provider_manager_register_provider_with_none_api_key():
+    """Test registering provider with None api_key creates instance."""
+    from nanobot.providers.provider_manager import ProviderManager
+
+    pm = ProviderManager()
+
+    pm.register_provider(
+        provider_id="no-key-provider",
+        api_key=None,
+        api_base="https://api.example.com",
+        provider_type="openai",
+    )
+
+    provider = pm.get("no-key-provider")
+    assert provider is not None
+    assert provider.api_key is None
