@@ -1,5 +1,6 @@
 """Azure OpenAI provider using native openai>=1.0 SDK."""
 
+import json
 from typing import Any
 
 from loguru import logger
@@ -77,7 +78,7 @@ class AzureProvider(LLMProvider):
                         ToolCallRequest(
                             id=tc.id,
                             name=tc.function.name,
-                            arguments=tc.function.arguments,
+                            arguments=json.loads(tc.function.arguments),
                         )
                     )
 

@@ -344,6 +344,10 @@ class ConfigRepository:
                      provider_type: str = "openai", is_system: bool = False,
                      sort_order: int = 0, config_json: str = "{}") -> None:
         """设置 Provider 配置。"""
+        # 防御：如果 name 看起来像 API key（sk- 开头），说明参数顺序错乱，用 provider_id 替代
+        if name.startswith("sk-") or name.startswith("sk1-") or ":" in name:
+            logger.warning(f"set_provider: name looks like an API key ({name[:10]}...), using provider_id instead")
+            name = provider_id
         updated_at = self._get_timestamp()
         try:
             with self._connect() as conn:
@@ -735,26 +739,16 @@ class ConfigRepository:
             self.set_config_value("mirror", self._camel_to_snake(key), value)
 
         providers_config = config_data.get("providers", {})
-        provider_names = {
-            "anthropic": "Anthropic",
-            "openai": "OpenAI",
-            "openrouter": "OpenRouter",
-            "deepseek": "DeepSeek",
-            "groq": "Groq",
-            "zhipu": "Zhipu",
-            "dashscope": "DashScope",
-            "vllm": "vLLM",
-            "ollama": "Ollama",
-            "gemini": "Gemini",
-            "minimax": "Minimax",
-        }
         for provider_id, provider_data in providers_config.items():
             api_key = provider_data.get("apiKey", "")
             api_base = provider_data.get("apiBase")
+            # displayName 从 provider_data 读（来自 load_full_config 从 SQLite 的 display_name 列），
+            # 不要用 hardcoded provider_names 映射（可能过时或被污染）
+            provider_display_name = provider_data.get("displayName", "") or provider_id.capitalize()
             self.set_provider(
                 provider_id=provider_id,
-                name=provider_names.get(provider_id, provider_id),
-                display_name=provider_names.get(provider_id, provider_id),
+                name=provider_display_name,
+                display_name=provider_display_name,
                 provider_type="openai",
                 is_system=False,
                 sort_order=0,

@@ -60,7 +60,16 @@ def init_system_providers(repo: "ConfigRepository") -> None:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
                 """,
-                (sp["id"], sp["id"], "", sp["api_base"], 0, 0, now, sp["display_name"], sp["provider_type"], 1, 0, "{}"),
+                (sp["id"], sp["id"], "", sp["api_base"], 1, 0, now, sp["display_name"], sp["provider_type"], 1, 0, "{}"),
+            )
+        # Upgrade existing system providers from enabled=0 → enabled=1 (first-start legacy).
+        # This UPDATE is conservative: it only flips providers that are still at enabled=0,
+        # which means the user has never touched them. Once a user sets enabled=0 manually,
+        # DO NOTHING on the next startup preserves that choice permanently.
+        with repo._connect() as conn:
+            conn.execute(
+                "UPDATE config_providers SET enabled=1 WHERE id=? AND enabled=0 AND is_system=1",
+                (sp["id"],),
             )
         # Write default models (upsert — safe to re-run)
         for m in sp.get("models", []):

@@ -290,8 +290,17 @@ function ProvidersConfig() {
   const [selectedProvider, setSelectedProvider] = useState<Provider | null>(null)
   const [addModalVisible, setAddModalVisible] = useState(false)
 
-  const handleRefresh = () => {
-    setSelectedProvider(null)
+  const handleRefresh = async () => {
+    // Reload providers from API and update the selected one with fresh data
+    try {
+      const fresh = await api.getProviders()
+      if (selectedProvider) {
+        const updated = fresh.find(p => p.id === selectedProvider.id)
+        if (updated) setSelectedProvider(updated)
+      }
+    } catch {
+      // Silently ignore refresh errors
+    }
   }
 
   const handleSelect = (p: Provider) => {
@@ -810,6 +819,23 @@ function ModelsConfig() {
   const [profiles, setProfiles] = useState<import('../types').ModelProfile[]>([])
   const [providers, setProviders] = useState<import('../types').Provider[]>([])
   const [activeTab, setActiveTab] = useState('profiles')
+
+  // Options for Select: enabled models (with custom input support via mode="tags")
+  const enabledModelOptions = useMemo(() => {
+    const enabledProviderIds = new Set(providers.filter(p => p.enabled).map(p => p.id))
+    return models
+      .filter(m => m.enabled && enabledProviderIds.has(m.providerId))
+      .map(m => ({ value: m.id, label: `${m.name} (${m.id})` }))
+  }, [models, providers])
+
+  // Models from enabled providers only
+  const visibleModels = useMemo(
+    () => {
+      const enabledProviderIds = new Set(providers.filter(p => p.enabled).map(p => p.id))
+      return models.filter(m => enabledProviderIds.has(m.providerId))
+    },
+    [models, providers]
+  )
   const [modelModalVisible, setModelModalVisible] = useState(false)
   const [profileModalVisible, setProfileModalVisible] = useState(false)
   const [globalDefaultModalVisible, setGlobalDefaultModalVisible] = useState(false)
@@ -959,12 +985,8 @@ function ModelsConfig() {
 
   const handleEditProfile = (profile: import('../types').ModelProfile) => {
     setEditingProfile(profile)
-    // 将逗号分隔的 modelChain 转换为数组
-    const modelChainArray = profile.modelChain ? profile.modelChain.split(',').filter(Boolean) : []
-    profileForm.setFieldsValue({
-      ...profile,
-      modelChain: modelChainArray
-    })
+    const chain = profile.modelChain ? profile.modelChain.split(',').filter(Boolean) : []
+    profileForm.setFieldsValue({ ...profile, modelChain: chain })
     setProfileModalVisible(true)
   }
 
@@ -1172,7 +1194,7 @@ function ModelsConfig() {
               }
             >
               <Table
-                dataSource={models}
+                dataSource={visibleModels}
                 columns={modelColumns}
                 rowKey="id"
                 pagination={false}
@@ -1202,7 +1224,7 @@ function ModelsConfig() {
                 modelForm.setFieldValue('litellmId', prefix || undefined)
               }}
             >
-              {providers.map(p => (
+              {providers.filter(p => p.enabled).map(p => (
                 <Select.Option key={p.id} value={p.id}>{p.name}</Select.Option>
               ))}
             </Select>
@@ -1281,14 +1303,11 @@ function ModelsConfig() {
             help="按优先级顺序选择模型，排在最前的优先使用"
           >
             <Select
-              mode="multiple"
-              placeholder="请选择模型（按优先级排序）"
-              options={models.filter(m => m.enabled).map(m => ({
-                value: m.id,
-                label: `${m.name} (${m.id})`,
-              }))}
+              mode="tags"
+              placeholder="请选择模型或直接输入模型 ID"
+              options={enabledModelOptions}
               showSearch
-              optionFilterProp="label"
+              filterOption={(input, option) => (option?.label as string)?.toLowerCase().includes(input.toLowerCase())}
             />
           </Form.Item>
           <Form.Item name="enabled" valuePropName="checked">
@@ -1319,14 +1338,11 @@ function ModelsConfig() {
             rules={[{ required: true, message: '请至少选择一个模型' }]}
           >
             <Select
-              mode="multiple"
-              placeholder="请选择模型"
-              options={models.filter(m => m.enabled).map(m => ({
-                value: m.id,
-                label: `${m.name} (${m.id})`,
-              }))}
+              mode="tags"
+              placeholder="请选择模型或直接输入模型 ID"
+              options={enabledModelOptions}
               showSearch
-              optionFilterProp="label"
+              filterOption={(input, option) => (option?.label as string)?.toLowerCase().includes(input.toLowerCase())}
             />
           </Form.Item>
         </Form>

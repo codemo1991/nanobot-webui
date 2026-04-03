@@ -222,7 +222,7 @@ class ModelRouter:
             return None
 
         return ModelHandle(
-            model=model.get("id") or model.get("litellm_id", ""),  # Native model ID
+            model=model.get("litellm_id") or model.get("id") or "",  # Native model ID
             api_key=provider_cfg["api_key"],
             api_base=provider_cfg.get("api_base"),
             provider=provider_instance,

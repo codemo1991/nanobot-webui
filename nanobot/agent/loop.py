@@ -1562,6 +1562,7 @@ class AgentLoop:
     def update_model(self, model: str) -> None:
         """Update default model at runtime (hot config)."""
         self.model = model
+        self._model_chain = [model]
         if not self.subagent_model:
             self.subagents.model = model
 
@@ -3462,13 +3463,21 @@ class AgentLoop:
         return "无法识别图片内容，请检查 vision 模板配置或 DashScope API Key。"
 
     def _resolve_model_chain(self, router: ModelRouter, profile_id: str) -> list[str]:
-        """从 router 获取 profile 的 model_chain，按优先级排序。"""
+        """从 router 获取 profile 的 model_chain，按优先级排序。仅返回 DB 中存在的模型。"""
         try:
             profile = router.repo.get_model_profile(profile_id)
             if profile:
                 model_chain = profile.get("model_chain", "")
                 if model_chain:
-                    return [m.strip() for m in model_chain.split(",") if m.strip()]
+                    ids = [m.strip() for m in model_chain.split(",") if m.strip()]
+                    valid = []
+                    for mid in ids:
+                        if router.repo.get_model(mid):
+                            valid.append(mid)
+                        else:
+                            logger.debug(f"[ModelFailover] model_chain 中的模型 {mid} 不存在于 DB，已跳过")
+                    if valid:
+                        return valid
         except Exception as e:
             logger.warning(f"[ModelFailover] 获取 model_chain 失败: {e}")
 
@@ -3501,9 +3510,18 @@ class AgentLoop:
                     native_model = model_id
             except Exception as e:
                 logger.warning(f"[ModelFailover] 解析模型 {model_id} 失败: {e}")
+                if self.provider is None:
+                    logger.debug(f"[ModelFailover] 无可用回退 provider，跳过模型 {model_id}")
+                    error_messages.append(f"{model_id}: {e}")
+                    continue
                 provider_instance = self.provider
                 native_model = model_id
                 logger.debug(f"[ModelFailover] 使用回退 provider: model={native_model}")
+
+            if provider_instance is None:
+                logger.warning(f"[ModelFailover] 模型 {model_id} 无 provider 实例，跳过")
+                error_messages.append(f"{model_id}: no provider instance")
+                continue
 
             for attempt in range(max_attempts_per_model):
                 try:

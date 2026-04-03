@@ -1,5 +1,6 @@
 """OpenAI provider using native openai>=1.0 SDK."""
 
+import json
 from typing import Any
 
 from loguru import logger
@@ -105,7 +106,7 @@ class OpenAIProvider(LLMProvider):
                             tool_calls[idx] = ToolCallRequest(
                                 id=tc.id,
                                 name=tc.function.name if tc.function else tool_calls[idx].name,
-                                arguments=tc.function.arguments
+                                arguments=json.loads(tc.function.arguments)
                                 if tc.function
                                 else tool_calls[idx].arguments,
                             )
@@ -135,7 +136,7 @@ class OpenAIProvider(LLMProvider):
                         ToolCallRequest(
                             id=tc.id,
                             name=tc.function.name,
-                            arguments=tc.function.arguments,
+                            arguments=json.loads(tc.function.arguments),
                         )
                     )
 

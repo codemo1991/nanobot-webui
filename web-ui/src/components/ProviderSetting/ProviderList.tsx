@@ -31,8 +31,7 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
 
   useEffect(() => { load() }, [])
 
-  const handleToggle = async (provider: Provider, checked: boolean, e: React.BaseSyntheticEvent) => {
-    e.stopPropagation()
+  const handleToggle = async (provider: Provider, checked: boolean) => {
     await api.updateProvider(provider.id, { ...provider, enabled: checked })
     await load()
     onRefresh()
@@ -85,7 +84,7 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
                     key="sw"
                     size="small"
                     checked={p.enabled}
-                    onChange={(checked, e) => handleToggle(p, checked, e)}
+                    onChange={(checked) => handleToggle(p, checked)}
                   />
                 ]}
               >
