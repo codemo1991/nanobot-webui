@@ -289,13 +289,14 @@ function ChannelsConfig() {
 function ProvidersConfig() {
   const [selectedProvider, setSelectedProvider] = useState<Provider | null>(null)
   const [addModalVisible, setAddModalVisible] = useState(false)
+  const [providers, setProviders] = useState<Provider[]>([])
 
   const handleRefresh = async () => {
-    // Reload providers from API and update the selected one with fresh data
     try {
       const fresh = await api.getProviders()
+      setProviders(fresh || [])
       if (selectedProvider) {
-        const updated = fresh.find(p => p.id === selectedProvider.id)
+        const updated = fresh?.find(p => p.id === selectedProvider.id)
         if (updated) setSelectedProvider(updated)
       }
     } catch {
@@ -316,6 +317,8 @@ function ProvidersConfig() {
       <div style={{ display: 'flex', height: 520 }}>
         <div style={{ width: '38%', minWidth: 280 }}>
           <ProviderList
+            providers={providers}
+            onProvidersChange={setProviders}
             onSelect={handleSelect}
             selectedId={selectedProvider?.id}
             onRefresh={handleRefresh}

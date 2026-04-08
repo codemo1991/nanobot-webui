@@ -1,19 +1,20 @@
 import React, { useState, useEffect } from 'react'
-import { List, Switch, Input, Tag, Empty, Button, message } from 'antd'
-import { PlusOutlined } from '@ant-design/icons'
+import { List, Switch, Input, Tag, Empty, Button, message, Popconfirm } from 'antd'
+import { PlusOutlined, StopOutlined } from '@ant-design/icons'
 import { api } from '../../api'
 import type { Provider } from '../../types'
 import { PROVIDER_TYPE_COLORS, PROVIDER_TYPE_ICONS } from './constants'
 
 interface ProviderListProps {
+  providers: Provider[]
+  onProvidersChange: (providers: Provider[]) => void
   onSelect: (p: Provider) => void
   selectedId?: string
   onRefresh: () => void
   onAddClick: () => void
 }
 
-export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId, onRefresh, onAddClick }) => {
-  const [providers, setProviders] = useState<Provider[]>([])
+export const ProviderList: React.FC<ProviderListProps> = ({ providers, onProvidersChange, onSelect, selectedId, onRefresh, onAddClick }) => {
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -21,7 +22,7 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
     setLoading(true)
     try {
       const data = await api.getProviders()
-      setProviders(data || [])
+      onProvidersChange(data || [])
     } catch {
       message.error('加载 Provider 列表失败')
     } finally {
@@ -33,8 +34,24 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
 
   const handleToggle = async (provider: Provider, checked: boolean) => {
     await api.updateProvider(provider.id, { ...provider, enabled: checked })
-    await load()
     onRefresh()
+  }
+
+  const handleBatchDisable = async () => {
+    const enabled = providers.filter(p => p.enabled)
+    if (enabled.length === 0) {
+      message.warning('没有已启用的 Provider')
+      return
+    }
+    try {
+      const ids = enabled.map(p => p.id)
+      await api.batchDisableProviders(ids)
+      message.success(`已禁用 ${ids.length} 个 Provider`)
+      onRefresh()
+    } catch (e: any) {
+      console.error('[BatchDisable] error:', e)
+      message.error(`批量禁用失败: ${e.message}`)
+    }
   }
 
   const filtered = providers.filter(p => {
@@ -46,21 +63,38 @@ export const ProviderList: React.FC<ProviderListProps> = ({ onSelect, selectedId
 
   return (
     <div style={{ borderRight: '1px solid #f0f0f0', height: '100%', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div style={{ padding: '8px 12px', borderBottom: '1px solid #f0f0f0', display: 'flex', gap: 8, alignItems: 'center' }}>
         <Input.Search
           placeholder="搜索 Provider..."
           onChange={e => setSearch(e.target.value)}
-          style={{ flex: 1, marginRight: 8 }}
+          style={{ flex: 1 }}
           allowClear
         />
-        <Button
-          type="primary"
-          size="small"
-          icon={<PlusOutlined />}
-          onClick={onAddClick}
-        >
-          添加
-        </Button>
+        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+          <Button
+            type="primary"
+            size="small"
+            icon={<PlusOutlined />}
+            onClick={onAddClick}
+          >
+            添加
+          </Button>
+          <Popconfirm
+            title="确认禁用"
+            description="确定要一键禁用所有已启用的 Provider 吗？"
+            onConfirm={handleBatchDisable}
+            okText="确定"
+            cancelText="取消"
+          >
+            <Button
+              size="small"
+              danger
+              icon={<StopOutlined />}
+            >
+              一键禁用
+            </Button>
+          </Popconfirm>
+        </div>
       </div>
       <div style={{ flex: 1, overflow: 'auto' }}>
         <List

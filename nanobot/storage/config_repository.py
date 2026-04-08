@@ -160,6 +160,8 @@ class ConfigRepository:
                 ("is_system", "INTEGER", "0"),
                 ("sort_order", "INTEGER", "0"),
                 ("config_json", "TEXT", "'{}'"),
+                ("api_version", "TEXT", "''"),
+                ("azure_deployment", "TEXT", "''"),
             ]:
                 try:
                     cols = {d[1] for d in conn.execute("PRAGMA table_info(config_providers)").fetchall()}
@@ -168,7 +170,7 @@ class ConfigRepository:
                         conn.commit()
                 except Exception:
                     pass
-            # 迁移：扩展 config_models 表
+            # 迁移：扩展 config_models 表（model_type 等列）
             for col, col_type, default in [
                 ("model_type", "TEXT", "'chat'"),
                 ("max_tokens", "INTEGER", "4096"),
@@ -181,8 +183,11 @@ class ConfigRepository:
                     if col not in cols:
                         conn.execute(f"ALTER TABLE config_models ADD COLUMN {col} {col_type} DEFAULT {default}")
                         conn.commit()
-                except Exception:
-                    pass
+                        logger.debug(f"Migration added column {col} to config_models")
+                    else:
+                        logger.debug(f"Migration column {col} already exists in config_models")
+                except Exception as e:
+                    logger.warning(f"Migration failed to add column {col} to config_models: {e}")
             conn.close()
             logger.debug("Base config tables initialized")
         except Exception as e:
@@ -306,6 +311,8 @@ class ConfigRepository:
                     "is_system": bool(row["is_system"]),
                     "sort_order": row["sort_order"],
                     "config_json": row["config_json"] or "{}",
+                    "api_version": row["api_version"] or "",
+                    "azure_deployment": row["azure_deployment"] or "",
                 }
         except Exception as e:
             logger.warning(f"Failed to get provider {provider_id}: {e}")
@@ -331,6 +338,8 @@ class ConfigRepository:
                         "is_system": bool(row["is_system"]),
                         "sort_order": row["sort_order"],
                         "config_json": row["config_json"] or "{}",
+                        "api_version": row["api_version"] or "",
+                        "azure_deployment": row["azure_deployment"] or "",
                     }
                     for row in rows
                 ]
@@ -342,7 +351,8 @@ class ConfigRepository:
                      api_base: str | None = None, enabled: bool = False,
                      priority: int = 0, display_name: str = "",
                      provider_type: str = "openai", is_system: bool = False,
-                     sort_order: int = 0, config_json: str = "{}") -> None:
+                     sort_order: int = 0, config_json: str = "{}",
+                     api_version: str = "", azure_deployment: str = "") -> None:
         """设置 Provider 配置。"""
         # 防御：如果 name 看起来像 API key（sk- 开头），说明参数顺序错乱，用 provider_id 替代
         if name.startswith("sk-") or name.startswith("sk1-") or ":" in name:
@@ -353,8 +363,8 @@ class ConfigRepository:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json, api_version, azure_deployment)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         name=excluded.name,
                         api_key=excluded.api_key,
@@ -366,9 +376,11 @@ class ConfigRepository:
                         provider_type=excluded.provider_type,
                         is_system=excluded.is_system,
                         sort_order=excluded.sort_order,
-                        config_json=excluded.config_json
+                        config_json=excluded.config_json,
+                        api_version=excluded.api_version,
+                        azure_deployment=excluded.azure_deployment
                     """,
-                    (provider_id, name, api_key, api_base, int(enabled), priority, updated_at, display_name, provider_type, int(is_system), sort_order, config_json)
+                    (provider_id, name, api_key, api_base, int(enabled), priority, updated_at, display_name, provider_type, int(is_system), sort_order, config_json, api_version, azure_deployment)
                 )
         except Exception as e:
             logger.exception(f"Failed to set provider {provider_id}")
@@ -386,6 +398,27 @@ class ConfigRepository:
         except Exception as e:
             logger.warning(f"Failed to delete provider {provider_id}: {e}")
             return False
+
+    def batch_disable_providers(self, provider_ids: list[str]) -> int:
+        """批量禁用 Provider。返回实际禁用的数量。"""
+        if not provider_ids:
+            return 0
+        updated_at = self._get_timestamp()
+        try:
+            with self._connect() as conn:
+                placeholders = ",".join("?" * len(provider_ids))
+                cursor = conn.execute(
+                    f"""
+                    UPDATE config_providers
+                    SET enabled = 0, updated_at = ?
+                    WHERE id IN ({placeholders}) AND enabled = 1
+                    """,
+                    [updated_at] + provider_ids
+                )
+                return cursor.rowcount
+        except Exception as e:
+            logger.warning(f"Failed to batch disable providers: {e}")
+            return 0
 
     def get_system_providers(self) -> list[dict[str, Any]]:
         """获取所有系统预置 Provider。"""

@@ -41,41 +41,66 @@ def ensure_system_db_initialized() -> None:
     logger.debug("System DB initialized: %s", system_db)
 
 
-def init_system_providers(repo: "ConfigRepository") -> None:
+def init_system_providers(repo: "ConfigRepository", yaml_config: Any = None) -> None:
     """Initialize system providers (is_system=True, user cannot delete).
 
-    Uses INSERT ... ON CONFLICT DO NOTHING so existing provider records
-    (including user-configured api_key / enabled) are preserved on every startup.
+    Writes to SQLite as the authoritative source. If yaml_config is provided
+    (Config object from YAML), its api_key values are used as the initial
+    write so that existing YAML credentials are migrated to SQLite.
+    Existing SQLite records are preserved (ON CONFLICT DO UPDATE with
+    api_key only when yaml has a non-empty key).
+
+    Args:
+        repo: ConfigRepository instance
+        yaml_config: Optional Config object with YAML values for migration
     """
     from nanobot.providers.system_providers import SYSTEM_PROVIDERS
+
+    # Extract yaml api_key values if config is provided
+    yaml_api_keys: dict[str, str] = {}
+    yaml_api_bases: dict[str, str | None] = {}
+    yaml_api_versions: dict[str, str] = {}
+    yaml_azure_deployments: dict[str, str] = {}
+    if yaml_config is not None and hasattr(yaml_config, "providers"):
+        for name in ["openai", "anthropic", "deepseek", "azure"]:
+            pc = getattr(yaml_config.providers, name, None)
+            if pc is not None:
+                yaml_api_keys[name] = getattr(pc, "api_key", "") or ""
+                yaml_api_bases[name] = getattr(pc, "api_base", None)
+                yaml_api_versions[name] = getattr(pc, "api_version", "") or ""
+                yaml_azure_deployments[name] = getattr(pc, "azure_deployment", "") or ""
 
     logger.info(f"Initializing {len(SYSTEM_PROVIDERS)} system providers...")
     total_models = 0
     for sp in SYSTEM_PROVIDERS:
+        sp_id = sp["id"]
         now = repo._get_timestamp()
+        # yaml 值作为初始写入（migration），已有记录则用 ON CONFLICT DO UPDATE
+        yaml_key = yaml_api_keys.get(sp_id, "")
+        yaml_base = yaml_api_bases.get(sp_id, sp.get("api_base"))
+        yaml_api_ver = yaml_api_versions.get(sp_id, "")
+        yaml_azure_dep = yaml_azure_deployments.get(sp_id, "")
         with repo._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO NOTHING
+                INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json, api_version, azure_deployment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    api_key=excluded.api_key,
+                    api_base=excluded.api_base,
+                    display_name=excluded.display_name,
+                    api_version=excluded.api_version,
+                    azure_deployment=excluded.azure_deployment
                 """,
-                (sp["id"], sp["id"], "", sp["api_base"], 1, 0, now, sp["display_name"], sp["provider_type"], 1, 0, "{}"),
-            )
-        # Upgrade existing system providers from enabled=0 → enabled=1 (first-start legacy).
-        # This UPDATE is conservative: it only flips providers that are still at enabled=0,
-        # which means the user has never touched them. Once a user sets enabled=0 manually,
-        # DO NOTHING on the next startup preserves that choice permanently.
-        with repo._connect() as conn:
-            conn.execute(
-                "UPDATE config_providers SET enabled=1 WHERE id=? AND enabled=0 AND is_system=1",
-                (sp["id"],),
+                (sp_id, sp_id, yaml_key, yaml_base, 1, 0, now,
+                 sp["display_name"], sp["provider_type"], 1, 0, "{}",
+                 yaml_api_ver, yaml_azure_dep),
             )
         # Write default models (upsert — safe to re-run)
         for m in sp.get("models", []):
             repo.set_model(
                 model_id=m["id"],
-                provider_id=sp["id"],
+                provider_id=sp_id,
                 name=m["name"],
                 litellm_id=m["id"],
                 model_type=m.get("model_type", "chat"),
@@ -129,6 +154,38 @@ def init_dynamic_providers(
 
     count = sum(1 for p in providers if p.get("enabled") and p.get("api_key"))
     logger.debug(f"Dynamic providers initialized from database: {count} providers")
+
+
+def ensure_models_populated(repo: "ConfigRepository") -> None:
+    """确保 config_models 表有系统模型数据。容错：列缺失时不崩溃，仅记录警告。"""
+    from nanobot.providers.system_providers import SYSTEM_PROVIDERS
+
+    total = 0
+    skipped = 0
+    for sp in SYSTEM_PROVIDERS:
+        for m in sp.get("models", []):
+            try:
+                repo.set_model(
+                    model_id=m["id"],
+                    provider_id=sp["id"],
+                    name=m["name"],
+                    litellm_id=m["id"],
+                    model_type=m.get("model_type", "chat"),
+                    context_window=m.get("context_window", 128000),
+                    max_tokens=m.get("max_tokens", 4096),
+                    supports_vision=m.get("supports_vision", False),
+                    supports_function_calling=m.get("supports_function_calling", True),
+                    supports_streaming=True,
+                    is_default=(m["id"] == sp.get("default_model")),
+                )
+                total += 1
+            except Exception as e:
+                logger.warning(f"ensure_models_populated: set_model({m['id']}) failed: {e}")
+                skipped += 1
+    if skipped > 0:
+        logger.warning(f"ensure_models_populated: {skipped} models skipped due to errors, {total} inserted")
+    else:
+        logger.debug(f"ensure_models_populated: {total} models ready")
 
 
 def ensure_initial_config() -> Config:

@@ -253,6 +253,75 @@ class AzureDiscovery(ProviderDiscovery):
         ]
 
 
+class DynamicOpenAICompatibleDiscovery(ProviderDiscovery):
+    """
+    Dynamic discovery for OpenAI-compatible providers.
+
+    Calls the provider's /v1/models endpoint to fetch available models at runtime.
+    Works with any OpenAI-compatible API (MiniMax, Silicon, CherryIN, etc.).
+    """
+
+    async def discover(self, api_key: str, api_base: str | None = None) -> list[DiscoveredModel]:
+        if not api_key:
+            logger.debug("DynamicOpenAICompatibleDiscovery: no API key, returning empty")
+            return []
+        if not api_base:
+            logger.debug("DynamicOpenAICompatibleDiscovery: no api_base, returning empty")
+            return []
+
+        import httpx
+
+        url = api_base.rstrip("/") + "/models"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    url,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    models = data.get("data", []) if isinstance(data, dict) else []
+                    return [self._parse_model(m) for m in models if self._is_chat_model(m)]
+                else:
+                    logger.warning(f"DynamicOpenAICompatibleDiscovery: {url} returned {response.status_code}: {response.text[:200]}")
+                    return []
+        except Exception as e:
+            logger.warning(f"DynamicOpenAICompatibleDiscovery: failed to fetch {url}: {e}")
+            return []
+
+    def _is_chat_model(self, m: dict) -> bool:
+        """Filter out non-chat models (embeddings, images, etc.)."""
+        mid = m.get("id", "")
+        object_type = m.get("object", "")
+        # Skip non-chat types
+        if object_type == "embedding":
+            return False
+        # Skip known non-chat IDs
+        skip_prefixes = ["embedding", "text-embedding", "dall-e", "tts", "whisper", "babbage", "ada"]
+        for prefix in skip_prefixes:
+            if mid.lower().startswith(prefix):
+                return False
+        return True
+
+    def _parse_model(self, m: dict) -> DiscoveredModel:
+        """Parse an OpenAI-compatible /models response entry into DiscoveredModel."""
+        mid = m.get("id", "")
+        owned_by = m.get("owned_by", "")
+        return DiscoveredModel(
+            id=mid,
+            name=mid,
+            litellm_id=mid,
+            aliases=[],
+            capabilities=["tools"],  # assume capable; real FC info not in /models
+            context_window=m.get("context_window", m.get("max_tokens", 128000)),
+            model_type=self._infer_model_type(m),
+            max_tokens=m.get("max_tokens", 4096),
+            supports_vision=self._infer_supports_vision(m),
+            supports_function_calling=self._infer_supports_function_calling(m),
+            supports_streaming=True,
+        )
+
+
 class ModelDiscoveryService:
     """Service for discovering models from configured providers (native SDK)."""
 
@@ -275,8 +344,9 @@ class ModelDiscoveryService:
 
         discovery_class = self.DISCOVERY_MAP.get(provider_id)
         if not discovery_class:
-            logger.warning(f"No discovery strategy for provider: {provider_id}")
-            return []
+            # Fall back to dynamic OpenAI-compatible discovery for unknown providers
+            logger.debug(f"No static discovery for '{provider_id}', trying dynamic OpenAI-compatible")
+            discovery_class = DynamicOpenAICompatibleDiscovery
 
         discovery = discovery_class()
         return await discovery.discover(

@@ -27,7 +27,7 @@ from nanobot.agentloop.db import connect_chat, connect_system, get_thread_chat_c
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.bus.queue import MessageBus
 from nanobot.config.defaults import init_default_profiles, init_default_agent_config
-from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, get_system_db_path, load_config, save_config
+from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, get_system_db_path, init_system_providers, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
 from nanobot.providers.provider_manager import ProviderManager
 from nanobot.providers.router import ModelRouter
@@ -91,8 +91,17 @@ class NanobotWebAPI:
         # Logging configured by setup_logging() in CLI main callback
         config = ensure_initial_config()
 
-        # Initialize config repository and ensure default profiles exist
+        # Initialize config repository
         repo = get_config_repository()
+
+        # Migrate YAML provider credentials to SQLite (one-time on startup)
+        init_system_providers(repo, config)
+
+        # Ensure system models are populated in config_models (resilient — won't crash on missing columns)
+        from nanobot.config.loader import ensure_models_populated
+        ensure_models_populated(repo)
+
+        # Ensure default profiles exist
         init_default_profiles(repo)
         init_default_agent_config(repo)
 
@@ -1736,52 +1745,12 @@ class NanobotWebAPI:
                 "allowFrom": config.channels.dingtalk.allow_from,
             },
         }
-        
-        # Providers (AI) configuration — merge YAML builtins + SQLite system/custom providers
+
+        # Providers (AI) configuration — all providers from SQLite (YAML is no longer used)
         repo = get_config_repository()
-        sqlite_providers = {p["id"]: p for p in repo.get_all_providers()}
-        yaml_providers_map = {
-            name: getattr(config.providers, name)
-            for name in ["openai", "anthropic", "deepseek", "azure"]
-            if hasattr(config.providers, name)
-        }
-        yaml_display_names = {
-            "anthropic": "Anthropic",
-            "openai": "OpenAI",
-            "deepseek": "DeepSeek",
-            "azure": "Azure OpenAI",
-        }
-
         providers = []
-        # Built-in YAML providers
-        for name, provider_config in yaml_providers_map.items():
-            yaml_key = getattr(provider_config, "api_key", None) or ""
-            yaml_base = getattr(provider_config, "api_base", None)
-            # YAML credentials override SQLite values
-            sqlite_p = sqlite_providers.get(name, {})
+        for sp in repo.get_all_providers():
             entry = {
-                "id": name,
-                "name": yaml_display_names.get(name, name.capitalize()),
-                "type": name,
-                "apiKey": yaml_key or sqlite_p.get("api_key") or None,
-                "apiBase": yaml_base or sqlite_p.get("api_base"),
-                "enabled": bool(yaml_key or sqlite_p.get("api_key")),
-                "displayName": yaml_display_names.get(name, name.capitalize()),
-                "providerType": name,
-                "isSystem": True,
-                "sortOrder": 0,
-                "configJson": "{}",
-            }
-            if name == "azure":
-                entry["apiVersion"] = getattr(provider_config, "api_version", "2024-12-01-preview")
-                entry["azureDeployment"] = getattr(provider_config, "azure_deployment", "")
-            providers.append(entry)
-            # Remove from sqlite dict so we don't emit duplicates
-            sqlite_providers.pop(name, None)
-
-        # System/custom providers from SQLite
-        for sp in sqlite_providers.values():
-            providers.append({
                 "id": sp["id"],
                 "name": sp["display_name"] or sp["name"],
                 "type": sp["provider_type"],
@@ -1793,8 +1762,12 @@ class NanobotWebAPI:
                 "isSystem": bool(sp["is_system"]),
                 "sortOrder": sp.get("sort_order", 0),
                 "configJson": sp.get("config_json", "{}"),
-            })
-        
+            }
+            if sp["provider_type"] == "azure" or sp["id"] == "azure":
+                entry["apiVersion"] = sp.get("api_version", "2024-12-01-preview")
+                entry["azureDeployment"] = sp.get("azure_deployment", "")
+            providers.append(entry)
+
         # Create default model entry - 使用 ModelRouter 解析的实际模型
         effective_model = self._get_effective_model()
         models = [{
@@ -1878,11 +1851,7 @@ class NanobotWebAPI:
         }
 
     def create_provider(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create a new AI provider configuration.
-
-        For built-in types (anthropic, openai, deepseek, azure): writes to YAML config.
-        For arbitrary IDs (custom/system): writes directly to SQLite.
-        """
+        """Create a new AI provider configuration. All providers are stored in SQLite."""
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
 
@@ -1891,60 +1860,40 @@ class NanobotWebAPI:
             raise ValueError("Provider 'id' is required")
 
         builtin_types = {"anthropic", "openai", "deepseek", "azure"}
-
+        # For builtins: enabled = True if api_key is provided; for custom: default False
         if provider_id in builtin_types:
-            # Builtin: write to YAML config
-            config = load_config()
-            provider_type = provider_id
-            provider_config = getattr(config.providers, provider_type)
-            if hasattr(provider_config, "api_key") and "apiKey" in data:
-                provider_config.api_key = data["apiKey"]
-            if hasattr(provider_config, "api_base") and "apiBase" in data:
-                provider_config.api_base = data["apiBase"]
-            if provider_type == "azure":
-                if hasattr(provider_config, "api_version") and "apiVersion" in data:
-                    provider_config.api_version = data["apiVersion"]
-                if hasattr(provider_config, "azure_deployment") and "azureDeployment" in data:
-                    provider_config.azure_deployment = data["azureDeployment"]
-            from nanobot.config.loader import save_config
-            save_config(config)
-            enabled = bool(getattr(provider_config, "api_key", None))
-            yaml_api_key = getattr(provider_config, "api_key", "") or ""
-            yaml_api_base = getattr(provider_config, "api_base", None)
-            # Hot-update
-            if yaml_api_key:
-                self.provider_manager.update_provider_config(
-                    provider_id,
-                    api_key=yaml_api_key,
-                    api_base=yaml_api_base,
-                    provider_type=data.get("providerType"),
-                )
+            provided_key = data.get("apiKey", "")
+            enabled = bool(provided_key)
         else:
-            # Custom/system: write directly to SQLite
             enabled = data.get("enabled", False)
-            yaml_api_key = ""
-            yaml_api_base = data.get("apiBase")
+
+        api_key_val = data.get("apiKey", "")
+        api_base_val = data.get("apiBase")
+        api_version_val = data.get("apiVersion", "")
+        azure_deployment_val = data.get("azureDeployment", "")
 
         repo.set_provider(
             provider_id=provider_id,
             name=data.get("displayName", data.get("name", provider_id.capitalize())),
             display_name=data.get("displayName", data.get("name", provider_id.capitalize())),
             provider_type=data.get("providerType", provider_id),
-            api_key=data.get("apiKey", "") if provider_id not in builtin_types else yaml_api_key,
-            api_base=data.get("apiBase") if provider_id not in builtin_types else yaml_api_base,
+            api_key=api_key_val,
+            api_base=api_base_val,
             enabled=enabled,
             priority=data.get("priority", 0),
-            is_system=data.get("isSystem", False),
+            is_system=data.get("isSystem", provider_id in builtin_types),
             sort_order=data.get("sortOrder", 0),
             config_json=data.get("configJson", "{}"),
+            api_version=api_version_val,
+            azure_deployment=azure_deployment_val,
         )
 
         # Create provider instance and clear router cache
-        if data.get("apiKey"):
+        if api_key_val:
             self.provider_manager.register_provider(
                 provider_id=provider_id,
-                api_key=data["apiKey"],
-                api_base=data.get("apiBase"),
+                api_key=api_key_val,
+                api_base=api_base_val,
                 provider_type=data.get("providerType", "openai"),
             )
             self.router.clear_cache()
@@ -1953,73 +1902,52 @@ class NanobotWebAPI:
             "id": provider_id,
             "name": data.get("displayName", data.get("name", provider_id.capitalize())),
             "type": provider_id,
-            "apiKey": data.get("apiKey") or None,
-            "apiBase": data.get("apiBase"),
+            "apiKey": api_key_val or None,
+            "apiBase": api_base_val,
             "enabled": enabled,
             "displayName": data.get("displayName", data.get("name", provider_id.capitalize())),
             "providerType": data.get("providerType", provider_id),
-            "isSystem": data.get("isSystem", False),
+            "isSystem": data.get("isSystem", provider_id in builtin_types),
             "sortOrder": data.get("sortOrder", 0),
             "configJson": data.get("configJson", "{}"),
+            "apiVersion": api_version_val,
+            "azureDeployment": azure_deployment_val,
         }
 
     def update_provider(self, provider_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Update AI provider configuration."""
+        """Update AI provider configuration. All providers stored in SQLite."""
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
 
-        builtins = {"anthropic", "openai", "deepseek", "azure"}
+        builtin_types = {"anthropic", "openai", "deepseek", "azure"}
+        enabled = data.get("enabled", False)
+        api_key_val = data.get("apiKey", "")
+        api_base_val = data.get("apiBase")
+        api_version_val = data.get("apiVersion", "")
+        azure_deployment_val = data.get("azureDeployment", "")
 
-        if provider_id in builtins:
-            # Existing YAML config flow for built-in providers
-            config = load_config()
-            provider_config = getattr(config.providers, provider_id)
-            if "apiKey" in data and data["apiKey"] != "***":
-                if hasattr(provider_config, "api_key"):
-                    provider_config.api_key = data["apiKey"]
-            if "apiBase" in data and hasattr(provider_config, "api_base"):
-                provider_config.api_base = data["apiBase"]
-            if provider_id == "azure":
-                if "apiVersion" in data and hasattr(provider_config, "api_version"):
-                    provider_config.api_version = data["apiVersion"]
-                if "azureDeployment" in data and hasattr(provider_config, "azure_deployment"):
-                    provider_config.azure_deployment = data["azureDeployment"]
-            from nanobot.config.loader import save_config
-            save_config(config)
-            # Hot-update
-            if getattr(provider_config, "api_key", None):
-                self.provider_manager.update_provider_config(
-                    provider_id,
-                    api_key=provider_config.api_key,
-                    api_base=getattr(provider_config, "api_base", None),
-                    provider_type=data.get("providerType"),
-                )
-            enabled = data.get("enabled", bool(getattr(provider_config, "api_key", None)))
-        else:
-            # System/custom providers: write directly to SQLite
-            enabled = data.get("enabled", False)
-
-        # Always persist to SQLite (works for both paths)
         repo.set_provider(
             provider_id=provider_id,
             name=data.get("name", data.get("displayName", provider_id.capitalize())),
             display_name=data.get("displayName", data.get("name", provider_id.capitalize())),
             provider_type=data.get("providerType", provider_id),
-            api_key=data.get("apiKey", ""),
-            api_base=data.get("apiBase"),
+            api_key=api_key_val,
+            api_base=api_base_val,
             enabled=enabled,
             priority=data.get("priority", 0),
-            is_system=data.get("isSystem", False),
+            is_system=data.get("isSystem", provider_id in builtin_types),
             sort_order=data.get("sortOrder", 0),
             config_json=data.get("configJson", "{}"),
+            api_version=api_version_val,
+            azure_deployment=azure_deployment_val,
         )
 
         # Update provider instance and clear router cache
-        if data.get("apiKey"):
+        if api_key_val:
             self.provider_manager.register_provider(
                 provider_id=provider_id,
-                api_key=data["apiKey"],
-                api_base=data.get("apiBase"),
+                api_key=api_key_val,
+                api_base=api_base_val,
                 provider_type=data.get("providerType", "openai"),
             )
             self.router.clear_cache()
@@ -2028,14 +1956,16 @@ class NanobotWebAPI:
             "id": provider_id,
             "name": data.get("name", data.get("displayName", provider_id.capitalize())),
             "type": provider_id,
-            "apiKey": data.get("apiKey") or None,
-            "apiBase": data.get("apiBase"),
+            "apiKey": api_key_val or None,
+            "apiBase": api_base_val,
             "enabled": enabled,
             "displayName": data.get("displayName", data.get("name", provider_id.capitalize())),
             "providerType": data.get("providerType", provider_id),
-            "isSystem": data.get("isSystem", False),
+            "isSystem": data.get("isSystem", provider_id in builtin_types),
             "sortOrder": data.get("sortOrder", 0),
             "configJson": data.get("configJson", "{}"),
+            "apiVersion": api_version_val,
+            "azureDeployment": azure_deployment_val,
         }
 
     def delete_provider(self, provider_id: str) -> bool:
@@ -2046,16 +1976,13 @@ class NanobotWebAPI:
         # Try to delete from SQLite (system providers are protected by is_system=0 guard)
         deleted = repo.delete_provider(provider_id)
 
-        # For builtin providers, also clear YAML config
-        if provider_id in ["openai", "anthropic", "deepseek", "azure"]:
-            config = load_config()
-            provider_config = getattr(config.providers, provider_id)
-            provider_config.api_key = ""
-            provider_config.api_base = None
-            from nanobot.config.loader import save_config
-            save_config(config)
-
         return deleted
+
+    def batch_disable_providers(self, provider_ids: list[str]) -> int:
+        """Batch disable providers. Returns the number of providers actually disabled."""
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
+        return repo.batch_disable_providers(provider_ids)
 
     def create_mcp(self, data: dict[str, Any]) -> dict[str, Any]:
         """Create a new MCP server configuration.
@@ -4771,6 +4698,17 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.CREATED, _ok(data))
             except ValueError as e:
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
+
+        # POST /api/v1/providers/batch-disable - Batch disable providers
+        if path == "/api/v1/providers/batch-disable":
+            body = self._read_json()
+            provider_ids = body.get("provider_ids", [])
+            if not isinstance(provider_ids, list):
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "provider_ids must be a list"))
+                return
+            disabled = app.batch_disable_providers(provider_ids)
+            self._write_json(HTTPStatus.OK, _ok({"disabled": disabled}))
             return
 
         # POST /api/v1/mcps - Create MCP

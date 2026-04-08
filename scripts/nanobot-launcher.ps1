@@ -184,7 +184,7 @@ function Ensure-FrontendBuilt {
     # npm install —— 每次构建前先执行，确保依赖完整（避免 node_modules 不完整导致 build 失败）
     Write-Host "$LAUNCHER_TAG 正在安装前端依赖 (npm install)..." -ForegroundColor Yellow
     Push-Location $WEB_UI_DIR
-    & npm install 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    & npm install --loglevel=verbose 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     $npmExit = $LASTEXITCODE
     Pop-Location
     if ($npmExit -ne 0) {

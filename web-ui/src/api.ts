@@ -312,6 +312,12 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(provider),
     }),
+
+  batchDisableProviders: (providerIds: string[]) =>
+    request<{ disabled: number }>('/providers/batch-disable', {
+      method: 'POST',
+      body: JSON.stringify({ provider_ids: providerIds }),
+    }),
   
   deleteProvider: (providerId: string) =>
     request<{ deleted: boolean }>(`/providers/${providerId}`, {
