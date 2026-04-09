@@ -49,6 +49,14 @@ class QQConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public)
 
 
+class BrowserConfig(BaseModel):
+    """Browser/WebUI channel configuration using WebSocket."""
+    enabled: bool = False
+    host: str = "127.0.0.1"  # WebSocket server host
+    port: int = 18791  # WebSocket server port
+    allow_from: list[str] = Field(default_factory=list)  # Allowed session IDs (empty = public)
+
+
 class DingTalkConfig(BaseModel):
     """DingTalk channel configuration using Stream Mode."""
     enabled: bool = False
@@ -65,6 +73,7 @@ class ChannelsConfig(BaseModel):
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
 
 
 class AgentDefaults(BaseModel):
