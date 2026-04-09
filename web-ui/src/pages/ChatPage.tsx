@@ -8,11 +8,15 @@ import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { api } from '../api'
 import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, SubagentProgressEvent, StreamEvent, McpServer } from '../types'
+import { useWebSocket } from '../hooks/useWebSocket'
+import type { WsEvent } from '../hooks/useWebSocket'
 import { ToolStepsPanel } from '../components/ToolStepsPanel'
 import './ChatPage.css'
 import 'highlight.js/styles/github-dark.css'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import { requestNotificationPermission, notifyTaskComplete } from '../utils/notification'
+
+const WS_BASE_URL = `ws://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8765`
 
 const { Header, Sider, Content } = Layout
 const { TextArea } = Input
@@ -174,6 +178,12 @@ function ChatPage() {
   }>>([])
   const bgAgentsAbortRef = useRef<AbortController | null>(null)
   const bgAgentsSessionRef = useRef<string | null>(null)
+
+  // WebSocket 连接 refs
+  const wsSendRef = useRef<((data: object) => void) | null>(null)
+  const wsDisconnectRef = useRef<(() => void) | null>(null)
+  // 存储当前的 stream event handler（避免 useWebSocket 依赖变化导致频繁重连）
+  const streamHandlerRef = useRef<(evt: StreamEvent) => void>(() => {})
 
   // 使用任务轮询 hook，当页面从后台恢复时检查任务状态
   useTaskPolling({
@@ -397,8 +407,99 @@ function ChatPage() {
     if (timer) { clearTimeout(timer); chunkFlushTimersRef.current.delete(sessionId) }
   }, [])
 
-  // 流式事件处理工厂（按会话 ID 路由：当前会话更新 UI，后台会话更新缓存）
-  const makeStreamEventHandler = useCallback((sessionId: string) => (evt: StreamEvent) => {
+  // WebSocket 消息处理：将 WsEvent 转换为 StreamEvent 并路由
+  const handleWsMessage = useCallback((event: WsEvent) => {
+    const sessionId = currentSessionIdRef.current
+    if (!sessionId) return
+
+    // 处理 done 事件
+    if (event.event?.type === 'done') {
+      if (sessionId === currentSessionIdRef.current) {
+        setLoading(false)
+        setStreamingThinking(false)
+        setStreamingToolSteps([])
+        setClaudeCodeProgress('')
+        refreshStreamDoneRef.current(sessionId)
+      } else {
+        void loadSessions()
+      }
+      // 更新图片状态为已发送
+      if (sessionId === currentSessionIdRef.current) {
+        setImageSendStatus(prev => {
+          const newStatus = { ...prev }
+          Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'sent' })
+          return newStatus
+        })
+      }
+      // 清理流式状态
+      if (sessionId === currentSessionIdRef.current) {
+        isStreamingRef.current = false
+        setStreamingToolSteps([])
+        setStreamingThinking(false)
+        setClaudeCodeProgress('')
+        currentTaskIdRef.current = null
+        setPollingTaskId(null)
+        clearStreamingState(sessionId)
+        abortControllerRef.current = null
+      }
+      void loadSessions()
+      return
+    }
+
+    // 处理错误事件
+    if (event.error) {
+      console.error('WebSocket error:', event.error)
+      antMessage.error(event.error)
+      if (sessionId === currentSessionIdRef.current) {
+        setLoading(false)
+        setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
+        isStreamingRef.current = false
+        setStreamingToolSteps([])
+        setStreamingThinking(false)
+        setClaudeCodeProgress('')
+        currentTaskIdRef.current = null
+        setPollingTaskId(null)
+        abortControllerRef.current = null
+      }
+      return
+    }
+
+    // 处理其他 stream 事件
+    if (event.event) {
+      streamHandlerRef.current(event.event as StreamEvent)
+    }
+  }, [])
+
+  // WebSocket 连接管理
+  const wsUrl = currentSession ? `${WS_BASE_URL}/ws/${currentSession.id}` : ''
+  const { send: wsSend, disconnect: wsDisconnect } = useWebSocket({
+    url: wsUrl,
+    onMessage: handleWsMessage,
+    onConnect: () => {
+      console.log('[WebSocket] Connected')
+    },
+    onDisconnect: () => {
+      console.log('[WebSocket] Disconnected')
+    },
+    onError: (error) => {
+      console.error('[WebSocket] Error:', error)
+    },
+    reconnect: true,
+    reconnectInterval: 3000,
+  })
+
+  // 更新 WebSocket refs（仅在连接变化时更新）
+  useEffect(() => {
+    wsSendRef.current = wsSend
+    wsDisconnectRef.current = wsDisconnect
+  }, [wsSend, wsDisconnect])
+
+  // 流式事件处理（按会话 ID 路由：当前会话更新 UI，后台会话更新缓存）
+  // 此函数处理 StreamEvent 并更新 streamHandlerRef
+  const processStreamEvent = useCallback((evt: StreamEvent) => {
+    const sessionId = currentSessionIdRef.current
+    if (!sessionId) return
+
     const isCurrent = sessionId === currentSessionIdRef.current
 
     if (evt.type === 'done') {
@@ -407,7 +508,7 @@ function ChatPage() {
         setStreamingThinking(false)
         setStreamingToolSteps([])
         setClaudeCodeProgress('')
-        // 收到 done 立即拉消息，避免仅依赖 sendMessageStream 返回后的 loadMessages（消除竞态与遗漏）
+        // 收到 done 立即拉消息
         refreshStreamDoneRef.current(sessionId)
       } else {
         loadSessionsRef.current()
@@ -470,7 +571,7 @@ function ChatPage() {
       return
     }
 
-    // 当前会话：正常更新 UI 状态（原 handleStreamEvent 逻辑）
+    // 当前会话：正常更新 UI 状态
     if (evt.type === 'thinking') {
       setStreamingThinking(true)
     } else if (evt.type === 'tool_start' && evt.id && evt.name) {
@@ -546,53 +647,22 @@ function ChatPage() {
     }
   }, [startBgAgentStream])
 
-  // 尝试重连 Chat SSE（刷新/切换 tab 后继续接收推送）
+  // 更新 streamHandlerRef 当 session 变化时
+  useEffect(() => {
+    streamHandlerRef.current = processStreamEvent
+  }, [processStreamEvent])
+
+  // WebSocket 重连处理（刷新/切换 tab 后等待 WebSocket 自动重连，然后刷新数据）
   const tryReconnectChatStream = useCallback(async (sessionId: string) => {
-    const ctrl = new AbortController()
-    perSessionAbortControllers.current.set(sessionId, ctrl)
-    // 若为当前会话则同步 compat ref
-    if (sessionId === currentSessionIdRef.current) {
-      abortControllerRef.current = ctrl
-      isStreamingRef.current = true
-      setLoading(true)
-    }
-    setStreamingSessionIds(prev => new Set([...prev, sessionId]))
-    try {
-      const result = await api.subscribeToChatStream(sessionId, makeStreamEventHandler(sessionId), ctrl.signal)
-      if (sessionId === currentSessionIdRef.current) {
-        await loadMessages(sessionId)
-        await loadSessionTokenUsage(sessionId)
-      }
-      void loadSessions()
-      if (result && sessionId === currentSessionIdRef.current) {
-        antMessage.success(t('chat.streamReconnected'))
-      }
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') return
-      console.warn('Chat stream reconnect failed:', err)
-    } finally {
-      perSessionAbortControllers.current.delete(sessionId)
-      setStreamingSessionIds(prev => {
-        const next = new Set(prev)
-        next.delete(sessionId)
-        return next
-      })
-      // 与 handleSend 一致：重连结束即清除 loading，避免切换会话后 ref 不匹配一直转圈
-      setLoading(false)
-      if (sessionId === currentSessionIdRef.current) {
-        isStreamingRef.current = false
-        isRestoringRef.current = false
-        setStreamingToolSteps([])
-        setStreamingThinking(false)
-        setClaudeCodeProgress('')
-        currentTaskIdRef.current = null
-        setPollingTaskId(null)
-        abortControllerRef.current = null
-      }
-      clearStreamingState(sessionId)
-      isRestoringRef.current = false
-    }
-  }, [makeStreamEventHandler, t])
+    console.log('[WebSocket] Waiting for reconnection...')
+    // 等待一小段时间让 WebSocket 自动重连
+    await new Promise(resolve => setTimeout(resolve, 1000))
+    // 刷新数据
+    await loadMessages(sessionId)
+    await loadSessionTokenUsage(sessionId)
+    void loadSessions()
+    antMessage.success(t('chat.streamReconnected'))
+  }, [t])
 
   // 所有子 Agent 完成后，10 秒后自动清除面板
   // 注意：如果连接已断开，保留面板让用户手动刷新
@@ -915,8 +985,8 @@ function ChatPage() {
         handleSelectSession(data.items[0])
       }
     } catch (error) {
+      console.error('[loadSessions]', error)
       antMessage.error(t('chat.loadSessionsFailed'))
-      console.error(error)
     } finally {
       setLoadingSessions(false)
     }
@@ -1153,42 +1223,28 @@ function ChatPage() {
       setImageSendStatus(status)
     }
 
-    try {
-      await api.sendMessageStream(
-        sessionId,
-        userMessage,
-        makeStreamEventHandler(sessionId),
-        controller.signal,
-        imagesToSend.length > 0 ? imagesToSend : undefined,
-        toolMode,
-        toolMode === 'specified' ? selectedMcpServers : undefined,
-      )
-      if (imagesToSend.length > 0 && sessionId === currentSessionIdRef.current) {
-        setImageSendStatus(prev => {
-          const newStatus = { ...prev }
-          Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'sent' })
-          return newStatus
-        })
-      }
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        // 仍走 finally 从服务端拉列表，避免停止后界面停在临时消息
-      } else {
-        if (imagesToSend.length > 0 && sessionId === currentSessionIdRef.current) {
-          setImageSendStatus(prev => {
-            const newStatus = { ...prev }
-            Object.keys(newStatus).forEach(k => { newStatus[Number(k)] = 'error' })
-            return newStatus
-          })
-        }
-        antMessage.error(t('chat.sendFailed'))
-        if (err instanceof Error) console.error(err)
-        if (sessionId === currentSessionIdRef.current) {
-          setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
-        }
-      }
-    } finally {
-      // 从并行流式集合移除该会话
+    // 通过 WebSocket 发送消息（done/error 由 handleWsMessage 处理）
+    const sendFn = wsSendRef.current
+    if (!sendFn) {
+      // WebSocket 未连接，等待连接后重试
+      console.warn('[WebSocket] Not connected, waiting for connection...')
+      // 清理状态
+      setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
+      setLoading(false)
+      setStreamingSessionIds(prev => {
+        const next = new Set(prev)
+        next.delete(sessionId)
+        return next
+      })
+      bgSessionStatesRef.current.delete(sessionId)
+      isStreamingRef.current = false
+      antMessage.error(t('chat.sendFailed'))
+      return
+    }
+
+    // 监听 abort 以清理状态
+    controller.signal.addEventListener('abort', () => {
+      console.log('[WebSocket] Message sending aborted')
       perSessionAbortControllers.current.delete(sessionId)
       setStreamingSessionIds(prev => {
         const next = new Set(prev)
@@ -1196,39 +1252,25 @@ function ChatPage() {
         return next
       })
       bgSessionStatesRef.current.delete(sessionId)
-
-      // 流结束始终清除 loading：若用户在请求完成前切换了会话，仅匹配 currentSessionIdRef 会漏清导致一直「请求中」
       setLoading(false)
+      isStreamingRef.current = false
+      setStreamingToolSteps([])
+      setStreamingThinking(false)
+      setClaudeCodeProgress('')
+      currentTaskIdRef.current = null
+      setPollingTaskId(null)
+      abortControllerRef.current = null
+    })
 
-      if (sessionId === currentSessionIdRef.current) {
-        isStreamingRef.current = false
-        if (isRestoringRef.current && currentSession) {
-          clearStreamingState(sessionId)
-          isRestoringRef.current = false
-          abortControllerRef.current = null
-          currentTaskIdRef.current = null
-          setPollingTaskId(null)
-          setStreamingToolSteps([])
-          setStreamingThinking(false)
-          setClaudeCodeProgress('')
-        } else {
-          setStreamingToolSteps([])
-          setStreamingThinking(false)
-          setClaudeCodeProgress('')
-          currentTaskIdRef.current = null
-          setPollingTaskId(null)
-          clearStreamingState(sessionId)
-          abortControllerRef.current = null
-        }
-      }
-      // 无论是否收到 SSE done、是否 Abort，只要会话仍在前台，都用服务端数据刷新列表（修复第二次起偶发不刷新）
-      if (sessionId === currentSessionIdRef.current) {
-        void loadMessages(sessionId)
-        void loadSessionTokenUsage(sessionId)
-      }
-      void loadSessions()
-    }
-  }, [input, loading, messages, currentSession, pendingImages.length, t, makeStreamEventHandler])
+    // 通过 WebSocket 发送消息
+    sendFn({
+      type: 'message',
+      content: userMessage,
+      media: imagesToSend.length > 0 ? imagesToSend : undefined,
+      toolMode,
+      selectedMcpServers: toolMode === 'specified' ? selectedMcpServers : undefined,
+    })
+  }, [input, currentSession, pendingImages, t, toolMode, selectedMcpServers, tasks, messages, streamingSessionIds])
 
   const handleImageSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
