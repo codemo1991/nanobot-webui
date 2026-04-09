@@ -23,7 +23,7 @@ export const ProviderList: React.FC<ProviderListProps> = ({ providers, onProvide
     try {
       const data = await api.getProviders()
       onProvidersChange(data || [])
-    } catch {
+    } catch (err) {
       message.error('加载 Provider 列表失败')
     } finally {
       setLoading(false)
@@ -49,7 +49,6 @@ export const ProviderList: React.FC<ProviderListProps> = ({ providers, onProvide
       message.success(`已禁用 ${ids.length} 个 Provider`)
       onRefresh()
     } catch (e: any) {
-      console.error('[BatchDisable] error:', e)
       message.error(`批量禁用失败: ${e.message}`)
     }
   }

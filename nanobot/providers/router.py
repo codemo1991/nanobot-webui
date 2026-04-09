@@ -236,6 +236,35 @@ class ModelRouter:
         self._cache.clear()
         logger.debug("ModelRouter cache cleared")
 
+    def update_provider_instance(
+        self,
+        provider_id: str,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        provider_type: str = "openai",
+    ) -> None:
+        """
+        Update or register a provider instance in the router (for dynamic providers from DB).
+        After this, _get_provider_instance will return the updated instance.
+        """
+        from nanobot.providers.provider_manager import create_provider_instance
+
+        existing = self._providers.get(provider_id)
+        if existing:
+            if api_key is not None:
+                existing.api_key = api_key
+            if api_base is not None:
+                existing.api_base = api_base
+            logger.debug(f"ModelRouter: updated instance for {provider_id}")
+        else:
+            instance = create_provider_instance(
+                provider_type=provider_type,
+                api_key=api_key,
+                api_base=api_base,
+            )
+            self._providers[provider_id] = instance
+            logger.debug(f"ModelRouter: registered new instance for {provider_id}")
+        self.clear_cache()
 
 class ModelNotFoundError(Exception):
     """Raised when no profile or model matches the reference."""

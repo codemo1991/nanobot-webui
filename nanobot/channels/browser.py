@@ -105,7 +105,8 @@ class BrowserChannel(BaseChannel):
                         break
                 except asyncio.CancelledError:
                     break
-                except Exception:
+                except Exception as e:
+                    logger.exception(f"[Browser] drain_events error: {e}")
                     break
 
         drain_task = asyncio.create_task(drain_events())
@@ -121,12 +122,15 @@ class BrowserChannel(BaseChannel):
 
                     # Directly call agent with progress_callback
                     try:
-                        response = await self.agent.process_direct(
-                            content=content,
-                            session_key=f"browser:{session_id}",
-                            channel="browser",
-                            progress_callback=on_progress,
-                            media=media,
+                        response = await asyncio.wait_for(
+                            self.agent.process_direct(
+                                content=content,
+                                session_key=f"browser:{session_id}",
+                                channel="browser",
+                                progress_callback=on_progress,
+                                media=media,
+                            ),
+                            timeout=self.config.agent_timeout,
                         )
 
                         # Send done event
@@ -134,12 +138,20 @@ class BrowserChannel(BaseChannel):
                             "type": "event",
                             "event": {"type": "done", "content": response}
                         })
+                    except asyncio.TimeoutError:
+                        logger.error(f"[Browser] Agent call timed out after {self.config.agent_timeout}s")
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": f"Agent call timed out after {self.config.agent_timeout}s"
+                        })
+                        break
                     except Exception as e:
                         logger.error(f"[Browser] Agent error: {e}")
                         await websocket.send_json({
                             "type": "error",
                             "error": str(e)
                         })
+                        break
 
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
@@ -147,6 +159,8 @@ class BrowserChannel(BaseChannel):
                 elif msg_type == "pong":
                     # Heartbeat response, ignore
                     pass
+                else:
+                    logger.warning(f"[Browser] Unknown message type: {msg_type}")
 
         except WebSocketDisconnect:
             logger.info(f"[Browser] Client disconnected: {session_id}")

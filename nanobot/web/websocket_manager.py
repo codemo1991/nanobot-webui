@@ -1,8 +1,6 @@
 """WebSocket connection manager for browser channel."""
 
-import asyncio
-from typing import Any
-
+from fastapi import WebSocket
 from loguru import logger
 
 
@@ -14,14 +12,14 @@ class WebSocketManager:
     """
 
     def __init__(self):
-        self._connections: dict[str, Any] = {}
+        self._connections: dict[str, WebSocket] = {}
 
-    def register(self, key: str, websocket: Any) -> None:
+    def register(self, key: str, websocket: WebSocket) -> None:
         """注册连接（每个 key 只允许一个连接）"""
         self._connections[key] = websocket
         logger.debug(f"[WebSocketManager] Registered: {key}")
 
-    def unregister(self, key: str, websocket: Any) -> None:
+    def unregister(self, key: str, websocket: WebSocket) -> None:
         """注销连接"""
         if self._connections.get(key) is websocket:
             del self._connections[key]
