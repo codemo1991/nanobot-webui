@@ -44,6 +44,8 @@ export function useWebSocket(options: UseWebSocketOptions) {
   const reconnectTimeoutRef = useRef<number | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  // Buffer for messages sent while WebSocket is reconnecting
+  const pendingMessagesRef = useRef<object[]>([]);
 
   // Use refs for callbacks to avoid reconnects when callback references change
   const onMessageRef = useRef(onMessage);
@@ -58,6 +60,19 @@ export function useWebSocket(options: UseWebSocketOptions) {
   onDisconnectRef.current = onDisconnect;
   onErrorRef.current = onError;
   urlRef.current = url;
+
+  // Flush pending messages when connected
+  const flushPendingMessages = useCallback(() => {
+    const pending = pendingMessagesRef.current
+    if (pending.length === 0) return
+    pendingMessagesRef.current = []
+    for (const msg of pending) {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(msg))
+        console.log('[WebSocket] Flushed pending message:', msg)
+      }
+    }
+  }, [])
 
   const clearHeartbeat = useCallback(() => {
     if (heartbeatIntervalRef.current) {
@@ -80,6 +95,8 @@ export function useWebSocket(options: UseWebSocketOptions) {
       wsRef.current.close();
       wsRef.current = null;
     }
+    // Clear pending messages when disconnecting
+    pendingMessagesRef.current = [];
   }, [clearHeartbeat, clearReconnect]);
 
   const startHeartbeat = useCallback(() => {
@@ -118,6 +135,8 @@ export function useWebSocket(options: UseWebSocketOptions) {
       setIsConnected(true);
       startHeartbeat();
       onConnectRef.current?.();
+      // Flush any messages that were queued during reconnection
+      flushPendingMessages();
     };
 
     ws.onmessage = (event) => {
@@ -222,7 +241,9 @@ export function useWebSocket(options: UseWebSocketOptions) {
       console.log('[WebSocket] message sent successfully');
       return true;
     }
-    console.warn('[WebSocket] cannot send, not connected');
+    // Buffer message for sending when reconnected
+    pendingMessagesRef.current.push(data);
+    console.log('[WebSocket] buffering message, pending count:', pendingMessagesRef.current.length);
     return false;
   }, []);
 

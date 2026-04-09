@@ -3371,10 +3371,33 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
                 return
 
-            # GET /api/v1/chat/sessions/{sessionId}/subagent-progress (SSE)
+            # GET /api/v1/chat/sessions/{sessionId}/subagent-progress (SSE) - Deprecated, use WebSocket
             if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "subagent-progress":
                 session_id = parts[4]
-                self._handle_subagent_progress_stream(app, session_id)
+                # SSE 已废弃，所有事件通过 WebSocket 发送
+                self._write_json(HTTPStatus.NOT_FOUND, _err("SSE_DEPRECATED", "Subagent progress is now delivered via WebSocket"))
+                return
+
+            # POST /api/v1/chat/warmup - Pre-warm MCP without processing a message
+            if path == "/api/v1/chat/warmup":
+                try:
+                    # 检查 MCP 是否已初始化
+                    if hasattr(app.agent, '_mcp_init_event') and app.agent._mcp_init_event.is_set():
+                        self._write_json(HTTPStatus.OK, _ok({"status": "already_initialized"}))
+                        return
+
+                    # MCP 未初始化，触发初始化并等待
+                    try:
+                        asyncio.run(asyncio.wait_for(
+                            app.agent._init_mcp_loader(only_server_ids=None),
+                            timeout=10.0
+                        ))
+                        self._write_json(HTTPStatus.OK, _ok({"status": "initialized"}))
+                    except asyncio.TimeoutError:
+                        self._write_json(HTTPStatus.OK, _ok({"status": "timeout"}))
+                except Exception as e:
+                    logger.warning(f"[Warmup] MCP warmup error: {e}")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("WARMUP_ERROR", str(e)))
                 return
 
             # Configuration endpoints

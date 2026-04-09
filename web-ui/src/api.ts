@@ -99,6 +99,12 @@ export const api = {
       body: sessionId ? JSON.stringify({ sessionId }) : undefined,
     }),
 
+  // Pre-warm MCP to eliminate first-message latency
+  warmup: () =>
+    request<{ status: 'already_initialized' | 'initialized' | 'timeout' }>('/chat/warmup', {
+      method: 'POST',
+    }),
+
   /** Stream chat with SSE; calls onEvent for each progress event. Rejects on error. */
   async sendMessageStream(
     sessionId: string,
@@ -809,8 +815,8 @@ export const api = {
     }),
 
   /**
-   * 订阅子 Agent 后台进度 SSE 流。
-   * 调用方传入 onEvent 回调，连接保持到 signal 中止或服务端发送 timeout 事件。
+   * @deprecated SSE 已废弃，子 Agent 进度现在通过 WebSocket 发送。
+   * 此函数保留用于向后兼容，但不再被调用。
    */
   async subagentProgressStream(
     sessionId: string,

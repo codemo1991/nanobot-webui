@@ -7,7 +7,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { api } from '../api'
-import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, SubagentProgressEvent, StreamEvent, McpServer } from '../types'
+import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, StreamEvent, McpServer } from '../types'
 import { useWebSocket } from '../hooks/useWebSocket'
 import type { WsEvent } from '../hooks/useWebSocket'
 import { ToolStepsPanel } from '../components/ToolStepsPanel'
@@ -150,11 +150,6 @@ function ChatPage() {
   const currentTaskIdRef = useRef<string | null>(null)
   // 追踪是否正在从 session 恢复 MCP 设置（避免触发保存）
   const isRestoringMcpRef = useRef(false)
-  // 已处理过的 subagent_summary message_id 集合，防止 replay 时重复插入消息
-  // （loadMessages 会将 id 从 "msg_subagent_xxx" 替换为 "msg_{seq}"，导致朴素 id 比对失效）
-  const seenSummaryIdsRef = useRef<Set<string>>(new Set())
-  // 已发送过浏览器通知的 task_id，防止 replay 时重复通知
-  const notifiedTasksRef = useRef<Set<string>>(new Set())
   /** 在收到 SSE done 时刷新列表（定义在下方，每轮 render 末尾更新引用） */
   const refreshStreamDoneRef = useRef<(sessionId: string) => void>(() => {})
   const loadSessionsRef = useRef<() => void>(() => {})
@@ -174,10 +169,8 @@ function ChatPage() {
     progress: string
     backend: string
     result?: string  // 完整结果
-    disconnected?: boolean  // SSE连接是否断开
+    disconnected?: boolean  // WebSocket 连接是否断开
   }>>([])
-  const bgAgentsAbortRef = useRef<AbortController | null>(null)
-  const bgAgentsSessionRef = useRef<string | null>(null)
   const bgAgentsRef = useRef(bgAgents)  // Track current bgAgents for use in stream handler
 
   // WebSocket 连接 refs
@@ -217,167 +210,6 @@ function ChatPage() {
       console.error('Task polling error:', err)
     },
   })
-
-  // 启动子 Agent 进度 SSE 订阅
-  const startBgAgentStream = useCallback((sessionId: string) => {
-    // 已在监听同一 session，不重复创建
-    if (bgAgentsAbortRef.current && bgAgentsSessionRef.current === sessionId) return
-    // 关闭旧的连接
-    if (bgAgentsAbortRef.current) {
-      bgAgentsAbortRef.current.abort()
-      bgAgentsAbortRef.current = null
-    }
-    // 新连接开始，重置 finished 标志
-    bgAgentsStreamFinishedRef.current = false
-    // 清理旧会话的 bgAgents 状态，防止内存泄漏
-    setBgAgents([])
-    console.log('[BgAgent] Starting subagent progress stream for session:', sessionId)
-    const ctrl = new AbortController()
-    bgAgentsAbortRef.current = ctrl
-    bgAgentsSessionRef.current = sessionId
-
-    const handleEvt = (evt: SubagentProgressEvent) => {
-      try {
-        console.log('[BgAgent] Received event:', evt.type, 'task_id' in evt ? evt.task_id : undefined, 'label' in evt ? evt.label : undefined)
-        console.log('[BgAgent] Current bgAgents before:', JSON.stringify(bgAgents))
-        if (evt.type === 'subagent_start') {
-          // 提取需要的数据，避免在 setBgAgents 回调中访问联合类型的可能未定义属性
-          const currentTaskId = evt.task_id
-          const currentLabel = evt.label
-          const currentTask = evt.task
-          const currentBackend = evt.backend
-          setBgAgents(prev => {
-            if (prev.find(a => a.taskId === currentTaskId)) return prev
-            return [...prev, {
-            taskId: currentTaskId,
-            label: currentLabel,
-            status: 'running',
-            progress: currentTask.slice(0, 80),
-            backend: currentBackend,
-          }]
-        })
-      } else if (evt.type === 'subagent_progress') {
-        const content = evt.content || ''
-        let line = ''
-        if (evt.subtype === 'tool_use') {
-          line = `[${evt.tool_name || 'Tool'}] ${content.slice(0, 100)}`
-        } else if (evt.subtype === 'assistant_text') {
-          line = content.length > 120 ? content.slice(0, 120) + '...' : content
-        } else if (evt.subtype === 'subagent_start') {
-          line = `🤖 ${content.slice(0, 80)}`
-        } else {
-          return
-        }
-        // 提取需要的数据，避免在 setBgAgents 回调中访问联合类型的可能未定义属性
-        const currentTaskId = evt.task_id
-        setBgAgents(prev => prev.map(a => {
-          if (a.taskId !== currentTaskId) return a
-          const lines = a.progress ? a.progress.split('\n') : []
-          lines.push(line)
-          const trimmed = lines.length > 20 ? lines.slice(-20) : lines
-          return { ...a, progress: trimmed.join('\n') }
-        }))
-      } else if (evt.type === 'subagent_end') {
-        // 提取需要的数据，避免在 setBgAgents 回调中访问联合类型的可能未定义属性
-        const currentTaskId = evt.task_id
-        const currentLabel = evt.label
-        const currentStatus = evt.status
-        const currentSummary = evt.summary
-        const currentResult = 'result' in evt ? evt.result : undefined
-        const currentBackend = ('backend' in evt && typeof evt.backend === 'string') ? evt.backend : 'unknown'
-        setBgAgents(prev => {
-          const existing = prev.find(a => a.taskId === currentTaskId)
-          if (existing) {
-            return prev.map(a =>
-              a.taskId === currentTaskId
-                ? {
-                    ...a,
-                    status: currentStatus === 'ok' ? 'done' : currentStatus === 'timeout' ? 'timeout' : currentStatus === 'cancelled' ? 'cancelled' : 'error',
-                    progress: currentSummary,
-                    result: currentResult,
-                  }
-                : a
-            )
-          }
-          // 未收到 subagent_start 时（如 trim_buffer 或连接时机导致），subagent_end 仍创建卡片以展示结果
-          return [...prev, {
-            taskId: currentTaskId,
-            label: currentLabel,
-            status: currentStatus === 'ok' ? 'done' : currentStatus === 'timeout' ? 'timeout' : currentStatus === 'cancelled' ? 'cancelled' : 'error',
-            progress: currentSummary,
-            backend: currentBackend,
-            result: currentResult,
-          }]
-        })
-        // 发送浏览器通知（用 ref 去重，避免 replay 时重复通知）
-        if (currentStatus === 'ok' && currentResult && !notifiedTasksRef.current.has(currentTaskId)) {
-          notifiedTasksRef.current.add(currentTaskId)
-          notifyTaskComplete(currentTaskId, currentResult)
-        }
-        console.log('[BgAgent] Current bgAgents after subagent_end:', JSON.stringify(bgAgents))
-      } else if (evt.type === 'subagent_summary') {
-        // seenSummaryIdsRef 去重：loadMessages 会把 id 从 "msg_subagent_xxx" 换成 "msg_{seq}"，
-        // 导致朴素的 m.id 比对在 tab 切回 replay 时失效，必须用独立 ref 记录已处理过的 message_id
-        if (seenSummaryIdsRef.current.has(evt.message_id)) {
-          console.log('[BgAgent] Skipping duplicate subagent_summary:', evt.message_id)
-          return
-        }
-        seenSummaryIdsRef.current.add(evt.message_id)
-        // 将 LLM 总结追加为主对话中的 assistant 消息
-        const summaryMsg: import('../types').Message = {
-          id: evt.message_id,
-          sessionId,
-          role: 'assistant',
-          content: evt.llm_summary,
-          createdAt: evt.timestamp || new Date().toISOString(),
-          sequence: Date.now(),
-        }
-        setMessages(prev => {
-          // 双重保险：若 messages 中已有相同 id（loadMessages 前后 id 一致的情况）也跳过
-          if (prev.some(m => m.id === summaryMsg.id)) return prev
-          return [...prev, summaryMsg]
-        })
-        // 收到 summary 后自动关闭对应的后台 agent 卡片
-        const idsToRemove = evt.task_ids && evt.task_ids.length > 0
-          ? evt.task_ids
-          : [evt.task_id]
-        setBgAgents(prev => prev.filter(a => !idsToRemove.includes(a.taskId)))
-        console.log('[BgAgent] Appended subagent_summary, closed cards:', idsToRemove)
-      } else if (evt.type === 'timeout') {
-        console.log('[BgAgent] Received timeout event')
-        bgAgentsAbortRef.current = null
-        bgAgentsSessionRef.current = null
-      } else if (evt.type === 'stream_done') {
-        console.log('[BgAgent] All subagents finished, stream closed')
-        bgAgentsStreamFinishedRef.current = true  // 标记已干净结束，切 tab 时不再重连
-        bgAgentsAbortRef.current = null
-        bgAgentsSessionRef.current = null
-      }
-    } catch (err) {
-      console.error('[BgAgent] Error handling event:', err)
-    }
-  }
-
-    api.subagentProgressStream(sessionId, handleEvt, ctrl.signal).catch((err) => {
-      console.error('[BgAgent] SSE connection lost:', err)
-      console.log('[BgAgent] Current bgAgents at disconnect:', JSON.stringify(bgAgents))
-      // SSE连接断开时，标记所有运行中的任务为断开状态，保留结果让用户手动获取
-      // 不要清除 bgAgents，因为子agent可能还在后台运行
-      setBgAgents(prev => {
-        const updated = prev.map(a => {
-          if (a.status === 'running') {
-            return { ...a, disconnected: true, progress: a.progress + '\n(连接已断开，点击刷新获取结果)' }
-          }
-          return a
-        })
-        console.log('[BgAgent] bgAgents after disconnect handling:', JSON.stringify(updated))
-        return updated
-      })
-      // 断开引用，避免重复处理
-      bgAgentsAbortRef.current = null
-      bgAgentsSessionRef.current = null
-    })
-  }, [])
 
   // 同步 currentSessionIdRef，供异步流式回调判断事件归属
   useEffect(() => {
@@ -752,7 +584,7 @@ function ChatPage() {
       // 所有子 agent 已结束，标记（后续由 auto-clear 机制清理）
       bgAgentsStreamFinishedRef.current = true
     }
-  }, [startBgAgentStream, setBgAgents])
+  }, [setBgAgents])
 
   // 更新 streamHandlerRef 当 session 变化时
   useEffect(() => {
@@ -785,11 +617,6 @@ function ChatPage() {
       const timer = setTimeout(() => {
         console.log('[BgAgent] Auto-clear triggered, clearing bgAgents')
         setBgAgents([])
-        if (bgAgentsAbortRef.current) {
-          bgAgentsAbortRef.current.abort()
-          bgAgentsAbortRef.current = null
-          bgAgentsSessionRef.current = null
-        }
       }, 12000)
       return () => clearTimeout(timer)
     }
@@ -798,11 +625,6 @@ function ChatPage() {
   // 切换 session 时清除子 Agent 状态
   useEffect(() => {
     return () => {
-      if (bgAgentsAbortRef.current) {
-        bgAgentsAbortRef.current.abort()
-        bgAgentsAbortRef.current = null
-        bgAgentsSessionRef.current = null
-      }
       setBgAgents([])
     }
   }, [currentSession?.id])
@@ -893,13 +715,12 @@ function ChatPage() {
           }, 500) // 延迟检查，让 finally 块有机会先执行
         }
 
-        // 页面重新可见时，仅在以下情况重连 subagent 进度流：
-        // 1. stream 未干净结束（bgAgentsStreamFinishedRef=false）：可能有未接收的事件
-        // 2. 有已断线的 agent：用户需要重新拉取结果
-        // 避免 stream 已完成时无意义重连触发 buffer replay 导致消息重复
+        // 页面重新可见时，WebSocket 会自动重连并接收所有事件
+        // 不需要额外处理（subagent 事件通过 processStreamEvent 处理）
         const hasDisconnectedAgents = bgAgents.some(a => a.disconnected)
-        if (!bgAgentsStreamFinishedRef.current || hasDisconnectedAgents) {
-          startBgAgentStream(currentSession.id)
+        if (hasDisconnectedAgents) {
+          // 仅刷新状态，移除断线标记
+          setBgAgents(prev => prev.map(a => ({ ...a, disconnected: false })))
         }
       }
     }
@@ -926,6 +747,8 @@ function ChatPage() {
 
   useEffect(() => {
     loadSessions()
+    // 预热 MCP，减少首次消息延迟
+    api.warmup().catch(() => { /* 忽略预热错误，不影响用户体验 */ })
     // 请求浏览器通知权限（用于后台任务完成提醒）
     void requestNotificationPermission()
   }, [])
@@ -1116,7 +939,7 @@ function ChatPage() {
     a => a.status === 'running' && !a.disconnected
   ).length
 
-  // 切换会话时恢复 MCP 工具设置
+  // 切换会话时恢复 MCP 工具设置并预热
   const handleSelectSession = (session: Session) => {
     isRestoringMcpRef.current = true
     setCurrentSession(session)
@@ -1124,6 +947,8 @@ function ChatPage() {
     setSelectedMcpServers(session.selectedMcpServers || [])
     // 恢复完成后允许正常保存
     setTimeout(() => { isRestoringMcpRef.current = false }, 50)
+    // 预热 MCP，减少首次消息延迟
+    api.warmup().catch(() => { /* 忽略预热错误，不影响用户体验 */ })
   }
 
   // MCP 工具设置变化时自动保存到当前会话
@@ -1334,10 +1159,9 @@ function ChatPage() {
     // 通过 WebSocket 发送消息（done/error 由 handleWsMessage 处理）
     const sendFn = wsSendRef.current
     if (!sendFn) {
-      // WebSocket 未连接，等待连接后重试
-      console.warn('[WebSocket] Not connected, waiting for connection...')
-      // 清理状态
-      setMessages(prev => prev.filter(m => !m.id.startsWith('temp-')))
+      // WebSocket 未连接，消息已在 hook 中缓冲，连接恢复后会自动发送
+      console.warn('[WebSocket] Not connected, message buffered for reconnection')
+      // 保持用户消息可见，只清除 loading 状态
       setLoading(false)
       setStreamingSessionIds(prev => {
         const next = new Set(prev)
@@ -1346,7 +1170,7 @@ function ChatPage() {
       })
       bgSessionStatesRef.current.delete(sessionId)
       isStreamingRef.current = false
-      antMessage.error(t('chat.sendFailed'))
+      antMessage.warning(t('chat.reconnecting'))
       return
     }
 
@@ -1650,7 +1474,11 @@ function ChatPage() {
                   size="small"
                   onClick={() => {
                     if (currentSession) {
-                      startBgAgentStream(currentSession.id)
+                      // WebSocket 自动重连，刷新消息获取最新状态
+                      void loadMessages(currentSession.id)
+                      void loadSessionTokenUsage(currentSession.id)
+                      // 移除断线标记
+                      setBgAgents(prev => prev.map(a => ({ ...a, disconnected: false })))
                     }
                   }}
                   style={{ marginLeft: 'auto', padding: '0 4px' }}
