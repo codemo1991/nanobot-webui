@@ -110,7 +110,20 @@ class ChannelManager:
                 logger.info("DingTalk channel enabled")
             except ImportError as e:
                 logger.warning(f"DingTalk channel not available: {e}")
-    
+
+        # Browser channel
+        if self.config.channels.browser.enabled:
+            try:
+                from nanobot.channels.browser import BrowserChannel
+                self.channels["browser"] = BrowserChannel(
+                    self.config.channels.browser,
+                    self.bus,
+                    agent=self.agent,
+                )
+                logger.info("Browser channel enabled")
+            except ImportError as e:
+                logger.warning(f"Browser channel not available: {e}")
+
     async def start_all(self) -> None:
         """Start WhatsApp channel and the outbound dispatcher."""
         if not self.channels:
