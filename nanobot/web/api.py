@@ -697,6 +697,25 @@ class NanobotWebAPI:
             SubagentProgressBus.get().clear_buffer(origin_key)
         return result
 
+    def subagent_progress_stream(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
+        """
+        订阅指定 web session 的子 Agent 进度事件队列。
+
+        origin_key = "web:{session_id}"（与 SpawnTool.set_context("web", session_id) 对应）。
+        返回的 Queue 会持续接收 subagent_start / subagent_progress / subagent_end 事件，
+        直到调用方手动取消订阅。
+        """
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+        origin_key = f"web:{session_id}"
+        return SubagentProgressBus.get().subscribe(origin_key, replay=True)
+
+    def unsubscribe_subagent_progress(
+        self, session_id: str, q: "queue.Queue[dict[str, Any]]"
+    ) -> None:
+        """取消订阅子 Agent 进度队列。"""
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+        SubagentProgressBus.get().unsubscribe(f"web:{session_id}", q)
+
     def get_messages(self, session_id: str, before: int | None, limit: int) -> list[dict[str, Any]]:
         key = self.to_session_key(session_id)
         session = self.sessions.get(key)
@@ -3344,6 +3363,12 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
                 return
 
+            # GET /api/v1/chat/sessions/{sessionId}/subagent-progress (SSE)
+            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "subagent-progress":
+                session_id = parts[4]
+                self._handle_subagent_progress_stream(app, session_id)
+                return
+
             # Configuration endpoints
             if path == "/api/v1/config":
                 self._write_json(HTTPStatus.OK, _ok(app.get_config()))
@@ -4915,6 +4940,71 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
             return
 
+    def _handle_subagent_progress_stream(
+        self, app: "NanobotWebAPI", session_id: str
+    ) -> None:
+        """
+        以 SSE 形式持续推送子 Agent 进度事件。
+
+        订阅 SubagentProgressBus 的 "web:{session_id}" origin_key，
+        将事件实时流给前端；20 分钟无事件后自动关闭并发送 {"type": "timeout"}。
+        """
+        origin_key = f"web:{session_id}"
+        logger.info(f"[SubagentProgress] SSE connection established for session: {session_id}")
+        evt_queue = app.subagent_progress_stream(session_id)
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        idle_timeout = 1200
+        heartbeat_interval = 30
+        last_event = time.time()
+        last_heartbeat = time.time()
+
+        try:
+            while True:
+                try:
+                    evt = evt_queue.get(timeout=0.5)
+                    last_event = time.time()
+                except queue.Empty:
+                    now = time.time()
+                    if now - last_event >= idle_timeout:
+                        try:
+                            self.wfile.write(b'data: {"type":"timeout"}\n\n')
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        break
+                    if now - last_heartbeat >= heartbeat_interval:
+                        try:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                            last_heartbeat = now
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            break
+                    continue
+
+                try:
+                    payload = _sse_json_dumps(evt)
+                except (TypeError, ValueError, OverflowError) as e:
+                    logger.warning(f"[SubagentProgress] Failed to serialize event: {e}")
+                    continue
+
+                try:
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    logger.warning(f"[SubagentProgress] Connection lost for session {session_id}: {e}")
+                    break
+                if evt.get("type") == "stream_done":
+                    break
+        finally:
+            app.unsubscribe_subagent_progress(session_id, evt_queue)
+            logger.info(f"[SubagentProgress] SSE connection closed for session: {session_id}")
 
 
 class NanobotHTTPServer(ThreadingHTTPServer):
