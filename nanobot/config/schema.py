@@ -51,7 +51,7 @@ class QQConfig(BaseModel):
 
 class BrowserConfig(BaseModel):
     """Browser/WebUI channel configuration using WebSocket."""
-    enabled: bool = False
+    enabled: bool = True  # Web UI 默认启用
     host: str = "127.0.0.1"  # WebSocket server host
     port: int = 8765  # WebSocket server port
     agent_timeout: float = 300.0  # Agent call timeout in seconds
