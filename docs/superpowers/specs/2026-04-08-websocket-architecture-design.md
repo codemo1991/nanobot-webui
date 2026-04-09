@@ -25,25 +25,32 @@ Web UI ← SSE over HTTP → ThreadingHTTPServer → ChatStreamBus → AgentLoop
 ### 新架构
 
 ```
-Web UI ← WebSocket → FastAPI/Starlette → MessageBus → AgentLoop
+Web UI ← WebSocket → FastAPI (独立 ASGI Server) → MessageBus → AgentLoop
          (单一连接: 双向 WebSocket)
-         ↓
-      browser channel
+              ↓
+         browser channel (按配置启用)
 ```
+
+### browser Channel 启动条件
+
+- 只有在配置文件中启用 browser channel 时才启动 WebSocket 服务器
+- 与其他 channel（Feishu/Telegram）一样，由 ChannelManager 统一管理生命周期
 
 ## 技术方案
 
-### 1. Server 迁移到 FastAPI
+### 1. WebSocket Server 方案
 
-**改动概述：**
-- 将 `ThreadingHTTPServer` + 自定义 handler 迁移到 FastAPI
-- 使用 Starlette 的 WebSocket 支持
-- 全面异步化
+**方案选择：** FastAPI + Uvicorn
+
+**设计要点：**
+- browser channel 内部启动独立的 FastAPI/Uvicorn ASGI server
+- 端口在配置中指定（如 `browser.port: 8765`）
+- 与现有的 ThreadingHTTPServer 独立运行（避免侵入现有 channel）
+- browser channel 启用时启动，禁用时关闭
 
 **新增依赖：**
 - `fastapi`
 - `uvicorn`（ASGI server）
-- `websockets`（如果 Starlette 不够用）
 
 ### 2. WebSocket 消息协议
 
@@ -98,39 +105,90 @@ Web UI ← WebSocket → FastAPI/Starlette → MessageBus → AgentLoop
 - 管理 WebSocket 连接生命周期
 - 将 WebSocket 消息转换为 `InboundMessage`（channel = "browser"）
 - 接收 `OutboundMessage` 并推送给对应客户端
-- 处理连接认证（复用现有 session 机制）
+- **启动独立的 WebSocket 服务器**（按配置启用/禁用）
 
 **核心逻辑：**
 ```python
 class BrowserChannel(BaseChannel):
     name = "browser"
 
-    def __init__(self, config, bus: MessageBus, ws_manager):
-        self.ws_manager = ws_manager
+    def __init__(self, config, bus: MessageBus):
+        self.config = config
         self.bus = bus
+        self.ws_manager = WebSocketManager()
+        self._server_task: asyncio.Task | None = None
 
-    async def handle_websocket(self, websocket: WebSocket, session_id: str):
-        """处理 WebSocket 连接"""
+    async def start(self):
+        """启动 WebSocket 服务器（由 ChannelManager 调用）"""
+        if not self.config.get("enabled", False):
+            return
+        port = self.config.get("port", 8765)
+        host = self.config.get("host", "127.0.0.1")
+
+        app = FastAPI()
+
+        @app.websocket("/ws/{session_id}")
+        async def websocket_endpoint(websocket: WebSocket, session_id: str):
+            await self._handle_connection(websocket, session_id)
+
+        # 在独立线程中运行 uvicorn（不阻塞主事件循环）
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        self._server_task = asyncio.create_task(server.serve())
+
+    async def stop(self):
+        """停止 WebSocket 服务器"""
+        if self._server_task:
+            self._server_task.cancel()
+            try:
+                await self._server_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _handle_connection(self, websocket: WebSocket, session_id: str):
+        """处理单个 WebSocket 连接"""
         await websocket.accept()
-
-        # 注册到 ws_manager
-        self.ws_manager.register(session_id, websocket)
+        key = f"browser:{session_id}"
+        self.ws_manager.register(key, websocket)
 
         try:
-            # 接收消息 -> 转换为 InboundMessage -> 推送到 bus
             while True:
                 data = await websocket.receive_json()
                 msg = self._parse_message(data, session_id)
-                await self.bus.publish_inbound(msg)
+                if msg:
+                    await self.bus.publish_inbound(msg)
         except WebSocketDisconnect:
             pass
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
         finally:
-            self.ws_manager.unregister(session_id)
+            self.ws_manager.unregister(key, websocket)
+
+    def _parse_message(self, data: dict, session_id: str) -> InboundMessage | None:
+        """解析 WebSocket 消息为 InboundMessage"""
+        msg_type = data.get("type")
+
+        if msg_type == "message":
+            return InboundMessage(
+                channel="browser",
+                sender_id=session_id,
+                chat_id=session_id,
+                content=data.get("content", ""),
+                media=data.get("media"),
+                metadata={"session_id": session_id, "ws": True}
+            )
+        elif msg_type == "ping":
+            # 心跳，异步响应
+            asyncio.create_task(self.ws_manager.send(
+                f"browser:{session_id}",
+                {"type": "pong"}
+            ))
+        return None
 
     async def send(self, message: OutboundMessage):
-        """发送消息到客户端"""
+        """发送 OutboundMessage 到客户端"""
         key = f"browser:{message.chat_id}"
-        await self.ws_manager.send(key, message)
+        await self.ws_manager.send(key, {"type": "message", "content": message.content})
 ```
 
 ### 4. WebSocket Manager
@@ -138,8 +196,8 @@ class BrowserChannel(BaseChannel):
 **文件：** `nanobot/web/websocket_manager.py`
 
 **职责：**
-- 管理所有 WebSocket 连接（session_id → WebSocket mapping）
-- 广播消息到连接
+- 管理所有 WebSocket 连接（key → WebSocket mapping）
+- 单连接推送（每个 session 只有一个 WebSocket 连接）
 - 处理连接心跳
 - 清理断开的连接
 
@@ -147,57 +205,61 @@ class BrowserChannel(BaseChannel):
 ```python
 class WebSocketManager:
     def __init__(self):
-        self._connections: dict[str, list[WebSocket]] = {}
+        self._connections: dict[str, WebSocket] = {}
 
-    def register(self, session_id: str, websocket: WebSocket):
-        """注册新连接"""
-        key = f"browser:{session_id}"
-        if key not in self._connections:
-            self._connections[key] = []
-        self._connections[key].append(websocket)
+    def register(self, key: str, websocket: WebSocket):
+        """注册连接（每个 key 只允许一个连接）"""
+        self._connections[key] = websocket
 
-    def unregister(self, session_id: str, websocket: WebSocket):
+    def unregister(self, key: str, websocket: WebSocket):
         """注销连接"""
-        key = f"browser:{session_id}"
-        if key in self._connections:
-            try:
-                self._connections[key].remove(websocket)
-            except ValueError:
-                pass
-            if not self._connections[key]:
-                del self._connections[key]
+        if self._connections.get(key) is websocket:
+            del self._connections[key]
 
-    async def broadcast(self, key: str, event: dict):
-        """广播事件到所有订阅者"""
-        if key not in self._connections:
-            return
-        disconnected = []
-        for ws in self._connections[key]:
+    async def send(self, key: str, data: dict):
+        """发送数据到指定连接"""
+        ws = self._connections.get(key)
+        if ws:
             try:
-                await ws.send_json(event)
+                await ws.send_json(data)
             except Exception:
-                disconnected.append(ws)
-        # 清理断开的连接
-        for ws in disconnected:
-            self._connections[key].remove(ws)
+                self.unregister(key, ws)
 ```
 
-### 5. Agent Loop 集成
+### 5. Agent Loop 集成（progress 事件路由）
 
-AgentLoop 的 `process_direct()` 方法已有 `progress_callback` 机制。只需要修改回调实现，让它通过 `browser` channel 推送事件：
+**问题：** agent loop 的 `process_direct` 需要将 progress 事件实时推送到 WebSocket。
+
+**方案：** browser channel 提供一个全局的 progress 回调注册机制。
 
 ```python
-# browser channel 注册 progress 回调
-async def on_progress(event: dict):
-    session_id = event.get("session_id")
-    await ws_manager.broadcast(f"browser:{session_id}", {
-        "type": "event",
-        "event": event
-    })
+class BrowserChannel(BaseChannel):
+    # ...
 
-# 传给 agent loop
-metadata["progress_callback"] = on_progress
+    def get_progress_sender(self, session_id: str) -> Callable:
+        """返回该 session 的 progress 回调"""
+        key = f"browser:{session_id}"
+
+        async def send_progress(event: dict):
+            await self.ws_manager.send(key, {"type": "event", "event": event})
+
+        return send_progress
 ```
+
+**调用流程：**
+```
+browser channel.start()
+    ↓
+WebSocket 连接建立
+    ↓
+browser channel._handle_connection()
+    ↓
+progress_callback = get_progress_sender(session_id)
+    ↓
+progress_callback → ws_manager.send() → WebSocket
+```
+
+**实现细节：** 通过 `InboundMessage.metadata["progress_callback"]` 传递 progress_sender，agent loop 读取并使用。
 
 ### 6. 移除的组件
 
@@ -209,12 +271,15 @@ metadata["progress_callback"] = on_progress
   - `_handle_subagent_progress_stream()`
   - `/api/v1/traces/stream`
 
-### 7. API 路由设计
+### 7. WebSocket 端点设计
 
 ```
-WebSocket: /ws/{session_id}          # 主 WebSocket 连接
-HTTP:      (保持现有非流式端点)         # 如配置获取等
+WebSocket: ws://{host}:{port}/ws/{session_id}
 ```
+
+- host/port 在 browser channel 配置中指定
+- session_id 用于标识会话
+- 客户端负责管理 session 生命周期
 
 ### 8. 错误处理
 
@@ -243,20 +308,21 @@ HTTP:      (保持现有非流式端点)         # 如配置获取等
 ### 修改文件
 | 文件 | 改动 |
 |------|------|
-| `nanobot/web/api.py` | 迁移到 FastAPI，添加 WebSocket 端点 |
-| `nanobot/web/server.py` | 替换为 Uvicorn/FastAPI server |
-| `nanobot/bus/events.py` | 确认 browser channel 事件格式 |
+| `nanobot/config/schema.py` | 添加 browser channel 配置 schema |
+| `nanobot/config/builtin_templates_data.py` | 添加 browser channel 默认配置 |
 | `nanobot/channels/manager.py` | 注册 browser channel |
+| `nanobot/bus/events.py` | 确认 browser channel 事件格式 |
 | `web-ui/src/api.ts` | WebSocket 客户端实现 |
 | `web-ui/src/pages/ChatPage.tsx` | 适配 WebSocket 事件 |
 | `web-ui/src/hooks/useWebSocket.ts` | 新增 WebSocket hook |
+| `web-ui/src/config.ts` | 添加 WebSocket 连接配置 |
 | `pyproject.toml` | 添加 fastapi、uvicorn 依赖 |
 
 ### 删除文件
 | 文件 | 原因 |
 |------|------|
 | `nanobot/web/chat_stream_bus.py` | SSE 专用，WebSocket 不需要 |
-| SSE 端点方法 | 全部迁移到 WebSocket |
+| SSE 端点方法（api.py） | 全部迁移到 WebSocket |
 
 ## 测试场景
 
@@ -269,11 +335,12 @@ HTTP:      (保持现有非流式端点)         # 如配置获取等
 
 ## 迁移步骤
 
-1. 添加 FastAPI 依赖
-2. 实现 WebSocketManager
-3. 实现 browser channel
-4. 创建 WebSocket 端点
-5. 修改 AgentLoop progress 回调
-6. 客户端 WebSocket 实现
-7. 移除 SSE 相关代码
-8. 测试验证
+1. 添加 FastAPI、Uvicorn 依赖
+2. 实现 WebSocketManager（`nanobot/web/websocket_manager.py`）
+3. 实现 browser channel（`nanobot/channels/browser.py`）
+4. 添加 browser channel 配置 schema
+5. 在 ChannelManager 中注册 browser channel
+6. 客户端 WebSocket 实现（`useWebSocket.ts`、`api.ts`）
+7. 适配 ChatPage 使用 WebSocket
+8. 移除 SSE 相关代码（chat_stream_bus.py、SSE 端点）
+9. 测试验证
