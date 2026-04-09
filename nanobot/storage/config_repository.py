@@ -721,6 +721,8 @@ class ConfigRepository:
                 "apiBase": provider["api_base"],
                 "displayName": provider["display_name"],
                 "priority": provider["priority"],
+                "enabled": provider["enabled"],
+                "providerType": provider["provider_type"],
             }
 
         for channel_id, channel_data in self.get_all_channels().items():

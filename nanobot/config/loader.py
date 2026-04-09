@@ -86,11 +86,11 @@ def init_system_providers(repo: "ConfigRepository", yaml_config: Any = None) -> 
                 INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json, api_version, azure_deployment)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
-                    api_key=excluded.api_key,
-                    api_base=excluded.api_base,
+                    api_key=CASE WHEN excluded.api_key != '' THEN excluded.api_key ELSE api_key END,
+                    api_base=CASE WHEN excluded.api_base IS NOT NULL AND excluded.api_base != '' THEN excluded.api_base ELSE api_base END,
                     display_name=excluded.display_name,
-                    api_version=excluded.api_version,
-                    azure_deployment=excluded.azure_deployment
+                    api_version=CASE WHEN excluded.api_version != '' THEN excluded.api_version ELSE api_version END,
+                    azure_deployment=CASE WHEN excluded.azure_deployment != '' THEN excluded.azure_deployment ELSE azure_deployment END
                 """,
                 (sp_id, sp_id, yaml_key, yaml_base, 1, 0, now,
                  sp["display_name"], sp["provider_type"], 1, 0, "{}",
