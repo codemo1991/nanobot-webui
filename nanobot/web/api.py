@@ -86,7 +86,7 @@ class NanobotWebAPI:
         self._sys = sys
         self.gateway_process = None
         self.start_time = time.time()
-        # core_loop 由 run_server() 的 core_thread 启动后赋值，用于 chat_stream Gateway 模式
+        # core_loop 由 run_server() 的 core_thread 启动后赋值，用于 chat_sync Gateway 模式
         self.core_loop: asyncio.AbstractEventLoop | None = None
         # Logging configured by setup_logging() in CLI main callback
         config = ensure_initial_config()
@@ -794,59 +794,6 @@ class NanobotWebAPI:
 
     # ==================== Mirror Room Methods ====================
 
-    def mirror_chat_stream(
-        self, session_type: str, session_id: str, content: str
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
-        """Run mirror chat with progress events."""
-        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-
-        def on_progress(evt: dict[str, Any]) -> None:
-            try:
-                evt_queue.put(evt)
-            except Exception as e:
-                logger.warning(f"[MirrorChat] Failed to push event {evt.get('type')} to queue: {e}")
-
-        def run_agent() -> None:
-            loop = None
-            try:
-                # 创建新的事件循环（避免与主线程冲突）
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(
-                    self._mirror_chat_with_progress(session_type, session_id, content, on_progress)
-                )
-                evt_queue.put({"type": "done", **result})
-            except asyncio.CancelledError:
-                evt_queue.put({"type": "error", "message": "cancelled"})
-            except Exception as e:
-                logger.exception("Mirror chat stream failed")
-                evt_queue.put({"type": "error", "message": str(e)})
-            finally:
-                # 等待事件循环内未完成的任务（含微内核、子代理），避免 loop.close() 导致 Task was destroyed / coroutine ignored GeneratorExit
-                if loop:
-                    try:
-                        current = asyncio.current_task()
-                        pending = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not current]
-                        if pending:
-                            logger.info(f"[MirrorChatStream] Waiting for {len(pending)} pending tasks before closing loop")
-                            try:
-                                loop.run_until_complete(asyncio.wait_for(
-                                    asyncio.gather(*pending, return_exceptions=True),
-                                    timeout=130,
-                                ))
-                            except asyncio.TimeoutError:
-                                logger.warning("[MirrorChatStream] Pending tasks timed out after 130s, cancelling")
-                                for t in pending:
-                                    if not t.done():
-                                        t.cancel()
-                                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                        loop.close()
-                    except Exception as e:
-                        logger.debug("Loop close error (ignored): %s", e)
-
-        thread = threading.Thread(target=run_agent, daemon=False)
-        return evt_queue, thread
-
     async def _mirror_chat_with_progress(
         self,
         session_type: str,
@@ -944,26 +891,6 @@ class NanobotWebAPI:
         self.sessions.save(session)
         return content
 
-    def wu_first_reply_stream(
-        self, session_id: str
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
-        """流式返回悟首次回复。"""
-        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-
-        def run() -> None:
-            try:
-                evt_queue.put({"type": "thinking"})
-                result = asyncio.run(self._wu_first_reply(session_id))
-                evt_queue.put({"type": "done", "content": result})
-            except KeyError:
-                evt_queue.put({"type": "error", "message": "mirror wu session not found"})
-            except Exception as e:
-                logger.exception("Wu first reply failed")
-                evt_queue.put({"type": "error", "message": str(e)})
-
-        thread = threading.Thread(target=run, daemon=False)
-        return evt_queue, thread
-
     async def _bian_first_reply(self, session_id: str) -> str:
         """辩首次回复：有 topic 时开场该辩题，无 topic 时随机给出三个辩题供选。"""
         key = MirrorService._session_key("bian", session_id)
@@ -1009,26 +936,6 @@ class NanobotWebAPI:
         session.add_message("assistant", content)
         self.sessions.save(session)
         return content
-
-    def bian_first_reply_stream(
-        self, session_id: str
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
-        """流式返回辩首次回复。"""
-        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-
-        def run() -> None:
-            try:
-                evt_queue.put({"type": "thinking"})
-                result = asyncio.run(self._bian_first_reply(session_id))
-                evt_queue.put({"type": "done", "content": result})
-            except KeyError:
-                evt_queue.put({"type": "error", "message": "mirror bian session not found"})
-            except Exception as e:
-                logger.exception("Bian first reply failed")
-                evt_queue.put({"type": "error", "message": str(e)})
-
-        thread = threading.Thread(target=run, daemon=False)
-        return evt_queue, thread
 
     async def _run_mirror_analysis(
         self, stype: str, key: str
@@ -1311,247 +1218,6 @@ class NanobotWebAPI:
             except Exception as e:
                 logger.warning(f"Failed to save image after {max_retries} attempts: {e}")
         return paths
-
-    def chat_stream(
-        self, session_id: str, content: str, images: list[str] | None = None,
-        tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread | None | str, str]:
-        """
-        Gateway 模式：将消息发布到 core_loop 的 inbound 队列，通过 on_complete / on_progress
-        回调将事件写入 evt_queue，供 SSE 消费端读取。
-
-        返回 (evt_queue, None, origin_key) — 正常 Gateway 模式
-              (evt_queue, threading.Thread, origin_key) — 降级线程模式
-              (evt_queue, reason, origin_key) — 入队失败，reason 见 try_publish_inbound_sync（如 queue_full、enqueue_timeout）
-        """
-        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        media_paths = self._save_images_to_temp(images or [])
-
-        # 立即保存用户消息，确保刷新界面时能看到提问（即使 nanobot 仍在回答中）
-        key = self.to_session_key(session_id)
-        session = self.sessions.get_or_create(key)
-        user_kwargs: dict[str, Any] = {}
-        if images:
-            user_kwargs["images"] = images
-        session.add_message("user", content or "[图片]", **user_kwargs)
-        self.sessions.save(session)
-        logger.info(f"[ChatStream] User message saved immediately for session {session_id}")
-
-        from nanobot.web.chat_stream_bus import ChatStreamBus
-        stream_bus = ChatStreamBus.get()
-        origin_key = f"web:{session_id}"
-        # 如果有活跃的 SSE 订阅者（旧连接还在等待 done 事件），不清空缓冲，
-        # 让旧 SSE 自然结束；新事件会累积到新的 evt_queue 供新 SSE 消费。
-        # 这样避免 clear_buffer 把旧 SSE 的 pending done 事件也清掉，导致挂起。
-        if not stream_bus.has_active_subscribers(origin_key):
-            stream_bus.clear_buffer(origin_key)
-
-        def _put_evt(evt: dict[str, Any]) -> None:
-            try:
-                evt_queue.put(evt)
-                stream_bus.push(origin_key, evt)
-            except Exception as e:
-                logger.warning(f"[ChatStream] Failed to push event {evt.get('type')} to queue: {e}")
-
-        # 注册 SSE 处理器，使 has_active_subscribers 能检测到活跃的 POST SSE
-        stream_bus.register_sse_handler(origin_key)
-
-        def on_progress(evt: dict[str, Any]) -> None:
-            _put_evt(evt)
-
-        def on_complete(response_content: str, error: str | None = None) -> None:
-            """由 AgentLoop.run() 在消息处理结束后调用，触发 SSE done/error 事件。"""
-            for p in media_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if error:
-                _put_evt({"type": "error", "message": error})
-                return
-            try:
-                assistant_msg = self._build_assistant_message(session_id, key)
-            except Exception as e:
-                logger.warning(f"[ChatStream] 构造 assistantMessage 失败，仍将下发 done: {e}")
-                assistant_msg = None
-            _put_evt({
-                "type": "done",
-                "content": response_content,
-                "assistantMessage": assistant_msg,
-            })
-
-        # 发送 start 事件（与旧实现一致，使前端知道流已建立）
-        _put_evt({"type": "start", "session_id": session_id})
-
-        _extra: dict[str, Any] = {"user_message_saved": True}
-        if tool_mode:
-            _extra["tool_mode"] = tool_mode
-        if selected_mcp_servers:
-            _extra["selected_mcp_servers"] = selected_mcp_servers
-
-        from nanobot.bus.events import InboundMessage as _InboundMessage
-        inbound_msg = _InboundMessage(
-            channel="web",
-            sender_id="user",
-            chat_id=session_id,
-            content=content or "",
-            metadata={
-                "progress_callback": on_progress,
-                "on_complete": on_complete,
-                **_extra,
-            },
-            media=media_paths,
-        )
-
-        core_loop = self.core_loop
-        if core_loop is None or not core_loop.is_running():
-            logger.error("[ChatStream] core_loop not ready, falling back to legacy thread mode")
-            # 降级：使用旧线程模式（兼容 core_loop 未就绪的情况）
-            thread = self._chat_stream_legacy(
-                session_id, content, images, tool_mode, selected_mcp_servers,
-                evt_queue=evt_queue, media_paths=media_paths,
-                on_progress=on_progress, key=key,
-            )
-            return evt_queue, thread, origin_key
-
-        ok, inbound_reason = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
-        if not ok:
-            logger.warning(
-                f"[ChatStream] inbound 入队失败 session={session_id} reason={inbound_reason} "
-                f"inbound_depth={self.agent.bus.inbound_size}"
-            )
-            return evt_queue, inbound_reason, origin_key
-
-        logger.info(f"[ChatStream] Message enqueued to core_loop for session {session_id}")
-        return evt_queue, None, origin_key
-
-    def _chat_stream_legacy(
-        self,
-        session_id: str,
-        content: str,
-        images: list[str] | None,
-        tool_mode: str | None,
-        selected_mcp_servers: list[str] | None,
-        evt_queue: "queue.Queue[dict[str, Any]]",
-        media_paths: list[str],
-        on_progress: Any,
-        key: str,
-    ) -> tuple["queue.Queue[dict[str, Any]]", threading.Thread]:
-        """
-        降级回退：当 core_loop 未就绪时，沿用旧的 threading.Thread + new_event_loop 模式。
-        正常运行时不应进入此路径。
-        """
-        logger.warning("[ChatStream] Using legacy thread mode (core_loop unavailable)")
-
-        def run_agent() -> None:
-            loop = None
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                _extra = {"user_message_saved": True}
-                if tool_mode:
-                    _extra["tool_mode"] = tool_mode
-                if selected_mcp_servers:
-                    _extra["selected_mcp_servers"] = selected_mcp_servers
-                result = loop.run_until_complete(
-                    self._chat_with_progress(
-                        session_id, content, on_progress, media_paths,
-                        extra_metadata=_extra,
-                    )
-                )
-                evt_queue.put({"type": "done", **result})
-            except asyncio.CancelledError:
-                evt_queue.put({"type": "error", "message": "cancelled"})
-            except Exception as e:
-                logger.exception(f"[ChatStream] legacy mode failed: {e}")
-                evt_queue.put({"type": "error", "message": str(e)})
-            finally:
-                if loop:
-                    try:
-                        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
-                        if pending:
-                            # 立即 cancel，给 3s 收尾（MCP 连接关闭等），避免线程长时间残留
-                            for t in pending:
-                                t.cancel()
-                            try:
-                                loop.run_until_complete(asyncio.wait_for(
-                                    asyncio.gather(*pending, return_exceptions=True),
-                                    timeout=3.0,
-                                ))
-                            except (asyncio.TimeoutError, Exception):
-                                pass
-                        loop.close()
-                    except Exception as e:
-                        logger.debug("Loop close error (ignored): %s", e)
-                for p in media_paths:
-                    try:
-                        Path(p).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-        thread = threading.Thread(target=run_agent, daemon=False)
-        return evt_queue, thread
-
-    async def _chat_with_progress(
-        self,
-        session_id: str,
-        content: str,
-        progress_callback: Any,
-        media: list[str] | None = None,
-        extra_metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Internal: run chat with optional progress callback. Used by chat() and legacy mode."""
-        key = self.to_session_key(session_id)
-        self.sessions.get_or_create(key)
-        # 注意：MCP 不再在这里 reload。Gateway 模式下 core_loop 持有稳定的 MCP 连接；
-        # 降级线程模式下保持原有行为（由 loop.py 的 loop-id 检测触发按需 reload）。
-        response = await self.agent.process_direct(
-            content=content,
-            session_key=key,
-            channel="web",
-            chat_id=session_id,
-            progress_callback=progress_callback,
-            media=media or [],
-            extra_metadata=extra_metadata,
-        )
-        try:
-            assistant_msg = self._build_assistant_message(session_id, key)
-        except Exception as e:
-            logger.warning(f"[_chat_with_progress] 构造 assistantMessage 失败: {e}")
-            assistant_msg = None
-        return {
-            "content": response,
-            "assistantMessage": assistant_msg,
-        }
-
-    def chat_stream_resume(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
-        """
-        订阅指定 session 的 Chat 流式事件（用于刷新/切换 tab 后重连 SSE）。
-        返回的 Queue 会接收 start / tool_start / tool_end / done / error 等事件，
-        支持 replay 已发生的事件。
-        """
-        from nanobot.web.chat_stream_bus import ChatStreamBus
-        origin_key = f"web:{session_id}"
-        return ChatStreamBus.get().subscribe(origin_key, replay=True)
-
-    def subagent_progress_stream(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
-        """
-        订阅指定 web session 的子 Agent 进度事件队列。
-
-        origin_key = "web:{session_id}"（与 SpawnTool.set_context("web", session_id) 对应）。
-        返回的 Queue 会持续接收 subagent_start / subagent_progress / subagent_end 事件，
-        直到调用方手动取消订阅。
-        """
-        from nanobot.agent.subagent_progress import SubagentProgressBus
-        origin_key = f"web:{session_id}"
-        return SubagentProgressBus.get().subscribe(origin_key, replay=True)
-
-    def unsubscribe_subagent_progress(
-        self, session_id: str, q: "queue.Queue[dict[str, Any]]"
-    ) -> None:
-        """取消订阅子 Agent 进度队列。"""
-        from nanobot.agent.subagent_progress import SubagentProgressBus
-        SubagentProgressBus.get().unsubscribe(f"web:{session_id}", q)
 
     async def chat(
         self, session_id: str, content: str, images: list[str] | None = None,
@@ -1887,6 +1553,7 @@ class NanobotWebAPI:
             api_version=api_version_val,
             azure_deployment=azure_deployment_val,
         )
+        logger.debug(f"[update_provider] {provider_id}: repo.set_provider done, api_key={bool(api_key_val)}")
 
         # Create provider instance and clear router cache
         if api_key_val:
@@ -1925,6 +1592,7 @@ class NanobotWebAPI:
         api_base_val = data.get("apiBase")
         api_version_val = data.get("apiVersion", "")
         azure_deployment_val = data.get("azureDeployment", "")
+        logger.debug(f"[update_provider] {provider_id}: apiKey received = {bool(api_key_val)}, apiKey[:6] = {api_key_val[:6] if api_key_val else 'EMPTY'}")
 
         repo.set_provider(
             provider_id=provider_id,
@@ -1941,6 +1609,7 @@ class NanobotWebAPI:
             api_version=api_version_val,
             azure_deployment=azure_deployment_val,
         )
+        logger.debug(f"[update_provider] {provider_id}: repo.set_provider done, api_key={bool(api_key_val)}")
 
         # Update provider instance and clear router cache
         if api_key_val:
@@ -1950,7 +1619,13 @@ class NanobotWebAPI:
                 api_base=api_base_val,
                 provider_type=data.get("providerType", "openai"),
             )
-            self.router.clear_cache()
+            # Also update the router's own provider registry so it picks up the new credentials
+            self.router.update_provider_instance(
+                provider_id=provider_id,
+                api_key=api_key_val,
+                api_base=api_base_val,
+                provider_type=data.get("providerType", "openai"),
+            )
 
         return {
             "id": provider_id,
@@ -3416,364 +3091,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _handle_chat_stream_resume(
-        self, app: "NanobotWebAPI", session_id: str
-    ) -> None:
-        """
-        重连 Chat SSE 流。当用户刷新或切换 tab 后，可由此端点继续接收推送结果。
-        """
-        logger.info(f"[ChatStream] SSE resume connection for session: {session_id}")
-        evt_queue = app.chat_stream_resume(session_id)
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        idle_timeout = 60  # 60 秒无事件则关闭（replay 后若流已结束会很快收到 done）
-        heartbeat_interval = 30
-        last_event = time.time()
-        last_heartbeat = time.time()
-
-        try:
-            while True:
-                try:
-                    evt = evt_queue.get(timeout=0.5)
-                    last_event = time.time()
-                except queue.Empty:
-                    now = time.time()
-                    if now - last_event >= idle_timeout:
-                        try:
-                            self.wfile.write(b'data: {"type":"timeout"}\n\n')
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            pass
-                        break
-                    if now - last_heartbeat >= heartbeat_interval:
-                        try:
-                            self.wfile.write(b": heartbeat\n\n")
-                            self.wfile.flush()
-                            last_heartbeat = now
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            break
-                    continue
-                try:
-                    payload = _sse_json_dumps(evt)
-                except (TypeError, ValueError, OverflowError) as e:
-                    logger.warning("Chat stream resume SSE serialization failed: %s", e)
-                    continue
-                try:
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
-                if evt.get("type") in ("done", "error"):
-                    break
-        except Exception as e:
-            logger.warning("Chat stream resume error: %s", e)
-        finally:
-            # 退订 ChatStreamBus，防止已消费完毕的 Queue 对象在订阅者列表中无限累积
-            from nanobot.web.chat_stream_bus import ChatStreamBus
-            ChatStreamBus.get().unsubscribe(f"web:{session_id}", evt_queue)
-
-    def _handle_chat_stream(
-        self, app: "NanobotWebAPI", session_id: str, content: str, images: list[str] | None = None,
-        tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
-    ) -> None:
-        """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
-        logger.info(f"Starting chat stream for session {session_id}")
-
-        from nanobot.web.chat_stream_bus import ChatStreamBus
-        stream_bus = ChatStreamBus.get()
-        origin_key = f"web:{session_id}"
-        # 注册 SSE 处理器，使后续 POST 能检测到活跃 SSE（避免 clear_buffer 挂死）
-        stream_bus.register_sse_handler(origin_key)
-
-        result = app.chat_stream(session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-        evt_queue = result[0]
-        thread_or_status = result[1] if len(result) > 1 else None
-        origin_key = result[2] if len(result) > 2 else f"web:{session_id}"
-        # 入队失败时直接返回 HTTP 503（由 chat_stream 返回 reason）
-        _inbound_fail_messages: dict[str, str] = {
-            "queue_full": "服务繁忙，请稍后重试（消息队列已满）",
-            "enqueue_timeout": "服务暂时无法接收消息，请稍后重试（执行核可能被长任务阻塞）",
-            "loop_none": "执行核未就绪，请稍后重试",
-            "loop_not_running": "执行核未运行，请稍后重试",
-            "loop_status_error": "执行核状态异常，请稍后重试",
-            "enqueue_error": "消息入队失败，请稍后重试",
-        }
-        if isinstance(thread_or_status, str) and thread_or_status in _inbound_fail_messages:
-            self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            payload = {
-                "error": _inbound_fail_messages[thread_or_status],
-                "inbound_fail_reason": thread_or_status,
-            }
-            try:
-                self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                # 客户端已断开（如 WinError 10053），避免抛到 do_POST 再次 _write_json 导致双次异常
-                pass
-            return
-        thread = thread_or_status if isinstance(thread_or_status, threading.Thread) else None
-        if thread is not None:
-            logger.info(f"Chat stream thread created: {thread}")
-            thread.start()
-            logger.info(f"Chat stream thread started: {thread.is_alive()}")
-        else:
-            logger.info(f"Chat stream running in Gateway mode for session {session_id}")
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        heartbeat_interval = 30
-        last_heartbeat = time.time()
-        stream_start = time.time()
-        # Gateway 模式总超时 = message_timeout + 60s 缓冲，防止 on_complete 永久不触发
-        total_timeout = getattr(app.agent, "message_timeout", 300.0) + 60.0
-
-        # 追踪流是否干净结束（done/error 事件已成功送达客户端）
-        # 干净结束时可以安全清理 ChatStreamBus 缓冲；客户端断开则保留以便 resume 重连
-        stream_ended_cleanly = False
-
-        try:
-            loop_count = 0
-            while True:
-                loop_count += 1
-                evt = None
-                try:
-                    evt = evt_queue.get(timeout=0.5)
-                    if isinstance(evt, dict) and evt.get('type'):
-                        logger.debug(f"Got event: {evt.get('type')}")
-                except queue.Empty:
-                    now = time.time()
-                    # Gateway 模式总超时保护：防止 core_loop 异常后 SSE 永久挂起
-                    if thread is None and (now - stream_start) > total_timeout:
-                        logger.warning(
-                            f"[ChatStream] SSE total timeout ({total_timeout}s) for session {session_id}"
-                        )
-                        try:
-                            self.wfile.write('data: {"type":"error","message":"处理超时"}\n\n'.encode("utf-8"))
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            pass
-                        break
-                    # 降级线程模式：线程已结束时尝试获取最后一个事件
-                    if thread is not None and not thread.is_alive():
-                        try:
-                            evt = evt_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    if evt is None:
-                        if now - last_heartbeat >= heartbeat_interval:
-                            try:
-                                self.wfile.write(b": heartbeat\n\n")
-                                self.wfile.flush()
-                                last_heartbeat = now
-                                logger.debug("SSE heartbeat sent")
-                            except (BrokenPipeError, ConnectionResetError, OSError):
-                                logger.debug("Client disconnected (heartbeat), cancelling session")
-                                app.agent.cancel_current_request(channel="web", session_id=session_id)
-                                break
-                        continue
-                try:
-                    payload = _sse_json_dumps(evt)
-                except (TypeError, ValueError, OverflowError) as e:
-                    logger.warning("SSE event serialization failed: %s", e)
-                    if evt.get("type") in ("done", "error"):
-                        try:
-                            if evt.get("type") == "done":
-                                payload = json.dumps(
-                                    {
-                                        "type": "done",
-                                        "content": str(evt.get("content") or ""),
-                                        "assistantMessage": None,
-                                    },
-                                    ensure_ascii=False,
-                                )
-                            else:
-                                payload = json.dumps(
-                                    {
-                                        "type": "error",
-                                        "message": str(evt.get("message") or "响应序列化失败"),
-                                    },
-                                    ensure_ascii=False,
-                                )
-                        except (TypeError, ValueError, OverflowError):
-                            continue
-                    else:
-                        continue
-                line = f"data: {payload}\n\n"
-                try:
-                    self.wfile.write(line.encode("utf-8"))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    logger.debug("Client disconnected during stream, cancelling session")
-                    # 客户端断开：通知 core_loop 取消正在处理的任务
-                    app.agent.cancel_current_request(channel="web", session_id=session_id)
-                    break
-                if evt.get("type") in ("done", "error"):
-                    stream_ended_cleanly = True
-                    break
-            if thread is not None:
-                # legacy 模式：等线程清理完 pending tasks（最多 3s）再加 2s 缓冲
-                thread.join(timeout=5.0)
-        except Exception as e:
-            logger.warning("Chat stream write error: %s", e)
-        finally:
-            # 注销 SSE 处理器计数，使后续 POST 能正确判断是否有活跃 SSE
-            stream_bus.unregister_sse_handler(origin_key)
-            if thread is not None and thread.is_alive():
-                # 正常情况不应到达此处（线程 finally 最多耗时 3s，join 给了 5s）
-                logger.warning("Chat stream thread still running after response end (legacy mode), waiting 3s more...")
-                thread.join(timeout=3.0)
-                if thread.is_alive():
-                    logger.error("Chat stream legacy thread failed to terminate within 8s, possible resource leak")
-            # 流正常结束时主动清理 ChatStreamBus 缓冲，防止长期运行内存积累；
-            # 客户端中途断开则保留缓冲，resume 重连时可回放
-            if stream_ended_cleanly:
-                stream_bus.close_session(origin_key)
-
-    def _handle_subagent_progress_stream(
-        self, app: "NanobotWebAPI", session_id: str
-    ) -> None:
-        """
-        以 SSE 形式持续推送子 Agent 进度事件。
-
-        订阅 SubagentProgressBus 的 "web:{session_id}" origin_key，
-        将事件实时流给前端；20 分钟无事件后自动关闭并发送 {"type": "timeout"}。
-        late result 场景下 SDK 可能超时后继续运行，延长空闲超时以便用户能收到最终结果。
-        """
-        origin_key = f"web:{session_id}"
-        logger.info(f"[SubagentProgress] SSE connection established for session: {session_id}, origin_key: {origin_key}")
-        evt_queue = app.subagent_progress_stream(session_id)
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        idle_timeout = 1200  # 20 分钟无事件自动关闭（覆盖 Claude Code SDK 超时后 late result 的等待期）
-        heartbeat_interval = 30
-        last_event = time.time()
-        last_heartbeat = time.time()
-
-        try:
-            while True:
-                try:
-                    evt = evt_queue.get(timeout=0.5)
-                    last_event = time.time()
-                except queue.Empty:
-                    now = time.time()
-                    if now - last_event >= idle_timeout:
-                        try:
-                            self.wfile.write(b'data: {"type":"timeout"}\n\n')
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            pass
-                        break
-                    if now - last_heartbeat >= heartbeat_interval:
-                        try:
-                            self.wfile.write(b": heartbeat\n\n")
-                            self.wfile.flush()
-                            last_heartbeat = now
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            break
-                    continue
-
-                try:
-                    payload = _sse_json_dumps(evt)
-                except (TypeError, ValueError, OverflowError) as e:
-                    logger.warning(f"[SubagentProgress] Failed to serialize event: {e}, event: {evt}")
-                    continue
-
-                try:
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-                    logger.debug(f"[SubagentProgress] Sent event to frontend: {evt.get('type')}, task_id: {evt.get('task_id')}")
-                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    logger.warning(f"[SubagentProgress] Connection lost for session {session_id}, event not sent: {evt.get('type')}, task_id: {evt.get('task_id')}, error: {e}")
-                    break
-                if evt.get("type") == "stream_done":
-                    logger.info(f"[SubagentProgress] All subagents finished for session {session_id}, closing SSE")
-                    break
-        finally:
-            app.unsubscribe_subagent_progress(session_id, evt_queue)
-            # 注意：不再自动清除缓冲区，保留事件供后续重连时 replay
-            # 缓冲区会在会话真正结束时通过 clear_buffer API 手动清除
-            logger.info(f"[SubagentProgress] SSE connection closed for session: {session_id}, buffer preserved for replay")
-
-    def _handle_mirror_chat_stream(
-        self, app: "NanobotWebAPI", session_type: str, session_id: str, content: str
-    ) -> None:
-        """Stream mirror chat progress via SSE."""
-        evt_queue, thread = app.mirror_chat_stream(session_type, session_id, content)
-        thread.start()
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        heartbeat_interval = 30  # 心跳间隔（秒）
-        last_heartbeat = time.time()
-
-        try:
-            loop_count = 0
-            while True:
-                loop_count += 1
-                evt = None
-                try:
-                    evt = evt_queue.get(timeout=0.5)
-                    if isinstance(evt, dict) and evt.get('type'):
-                        logger.debug(f"Got event: {evt.get('type')}")
-                except queue.Empty:
-                    now = time.time()
-                    if not thread.is_alive():
-                        try:
-                            evt = evt_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    if evt is None:
-                        if now - last_heartbeat >= heartbeat_interval:
-                            try:
-                                self.wfile.write(b": heartbeat\n\n")
-                                self.wfile.flush()
-                                last_heartbeat = now
-                            except (BrokenPipeError, ConnectionResetError, OSError):
-                                logger.debug("Client disconnected, stopping stream")
-                                break
-                        continue
-                try:
-                    payload = _sse_json_dumps(evt)
-                except (TypeError, ValueError, OverflowError) as e:
-                    logger.warning(f"[ChatStream] Failed to serialize mirror event: {e}")
-                    continue
-                line = f"data: {payload}\n\n"
-                try:
-                    self.wfile.write(line.encode("utf-8"))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
-                if evt.get("type") in ("done", "error"):
-                    break
-            thread.join(timeout=1.0)
-        except Exception:
-            pass
-
     def _serve_static(self, file_path: Path) -> None:
         """Serve a static file."""
         try:
@@ -4018,32 +3335,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
                 return
 
-            # GET /api/v1/chat/sessions/{sessionId}/stream  (SSE 重连)
-            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "stream":
-                session_id = parts[4]
-                try:
-                    self._handle_chat_stream_resume(app, session_id)
-                except Exception as exc:
-                    logger.exception("Chat stream resume failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("CHAT_STREAM_RESUME_FAILED", "Chat 流重连失败", str(exc)),
-                    )
-                return
-
-            # GET /api/v1/chat/sessions/{sessionId}/subagent-progress  (SSE)
-            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "subagent-progress":
-                session_id = parts[4]
-                try:
-                    self._handle_subagent_progress_stream(app, session_id)
-                except Exception as exc:
-                    logger.exception("Subagent progress stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("SUBAGENT_PROGRESS_FAILED", "子 Agent 进度流失败", str(exc)),
-                    )
-                return
-
             # GET /api/v1/chat/sessions/{sessionId}/token-summary
             if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "token-summary":
                 session_id = parts[4]
@@ -4079,6 +3370,15 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/providers":
                 config_data = app.get_config()
                 self._write_json(HTTPStatus.OK, _ok(config_data["providers"]))
+                return
+
+            if path == "/api/v1/debug/path":
+                from nanobot.config.loader import get_system_db_path
+                self._write_json(HTTPStatus.OK, _ok({
+                    "system_db": str(get_system_db_path()),
+                    "home": str(Path.home()),
+                    "cwd": str(Path.cwd()),
+                }))
                 return
 
             if path == "/api/v1/models":
@@ -4624,20 +3924,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 或 images 不能为空"))
                 return
             session_id = parts[4]
-            use_stream = query.get("stream", [None])[0] == "1"
             tool_mode = body.get("tool_mode")
             selected_mcp_servers = body.get("selected_mcp_servers")
-
-            if use_stream:
-                try:
-                    self._handle_chat_stream(app, session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-                except Exception as exc:
-                    logger.exception("Chat stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("CHAT_STREAM_FAILED", "流式处理失败", str(exc)),
-                    )
-                return
 
             try:
                 # Gateway 模式：消息入队到 core_loop，避免 asyncio.run 创建新 loop 触发 MCP reload
@@ -4867,7 +4155,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("MIRROR_CREATE_FAILED", str(e)))
             return
 
-        # POST /api/v1/mirror/sessions/{sessionId}/wu-first-reply (stream=1)
+        # POST /api/v1/mirror/sessions/{sessionId}/wu-first-reply
         if (
             len(parts) == 6
             and parts[:3] == ["api", "v1", "mirror"]
@@ -4875,75 +4163,24 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             and parts[5] == "wu-first-reply"
         ):
             session_id = parts[4]
-            use_stream = query.get("stream", [None])[0] == "1"
             key_wu = MirrorService._session_key("wu", session_id)
             if app.sessions.get(key_wu) is None:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "悟会话不存在"))
                 return
-            if use_stream:
-                try:
-                    evt_queue, thread = app.wu_first_reply_stream(session_id)
-                    thread.start()
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "keep-alive")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    heartbeat_interval = 30  # 心跳间隔（秒）
-                    last_heartbeat = time.time()
-                    try:
-                        while True:
-                            evt = None
-                            try:
-                                evt = evt_queue.get(timeout=0.5)
-                            except queue.Empty:
-                                now = time.time()
-                                if not thread.is_alive():
-                                    try:
-                                        evt = evt_queue.get_nowait()
-                                    except queue.Empty:
-                                        break
-                                if evt is None:
-                                    if now - last_heartbeat >= heartbeat_interval:
-                                        try:
-                                            self.wfile.write(b": heartbeat\n\n")
-                                            self.wfile.flush()
-                                            last_heartbeat = now
-                                        except (BrokenPipeError, ConnectionResetError, OSError):
-                                            break
-                                    continue
-                            if evt is None:
-                                continue
-                            payload = _sse_json_dumps(evt)
-                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                            self.wfile.flush()
-                            if evt.get("type") in ("done", "error"):
-                                break
-                        thread.join(timeout=1.0)
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    logger.exception("Wu first reply stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("WU_FIRST_REPLY_FAILED", "悟首次回复失败", str(exc)),
-                    )
-            else:
-                try:
-                    content = asyncio.run(app._wu_first_reply(session_id))
-                    self._write_json(HTTPStatus.OK, _ok({"content": content}))
-                except KeyError:
-                    self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "悟会话不存在"))
-                except Exception as exc:
-                    logger.exception("Wu first reply failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("WU_FIRST_REPLY_FAILED", "悟首次回复失败", str(exc)),
-                    )
+            try:
+                content = asyncio.run(app._wu_first_reply(session_id))
+                self._write_json(HTTPStatus.OK, _ok({"content": content}))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "悟会话不存在"))
+            except Exception as exc:
+                logger.exception("Wu first reply failed")
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    _err("WU_FIRST_REPLY_FAILED", "悟首次回复失败", str(exc)),
+                )
             return
 
-        # POST /api/v1/mirror/sessions/{sessionId}/bian-first-reply (stream=1)
+        # POST /api/v1/mirror/sessions/{sessionId}/bian-first-reply
         if (
             len(parts) == 6
             and parts[:3] == ["api", "v1", "mirror"]
@@ -4951,75 +4188,24 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             and parts[5] == "bian-first-reply"
         ):
             session_id = parts[4]
-            use_stream = query.get("stream", [None])[0] == "1"
             key_bian = MirrorService._session_key("bian", session_id)
             if app.sessions.get(key_bian) is None:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "辩会话不存在"))
                 return
-            if use_stream:
-                try:
-                    evt_queue, thread = app.bian_first_reply_stream(session_id)
-                    thread.start()
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "keep-alive")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    heartbeat_interval = 30  # 心跳间隔（秒）
-                    last_heartbeat = time.time()
-                    try:
-                        while True:
-                            evt = None
-                            try:
-                                evt = evt_queue.get(timeout=0.5)
-                            except queue.Empty:
-                                now = time.time()
-                                if not thread.is_alive():
-                                    try:
-                                        evt = evt_queue.get_nowait()
-                                    except queue.Empty:
-                                        break
-                                if evt is None:
-                                    if now - last_heartbeat >= heartbeat_interval:
-                                        try:
-                                            self.wfile.write(b": heartbeat\n\n")
-                                            self.wfile.flush()
-                                            last_heartbeat = now
-                                        except (BrokenPipeError, ConnectionResetError, OSError):
-                                            break
-                                    continue
-                            if evt is None:
-                                continue
-                            payload = _sse_json_dumps(evt)
-                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                            self.wfile.flush()
-                            if evt.get("type") in ("done", "error"):
-                                break
-                        thread.join(timeout=1.0)
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    logger.exception("Bian first reply stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("BIAN_FIRST_REPLY_FAILED", "辩首次回复失败", str(exc)),
-                    )
-            else:
-                try:
-                    content = asyncio.run(app._bian_first_reply(session_id))
-                    self._write_json(HTTPStatus.OK, _ok({"content": content}))
-                except KeyError:
-                    self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "辩会话不存在"))
-                except Exception as exc:
-                    logger.exception("Bian first reply failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("BIAN_FIRST_REPLY_FAILED", "辩首次回复失败", str(exc)),
-                    )
+            try:
+                content = asyncio.run(app._bian_first_reply(session_id))
+                self._write_json(HTTPStatus.OK, _ok({"content": content}))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "辩会话不存在"))
+            except Exception as exc:
+                logger.exception("Bian first reply failed")
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    _err("BIAN_FIRST_REPLY_FAILED", "辩首次回复失败", str(exc)),
+                )
             return
 
-        # POST /api/v1/mirror/sessions/{sessionId}/messages (with optional ?stream=1)
+        # POST /api/v1/mirror/sessions/{sessionId}/messages
         if (
             len(parts) == 6
             and parts[:3] == ["api", "v1", "mirror"]
@@ -5032,7 +4218,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 不能为空"))
                 return
             session_id = parts[4]
-            use_stream = query.get("stream", [None])[0] == "1"
 
             # Session type: prefer from body, else detect by iterating
             stype = body.get("type") if body.get("type") in ("wu", "bian") else None
@@ -5044,17 +4229,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                         break
                 if not stype:
                     stype = "wu"
-
-            if use_stream:
-                try:
-                    self._handle_mirror_chat_stream(app, stype, session_id, content)
-                except Exception as exc:
-                    logger.exception("Mirror chat stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("MIRROR_STREAM_FAILED", "镜室流式处理失败", str(exc)),
-                    )
-                return
 
             try:
                 data = asyncio.run(
@@ -5843,25 +5017,6 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
         cron_thread, cron_loop = _run_cron_in_thread(app)
     except Exception as e:
         logger.warning(f"Failed to start cron service: {e}")
-
-    # ── ② Cron ChatStreamBus 过期会话 TTL 清理（每小时一次）──
-    # 对于客户端中途断开、从未触发 close_session 的 session，每小时清理一次无活跃订阅且超时的缓冲
-    def _stream_bus_cleanup_loop() -> None:
-        from nanobot.web.chat_stream_bus import ChatStreamBus
-        while True:
-            time.sleep(3600)
-            try:
-                n = ChatStreamBus.get().cleanup_stale_sessions()
-                if n:
-                    logger.debug("[ChatStreamBus] 清理了 %d 个过期会话缓冲", n)
-            except Exception as _e:
-                logger.warning("[ChatStreamBus] cleanup error: %s", _e)
-
-    threading.Thread(
-        target=_stream_bus_cleanup_loop,
-        daemon=True,
-        name="stream-bus-cleanup",
-    ).start()
 
     # ── ③ 确定静态文件目录 ──
     if static_dir is None:
