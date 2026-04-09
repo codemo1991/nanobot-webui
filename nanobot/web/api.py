@@ -94,8 +94,8 @@ class NanobotWebAPI:
         # Initialize config repository
         repo = get_config_repository()
 
-        # Migrate YAML provider credentials to SQLite (one-time on startup)
-        init_system_providers(repo, config)
+        # Initialize system providers in SQLite
+        init_system_providers(repo)
 
         # Ensure system models are populated in config_models (resilient — won't crash on missing columns)
         from nanobot.config.loader import ensure_models_populated
@@ -234,6 +234,14 @@ class NanobotWebAPI:
         self.mirror = MirrorService(
             workspace=workspace_path,
             sessions_manager=self.sessions,
+        )
+
+        # Browser/WebUI channel — WebSocket server for local web UI
+        from nanobot.channels.browser import BrowserChannel
+        self.browser_channel = BrowserChannel(
+            config=config.channels.browser,
+            bus=self.agent.bus,
+            agent=self.agent,
         )
 
         # 初始化仅用于发送的渠道客户端（供 cron 任务推送回复使用，不启动 inbound 监听）
@@ -638,14 +646,14 @@ class NanobotWebAPI:
 
     @staticmethod
     def to_session_id(key: str) -> str:
-        return key.split(":", 1)[1] if key.startswith("web:") else key
+        return key.split(":", 1)[1] if key.startswith("web:") or key.startswith("browser:") else key
 
     @staticmethod
     def to_session_key(session_id: str) -> str:
-        return f"web:{session_id}"
+        return f"browser:{session_id}"
 
     def list_sessions(self, page: int, page_size: int) -> dict[str, Any]:
-        all_sessions = self.sessions.list_sessions(key_prefix="web:")
+        all_sessions = self.sessions.list_sessions(key_prefix="browser:")
         total = len(all_sessions)
         start = max(0, (page - 1) * page_size)
         end = start + page_size
@@ -690,7 +698,7 @@ class NanobotWebAPI:
     def delete_session(self, session_id: str) -> bool:
         # 先删除会话，如果成功则清理缓冲区
         from nanobot.agent.subagent_progress import SubagentProgressBus
-        origin_key = f"web:{session_id}"
+        origin_key = f"browser:{session_id}"
         result = self.sessions.delete(self.to_session_key(session_id))
         # 只有会话删除成功后才清理缓冲区，防止内存泄漏
         if result:
@@ -701,12 +709,12 @@ class NanobotWebAPI:
         """
         订阅指定 web session 的子 Agent 进度事件队列。
 
-        origin_key = "web:{session_id}"（与 SpawnTool.set_context("web", session_id) 对应）。
+        origin_key = "browser:{session_id}"（4e0e SpawnTool.set_context("browser", session_id) 5bf95e94Ff09
         返回的 Queue 会持续接收 subagent_start / subagent_progress / subagent_end 事件，
         直到调用方手动取消订阅。
         """
         from nanobot.agent.subagent_progress import SubagentProgressBus
-        origin_key = f"web:{session_id}"
+        origin_key = f"browser:{session_id}"
         return SubagentProgressBus.get().subscribe(origin_key, replay=True)
 
     def unsubscribe_subagent_progress(
@@ -714,7 +722,7 @@ class NanobotWebAPI:
     ) -> None:
         """取消订阅子 Agent 进度队列。"""
         from nanobot.agent.subagent_progress import SubagentProgressBus
-        SubagentProgressBus.get().unsubscribe(f"web:{session_id}", q)
+        SubagentProgressBus.get().unsubscribe(f"browser:{session_id}", q)
 
     def get_messages(self, session_id: str, before: int | None, limit: int) -> list[dict[str, Any]]:
         key = self.to_session_key(session_id)
@@ -4949,7 +4957,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         订阅 SubagentProgressBus 的 "web:{session_id}" origin_key，
         将事件实时流给前端；20 分钟无事件后自动关闭并发送 {"type": "timeout"}。
         """
-        origin_key = f"web:{session_id}"
+        origin_key = f"browser:{session_id}"
         logger.info(f"[SubagentProgress] SSE connection established for session: {session_id}")
         evt_queue = app.subagent_progress_stream(session_id)
 
@@ -5057,6 +5065,13 @@ async def _core_main(app: "NanobotWebAPI", core_ready: "threading.Event") -> Non
     app.core_loop = asyncio.get_running_loop()
     core_ready.set()
     try:
+        # Start browser/WebUI channel WebSocket server
+        logger.info("[Browser] Starting WebSocket server...")
+        try:
+            await app.browser_channel.start()
+            logger.info("[Browser] WebSocket server started successfully")
+        except Exception as e:
+            logger.exception(f"[Browser] Failed to start WebSocket server: {e}")
         await app.agent.run()
     except Exception as e:
         logger.error(f"[Core] Agent loop crashed unexpectedly: {e}", exc_info=True)

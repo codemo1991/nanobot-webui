@@ -648,16 +648,11 @@ class ConfigRepository:
             raise
 
     def has_config(self) -> bool:
-        """检查是否已有配置数据。"""
+        """检查是否已有用户配置数据（仅检查 config 表，不检查 config_providers）。"""
         try:
             with self._connect() as conn:
                 row = conn.execute("SELECT COUNT(*) as cnt FROM config").fetchone()
-                if row and row["cnt"] > 0:
-                    return True
-                row = conn.execute("SELECT COUNT(*) as cnt FROM config_providers").fetchone()
-                if row and row["cnt"] > 0:
-                    return True
-                return False
+                return row is not None and row["cnt"] > 0
         except Exception:
             return False
 

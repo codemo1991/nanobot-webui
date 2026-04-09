@@ -80,6 +80,12 @@ export type StreamEvent =
   | { type: 'done'; content: string; assistantMessage: Message | null }
   | { type: 'error'; message: string }
   | { type: 'timeout' }
+  | { type: 'subagent_start'; task_id: string; label: string; backend: string; task: string }
+  | { type: 'subagent_progress'; task_id: string; label: string; subtype: string; content: string; tool_name?: string }
+  | { type: 'subagent_end'; task_id: string; label: string; status: 'ok' | 'error' | 'timeout' | 'cancelled'; summary: string }
+  | { type: 'subagent_summary'; task_id: string; task_ids?: string[]; label: string; llm_summary: string; message_id: string }
+  | { type: 'stream_done' }
+  | { type: 'microkernel_end'; task_id: string; label: string; status: string }
 
 /** 子 Agent 后台进度 SSE 事件（来自 /subagent-progress 端点） */
 export type SubagentProgressEvent =

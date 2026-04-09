@@ -41,45 +41,20 @@ def ensure_system_db_initialized() -> None:
     logger.debug("System DB initialized: %s", system_db)
 
 
-def init_system_providers(repo: "ConfigRepository", yaml_config: Any = None) -> None:
+def init_system_providers(repo: "ConfigRepository") -> None:
     """Initialize system providers (is_system=True, user cannot delete).
 
-    Writes to SQLite as the authoritative source. If yaml_config is provided
-    (Config object from YAML), its api_key values are used as the initial
-    write so that existing YAML credentials are migrated to SQLite.
-    Existing SQLite records are preserved (ON CONFLICT DO UPDATE with
-    api_key only when yaml has a non-empty key).
-
-    Args:
-        repo: ConfigRepository instance
-        yaml_config: Optional Config object with YAML values for migration
+    Writes to SQLite as the authoritative source. Existing SQLite records
+    are preserved (ON CONFLICT DO UPDATE with api_key/api_base only when
+    the new value is non-empty).
     """
     from nanobot.providers.system_providers import SYSTEM_PROVIDERS
-
-    # Extract yaml api_key values if config is provided
-    yaml_api_keys: dict[str, str] = {}
-    yaml_api_bases: dict[str, str | None] = {}
-    yaml_api_versions: dict[str, str] = {}
-    yaml_azure_deployments: dict[str, str] = {}
-    if yaml_config is not None and hasattr(yaml_config, "providers"):
-        for name in ["openai", "anthropic", "deepseek", "azure"]:
-            pc = getattr(yaml_config.providers, name, None)
-            if pc is not None:
-                yaml_api_keys[name] = getattr(pc, "api_key", "") or ""
-                yaml_api_bases[name] = getattr(pc, "api_base", None)
-                yaml_api_versions[name] = getattr(pc, "api_version", "") or ""
-                yaml_azure_deployments[name] = getattr(pc, "azure_deployment", "") or ""
 
     logger.info(f"Initializing {len(SYSTEM_PROVIDERS)} system providers...")
     total_models = 0
     for sp in SYSTEM_PROVIDERS:
         sp_id = sp["id"]
         now = repo._get_timestamp()
-        # yaml 值作为初始写入（migration），已有记录则用 ON CONFLICT DO UPDATE
-        yaml_key = yaml_api_keys.get(sp_id, "")
-        yaml_base = yaml_api_bases.get(sp_id, sp.get("api_base"))
-        yaml_api_ver = yaml_api_versions.get(sp_id, "")
-        yaml_azure_dep = yaml_azure_deployments.get(sp_id, "")
         with repo._connect() as conn:
             conn.execute(
                 """
@@ -92,12 +67,14 @@ def init_system_providers(repo: "ConfigRepository", yaml_config: Any = None) -> 
                     api_version=CASE WHEN excluded.api_version != '' THEN excluded.api_version ELSE api_version END,
                     azure_deployment=CASE WHEN excluded.azure_deployment != '' THEN excluded.azure_deployment ELSE azure_deployment END
                 """,
-                (sp_id, sp_id, yaml_key, yaml_base, 1, 0, now,
-                 sp["display_name"], sp["provider_type"], 1, 0, "{}",
-                 yaml_api_ver, yaml_azure_dep),
+                (sp_id, sp_id, "", sp.get("api_base"), 1, 0, now,
+                 sp["display_name"], sp["provider_type"], 1, 0, "{}", "", ""),
             )
-        # Write default models (upsert — safe to re-run)
+        # Write default models only if they don't exist (preserve user modifications)
         for m in sp.get("models", []):
+            existing = repo.get_model(m["id"])
+            if existing:
+                continue  # Skip existing models to preserve user modifications
             repo.set_model(
                 model_id=m["id"],
                 provider_id=sp_id,
@@ -125,10 +102,6 @@ def init_dynamic_providers(
     This registers all providers (including system providers from
     system_providers.py and user-created providers) with the
     ProviderManager so they can be used for model routing.
-
-    Args:
-        repo: ConfigRepository instance
-        provider_manager: ProviderManager instance
     """
     providers = repo.get_all_providers()
 
@@ -165,6 +138,10 @@ def ensure_models_populated(repo: "ConfigRepository") -> None:
     for sp in SYSTEM_PROVIDERS:
         for m in sp.get("models", []):
             try:
+                # Only insert if model doesn't exist (preserve user modifications)
+                existing = repo.get_model(m["id"])
+                if existing:
+                    continue
                 repo.set_model(
                     model_id=m["id"],
                     provider_id=sp["id"],
@@ -195,9 +172,12 @@ def ensure_initial_config() -> Config:
     """
     ensure_system_db_initialized()
     repo = get_config_repository()
-    init_system_providers(repo)
 
+    # Only check config table (not config_providers) to determine if user config exists.
+    # config_providers is populated by init_system_providers, so checking it would
+    # always return True after init_system_providers is called.
     if not repo.has_config():
+        init_system_providers(repo)
         config = Config()
         save_config(config)
         ws_path = config.workspace_path
@@ -207,6 +187,7 @@ def ensure_initial_config() -> Config:
         )
         return config
 
+    init_system_providers(repo)
     return load_config()
 
 
@@ -230,7 +211,11 @@ def get_effective_model() -> str:
 
 
 def load_config() -> Config:
-    """Load configuration from SQLite."""
+    """Load configuration from SQLite.
+
+    Applies schema defaults for new fields added after initial installation
+    (e.g., browser channel enabled flag).
+    """
     repo = get_config_repository()
     try:
         config_data = repo.load_full_config()
@@ -238,6 +223,16 @@ def load_config() -> Config:
         # 移除 Config schema 中不存在的扩展字段，避免 Pydantic 校验失败
         for key in ("models", "model_profiles"):
             data.pop(key, None)
+
+        # Apply schema defaults for missing browser channel config
+        # browser channel was added later with schema default enabled=True,
+        # but old configs may have enabled=False stored. Always use True.
+        if "channels" not in data:
+            data["channels"] = {}
+        if "browser" not in data["channels"]:
+            data["channels"]["browser"] = {}
+        data["channels"]["browser"]["enabled"] = True
+
         return Config.model_validate(data)
     except Exception as e:
         logger.warning(f"Failed to load config from SQLite: {e}, using defaults")

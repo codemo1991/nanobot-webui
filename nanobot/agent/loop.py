@@ -2289,8 +2289,8 @@ class AgentLoop:
             if progress:
                 try:
                     progress(evt)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[_emit] progress_callback raised: {e}")
 
         # 细粒度事件流：agent_start
         _emit({"type": "agent_start", "iteration": 0})
@@ -3332,9 +3332,9 @@ class AgentLoop:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         extra_metadata: dict[str, Any] | None = None,
         media: list[str] | None = None,
-    ) -> str:
+    ) -> "OutboundMessage | None":
         """
-        Process a message directly (for CLI or cron usage).
+        Process a message directly (for CLI or browser WebSocket usage).
 
         Args:
             content: The message content.
@@ -3394,10 +3394,10 @@ class AgentLoop:
         try:
             await self._check_cancelled(session_key)
             response = await self._process_message(msg)
-            return response.content if response else ""
+            return response
         except asyncio.CancelledError:
             logger.info("Agent request was cancelled")
-            return ""
+            return None
         finally:
             # 异常/取消时确保结束执行链路并持久化节点（正常返回时 _process_message 已调用）
             try:

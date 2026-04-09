@@ -178,12 +178,15 @@ function ChatPage() {
   }>>([])
   const bgAgentsAbortRef = useRef<AbortController | null>(null)
   const bgAgentsSessionRef = useRef<string | null>(null)
+  const bgAgentsRef = useRef(bgAgents)  // Track current bgAgents for use in stream handler
 
   // WebSocket 连接 refs
   const wsSendRef = useRef<((data: object) => void) | null>(null)
   const wsDisconnectRef = useRef<(() => void) | null>(null)
   // 存储当前的 stream event handler（避免 useWebSocket 依赖变化导致频繁重连）
   const streamHandlerRef = useRef<(evt: StreamEvent) => void>(() => {})
+  // Track the streaming assistant message ID to prevent duplicate rendering
+  const streamingAssistantIdRef = useRef<string | null>(null)
 
   // 使用任务轮询 hook，当页面从后台恢复时检查任务状态
   useTaskPolling({
@@ -381,6 +384,11 @@ function ChatPage() {
     currentSessionIdRef.current = currentSession?.id ?? null
   }, [currentSession])
 
+  // 同步 bgAgentsRef，供 processStreamEvent 中读取当前值
+  useEffect(() => {
+    bgAgentsRef.current = bgAgents
+  }, [bgAgents])
+
   // 批量 flush pending chunks 到 UI（16ms debounce ≈ 1 frame at 60fps，避免每条都重渲染）
   const flushPendingChunks = useCallback((sessionId: string) => {
     const pending = pendingChunksRef.current.get(sessionId)
@@ -409,17 +417,34 @@ function ChatPage() {
 
   // WebSocket 消息处理：将 WsEvent 转换为 StreamEvent 并路由
   const handleWsMessage = useCallback((event: WsEvent) => {
+    console.log('[handleWsMessage] received:', JSON.stringify(event))
     const sessionId = currentSessionIdRef.current
     if (!sessionId) return
 
     // 处理 done 事件
     if (event.event?.type === 'done') {
+      console.log('[handleWsMessage] processing done, assistantMessage:', JSON.stringify(event.event.assistantMessage))
       if (sessionId === currentSessionIdRef.current) {
         setLoading(false)
         setStreamingThinking(false)
         setStreamingToolSteps([])
         setClaudeCodeProgress('')
-        refreshStreamDoneRef.current(sessionId)
+
+        // 直接用 assistantMessage 替换 temp 消息（避免 loadMessages 时序问题）
+        const assistantMsg = event.event.assistantMessage
+        console.log('[handleWsMessage] setting messages, assistantMsg:', JSON.stringify(assistantMsg))
+        setMessages(prev => {
+          // 移除所有 temp- 开头的占位消息
+          const withoutTemp = prev.filter(m => !m.id.startsWith('temp-'))
+          // 添加真实 assistant 消息（来自 DB，有 sequence）
+          if (assistantMsg) {
+            streamingAssistantIdRef.current = assistantMsg.id
+            return [...withoutTemp, assistantMsg]
+          }
+          return withoutTemp
+        })
+        // 后台刷新确保数据一致
+        void loadSessionTokenUsage(sessionId)
       } else {
         void loadSessions()
       }
@@ -437,6 +462,7 @@ function ChatPage() {
         setStreamingToolSteps([])
         setStreamingThinking(false)
         setClaudeCodeProgress('')
+        streamingAssistantIdRef.current = null
         currentTaskIdRef.current = null
         setPollingTaskId(null)
         clearStreamingState(sessionId)
@@ -457,6 +483,7 @@ function ChatPage() {
         setStreamingToolSteps([])
         setStreamingThinking(false)
         setClaudeCodeProgress('')
+        streamingAssistantIdRef.current = null
         currentTaskIdRef.current = null
         setPollingTaskId(null)
         abortControllerRef.current = null
@@ -504,6 +531,16 @@ function ChatPage() {
 
     if (evt.type === 'done') {
       bgSessionStatesRef.current.delete(sessionId)
+      // Skip reload if handleWsMessage already added assistantMessage
+      if (streamingAssistantIdRef.current) {
+        streamingAssistantIdRef.current = null
+        if (isCurrent) {
+          setStreamingThinking(false)
+          setStreamingToolSteps([])
+          setClaudeCodeProgress('')
+        }
+        return
+      }
       if (isCurrent) {
         setStreamingThinking(false)
         setStreamingToolSteps([])
@@ -566,6 +603,31 @@ function ChatPage() {
         const newText = bgState.progress ? bgState.progress + '\n' + line : line
         const lines = newText.split('\n')
         bgState.progress = lines.length > 30 ? lines.slice(-30).join('\n') : newText
+      } else if (evt.type === 'subagent_start') {
+        // 后台会话：追加到 bgSessionStatesRef（不影响当前 UI）
+        const agents = bgAgentsRef.current
+        if (!agents.find(a => a.taskId === evt.task_id)) {
+          setBgAgents(prev => [...prev, {
+            taskId: evt.task_id,
+            label: evt.label,
+            status: 'running',
+            progress: evt.task.slice(0, 80),
+            backend: evt.backend,
+          }])
+        }
+      } else if (evt.type === 'subagent_progress') {
+        setBgAgents(prev => prev.map(a =>
+          a.taskId === evt.task_id ? { ...a, progress: evt.content ? (a.progress + '\n' + evt.content).slice(-500) : a.progress } : a
+        ))
+      } else if (evt.type === 'subagent_end') {
+        setBgAgents(prev => prev.map(a =>
+          a.taskId === evt.task_id ? { ...a, status: evt.status as 'done' | 'error' | 'timeout' | 'cancelled', result: evt.summary } : a
+        ))
+      } else if (evt.type === 'subagent_summary') {
+        setBgAgents(prev => prev.map(a =>
+          (a.taskId === evt.task_id || (evt.task_ids && evt.task_ids.includes(a.taskId)))
+            ? { ...a, result: evt.llm_summary, status: 'done' as const } : a
+        ))
       }
       bgSessionStatesRef.current.set(sessionId, bgState)
       return
@@ -579,9 +641,7 @@ function ChatPage() {
       if (evt.name === 'claude_code') {
         setClaudeCodeProgress('')
       }
-      if (evt.name === 'spawn') {
-        startBgAgentStream(sessionId)
-      }
+      // subagent 进度通过 WebSocket 接收，不再单独启动 SSE
       setStreamingToolSteps(prev => [...prev, {
         id: evt.id,
         name: evt.name,
@@ -644,8 +704,55 @@ function ChatPage() {
         const lines = newText.split('\n')
         return lines.length > 30 ? lines.slice(-30).join('\n') : newText
       })
+    } else if (evt.type === 'subagent_start') {
+      // WebSocket 接收 subagent 进度事件（不再走 SSE）
+      setBgAgents(prev => {
+        if (prev.find(a => a.taskId === evt.task_id)) return prev
+        return [...prev, {
+          taskId: evt.task_id,
+          label: evt.label,
+          status: 'running',
+          progress: evt.task.slice(0, 80),
+          backend: evt.backend,
+        }]
+      })
+      if (!currentTaskIdRef.current && evt.backend === 'claude_code') {
+        currentTaskIdRef.current = evt.task_id
+        if (document.visibilityState === 'hidden') {
+          setPollingTaskId(evt.task_id)
+        }
+      }
+    } else if (evt.type === 'subagent_progress') {
+      setBgAgents(prev => prev.map(a =>
+        a.taskId === evt.task_id
+          ? { ...a, progress: evt.content ? (a.progress + '\n' + evt.content).slice(-500) : a.progress }
+          : a
+      ))
+    } else if (evt.type === 'subagent_end') {
+      const statusMap: Record<string, typeof bgAgents[number]['status']> = {
+        ok: 'done', error: 'error', timeout: 'timeout', cancelled: 'cancelled',
+      }
+      setBgAgents(prev => prev.map(a =>
+        a.taskId === evt.task_id ? { ...a, status: statusMap[evt.status] ?? 'error', result: evt.summary, disconnected: false } : a
+      ))
+    } else if (evt.type === 'subagent_summary') {
+      setBgAgents(prev => prev.map(a =>
+        (a.taskId === evt.task_id || (evt.task_ids && evt.task_ids.includes(a.taskId)))
+          ? { ...a, result: evt.llm_summary, status: 'done' as const, disconnected: false }
+          : a
+      ))
+      if (isCurrent) {
+        refreshStreamDoneRef.current(sessionId)
+      }
+    } else if (evt.type === 'microkernel_end') {
+      setBgAgents(prev => prev.map(a =>
+        a.taskId === evt.task_id ? { ...a, status: 'done' as const, disconnected: false } : a
+      ))
+    } else if (evt.type === 'stream_done') {
+      // 所有子 agent 已结束，标记（后续由 auto-clear 机制清理）
+      bgAgentsStreamFinishedRef.current = true
     }
-  }, [startBgAgentStream])
+  }, [startBgAgentStream, setBgAgents])
 
   // 更新 streamHandlerRef 当 session 变化时
   useEffect(() => {
@@ -1206,6 +1313,7 @@ function ChatPage() {
     perSessionAbortControllers.current.set(sessionId, controller)
     abortControllerRef.current = controller
 
+    streamingAssistantIdRef.current = null  // Reset before new stream
     const tempUserMsg: Message = {
       id: `temp-${Date.now()}`,
       sessionId,

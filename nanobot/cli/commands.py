@@ -277,7 +277,7 @@ def gateway(
             await bus.publish_outbound(OutboundMessage(
                 channel=channel,
                 chat_id=to,
-                content=response or ""
+                content=response.content if response else ""
             ))
             logger.info(f"Cron job '{job_name}' response delivered to {channel}:{to}")
 
@@ -597,7 +597,7 @@ def agent(
         # Single message mode
         async def run_once():
             response = await agent_loop.process_direct(message, session_id)
-            console.print(f"\n{__logo__} {response}")
+            console.print(f"\n{__logo__} {response.content if response else ''}")
         
         asyncio.run(run_once())
     else:
@@ -612,7 +612,7 @@ def agent(
                         continue
                     
                     response = await agent_loop.process_direct(user_input, session_id)
-                    console.print(f"\n{__logo__} {response}\n")
+                    console.print(f"\n{__logo__} {response.content if response else ''}\n")
                 except KeyboardInterrupt:
                     console.print("\nGoodbye!")
                     break

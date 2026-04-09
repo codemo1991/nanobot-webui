@@ -1,5 +1,12 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 
+// 扩展 Window 类型
+declare global {
+  interface Window {
+    __wsUnloaded?: boolean;
+  }
+}
+
 export interface WsEvent {
   type: string;
   event?: {
@@ -18,6 +25,7 @@ export interface UseWebSocketOptions {
   onError?: (error: Event) => void;
   reconnect?: boolean;
   reconnectInterval?: number;
+  heartbeatInterval?: number;  // 心跳间隔(ms)，默认 30s
 }
 
 export function useWebSocket(options: UseWebSocketOptions) {
@@ -29,28 +37,98 @@ export function useWebSocket(options: UseWebSocketOptions) {
     onError,
     reconnect = true,
     reconnectInterval = 3000,
+    heartbeatInterval = 30000,  // 30秒心跳
   } = options;
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const heartbeatIntervalRef = useRef<number | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
+  // Use refs for callbacks to avoid reconnects when callback references change
+  const onMessageRef = useRef(onMessage);
+  const onConnectRef = useRef(onConnect);
+  const onDisconnectRef = useRef(onDisconnect);
+  const onErrorRef = useRef(onError);
+  const urlRef = useRef(url);
+
+  // Keep refs updated
+  onMessageRef.current = onMessage;
+  onConnectRef.current = onConnect;
+  onDisconnectRef.current = onDisconnect;
+  onErrorRef.current = onError;
+  urlRef.current = url;
+
+  const clearHeartbeat = useCallback(() => {
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
+  }, []);
+
+  const clearReconnect = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+  }, []);
+
+  const disconnect = useCallback(() => {
+    clearHeartbeat();
+    clearReconnect();
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+  }, [clearHeartbeat, clearReconnect]);
+
+  const startHeartbeat = useCallback(() => {
+    clearHeartbeat();
+    heartbeatIntervalRef.current = window.setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, heartbeatInterval);
+  }, [clearHeartbeat, heartbeatInterval]);
+
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+    const currentUrl = urlRef.current;
+    console.log('[WebSocket] connect called, URL:', currentUrl);
+
+    if (!currentUrl) {
+      console.log('[WebSocket] No URL provided, skipping connect');
       return;
     }
 
-    const ws = new WebSocket(url);
+    // 如果已有连接且正在打开或已打开，不再重复连接
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      console.log('[WebSocket] Already connected');
+      return;
+    }
+    if (wsRef.current?.readyState === WebSocket.CONNECTING) {
+      console.log('[WebSocket] Already connecting');
+      return;
+    }
+
+    const ws = new WebSocket(currentUrl);
+    console.log('[WebSocket] WebSocket created for URL:', currentUrl);
 
     ws.onopen = () => {
+      console.log('[WebSocket] Connected!');
       setIsConnected(true);
-      onConnect?.();
+      startHeartbeat();
+      onConnectRef.current?.();
     };
 
     ws.onmessage = (event) => {
+      console.log('[WebSocket] message received:', event.data);
       try {
+        // 忽略 pong 响应（心跳回执）
+        if (event.data === JSON.stringify({ type: 'pong' })) {
+          return;
+        }
         const data = JSON.parse(event.data) as WsEvent;
-        onMessage(data);
+        onMessageRef.current(data);
       } catch (e) {
         console.error('Failed to parse WebSocket message:', e);
       }
@@ -58,45 +136,95 @@ export function useWebSocket(options: UseWebSocketOptions) {
 
     ws.onclose = () => {
       setIsConnected(false);
-      onDisconnect?.();
+      clearHeartbeat();
+      onDisconnectRef.current?.();
 
-      if (reconnect) {
+      // 自动重连（只在页面未卸载时）
+      if (reconnect && !window.__wsUnloaded) {
+        clearReconnect();
         reconnectTimeoutRef.current = window.setTimeout(() => {
-          connect();
+          // 检查 URL 是否变化，如果变化则不重连旧 URL
+          if (urlRef.current === currentUrl) {
+            connect();
+          }
         }, reconnectInterval);
       }
     };
 
     ws.onerror = (error) => {
-      onError?.(error);
+      // 不打印 error 事件，onclose 会处理重连
+      onErrorRef.current?.(error);
     };
 
     wsRef.current = ws;
-  }, [url, onMessage, onConnect, onDisconnect, onError, reconnect, reconnectInterval]);
-
-  const disconnect = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-  }, []);
-
-  const send = useCallback((data: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data));
-    }
-  }, []);
+  }, [reconnect, reconnectInterval, startHeartbeat, clearHeartbeat, clearReconnect]);
 
   useEffect(() => {
+    console.log('[WebSocket] Hook mounted, URL:', url);
     connect();
-    return () => {
+
+    // 标记页面未卸载
+    window.__wsUnloaded = false;
+
+    // 页面卸载时断开连接（只断开，不重连）
+    const handleBeforeUnload = () => {
+      window.__wsUnloaded = true;
       disconnect();
     };
-  }, [connect, disconnect]);
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
+    return () => {
+      console.log('[WebSocket] Hook unmounting');
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.__wsUnloaded = true;
+      disconnect();
+    };
+  }, [connect, disconnect]);  // 依赖 connect（内部已通过 ref 访问最新状态）
+
+  // URL 变化时断开旧连接并连接新会话
+  useEffect(() => {
+    console.log('[WebSocket] URL changed:', url);
+    const pendingConnect = { current: false };
+
+    if (!url) {
+      if (wsRef.current) {
+        disconnect();
+      }
+      return;
+    }
+
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      disconnect();
+      pendingConnect.current = true;
+      const t = setTimeout(() => {
+        if (pendingConnect.current) {
+          connect();
+        }
+      }, 100);
+      return () => {
+        pendingConnect.current = false;
+        clearTimeout(t);
+      };
+    }
+
+    if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+      connect();
+    }
+    // CONNECTING 状态时不需要操作，连接建立后会触发 onopen
+  }, [url, connect, disconnect]);
+
+  const send = useCallback((data: object) => {
+    console.log('[WebSocket] send called:', data);
+    console.log('[WebSocket] readyState:', wsRef.current?.readyState);
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(data));
+      console.log('[WebSocket] message sent successfully');
+      return true;
+    }
+    console.warn('[WebSocket] cannot send, not connected');
+    return false;
+  }, []);
 
   return {
     isConnected,

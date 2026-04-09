@@ -1,5 +1,7 @@
 """WebSocket connection manager for browser channel."""
 
+import asyncio
+
 from fastapi import WebSocket
 from loguru import logger
 
@@ -15,7 +17,17 @@ class WebSocketManager:
         self._connections: dict[str, WebSocket] = {}
 
     def register(self, key: str, websocket: WebSocket) -> None:
-        """注册连接（每个 key 只允许一个连接）"""
+        """注册连接（每个 key 只允许一个连接，自动清理旧连接）"""
+        # Close any existing connection for this key before registering new one
+        if key in self._connections:
+            old_ws = self._connections[key]
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(old_ws.close())
+            except RuntimeError:
+                # Fallback: no running loop, skip async close
+                pass
+            logger.debug(f"[WebSocketManager] Replaced existing connection: {key}")
         self._connections[key] = websocket
         logger.debug(f"[WebSocketManager] Registered: {key}")
 
