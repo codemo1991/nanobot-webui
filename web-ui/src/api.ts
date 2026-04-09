@@ -1,5 +1,6 @@
 import i18n from './i18n'
 import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, SubagentProgressEvent, TokenUsage, Task, TaskListResponse, TraceSummary, RecentSpan, TraceDetail, Anomaly } from './types'
+import { useWebSocket } from './hooks/useWebSocket';
 
 const API_BASE = '/api/v1'
 
@@ -941,3 +942,54 @@ export const api = {
     throw new Error('Trace stream failed after all retries')
   },
 }
+
+// ==================== WebSocket ====================
+
+// WebSocket configuration
+const WS_BASE_URL = `ws://${window.location.hostname}:8765`;
+
+// WebSocket event interface
+export interface WsEvent {
+  type: string;
+  event?: {
+    type: string;
+    content?: string;
+    [key: string]: any;
+  };
+  error?: string;
+}
+
+// Create WebSocket chat connection
+export function createWebSocketChat(options: {
+  sessionId: string;
+  onEvent: (event: WsEvent) => void;
+  onConnect?: () => void;
+  onDisconnect?: () => void;
+  onError?: (error: Event) => void;
+}) {
+  const { sessionId, onEvent, onConnect, onDisconnect, onError } = options;
+
+  return useWebSocket({
+    url: `${WS_BASE_URL}/ws/${sessionId}`,
+    onMessage: onEvent,
+    onConnect,
+    onDisconnect,
+    onError,
+  });
+}
+
+// Send chat message via WebSocket
+export function wsSendMessage(
+  send: (data: object) => void,
+  content: string,
+  media?: string[]
+) {
+  send({
+    type: 'message',
+    content,
+    media,
+  });
+}
+
+// Re-export useWebSocket for direct usage
+export { useWebSocket };
