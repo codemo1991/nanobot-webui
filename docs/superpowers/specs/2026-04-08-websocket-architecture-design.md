@@ -228,22 +228,90 @@ class WebSocketManager:
 
 ### 5. Agent Loop 集成（progress 事件路由）
 
-**问题：** agent loop 的 `process_direct` 需要将 progress 事件实时推送到 WebSocket。
+**关键发现：** `process_direct` 通过 `extra_metadata` 传递 `progress_callback`，而不是从 `InboundMessage.metadata` 读取。
 
-**方案：** browser channel 提供一个全局的 progress 回调注册机制。
+**正确方案：** browser channel 维护自己的 event queue，直接调用 `process_direct`，不走 MessageBus。
 
 ```python
 class BrowserChannel(BaseChannel):
-    # ...
+    def __init__(self, config, bus: MessageBus, agent: AgentLoop):
+        self.config = config
+        self.bus = bus
+        self.agent = agent
+        self.ws_manager = WebSocketManager()
 
-    def get_progress_sender(self, session_id: str) -> Callable:
-        """返回该 session 的 progress 回调"""
+    async def _handle_connection(self, websocket: WebSocket, session_id: str):
+        """处理单个 WebSocket 连接"""
+        await websocket.accept()
         key = f"browser:{session_id}"
+        self.ws_manager.register(key, websocket)
 
-        async def send_progress(event: dict):
-            await self.ws_manager.send(key, {"type": "event", "event": event})
+        # 1. 为这个连接创建专属的 event queue
+        evt_queue: asyncio.Queue = asyncio.Queue()
 
-        return send_progress
+        # 2. 创建 progress 回调（sync put_nowait，与 SSE 一致）
+        def on_progress(evt: dict) -> None:
+            try:
+                evt_queue.put_nowait(evt)
+            except asyncio.QueueFull:
+                logger.warning(f"[Browser] Event queue full, dropping event")
+
+        # 3. 创建后台任务，drain queue → 推 WebSocket
+        async def drain_events():
+            while True:
+                try:
+                    evt = await asyncio.wait_for(evt_queue.get(), timeout=60)
+                    await websocket.send_json({"type": "event", "event": evt})
+                except asyncio.TimeoutError:
+                    # 心跳保活检查
+                    try:
+                        await websocket.send_json({"type": "ping_check"})
+                    except Exception:
+                        break
+                except Exception:
+                    break
+
+        drain_task = asyncio.create_task(drain_events())
+
+        try:
+            while True:
+                # 4. 接收客户端消息
+                data = await websocket.receive_json()
+                msg_type = data.get("type")
+
+                if msg_type == "message":
+                    content = data.get("content", "")
+                    media = data.get("media")
+
+                    # 5. 直接调用 agent（不走 bus），传入 progress_callback
+                    response = await self.agent.process_direct(
+                        content=content,
+                        session_key=f"browser:{session_id}",
+                        channel="browser",
+                        progress_callback=on_progress,
+                        media=media,
+                    )
+
+                    # 6. 发送完成事件
+                    await websocket.send_json({
+                        "type": "event",
+                        "event": {"type": "done", "content": response}
+                    })
+
+                elif msg_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
+            try:
+                await websocket.send_json({"type": "error", "error": str(e)})
+            except Exception:
+                pass
+        finally:
+            drain_task.cancel()
+            self.ws_manager.unregister(key, websocket)
 ```
 
 **调用流程：**
@@ -254,12 +322,19 @@ WebSocket 连接建立
     ↓
 browser channel._handle_connection()
     ↓
-progress_callback = get_progress_sender(session_id)
+evt_queue + drain_task + on_progress
     ↓
-progress_callback → ws_manager.send() → WebSocket
+agent.process_direct(progress_callback=on_progress)
+    ↓
+on_progress → evt_queue.put_nowait()
+    ↓
+drain_task → WebSocket.send_json()
 ```
 
-**实现细节：** 通过 `InboundMessage.metadata["progress_callback"]` 传递 progress_sender，agent loop 读取并使用。
+**好处：**
+- progress 回调机制与 SSE 完全一致（sync put_nowait）
+- 简单直接，不需要改 agent loop
+- browser channel 自己管理生命周期
 
 ### 6. 移除的组件
 
@@ -310,7 +385,9 @@ WebSocket: ws://{host}:{port}/ws/{session_id}
 |------|------|
 | `nanobot/config/schema.py` | 添加 browser channel 配置 schema |
 | `nanobot/config/builtin_templates_data.py` | 添加 browser channel 默认配置 |
-| `nanobot/channels/manager.py` | 注册 browser channel |
+| `nanobot/channels/manager.py` | 注册 browser channel（传入 agent 实例） |
+| `nanobot/channels/browser.py` | 新增 browser channel 实现 |
+| `nanobot/web/websocket_manager.py` | 新增 WebSocket 连接管理器 |
 | `nanobot/bus/events.py` | 确认 browser channel 事件格式 |
 | `web-ui/src/api.ts` | WebSocket 客户端实现 |
 | `web-ui/src/pages/ChatPage.tsx` | 适配 WebSocket 事件 |
