@@ -145,6 +145,7 @@ function ChatPage() {
   const abortControllerRef = useRef<AbortController | null>(null)
   // 当前会话 ID 的 ref（供异步流式回调路由使用，避免闭包捕获过期值）
   const currentSessionIdRef = useRef<string | null>(null)
+  currentSessionIdRef.current = currentSession?.id ?? null
   // 每个会话独立的 AbortController（支持并行多会话各自停止）
   const perSessionAbortControllers = useRef<Map<string, AbortController>>(new Map())
   // 后台会话的流式 UI 状态缓存（切换回来时恢复 toolSteps/thinking/progress）
@@ -222,11 +223,6 @@ function ChatPage() {
       console.error('Task polling error:', err)
     },
   })
-
-  // 同步 currentSessionIdRef，供异步流式回调判断事件归属
-  useEffect(() => {
-    currentSessionIdRef.current = currentSession?.id ?? null
-  }, [currentSession])
 
   // 同步 bgAgentsRef，供 processStreamEvent 中读取当前值
   useEffect(() => {
@@ -889,7 +885,8 @@ function ChatPage() {
       setLoadingSessions(true)
       const data = await api.getSessions()
       setSessions(data.items)
-      if (data.items.length > 0 && !currentSession) {
+      // 必须用 ref：loadSessions 常从 handleWsMessage（空依赖）等闭包中调用，await 后 state 中的 currentSession 可能仍是旧值
+      if (data.items.length > 0 && !currentSessionIdRef.current) {
         handleSelectSession(data.items[0])
       }
     } catch (error) {
