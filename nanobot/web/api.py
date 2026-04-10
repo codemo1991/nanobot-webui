@@ -4042,8 +4042,15 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 try:
                     body_data = self._read_json()
                     if body_data:
-                        channel = body_data.get("channel", "web")
                         session_id = body_data.get("sessionId")
+                        # WebUI WebSocket 会话键为 browser:{id}；旧客户端未传 channel 时误用 web，导致无法取消
+                        ch = body_data.get("channel")
+                        if ch is not None:
+                            channel = ch
+                        elif session_id:
+                            channel = "browser"
+                        else:
+                            channel = "web"
                 except (json.JSONDecodeError, TypeError):
                     pass
                 app.agent.cancel_current_request(channel=channel, session_id=session_id)

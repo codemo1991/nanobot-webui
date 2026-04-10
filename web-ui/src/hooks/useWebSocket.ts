@@ -43,6 +43,8 @@ export function useWebSocket(options: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const heartbeatIntervalRef = useRef<number | null>(null);
+  /** 主动 disconnect() 时跳过一次 onclose 里的自动重连（避免与 URL 切换的 connect 重复，或误触发重连风暴） */
+  const skipReconnectRef = useRef(false);
   const [isConnected, setIsConnected] = useState(false);
   // Buffer for messages sent while WebSocket is reconnecting
   const pendingMessagesRef = useRef<object[]>([]);
@@ -88,10 +90,15 @@ export function useWebSocket(options: UseWebSocketOptions) {
     }
   }, []);
 
+  const clearPendingSend = useCallback(() => {
+    pendingMessagesRef.current = [];
+  }, []);
+
   const disconnect = useCallback(() => {
     clearHeartbeat();
     clearReconnect();
     if (wsRef.current) {
+      skipReconnectRef.current = true;
       wsRef.current.close();
       wsRef.current = null;
     }
@@ -157,6 +164,11 @@ export function useWebSocket(options: UseWebSocketOptions) {
       setIsConnected(false);
       clearHeartbeat();
       onDisconnectRef.current?.();
+
+      if (skipReconnectRef.current) {
+        skipReconnectRef.current = false;
+        return;
+      }
 
       // 自动重连（只在页面未卸载时）
       if (reconnect && !window.__wsUnloaded) {
@@ -252,5 +264,6 @@ export function useWebSocket(options: UseWebSocketOptions) {
     send,
     disconnect,
     reconnect: connect,
+    clearPendingSend,
   };
 }

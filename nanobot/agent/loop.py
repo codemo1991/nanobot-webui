@@ -20,7 +20,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.router import ModelRouter, ModelHandle
 from nanobot.providers.provider_manager import ProviderManager
-from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context import ContextBuilder, repair_openai_tool_messages
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.memory import RememberTool
@@ -33,7 +33,11 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.tools.get_subagent_results import GetSubagentResultsTool
 from nanobot.agent.tools.delegate_microkernel import DelegateMicrokernelTool
-from nanobot.agent.tool_errors import format_tool_error, is_retryable_error
+from nanobot.agent.tool_errors import (
+    format_tool_error,
+    is_retryable_error,
+    is_tool_call_result_mismatch_error,
+)
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.tracing import span, trace_context
@@ -908,6 +912,42 @@ class AgentLoop:
             groups.append([tc])
         return groups
 
+    async def _gather_awaitables_with_cancel_poll(
+        self,
+        awaitables: list,
+        session_key: str | None,
+        *,
+        interval: float = 1.0,
+        return_exceptions: bool = False,
+    ) -> list:
+        """并行等待多个 awaitable，期间轮询用户取消；避免 asyncio.gather 长时间阻塞无法响应停止。"""
+        if not awaitables:
+            return []
+        tasks = [asyncio.ensure_future(a) for a in awaitables]
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, timeout=interval, return_when=asyncio.FIRST_COMPLETED
+                )
+                await self._check_cancelled(session_key)
+            if return_exceptions:
+                out: list = []
+                for t in tasks:
+                    exc = t.exception()
+                    if exc is not None:
+                        out.append(exc)
+                    else:
+                        out.append(t.result())
+                return out
+            return [t.result() for t in tasks]
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     async def _execute_tool_parallel(
         self,
         tool_calls: list,
@@ -1049,9 +1089,10 @@ class AgentLoop:
                             r = await self._execute_single_tool(group[0], progress)
                             results.append((group[0], r))
                         else:
-                            # 组内并行：与主并行路径保持一致
-                            group_results = await asyncio.gather(
-                                *[self._execute_single_tool(tc, progress) for tc in group],
+                            # 组内并行：与主并行路径保持一致（可响应停止）
+                            group_results = await self._gather_awaitables_with_cancel_poll(
+                                [self._execute_single_tool(tc, progress) for tc in group],
+                                session_key,
                                 return_exceptions=True,
                             )
                             for tc, r in zip(group, group_results):
@@ -1101,10 +1142,11 @@ class AgentLoop:
                 logger.exception(f"Tool execution failed in parallel: {tc.name}")
                 return (tc, format_tool_error(tc.name, e))
 
-        # 使用 asyncio.gather 并行执行，捕获异常避免整体失败
-        results = await asyncio.gather(
-            *[execute_with_progress(tc) for tc in tool_calls],
-            return_exceptions=True
+        # 并行执行，捕获异常避免整体失败；轮询取消，避免长时间工具阻塞停止
+        results = await self._gather_awaitables_with_cancel_poll(
+            [execute_with_progress(tc) for tc in tool_calls],
+            session_key,
+            return_exceptions=True,
         )
 
         # 处理异常结果（gather return_exceptions=True 时，协程未捕获的异常会作为 Exception 返回）
@@ -1597,7 +1639,41 @@ class AgentLoop:
         # Fallback: check common audio extensions
         return str(path).lower().endswith(('.mp3', '.wav', '.ogg', '.m4a', '.opus', '.webm', '.aac'))
 
-    async def _wait_for_subagents(self, task_ids: list[str], timeout: float = 120.0) -> None:
+    def _build_user_message_kwargs_from_media_paths(self, media: list[str] | None) -> dict[str, Any]:
+        """从本地媒体路径构建用户消息的附加字段（与 _process_message 落库逻辑一致，含图片 base64）。"""
+        out: dict[str, Any] = {}
+        if not media:
+            return out
+        import base64
+
+        user_images: list[str] = []
+        for media_path in media:
+            if not self._is_image_file(media_path):
+                continue
+            try:
+                with open(media_path, "rb") as f:
+                    img_data = base64.b64encode(f.read()).decode("utf-8")
+                ext = Path(media_path).suffix.lower()
+                mime_type = "image/jpeg"
+                if ext in [".png"]:
+                    mime_type = "image/png"
+                elif ext in [".gif"]:
+                    mime_type = "image/gif"
+                elif ext in [".webp"]:
+                    mime_type = "image/webp"
+                user_images.append(f"data:{mime_type};base64,{img_data}")
+            except Exception as e:
+                logger.warning(f"Failed to read media file {media_path}: {e}")
+        if user_images:
+            out["images"] = user_images
+        return out
+
+    async def _wait_for_subagents(
+        self,
+        task_ids: list[str],
+        timeout: float = 120.0,
+        session_key: str | None = None,
+    ) -> None:
         """等待指定的所有子 Agent 任务完成。"""
         if not task_ids or not self.subagents:
             return
@@ -1621,6 +1697,7 @@ class AgentLoop:
                 logger.info(f"[BatchMode] All subagent tasks completed: {task_ids}")
                 break
 
+            await self._check_cancelled(session_key)
             # 等待一段时间再检查
             await asyncio.sleep(check_interval)
 
@@ -1652,7 +1729,7 @@ class AgentLoop:
             return False
 
         try:
-            await self._wait_for_subagents([vision_task_id], timeout=120.0)
+            await self._wait_for_subagents([vision_task_id], timeout=120.0, session_key=session_key)
             logger.info("[VisionInject] Vision spawn %s completed, injecting into spawn_others", vision_task_id)
         except asyncio.TimeoutError:
             logger.warning("[VisionInject] Timeout waiting for vision spawn %s", vision_task_id)
@@ -1836,10 +1913,11 @@ class AgentLoop:
             if raw is _STOP_SENTINEL:
                 break
             if isinstance(raw, _CancelProbe):
-                # 探针：若对应 session 的取消标记已被清理（即消息已开始处理），
-                # 则此探针无需任何操作；否则移除孤立的取消标记。
-                self._cancelled_sessions.discard(raw.session_key)
-                logger.debug(f"[AgentLoop] 取消探针已处理: {raw.session_key}")
+                # 探针仅用于唤醒可能阻塞在 inbound.get() 上的 run()；不得在此处 discard
+                # _cancelled_sessions：WebSocket 的 process_direct 在同进程内直接 await _process_message，
+                # 若此处清除标记，正在执行的 LLM 轮询将永远看不到取消（与用户日志一致）。
+                # 取消位仅应由 _check_cancelled 消费，或由新请求 process_direct 开头的 _reset_cancel_event 清理。
+                logger.debug(f"[AgentLoop] 取消探针已接收（保留取消标记）: {raw.session_key}")
                 continue
             msg: InboundMessage = raw
 
@@ -1892,7 +1970,7 @@ class AgentLoop:
                     try:
                         _sk = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
                         _sess = self.sessions.get_or_create(_sk)
-                        _sess.add_message("assistant", "[已停止]")
+                        _sess.add_message("assistant", "用户已取消操作。")
                         self.sessions.save(_sess)
                     except Exception as _e:
                         logger.warning(f"[AgentLoop] Failed to save cancel placeholder: {_e}")
@@ -1906,7 +1984,7 @@ class AgentLoop:
                             await self.bus.publish_outbound(OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
-                                content="[已停止]",
+                                content="用户已取消操作。",
                             ))
                         except Exception as _e:
                             logger.warning(f"[AgentLoop] publish_outbound (cancelled) failed: {_e}")
@@ -2331,7 +2409,9 @@ class AgentLoop:
                 if running_spawns_needing_inject:
                     logger.info(f"[SubagentInject] Waiting for vision spawns before LLM call: {running_spawns_needing_inject}")
                     try:
-                        await self._wait_for_subagents(running_spawns_needing_inject, timeout=120.0)
+                        await self._wait_for_subagents(
+                            running_spawns_needing_inject, timeout=120.0, session_key=sk
+                        )
                         logger.info("[SubagentInject] Vision spawn tasks completed")
                     except asyncio.TimeoutError:
                         logger.warning("[SubagentInject] Timeout waiting for vision spawn tasks")
@@ -2362,9 +2442,9 @@ class AgentLoop:
 
             # 细粒度事件流：thinking
             _emit({"type": "thinking"})
-            # Call LLM（单次最长 120 秒，等待期间每 2 秒检查一次取消）
+            # Call LLM（单次最长 120 秒，等待期间约每 1 秒检查一次取消）
             _LLM_CALL_TIMEOUT = 120
-            _CANCEL_CHECK_INTERVAL = 2.0
+            _CANCEL_CHECK_INTERVAL = 1.0
             tool_mode = msg_tool_mode
             selected_mcp_servers = msg_selected_mcp
             selected_tools = self._select_tools_for_message(msg.content, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
@@ -2552,7 +2632,9 @@ class AgentLoop:
                     if running_spawns_needing_inject:
                         logger.info(f"[BatchMode] Waiting for vision spawns before next LLM call: {running_spawns_needing_inject}")
                         try:
-                            await self._wait_for_subagents(running_spawns_needing_inject, timeout=120.0)
+                            await self._wait_for_subagents(
+                                running_spawns_needing_inject, timeout=120.0, session_key=sk
+                            )
                             logger.info(f"[BatchMode] Vision spawn tasks completed before next LLM call")
                         except asyncio.TimeoutError:
                             logger.warning(f"[BatchMode] Timeout waiting for vision spawn tasks")
@@ -2649,7 +2731,9 @@ class AgentLoop:
                         parallel_tasks.append(self._execute_single_tool(tc, _progress))
 
                     if parallel_tasks:
-                        parallel_results = await asyncio.gather(*parallel_tasks)
+                        parallel_results = await self._gather_awaitables_with_cancel_poll(
+                            parallel_tasks, sk
+                        )
                         for tc, result in zip(spawn_other + exec_other, parallel_results):
                             if tc.name == "spawn":
                                 spawn_results.append((tc, result))
@@ -2806,7 +2890,7 @@ class AgentLoop:
             if running_vision_ids and self.subagents:
                 logger.info(f"[BatchMode] Waiting for vision spawns before return: {running_vision_ids}")
                 try:
-                    await self._wait_for_subagents(running_vision_ids, timeout=120.0)
+                    await self._wait_for_subagents(running_vision_ids, timeout=120.0, session_key=sk)
                     logger.info(f"[BatchMode] Vision spawns completed, injecting results")
                     # 注入已完成且尚未注入的子 Agent 结果
                     to_inject = [
@@ -2946,31 +3030,9 @@ class AgentLoop:
         # Web 渠道在请求开始时已保存用户消息，此处跳过避免重复
         user_message_saved = msg.metadata.get("user_message_saved") if msg.metadata else False
 
-        # 分离图片和音频文件，只处理图片
-        if msg.media:
-            import base64
-            user_images: list[str] = []
-            for media_path in msg.media:
-                # 只处理图片文件
-                if not self._is_image_file(media_path):
-                    continue
-                try:
-                    with open(media_path, "rb") as f:
-                        img_data = base64.b64encode(f.read()).decode("utf-8")
-                        ext = Path(media_path).suffix.lower()
-                        mime_type = "image/jpeg"
-                        if ext in [".png"]:
-                            mime_type = "image/png"
-                        elif ext in [".gif"]:
-                            mime_type = "image/gif"
-                        elif ext in [".webp"]:
-                            mime_type = "image/webp"
-                        user_images.append(f"data:{mime_type};base64,{img_data}")
-                except Exception as e:
-                    logger.warning(f"Failed to read media file {media_path}: {e}")
-            if user_images:
-                user_message_kwargs["images"] = user_images
-        
+        if not user_message_saved and msg.media:
+            user_message_kwargs.update(self._build_user_message_kwargs_from_media_paths(msg.media))
+
         if not user_message_saved:
             session.add_message("user", msg.content, **user_message_kwargs)
             self.sessions.save(session)
@@ -3156,9 +3218,9 @@ class AgentLoop:
                     break
 
             selected_tools = self._select_tools_for_message(msg.content, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-            # 与主流程一致：LLM 调用期间每 2 秒轮询取消
+            # 与主流程一致：LLM 调用期间轮询取消
             _LLM_CALL_TIMEOUT = 120
-            _CANCEL_CHECK_INTERVAL = 2.0
+            _CANCEL_CHECK_INTERVAL = 1.0
             try:
                 llm_task = asyncio.create_task(
                     self._call_llm_with_failover(
@@ -3332,6 +3394,7 @@ class AgentLoop:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         extra_metadata: dict[str, Any] | None = None,
         media: list[str] | None = None,
+        raise_on_cancel: bool = False,
     ) -> "OutboundMessage | None":
         """
         Process a message directly (for CLI or browser WebSocket usage).
@@ -3344,6 +3407,7 @@ class AgentLoop:
             progress_callback: Optional callback for streaming progress (tool_start, tool_end, etc.).
             extra_metadata: Optional extra metadata (e.g. attack_level for mirror bian sessions).
             media: Optional list of local file paths for images to include in the message.
+            raise_on_cancel: 为 True 时向上抛出 CancelledError，供 Browser WebSocket 发送 cancelled 事件（默认吞掉保持兼容）。
 
         Returns:
             The agent's response.
@@ -3384,6 +3448,24 @@ class AgentLoop:
         if extra_metadata:
             metadata.update(extra_metadata)
 
+        # 纯图无文：由 _handle_image_only 内部落库用户消息
+        if media and not content:
+            return await self._handle_image_only(media, session_key, channel, chat_id)
+
+        # Browser WebSocket：收到即落库（与 HTTP chat_sync 的 user_message_saved 对齐），取消时也不丢用户输入
+        if channel == "browser" and (content.strip() or (media or [])):
+            session = self.sessions.get_or_create(session_key)
+            user_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            ukw = self._build_user_message_kwargs_from_media_paths(media or [])
+            session.add_message(
+                "user",
+                content or "[图片]",
+                token_usage=user_token_usage,
+                **ukw,
+            )
+            self.sessions.save(session)
+            metadata["user_message_saved"] = True
+
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
@@ -3393,22 +3475,25 @@ class AgentLoop:
             media=media or [],
         )
 
-        if media and not content:
-            return await self._handle_image_only(media, session_key, channel, chat_id)
-
         try:
             await self._check_cancelled(session_key)
             response = await self._process_message(msg)
             return response
         except asyncio.CancelledError:
             logger.info("Agent request was cancelled")
-            return None
-        finally:
-            # 异常/取消时确保结束执行链路并持久化节点（正常返回时 _process_message 已调用）
             try:
-                self._chain_monitor.end_chain(status="completed")
+                sess = self.sessions.get_or_create(session_key)
+                sess.add_message("assistant", "用户已取消操作。")
+                self.sessions.save(sess)
             except Exception as e:
-                logger.error(f"[ExecutionChain] Failed to end chain: {e}")
+                logger.warning(f"[process_direct] Failed to persist cancel notice: {e}")
+            try:
+                self._chain_monitor.end_chain(status="cancelled")
+            except Exception as e:
+                logger.error(f"[ExecutionChain] Failed to end chain on cancel: {e}")
+            if raise_on_cancel:
+                raise
+            return None
     
     async def _handle_image_only(
         self,
@@ -3530,12 +3615,26 @@ class AgentLoop:
 
             for attempt in range(max_attempts_per_model):
                 try:
-                    logger.debug(f"[ModelFailover] 尝试模型 {model_id} (attempt {attempt + 1})")
-                    response = await provider_instance.chat(
-                        messages=messages,
-                        tools=tools,
-                        model=native_model,
-                    )
+                    while True:
+                        try:
+                            logger.debug(f"[ModelFailover] 尝试模型 {model_id} (attempt {attempt + 1})")
+                            response = await provider_instance.chat(
+                                messages=messages,
+                                tools=tools,
+                                model=native_model,
+                            )
+                            break
+                        except Exception as inner_e:
+                            if is_tool_call_result_mismatch_error(inner_e):
+                                new_msgs, fixed = repair_openai_tool_messages(messages)
+                                if fixed:
+                                    messages[:] = new_msgs
+                                    logger.warning(
+                                        "[ModelFailover] tool_calls 与 tool 消息不一致（如 MiniMax 2013），"
+                                        "已补全/重排后自动重试同一模型"
+                                    )
+                                    continue
+                            raise inner_e
 
                     if idx > 0:
                         logger.info(f"[ModelFailover] 故障转移成功: {models_to_try[0]} -> {model_id}")

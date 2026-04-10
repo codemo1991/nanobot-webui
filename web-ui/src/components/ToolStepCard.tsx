@@ -71,9 +71,8 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
   isLast,
   defaultExpanded = false,
 }) => {
-  const [isExpanded, setIsExpanded] = useState(
-    () => defaultExpanded || !!(typeof step.result === 'string' && step.result.trim()),
-  )
+  // 默认折叠；仅由 defaultExpanded /「运行中且为最后一步」展开；结束后自动折叠（见下方 effect）
+  const [isExpanded, setIsExpanded] = useState(() => defaultExpanded)
   const [outputExpanded, setOutputExpanded] = useState(false)
   const [paramsExpanded, setParamsExpanded] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -134,23 +133,19 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     return null
   }
 
-  // 自动展开运行中的步骤
+  // 运行中的最后一步自动展开，便于看到实时输出
   React.useEffect(() => {
     if (status === 'running' && isLast) {
       setIsExpanded(true)
     }
   }, [status, isLast])
 
-  // 结果到达时自动展开，便于直接看到工具输出（不再在完成后强制收起）
-  const prevResultRef = React.useRef(step.result)
+  // 调用结束（成功/失败）后折叠整卡，结果在标题行可见状态，点击标题可展开查看参数与输出
   React.useEffect(() => {
-    const had = typeof prevResultRef.current === 'string' && prevResultRef.current.trim()
-    const now = typeof step.result === 'string' && step.result.trim()
-    if (!had && now) {
-      setIsExpanded(true)
+    if (status === 'completed' || status === 'error') {
+      setIsExpanded(false)
     }
-    prevResultRef.current = step.result
-  }, [step.result])
+  }, [status])
 
   const args = useMemo(() => {
     if (typeof step.arguments === 'string') {

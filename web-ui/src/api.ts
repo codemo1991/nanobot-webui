@@ -96,7 +96,8 @@ export const api = {
   stopAgent: (sessionId?: string) =>
     request<{ stopped: boolean }>('/chat/stop', {
       method: 'POST',
-      body: sessionId ? JSON.stringify({ sessionId }) : undefined,
+      // 必须与 WebSocket 会话键 browser:{sessionId} 一致，否则 cancel_current_request 无法命中
+      body: sessionId ? JSON.stringify({ sessionId, channel: 'browser' }) : undefined,
     }),
 
   // Pre-warm MCP to eliminate first-message latency

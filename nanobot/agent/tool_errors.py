@@ -84,3 +84,19 @@ def is_structured_error(result: str) -> bool:
 def is_retryable_result(result: str) -> bool:
     """从标准化错误字符串判断是否可重试。"""
     return result.startswith(PREFIX_RETRYABLE)
+
+
+def is_tool_call_result_mismatch_error(exc: BaseException) -> bool:
+    """
+    判断是否为「assistant tool_calls 与 tool 消息不一致」类 API 错误。
+    MiniMax / 部分兼容 OpenAI 的网关会返回 400 + 2013。
+    此类错误可通过补全缺失的 tool 消息或按 tool_calls 顺序重排后重试。
+    """
+    msg = str(exc).lower()
+    if "2013" in msg:
+        return True
+    if "tool call" in msg and "not match" in msg:
+        return True
+    if "tool_call" in msg and "result" in msg and ("match" in msg or "mismatch" in msg):
+        return True
+    return False

@@ -186,6 +186,8 @@ function ChatPage() {
   // WebSocket 连接 refs
   const wsSendRef = useRef<((data: object) => void) | null>(null)
   const wsDisconnectRef = useRef<(() => void) | null>(null)
+  const wsClearPendingRef = useRef<(() => void) | null>(null)
+  const lastStreamReconnectToastRef = useRef(0)
   // 存储当前的 stream event handler（避免 useWebSocket 依赖变化导致频繁重连）
   const streamHandlerRef = useRef<(evt: StreamEvent) => void>(() => {})
   // Track the streaming assistant message ID to prevent duplicate rendering
@@ -262,6 +264,35 @@ function ChatPage() {
     console.log('[handleWsMessage] received:', JSON.stringify(event))
     const sessionId = currentSessionIdRef.current
     if (!sessionId) return
+
+    // 用户点击停止后，后端中断 agent 并发送 cancelled（可带 assistantMessage：用户已取消操作）
+    if (event.event?.type === 'cancelled') {
+      if (sessionId === currentSessionIdRef.current) {
+        setLoading(false)
+        setStreamingThinking(false)
+        setStreamingToolSteps([])
+        setClaudeCodeProgress('')
+        isStreamingRef.current = false
+        streamingAssistantIdRef.current = null
+        currentTaskIdRef.current = null
+        setPollingTaskId(null)
+        clearStreamingState(sessionId)
+        abortControllerRef.current = null
+        removeFromStreamingSessionsRef.current(sessionId)
+        const cancelAssistant = (event.event as { assistantMessage?: Message | null }).assistantMessage
+        if (cancelAssistant) {
+          setMessages(prev => {
+            const withoutTempAssistant = prev.filter(m => !(m.id.startsWith('temp-') && m.role === 'assistant'))
+            streamingAssistantIdRef.current = cancelAssistant.id
+            return [...withoutTempAssistant, cancelAssistant]
+          })
+        }
+        void loadMessages(sessionId)
+        void loadSessionTokenUsage(sessionId)
+      }
+      void loadSessions()
+      return
+    }
 
     // 处理 done 事件
     if (event.event?.type === 'done') {
@@ -345,7 +376,7 @@ function ChatPage() {
 
   // WebSocket 连接管理
   const wsUrl = currentSession ? `${WS_BASE_URL}/ws/${currentSession.id}` : ''
-  const { send: wsSend, disconnect: wsDisconnect } = useWebSocket({
+  const { send: wsSend, disconnect: wsDisconnect, clearPendingSend: wsClearPending } = useWebSocket({
     url: wsUrl,
     onMessage: handleWsMessage,
     onConnect: () => {
@@ -365,7 +396,8 @@ function ChatPage() {
   useEffect(() => {
     wsSendRef.current = wsSend
     wsDisconnectRef.current = wsDisconnect
-  }, [wsSend, wsDisconnect])
+    wsClearPendingRef.current = wsClearPending
+  }, [wsSend, wsDisconnect, wsClearPending])
 
   // 流式事件处理（WebSocket 与当前选中会话一一对应，事件均属当前会话）
   const processStreamEvent = useCallback((evt: StreamEvent) => {
@@ -522,7 +554,11 @@ function ChatPage() {
     await loadMessages(sessionId)
     await loadSessionTokenUsage(sessionId)
     void loadSessions()
-    antMessage.success(t('chat.streamReconnected'))
+    const now = Date.now()
+    if (now - lastStreamReconnectToastRef.current > 4000) {
+      lastStreamReconnectToastRef.current = now
+      antMessage.success(t('chat.streamReconnected'))
+    }
   }, [t])
 
   // 所有子 Agent 完成后，10 秒后自动清除面板
@@ -976,6 +1012,11 @@ function ChatPage() {
 
   const handleStop = async () => {
     const sessionId = currentSession?.id
+    // 清除 sessionStorage 流式快照，否则会话 effect 误认为仍在流式中并反复 tryReconnectChatStream + Toast
+    if (sessionId) {
+      clearStreamingState(sessionId)
+    }
+    wsClearPendingRef.current?.()
     // 停止当前会话的独立 AbortController
     const ctrl = sessionId ? perSessionAbortControllers.current.get(sessionId) : null
     const hadStream = ctrl !== null || abortControllerRef.current !== null
@@ -1086,6 +1127,8 @@ function ChatPage() {
     // 监听 abort 以清理状态
     controller.signal.addEventListener('abort', () => {
       console.log('[WebSocket] Message sending aborted')
+      clearStreamingState(sessionId)
+      wsClearPendingRef.current?.()
       perSessionAbortControllers.current.delete(sessionId)
       removeFromStreamingSessionsRef.current(sessionId)
       bgSessionStatesRef.current.delete(sessionId)
@@ -1275,7 +1318,7 @@ function ChatPage() {
                               <ToolStepsPanel
                                 steps={message.toolSteps}
                                 showRunningOnLast={false}
-                                maxVisibleBeforeCollapse={20}
+                                maxVisibleBeforeCollapse={6}
                               />
                             )}
                             <AssistantMarkdownContent content={message.content} />
@@ -1328,7 +1371,7 @@ function ChatPage() {
                           </div>
                         )}
                         {streamingToolSteps.length > 0 && (
-                          <ToolStepsPanel steps={streamingToolSteps} showRunningOnLast maxVisibleBeforeCollapse={20} />
+                          <ToolStepsPanel steps={streamingToolSteps} showRunningOnLast maxVisibleBeforeCollapse={6} />
                         )}
                         {!!claudeCodeProgress && (
                           <Collapse ghost size="small" className="claude-code-progress-collapse">

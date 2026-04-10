@@ -78,6 +78,7 @@ export type StreamEvent =
   | { type: 'tool_end'; id: string; name: string; result: string }
   | { type: 'claude_code_progress'; task_id: string; subtype: string; content: string; tool_name?: string; timestamp?: string }
   | { type: 'done'; content: string; assistantMessage: Message | null }
+  | { type: 'cancelled'; assistantMessage?: Message | null }
   | { type: 'error'; message: string }
   | { type: 'timeout' }
   | { type: 'subagent_start'; task_id: string; label: string; backend: string; task: string }

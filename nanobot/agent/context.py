@@ -398,3 +398,84 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
         
         messages.append(msg)
         return messages
+
+
+def repair_openai_tool_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    """
+    修复 OpenAI 格式的 tool 消息链，满足「每条 assistant.tool_calls 均有对应 tool 消息」且顺序与 id 一致。
+
+    - 为缺失的 tool_call_id 插入占位 tool 消息（MiniMax 2013）
+    - 按 tool_calls 顺序重排紧随其后的 tool 消息，丢弃多余或重复的 tool 行
+
+    Returns:
+        (新消息列表, 是否发生了修改)
+    """
+    out: list[dict[str, Any]] = []
+    changed = False
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            out.append(m)
+            i += 1
+            continue
+
+        tcs = m["tool_calls"]
+        if not tcs:
+            out.append(m)
+            i += 1
+            continue
+
+        out.append(m)
+        j = i + 1
+        tool_block: list[dict[str, Any]] = []
+        while j < len(messages) and messages[j].get("role") == "tool":
+            tool_block.append(messages[j])
+            j += 1
+
+        by_id: dict[str, dict[str, Any]] = {}
+        for t in tool_block:
+            tid = str(t.get("tool_call_id", "") or "")
+            if tid and tid not in by_id:
+                by_id[tid] = t
+
+        merged: list[dict[str, Any]] = []
+        for tc in tcs:
+            tid = str(tc.get("id", "") or "")
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = (fn.get("name") if isinstance(fn, dict) else None) or "unknown"
+            if tid in by_id:
+                orig = by_id[tid]
+                if str(orig.get("tool_call_id", "") or "") != tid:
+                    merged.append(
+                        {
+                            **orig,
+                            "tool_call_id": tid,
+                            "name": orig.get("name") or name,
+                        }
+                    )
+                    changed = True
+                else:
+                    merged.append(orig)
+            else:
+                merged.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "name": name,
+                        "content": (
+                            "[系统补全] 该工具调用缺少对应的 tool 返回消息，已插入占位以满足 API 要求。"
+                            "请根据上下文继续回答，必要时可重新调用工具。"
+                        ),
+                    }
+                )
+                changed = True
+
+        orig_ids = [str(t.get("tool_call_id", "") or "") for t in tool_block]
+        merged_ids = [str(t.get("tool_call_id", "") or "") for t in merged]
+        if orig_ids != merged_ids or len(tool_block) != len(merged):
+            changed = True
+
+        out.extend(merged)
+        i = j
+    return out, changed

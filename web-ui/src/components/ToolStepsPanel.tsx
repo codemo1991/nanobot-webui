@@ -11,7 +11,8 @@ interface ToolStepsPanelProps {
   maxVisibleBeforeCollapse?: number
 }
 
-const COLLAPSE_THRESHOLD = 5
+/** 超过该数量时，外层收纳为一条可展开汇总（默认 6，即第 7 条起收纳） */
+const COLLAPSE_THRESHOLD = 6
 
 export const ToolStepsPanel: React.FC<ToolStepsPanelProps> = ({
   steps,
@@ -38,7 +39,7 @@ export const ToolStepsPanel: React.FC<ToolStepsPanelProps> = ({
     </div>
   )
 
-  // 工具步骤过多时，外层使用 Collapse
+  // 工具步骤过多时，外层收纳为一条 Collapse，点击展开全部步骤
   if (steps.length > maxVisibleBeforeCollapse) {
     return (
       <Collapse
@@ -46,6 +47,7 @@ export const ToolStepsPanel: React.FC<ToolStepsPanelProps> = ({
         size="small"
         className="tool-steps-outer-collapse"
         defaultActiveKey={runningCount > 0 ? ['tools'] : []}
+        collapsible="header"
         items={[
           {
             key: 'tools',

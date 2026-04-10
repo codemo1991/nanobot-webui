@@ -190,6 +190,7 @@ class BrowserChannel(BaseChannel):
                                 progress_callback=on_progress,
                                 media=media,
                                 extra_metadata=extra_meta or None,
+                                raise_on_cancel=True,
                             ),
                             timeout=self.config.agent_timeout,
                         )
@@ -231,6 +232,41 @@ class BrowserChannel(BaseChannel):
                             logger.info(f"[Browser] Connection closed before sending done event")
                             break
                         logger.info(f"[Browser] Done event sent successfully")
+                    except asyncio.CancelledError:
+                        logger.info(f"[Browser] Agent cancelled (user stop), notifying client")
+                        assistant_msg = None
+                        try:
+                            messages = self.agent.sessions.get_messages(key=f"browser:{session_id}", limit=4)
+                            assistant = next(
+                                (m for m in reversed(messages) if m.get("role") == "assistant"),
+                                None,
+                            )
+                            if assistant:
+                                assistant_msg = {
+                                    "id": f"msg_{assistant['sequence']}",
+                                    "sessionId": session_id,
+                                    "role": assistant["role"],
+                                    "content": assistant["content"],
+                                    "createdAt": assistant["timestamp"],
+                                    "sequence": assistant["sequence"],
+                                }
+                                if assistant.get("tool_steps"):
+                                    assistant_msg["toolSteps"] = assistant["tool_steps"]
+                                if assistant.get("token_usage"):
+                                    tu = assistant["token_usage"]
+                                    assistant_msg["tokenUsage"] = {
+                                        "promptTokens": int(tu.get("prompt_tokens", 0) or 0),
+                                        "completionTokens": int(tu.get("completion_tokens", 0) or 0),
+                                        "totalTokens": int(tu.get("total_tokens", 0) or 0),
+                                    }
+                        except Exception as e:
+                            logger.warning(f"[Browser] Failed to build assistantMessage on cancel: {e}")
+                        if not await safe_send({
+                            "type": "event",
+                            "event": {"type": "cancelled", "assistantMessage": assistant_msg},
+                        }):
+                            break
+                        continue
                     except asyncio.TimeoutError:
                         logger.error(f"[Browser] Agent call timed out after {self.config.agent_timeout}s")
                         if not await safe_send({
