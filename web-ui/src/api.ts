@@ -359,11 +359,34 @@ export const api = {
       method: 'POST',
     }),
 
-  // Model Discovery - 仅查询可用模型（不保存），供添加模型时 LiteLLM ID 下拉选择
+  // Model Discovery — GET：仅查询（不保存），供配置页下拉；POST：检测并写入数据库
   discoverModels: (providerId: string) =>
     request<import('./types').DiscoveredModel[]>(`/providers/${providerId}/discover`, {
       method: 'GET',
     }),
+
+  /** 检测模型并持久化；可选传入表单中的 apiBase/apiKey（未点保存时也能检测） */
+  discoverAndSaveProviderModels: (
+    providerId: string,
+    body?: { apiBase?: string; apiKey?: string }
+  ) =>
+    request<import('./types').DiscoveredModel[]>(`/providers/${encodeURIComponent(providerId)}/discover`, {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+    }),
+
+  /** 服务端探测 {apiBase}/models，避免浏览器直连第三方 API 的 CORS */
+  testProviderConnection: (
+    providerId: string,
+    body?: { apiBase?: string; apiKey?: string }
+  ) =>
+    request<{ ok: boolean; status: number; detail: string }>(
+      `/providers/${encodeURIComponent(providerId)}/test`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body ?? {}),
+      }
+    ),
 
   // Model Profiles (New)
   getModelProfiles: () =>

@@ -169,6 +169,14 @@ class BrowserChannel(BaseChannel):
                 if msg_type == "message":
                     content = data.get("content", "")
                     media = data.get("media")
+                    # 与 WebUI 约定：toolMode / selectedMcpServers，供 Agent 按 tool_mode 决定是否加载 MCP
+                    extra_meta: dict[str, Any] = {}
+                    _tm = data.get("toolMode") or data.get("tool_mode")
+                    if _tm is not None:
+                        extra_meta["tool_mode"] = _tm
+                    _mcp_ids = data.get("selectedMcpServers") or data.get("selected_mcp_servers")
+                    if _mcp_ids:
+                        extra_meta["selected_mcp_servers"] = _mcp_ids
 
                     resp_content = ""
                     # Directly call agent with progress_callback
@@ -181,6 +189,7 @@ class BrowserChannel(BaseChannel):
                                 channel="browser",
                                 progress_callback=on_progress,
                                 media=media,
+                                extra_metadata=extra_meta or None,
                             ),
                             timeout=self.config.agent_timeout,
                         )

@@ -71,7 +71,9 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
   isLast,
   defaultExpanded = false,
 }) => {
-  const [isExpanded, setIsExpanded] = useState(defaultExpanded)
+  const [isExpanded, setIsExpanded] = useState(
+    () => defaultExpanded || !!(typeof step.result === 'string' && step.result.trim()),
+  )
   const [outputExpanded, setOutputExpanded] = useState(false)
   const [paramsExpanded, setParamsExpanded] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -139,17 +141,16 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     }
   }, [status, isLast])
 
-  // 完成后自动收起（如果是自动展开的）
-  const wasAutoExpanded = React.useRef(false)
+  // 结果到达时自动展开，便于直接看到工具输出（不再在完成后强制收起）
+  const prevResultRef = React.useRef(step.result)
   React.useEffect(() => {
-    if (status === 'completed' && wasAutoExpanded.current) {
-      setIsExpanded(false)
-      wasAutoExpanded.current = false
+    const had = typeof prevResultRef.current === 'string' && prevResultRef.current.trim()
+    const now = typeof step.result === 'string' && step.result.trim()
+    if (!had && now) {
+      setIsExpanded(true)
     }
-    if (status === 'running' && isLast) {
-      wasAutoExpanded.current = true
-    }
-  }, [status, isLast])
+    prevResultRef.current = step.result
+  }, [step.result])
 
   const args = useMemo(() => {
     if (typeof step.arguments === 'string') {
@@ -307,11 +308,13 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
             </div>
           )}
 
-          {/* 结果展示 — 折叠预览 + 操作按钮 */}
-          {step.result && status === 'completed' && (
-            <div className="tool-step-section">
+          {/* 结果展示：任意非空 result 均展示（含失败、流式收尾等） */}
+          {typeof step.result === 'string' && step.result.trim() && (
+            <div className={`tool-step-section ${status === 'error' ? 'tool-step-result-error' : ''}`}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                <Text type="secondary" style={{ fontSize: 12 }}>执行结果</Text>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {status === 'error' ? '错误 / 输出' : '执行结果'}
+                </Text>
                 <div className="output-actions">
                   {needsOutputCollapse && !outputExpanded && (
                     <button className="output-action-btn" onClick={() => setOutputExpanded(true)}>
@@ -350,6 +353,7 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
 }, (prevProps, nextProps) => {
   const prev = prevProps.step
   const next = nextProps.step
+  const argsEqual = JSON.stringify(prev.arguments) === JSON.stringify(next.arguments)
   return (
     prev.id === next.id &&
     prev.status === next.status &&
@@ -360,7 +364,9 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     prev.endTime === next.endTime &&
     prev.progress?.detail === next.progress?.detail &&
     prev.progress?.percent === next.progress?.percent &&
-    Math.abs((prev.outputChunks?.length ?? 0) - (next.outputChunks?.length ?? 0)) < 10 &&
+    prev.progress?.lastUpdate === next.progress?.lastUpdate &&
+    (prev.outputChunks?.length ?? 0) === (next.outputChunks?.length ?? 0) &&
+    argsEqual &&
     prevProps.isLast === nextProps.isLast &&
     prevProps.defaultExpanded === nextProps.defaultExpanded
   )

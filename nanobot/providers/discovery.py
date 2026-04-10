@@ -3,9 +3,14 @@
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
+
+from nanobot.providers.openai_compat_probe import (
+    MINIMAX_FALLBACK_MODEL_ROWS,
+    is_minimax_openai_base,
+)
 
 if TYPE_CHECKING:
     from nanobot.storage.config_repository import ConfigRepository
@@ -282,9 +287,16 @@ class DynamicOpenAICompatibleDiscovery(ProviderDiscovery):
                     data = response.json()
                     models = data.get("data", []) if isinstance(data, dict) else []
                     return [self._parse_model(m) for m in models if self._is_chat_model(m)]
-                else:
-                    logger.warning(f"DynamicOpenAICompatibleDiscovery: {url} returned {response.status_code}: {response.text[:200]}")
-                    return []
+                if response.status_code == 404 and is_minimax_openai_base(api_base):
+                    logger.info(
+                        "DynamicOpenAICompatibleDiscovery: %s 无模型列表接口，使用 MiniMax 静态回退列表",
+                        url,
+                    )
+                    return [self._minimax_fallback_model(r) for r in MINIMAX_FALLBACK_MODEL_ROWS]
+                logger.warning(
+                    f"DynamicOpenAICompatibleDiscovery: {url} returned {response.status_code}: {response.text[:200]}"
+                )
+                return []
         except Exception as e:
             logger.warning(f"DynamicOpenAICompatibleDiscovery: failed to fetch {url}: {e}")
             return []
@@ -302,6 +314,25 @@ class DynamicOpenAICompatibleDiscovery(ProviderDiscovery):
             if mid.lower().startswith(prefix):
                 return False
         return True
+
+    def _minimax_fallback_model(self, row: dict[str, Any]) -> DiscoveredModel:
+        """MiniMax 官方部分环境不提供 GET /models，使用与预置 provider 一致的静态模型行。"""
+        mid = row["id"]
+        name = row.get("name", mid)
+        cw = int(row.get("context_window", 128000))
+        return DiscoveredModel(
+            id=mid,
+            name=name,
+            litellm_id=mid,
+            aliases=[],
+            capabilities=["tools"],
+            context_window=cw,
+            model_type="chat",
+            max_tokens=4096,
+            supports_vision=False,
+            supports_function_calling=True,
+            supports_streaming=True,
+        )
 
     def _parse_model(self, m: dict) -> DiscoveredModel:
         """Parse an OpenAI-compatible /models response entry into DiscoveredModel."""
@@ -335,28 +366,50 @@ class ModelDiscoveryService:
     def __init__(self, repo: "ConfigRepository"):
         self.repo = repo
 
-    async def discover_for_provider(self, provider_id: str) -> list[DiscoveredModel]:
-        """Discover models for a specific provider."""
+    def _select_discovery_class(self, provider: dict[str, Any]) -> type[ProviderDiscovery]:
+        """系统预置 provider 用静态列表；用户自建（含 MiniMax 等 OpenAI 兼容）一律走动态 /models。"""
+        if provider.get("is_system"):
+            pid = provider.get("id", "")
+            cls = self.DISCOVERY_MAP.get(pid)
+            if cls:
+                return cls
+            ptype = (provider.get("provider_type") or "openai").lower()
+            cls = self.DISCOVERY_MAP.get(ptype)
+            if cls:
+                return cls
+        return DynamicOpenAICompatibleDiscovery
+
+    async def discover_for_provider(
+        self,
+        provider_id: str,
+        *,
+        api_key: str | None = None,
+        api_base: str | None = None,
+    ) -> list[DiscoveredModel]:
+        """Discover models for a specific provider. Optional api_key/api_base override DB (表单未保存时)."""
         provider = self.repo.get_provider(provider_id)
         if not provider:
             logger.warning(f"Provider {provider_id} not found")
             return []
 
-        discovery_class = self.DISCOVERY_MAP.get(provider_id)
-        if not discovery_class:
-            # Fall back to dynamic OpenAI-compatible discovery for unknown providers
-            logger.debug(f"No static discovery for '{provider_id}', trying dynamic OpenAI-compatible")
-            discovery_class = DynamicOpenAICompatibleDiscovery
+        discovery_class = self._select_discovery_class(provider)
+        eff_key = provider.get("api_key", "") if api_key is None else api_key
+        eff_base = provider.get("api_base") if api_base is None else api_base
 
         discovery = discovery_class()
-        return await discovery.discover(
-            api_key=provider.get("api_key", ""),
-            api_base=provider.get("api_base"),
-        )
+        return await discovery.discover(api_key=eff_key, api_base=eff_base)
 
-    async def discover_and_save(self, provider_id: str) -> list[DiscoveredModel]:
+    async def discover_and_save(
+        self,
+        provider_id: str,
+        *,
+        api_key: str | None = None,
+        api_base: str | None = None,
+    ) -> list[DiscoveredModel]:
         """Discover models and save to database."""
-        models = await self.discover_for_provider(provider_id)
+        models = await self.discover_for_provider(
+            provider_id, api_key=api_key, api_base=api_base
+        )
 
         for i, model in enumerate(models):
             is_default = (i == 0)

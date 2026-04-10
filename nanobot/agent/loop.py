@@ -3348,20 +3348,25 @@ class AgentLoop:
         Returns:
             The agent's response.
         """
-        # MCP 工具已在 run_server 主线程中通过后台线程初始化完成，
-        # 这里只做安全检查（如果超时会话内有延迟，仍等待但不阻塞）
-        if not self._mcp_init_event.is_set():
-            logger.debug("[MCP] Web API: MCP not yet initialized, waiting...")
-            # threading.Event.wait() is blocking, run in thread pool
-            initialized = await asyncio.to_thread(self._mcp_init_event.wait, timeout=5.0)
-            if not initialized:
-                logger.warning("[MCP] Web API: MCP init still pending after 5s, triggering on-demand init")
-                # 5秒后仍未初始化，说明 run_server 的后台线程可能超时/失败
-                # 在当前事件循环中直接触发一次加载（on-demand fallback）
-                try:
-                    await self._init_mcp_loader(only_server_ids=None)
-                except Exception as e:
-                    logger.warning(f"[MCP] Web API on-demand init failed: {e}")
+        # 仅在需要 MCP 时等待后台初始化或按需加载；tool_mode=disable 时不等待、不连接 MCP
+        _early_tool_mode = (extra_metadata or {}).get("tool_mode")
+        if _early_tool_mode != "disable":
+            # MCP 工具已在 run_server 主线程中通过后台线程初始化完成，
+            # 这里只做安全检查（如果超时会话内有延迟，仍等待但不阻塞）
+            if not self._mcp_init_event.is_set():
+                logger.debug("[MCP] Web API: MCP not yet initialized, waiting...")
+                # threading.Event.wait() is blocking, run in thread pool
+                initialized = await asyncio.to_thread(self._mcp_init_event.wait, timeout=5.0)
+                if not initialized:
+                    logger.warning("[MCP] Web API: MCP init still pending after 5s, triggering on-demand init")
+                    # 5秒后仍未初始化，说明 run_server 的后台线程可能超时/失败
+                    # 在当前事件循环中直接触发一次加载（on-demand fallback）
+                    try:
+                        await self._init_mcp_loader(only_server_ids=None)
+                    except Exception as e:
+                        logger.warning(f"[MCP] Web API on-demand init failed: {e}")
+        else:
+            logger.debug("[MCP] tool_mode=disable: skip MCP init wait and on-demand load (process_direct)")
 
         self._reset_cancel_event(session_key)
         

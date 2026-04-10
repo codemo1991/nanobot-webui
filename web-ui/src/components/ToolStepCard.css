@@ -176,6 +176,13 @@
   font-size: 11px;
   line-height: 1;
 }
+/* 工具失败时结果区强调 */
+.tool-step-result-error .tool-output-collapsed,
+.tool-step-result-error .tool-output-expanded {
+  border-left: 3px solid #f87171;
+  background: #1a1212;
+}
+
 .output-action-btn:hover {
   text-decoration: underline;
 }

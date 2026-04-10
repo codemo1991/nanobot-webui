@@ -1,20 +1,18 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useLocation } from 'react-router-dom'
 import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Tag, Modal, Popconfirm, Checkbox, Popover } from 'antd'
 import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, MessageOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import rehypeHighlight from 'rehype-highlight'
 import { api } from '../api'
 import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, StreamEvent, McpServer } from '../types'
 import { useWebSocket } from '../hooks/useWebSocket'
 import type { WsEvent } from '../hooks/useWebSocket'
-import { ToolStepsPanel } from '../components/ToolStepsPanel'
 import './ChatPage.css'
 import 'highlight.js/styles/github-dark.css'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import { requestNotificationPermission, notifyTaskComplete } from '../utils/notification'
+import { ToolStepsPanel } from '../components/ToolStepsPanel'
+import { AssistantMarkdownContent } from '../components/AssistantMarkdownContent'
 
 const WS_BASE_URL = `ws://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8765`
 
@@ -109,15 +107,25 @@ function ChatPage() {
   const [editTitle, setEditTitle] = useState('')
   const [streamingToolSteps, setStreamingToolSteps] = useState<ToolStep[]>([])
   const [streamingThinking, setStreamingThinking] = useState(false)
-  const [streamingCursorFast, setStreamingCursorFast] = useState(true)
-  const [cursorVisible, setCursorVisible] = useState(false)
-  const cursorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const cursorHideRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [claudeCodeProgress, setClaudeCodeProgress] = useState('')
-  const claudeCodeLineCount = useMemo(
-    () => (claudeCodeProgress ? claudeCodeProgress.split('\n').length : 0),
-    [claudeCodeProgress],
-  )
+  // 与 state 同步，供 session 切换时快照到 bgSessionStatesRef
+  const streamingToolStepsRef = useRef<ToolStep[]>([])
+  streamingToolStepsRef.current = streamingToolSteps
+  const streamingThinkingRef = useRef(false)
+  streamingThinkingRef.current = streamingThinking
+  const claudeCodeProgressRef = useRef('')
+  claudeCodeProgressRef.current = claudeCodeProgress
+  /** 从「正在流式」集合中移除会话（done / error / stop / abort 共用，避免 handleWsMessage 闭包依赖变化） */
+  const removeFromStreamingSessionsRef = useRef<(id: string) => void>(() => {})
+  removeFromStreamingSessionsRef.current = (sessionId: string) => {
+    setStreamingSessionIds(prev => {
+      const next = new Set(prev)
+      next.delete(sessionId)
+      return next
+    })
+  }
+  // 跟踪待发送的用户消息内容（用于立即显示在加载区域）
+  const pendingUserMessageRef = useRef<string>('')
   const [pendingImages, setPendingImages] = useState<string[]>([])
   const [imageSendStatus, setImageSendStatus] = useState<Record<number, 'sending' | 'sent' | 'error'>>({})
   const [sessionTokenUsage, setSessionTokenUsage] = useState<TokenUsage>({
@@ -144,6 +152,8 @@ function ChatPage() {
   const imageInputRef = useRef<HTMLInputElement>(null)
   // 追踪是否有活跃的流式请求
   const isStreamingRef = useRef(false)
+  // 追踪 session switch effect 上一次处理的 session ID（区分「会话切换」和「流式状态变更」）
+  const prevSessionIdForEffectRef = useRef<string | null>(null)
   // 追踪页面是否刚恢复
   const isRestoringRef = useRef(false)
   // 追踪当前运行的 Claude Code 任务 ID（用于后台轮询）
@@ -262,20 +272,21 @@ function ChatPage() {
         setStreamingToolSteps([])
         setClaudeCodeProgress('')
 
-        // 直接用 assistantMessage 替换 temp 消息（避免 loadMessages 时序问题）
+        // 直接用 assistantMessage 替换 temp 助手占位，保留 temp 用户消息（避免用户消息闪烁消失）
         const assistantMsg = event.event.assistantMessage
         console.log('[handleWsMessage] setting messages, assistantMsg:', JSON.stringify(assistantMsg))
         setMessages(prev => {
-          // 移除所有 temp- 开头的占位消息
-          const withoutTemp = prev.filter(m => !m.id.startsWith('temp-'))
+          // 只移除 temp- 开头的助手占位消息，保留用户的 temp 消息直到 loadMessages 取回真实数据
+          const withoutTempAssistant = prev.filter(m => !(m.id.startsWith('temp-') && m.role === 'assistant'))
           // 添加真实 assistant 消息（来自 DB，有 sequence）
           if (assistantMsg) {
             streamingAssistantIdRef.current = assistantMsg.id
-            return [...withoutTemp, assistantMsg]
+            return [...withoutTempAssistant, assistantMsg]
           }
-          return withoutTemp
+          return withoutTempAssistant
         })
-        // 后台刷新确保数据一致
+        // 重新加载消息，确保用户消息和助手消息都以真实 ID 显示
+        void loadMessages(sessionId)
         void loadSessionTokenUsage(sessionId)
       } else {
         void loadSessions()
@@ -299,6 +310,8 @@ function ChatPage() {
         setPollingTaskId(null)
         clearStreamingState(sessionId)
         abortControllerRef.current = null
+        pendingUserMessageRef.current = ''  // 清除待发送消息
+        removeFromStreamingSessionsRef.current(sessionId)
       }
       void loadSessions()
       return
@@ -319,6 +332,7 @@ function ChatPage() {
         currentTaskIdRef.current = null
         setPollingTaskId(null)
         abortControllerRef.current = null
+        removeFromStreamingSessionsRef.current(sessionId)
       }
       return
     }
@@ -353,119 +367,29 @@ function ChatPage() {
     wsDisconnectRef.current = wsDisconnect
   }, [wsSend, wsDisconnect])
 
-  // 流式事件处理（按会话 ID 路由：当前会话更新 UI，后台会话更新缓存）
-  // 此函数处理 StreamEvent 并更新 streamHandlerRef
+  // 流式事件处理（WebSocket 与当前选中会话一一对应，事件均属当前会话）
   const processStreamEvent = useCallback((evt: StreamEvent) => {
     const sessionId = currentSessionIdRef.current
     if (!sessionId) return
-
-    const isCurrent = sessionId === currentSessionIdRef.current
 
     if (evt.type === 'done') {
       bgSessionStatesRef.current.delete(sessionId)
       // Skip reload if handleWsMessage already added assistantMessage
       if (streamingAssistantIdRef.current) {
         streamingAssistantIdRef.current = null
-        if (isCurrent) {
-          setStreamingThinking(false)
-          setStreamingToolSteps([])
-          setClaudeCodeProgress('')
-        }
-        return
-      }
-      if (isCurrent) {
         setStreamingThinking(false)
         setStreamingToolSteps([])
         setClaudeCodeProgress('')
-        // 收到 done 立即拉消息
-        refreshStreamDoneRef.current(sessionId)
-      } else {
-        loadSessionsRef.current()
+        return
       }
+      setStreamingThinking(false)
+      setStreamingToolSteps([])
+      setClaudeCodeProgress('')
+      refreshStreamDoneRef.current(sessionId)
       return
     }
 
-    if (!isCurrent) {
-      // 后台会话：只更新状态缓存，不触发 UI 重渲染
-      const bgState = bgSessionStatesRef.current.get(sessionId) || { toolSteps: [], thinking: false, progress: '' }
-      if (evt.type === 'thinking') {
-        bgState.thinking = true
-      } else if (evt.type === 'tool_start' && evt.id && evt.name) {
-        bgState.thinking = false
-        if (evt.name === 'claude_code') bgState.progress = ''
-        bgState.toolSteps = [...bgState.toolSteps, {
-          id: evt.id,
-          name: evt.name,
-          arguments: evt.arguments ?? {},
-          result: '',
-          status: 'running',
-          startTime: Date.now(),
-        }]
-      } else if (evt.type === 'tool_progress' && evt.tool_id) {
-        bgState.toolSteps = bgState.toolSteps.map(step =>
-          step.id === evt.tool_id
-            ? { ...step, status: evt.status as 'running' | 'waiting', progress: { detail: evt.detail, percent: evt.progress_percent, lastUpdate: Date.now() } }
-            : step
-        )
-      } else if (evt.type === 'tool_stream_chunk' && evt.tool_id) {
-        bgState.toolSteps = bgState.toolSteps.map(step =>
-          step.id === evt.tool_id
-            ? { ...step, outputChunks: [...(step.outputChunks || []), { chunk: evt.chunk, isError: evt.is_error || false, timestamp: Date.now() }].slice(-100) }
-            : step
-        )
-      } else if (evt.type === 'tool_end' && evt.id) {
-        const steps = [...bgState.toolSteps]
-        for (let i = steps.length - 1; i >= 0; i--) {
-          const step = steps[i]
-          if (step && (step.id === evt.id || step.name === evt.name) && !step.result) {
-            steps[i] = { ...step, result: evt.result ?? '', status: 'completed', endTime: Date.now(), durationMs: step.startTime ? Date.now() - step.startTime : undefined }
-            break
-          }
-        }
-        bgState.toolSteps = steps
-        if (evt.name === 'claude_code') bgState.progress = ''
-      } else if (evt.type === 'claude_code_progress') {
-        const subtype = evt.subtype || 'text'
-        const content = evt.content || ''
-        let line = ''
-        if (subtype === 'tool_use') line = `[${evt.tool_name || 'Tool'}] ${content}`
-        else if (subtype === 'tool_result') line = `  -> ${content}`
-        else if (subtype === 'assistant_text') line = content.length > 120 ? content.slice(0, 120) + '...' : content
-        else line = content
-        const newText = bgState.progress ? bgState.progress + '\n' + line : line
-        const lines = newText.split('\n')
-        bgState.progress = lines.length > 30 ? lines.slice(-30).join('\n') : newText
-      } else if (evt.type === 'subagent_start') {
-        // 后台会话：追加到 bgSessionStatesRef（不影响当前 UI）
-        const agents = bgAgentsRef.current
-        if (!agents.find(a => a.taskId === evt.task_id)) {
-          setBgAgents(prev => [...prev, {
-            taskId: evt.task_id,
-            label: evt.label,
-            status: 'running',
-            progress: evt.task.slice(0, 80),
-            backend: evt.backend,
-          }])
-        }
-      } else if (evt.type === 'subagent_progress') {
-        setBgAgents(prev => prev.map(a =>
-          a.taskId === evt.task_id ? { ...a, progress: evt.content ? (a.progress + '\n' + evt.content).slice(-500) : a.progress } : a
-        ))
-      } else if (evt.type === 'subagent_end') {
-        setBgAgents(prev => prev.map(a =>
-          a.taskId === evt.task_id ? { ...a, status: evt.status as 'done' | 'error' | 'timeout' | 'cancelled', result: evt.summary } : a
-        ))
-      } else if (evt.type === 'subagent_summary') {
-        setBgAgents(prev => prev.map(a =>
-          (a.taskId === evt.task_id || (evt.task_ids && evt.task_ids.includes(a.taskId)))
-            ? { ...a, result: evt.llm_summary, status: 'done' as const } : a
-        ))
-      }
-      bgSessionStatesRef.current.set(sessionId, bgState)
-      return
-    }
-
-    // 当前会话：正常更新 UI 状态
+    // 当前会话：更新 UI 状态
     if (evt.type === 'thinking') {
       setStreamingThinking(true)
     } else if (evt.type === 'tool_start' && evt.id && evt.name) {
@@ -500,7 +424,7 @@ function ChatPage() {
         timestamp: Date.now(),
       })
       if (!chunkFlushTimersRef.current.has(sessionId)) {
-        const timer = setTimeout(() => flushPendingChunks(sessionId), 16)
+        const timer = setTimeout(() => flushPendingChunks(sessionId), 8)
         chunkFlushTimersRef.current.set(sessionId, timer)
       }
     } else if (evt.type === 'tool_end' && evt.id) {
@@ -573,9 +497,7 @@ function ChatPage() {
           ? { ...a, result: evt.llm_summary, status: 'done' as const, disconnected: false }
           : a
       ))
-      if (isCurrent) {
-        refreshStreamDoneRef.current(sessionId)
-      }
+      refreshStreamDoneRef.current(sessionId)
     } else if (evt.type === 'microkernel_end') {
       setBgAgents(prev => prev.map(a =>
         a.taskId === evt.task_id ? { ...a, status: 'done' as const, disconnected: false } : a
@@ -640,12 +562,14 @@ function ChatPage() {
     }
   }, [])
 
-  // 工具模式切换到 specified 时加载 MCP 列表
+  // 仅在「指定 MCP」时需要列表；禁用/自动时不请求 /mcps，避免首屏与首条消息变慢
   useEffect(() => {
     if (toolMode === 'specified') {
       api.getMcps().then(data => {
         setAvailableMcps(data || [])
       }).catch(console.error)
+    } else {
+      setAvailableMcps([])
     }
   }, [toolMode])
 
@@ -747,11 +671,15 @@ function ChatPage() {
 
   useEffect(() => {
     loadSessions()
-    // 预热 MCP，减少首次消息延迟
-    api.warmup().catch(() => { /* 忽略预热错误，不影响用户体验 */ })
     // 请求浏览器通知权限（用于后台任务完成提醒）
     void requestNotificationPermission()
   }, [])
+
+  // 仅在启用工具（自动/指定 MCP）时预热后端 MCP，避免「禁用工具」时仍拉 MCP 导致首条消息变慢
+  useEffect(() => {
+    if (toolMode === 'disable') return
+    api.warmup().catch(() => { /* 忽略预热错误 */ })
+  }, [toolMode])
 
   // 加载当前使用的模型名称（页面可见时刷新，确保配置变更后能实时更新）
   const loadCurrentModel = useCallback(() => {
@@ -769,28 +697,38 @@ function ChatPage() {
     return () => document.removeEventListener('visibilitychange', onVisible)
   }, [loadCurrentModel])
 
-  // 加载 MCP 服务器列表（仅在可见性变化时刷新，避免每次 session 切换都请求）
-  useEffect(() => {
-    api.getMcps().then(setAvailableMcps).catch(() => setAvailableMcps([]))
-  }, [])
+  // 切回页面且为「指定 MCP」时刷新列表（禁用/自动不请求）
   useEffect(() => {
     const onVisible = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && toolMode === 'specified') {
         api.getMcps().then(setAvailableMcps).catch(() => setAvailableMcps([]))
       }
     }
     document.addEventListener('visibilitychange', onVisible)
     return () => document.removeEventListener('visibilitychange', onVisible)
-  }, [])
+  }, [toolMode])
 
   // Session 切换时恢复状态（不中止后台流式，支持并行聊天）
   useEffect(() => {
     const sessionId = currentSession?.id ?? null
+    const prevId = prevSessionIdForEffectRef.current
+    const sessionActuallyChanged = sessionId !== prevId
+    // 离开仍在流式中的会话时，把当前工具/思考 UI 快照到缓存，切回时可恢复
+    if (sessionActuallyChanged && prevId && streamingSessionIds.has(prevId)) {
+      bgSessionStatesRef.current.set(prevId, {
+        toolSteps: [...streamingToolStepsRef.current],
+        thinking: streamingThinkingRef.current,
+        progress: claudeCodeProgressRef.current,
+      })
+    }
+    prevSessionIdForEffectRef.current = sessionId
 
-    // 重置当前 UI 的流式显示状态（将由目标会话状态填充）
-    setStreamingToolSteps([])
-    setStreamingThinking(false)
-    setClaudeCodeProgress('')
+    // 只在真正切换会话时重置流式显示状态
+    if (sessionActuallyChanged) {
+      setStreamingToolSteps([])
+      setStreamingThinking(false)
+      setClaudeCodeProgress('')
+    }
 
     if (currentSession && sessionId) {
       const isStreaming = streamingSessionIds.has(sessionId)
@@ -814,7 +752,11 @@ function ChatPage() {
       }
 
       loadCurrentModel()
-      loadMessages(sessionId)
+      // 仅在真正切换会话、或当前会话不处于流式状态时加载消息
+      // 避免同一会话启动流式时（setStreamingSessionIds 触发本 effect）覆盖刚加入的 temp 用户消息
+      if (sessionActuallyChanged || !isStreaming) {
+        loadMessages(sessionId)
+      }
       loadSessionTokenUsage(sessionId)
 
       // 非流式进行中时，尝试从 sessionStorage 恢复（用于页面刷新后恢复）
@@ -888,7 +830,7 @@ function ChatPage() {
 
   useEffect(() => {
     scrollToBottom()
-  }, [messages])
+  }, [messages, loading, streamingToolSteps, streamingThinking, claudeCodeProgress])
 
   // 加载任务列表
   useEffect(() => {
@@ -939,16 +881,13 @@ function ChatPage() {
     a => a.status === 'running' && !a.disconnected
   ).length
 
-  // 切换会话时恢复 MCP 工具设置并预热
+  // 切换会话时恢复 MCP 工具设置（warmup 由 toolMode 的 useEffect 统一处理，禁用工具时不预热）
   const handleSelectSession = (session: Session) => {
     isRestoringMcpRef.current = true
     setCurrentSession(session)
     setToolMode(session.toolMode || 'disable')
     setSelectedMcpServers(session.selectedMcpServers || [])
-    // 恢复完成后允许正常保存
     setTimeout(() => { isRestoringMcpRef.current = false }, 50)
-    // 预热 MCP，减少首次消息延迟
-    api.warmup().catch(() => { /* 忽略预热错误，不影响用户体验 */ })
   }
 
   // MCP 工具设置变化时自动保存到当前会话
@@ -985,30 +924,6 @@ function ChatPage() {
     void loadSessionTokenUsage(sessionId)
     void loadSessions()
   }
-
-  // Cursor blink: fast while streaming, slow after done
-  useEffect(() => {
-    if (loading && streamingThinking) {
-      setCursorVisible(true)
-      setStreamingCursorFast(true)
-    } else if (loading) {
-      // text streaming, start with fast
-      setCursorVisible(true)
-      setStreamingCursorFast(true)
-    } else {
-      // done, wait 300ms then switch to slow blink then hide
-      if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current)
-      if (cursorHideRef.current) clearTimeout(cursorHideRef.current)
-      cursorTimerRef.current = setTimeout(() => {
-        setStreamingCursorFast(false)
-        cursorHideRef.current = setTimeout(() => setCursorVisible(false), 1500)
-      }, 300)
-    }
-    return () => {
-      if (cursorTimerRef.current) clearTimeout(cursorTimerRef.current)
-      if (cursorHideRef.current) clearTimeout(cursorHideRef.current)
-    }
-  }, [loading, streamingThinking])
 
   const handleCreateSession = async () => {
     try {
@@ -1073,11 +988,7 @@ function ChatPage() {
     abortControllerRef.current = null
     setLoading(false)
     if (sessionId) {
-      setStreamingSessionIds(prev => {
-        const next = new Set(prev)
-        next.delete(sessionId)
-        return next
-      })
+      removeFromStreamingSessionsRef.current(sessionId)
     }
     if (hadStream) {
       antMessage.info(t('chat.generationStopped'))
@@ -1139,6 +1050,8 @@ function ChatPage() {
     abortControllerRef.current = controller
 
     streamingAssistantIdRef.current = null  // Reset before new stream
+    // 跟踪待发送的用户消息，用于立即显示
+    pendingUserMessageRef.current = userMessage
     const tempUserMsg: Message = {
       id: `temp-${Date.now()}`,
       sessionId,
@@ -1163,11 +1076,7 @@ function ChatPage() {
       console.warn('[WebSocket] Not connected, message buffered for reconnection')
       // 保持用户消息可见，只清除 loading 状态
       setLoading(false)
-      setStreamingSessionIds(prev => {
-        const next = new Set(prev)
-        next.delete(sessionId)
-        return next
-      })
+      removeFromStreamingSessionsRef.current(sessionId)
       bgSessionStatesRef.current.delete(sessionId)
       isStreamingRef.current = false
       antMessage.warning(t('chat.reconnecting'))
@@ -1178,11 +1087,7 @@ function ChatPage() {
     controller.signal.addEventListener('abort', () => {
       console.log('[WebSocket] Message sending aborted')
       perSessionAbortControllers.current.delete(sessionId)
-      setStreamingSessionIds(prev => {
-        const next = new Set(prev)
-        next.delete(sessionId)
-        return next
-      })
+      removeFromStreamingSessionsRef.current(sessionId)
       bgSessionStatesRef.current.delete(sessionId)
       setLoading(false)
       isStreamingRef.current = false
@@ -1367,25 +1272,13 @@ function ChatPage() {
                         {message.role === 'assistant' ? (
                           <>
                             {message.toolSteps && message.toolSteps.length > 0 && (
-                              <ToolStepsPanel steps={message.toolSteps} />
+                              <ToolStepsPanel
+                                steps={message.toolSteps}
+                                showRunningOnLast={false}
+                                maxVisibleBeforeCollapse={20}
+                              />
                             )}
-                            <ReactMarkdown
-                              remarkPlugins={[remarkGfm]}
-                              rehypePlugins={[rehypeHighlight]}
-                              className="markdown-body"
-                              components={{
-                                table: ({ children }) => (
-                                  <div className="markdown-table-wrapper">
-                                    <table>{children}</table>
-                                  </div>
-                                ),
-                              }}
-                            >
-                              {message.content}
-                            </ReactMarkdown>
-                            {cursorVisible && message.role === 'assistant' && loading && (
-                              <span className={`stream-cursor ${streamingCursorFast ? '' : 'idle'}`}>|</span>
-                            )}
+                            <AssistantMarkdownContent content={message.content} />
                           </>
                         ) : (
                           <>
@@ -1427,31 +1320,26 @@ function ChatPage() {
                       </div>
                     </div>
                     <div className="message-content">
-                      <div className="message-text loading-text">
-                        <div className="loading-status">
-                          {streamingThinking ? (
-                            <span className="pulse-dot" />
-                          ) : (
-                            <Spin size="small" />
-                          )}
-                          <span>{streamingThinking ? t('chat.thinking') : streamingToolSteps.length > 0 ? t('chat.callingTool') : t('chat.thinkingOrTool')}</span>
-                        </div>
-                        {streamingToolSteps.length > 0 && (
-                          <ToolStepsPanel steps={streamingToolSteps} showRunningOnLast />
-                        )}
-                        {claudeCodeProgress && (
-                          <div className="claude-code-progress">
-                            <div className="claude-code-output-header">
-                              <span />
-                              <span className="claude-code-lines-badge">
-                                [{claudeCodeLineCount} lines]
-                              </span>
-                            </div>
-                            <div className="claude-code-progress-inner">
-                              <pre>{claudeCodeProgress}</pre>
-                            </div>
+                      <div className="message-text loading-text streaming-assistant-panel">
+                        {streamingThinking && (
+                          <div className="streaming-thinking-row">
+                            <span className="pulse-dot" aria-hidden />
+                            <Text type="secondary">{t('chat.thinking')}</Text>
                           </div>
                         )}
+                        {streamingToolSteps.length > 0 && (
+                          <ToolStepsPanel steps={streamingToolSteps} showRunningOnLast maxVisibleBeforeCollapse={20} />
+                        )}
+                        {!!claudeCodeProgress && (
+                          <Collapse ghost size="small" className="claude-code-progress-collapse">
+                            <Collapse.Panel header="Claude Code" key="ccp">
+                              <pre className="claude-code-progress-pre">{claudeCodeProgress}</pre>
+                            </Collapse.Panel>
+                          </Collapse>
+                        )}
+                        <div className="loading-status">
+                          <Spin size="small" />
+                        </div>
                       </div>
                     </div>
                   </div>

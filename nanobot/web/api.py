@@ -75,6 +75,15 @@ def _sync_smart_profile_default_model(repo: "ConfigRepository", model_id: str) -
         )
 
 
+def _refresh_router_and_agent_model(app: "NanobotWebAPI", model_id: str | None) -> None:
+    """配置库中模型变更后：清 Router 缓存；若指定了 model_id 则热更新 Agent 当前解析模型。"""
+    if hasattr(app, "router") and hasattr(app.router, "clear_cache"):
+        app.router.clear_cache()
+    agent = getattr(app, "agent", None)
+    if model_id and agent is not None and hasattr(agent, "update_model"):
+        agent.update_model(model_id)
+
+
 class NanobotWebAPI:
     """State holder for web API handlers."""
 
@@ -1685,6 +1694,32 @@ class NanobotWebAPI:
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
         return repo.batch_disable_providers(provider_ids)
+
+    def test_provider_connection(
+        self,
+        provider_id: str,
+        api_base: str | None = None,
+        api_key: str | None = None,
+    ) -> dict[str, Any]:
+        """服务端探测 OpenAI 兼容 API（含 MiniMax 无 /models 时的对话接口回退）。"""
+        from nanobot.config.loader import get_config_repository
+        from nanobot.providers.openai_compat_probe import probe_openai_compatible_connection
+
+        repo = get_config_repository()
+        p = repo.get_provider(provider_id)
+        if not p:
+            raise ValueError("Provider 不存在")
+
+        base = api_base if api_base is not None else (p.get("api_base") or "")
+        key = api_key if api_key is not None else (p.get("api_key") or "")
+        if not str(base).strip():
+            return {"ok": False, "status": 0, "detail": "请先填写 API Base URL"}
+
+        try:
+            return probe_openai_compatible_connection(str(base), str(key))
+        except Exception as e:
+            logger.warning(f"test_provider_connection {base!r}: {e}")
+            return {"ok": False, "status": 0, "detail": str(e)}
 
     def create_mcp(self, data: dict[str, Any]) -> dict[str, Any]:
         """Create a new MCP server configuration.
@@ -4055,6 +4090,57 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.OK, _ok({"disabled": disabled}))
             return
 
+        # POST /api/v1/providers/{providerId}/discover - 检测模型并写入数据库（配置页「检测模型」）
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "providers"] and parts[4] == "discover":
+            provider_id = unquote(parts[3])
+            body = self._read_json() or {}
+            from nanobot.providers.discovery import ModelDiscoveryService
+            from nanobot.config.loader import get_config_repository
+            repo = get_config_repository()
+            discovery = ModelDiscoveryService(repo)
+            try:
+                kw: dict[str, Any] = {}
+                if "apiBase" in body:
+                    kw["api_base"] = body.get("apiBase")
+                if "apiKey" in body:
+                    kw["api_key"] = body.get("apiKey")
+                models = asyncio.run(discovery.discover_and_save(provider_id, **kw))
+                self._write_json(HTTPStatus.OK, _ok([{
+                    "id": m.id,
+                    "name": m.name,
+                    "litellmId": m.litellm_id,
+                    "aliases": m.aliases,
+                    "capabilities": m.capabilities,
+                    "contextWindow": m.context_window,
+                    "modelType": m.model_type,
+                    "maxTokens": m.max_tokens,
+                    "supportsVision": m.supports_vision,
+                    "supportsFunctionCalling": m.supports_function_calling,
+                    "supportsStreaming": m.supports_streaming,
+                } for m in models]))
+            except Exception as e:
+                logger.exception(f"Failed to discover and save models for {provider_id}")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("DISCOVERY_FAILED", str(e)))
+            return
+
+        # POST /api/v1/providers/{providerId}/test - 服务端测试 /models，避免浏览器 CORS
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "providers"] and parts[4] == "test":
+            provider_id = unquote(parts[3])
+            body = self._read_json() or {}
+            try:
+                result = app.test_provider_connection(
+                    provider_id,
+                    api_base=body.get("apiBase") if "apiBase" in body else None,
+                    api_key=body.get("apiKey") if "apiKey" in body else None,
+                )
+                self._write_json(HTTPStatus.OK, _ok(result))
+            except ValueError as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            except Exception as e:
+                logger.exception("test_provider_connection")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TEST_FAILED", str(e)))
+            return
+
         # POST /api/v1/mcps - Create MCP
         if path == "/api/v1/mcps":
             body = self._read_json()
@@ -4132,6 +4218,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     supports_function_calling=body.get("supportsFunctionCalling", True),
                     supports_streaming=body.get("supportsStreaming", True),
                 )
+                _refresh_router_and_agent_model(app, model_id if is_default else None)
                 self._write_json(HTTPStatus.CREATED, _ok({"success": True}))
             except Exception as e:
                 logger.exception("Failed to create model")
@@ -4185,13 +4272,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 )
                 # 同步 smart 场景的 model_chain，将默认模型置于首位（router 通过 smart profile 解析）
                 _sync_smart_profile_default_model(repo, model_id)
-                if hasattr(app, "router") and hasattr(app.router, "clear_cache"):
-                    app.router.clear_cache()
-                # 热更新 agent 的模型和 provider 的 api_key
-                # update_model 传入 model_id（router 通过它查找 DB，再取 litellm_id 送 API）
-                if hasattr(app, "agent") and app.agent and hasattr(app, "provider_manager"):
-                    if hasattr(app.agent, "update_model"):
-                        app.agent.update_model(model_id)
+                _refresh_router_and_agent_model(app, model_id)
             self._write_json(HTTPStatus.OK, _ok({"success": True}))
             return
 
@@ -4723,6 +4804,15 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             repo = get_config_repository()
             deleted = repo.delete_model(model_id)
             if deleted:
+                _refresh_router_and_agent_model(app, None)
+                try:
+                    for m in repo.get_all_models():
+                        if m.get("is_default") and getattr(app, "agent", None):
+                            if hasattr(app.agent, "update_model"):
+                                app.agent.update_model(m["id"])
+                            break
+                except Exception:
+                    pass
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MODEL_NOT_FOUND", "模型不存在"))
@@ -4937,6 +5027,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     supports_function_calling=body.get("supportsFunctionCalling", existing.get("supports_function_calling", True)),
                     supports_streaming=body.get("supportsStreaming", existing.get("supports_streaming", True)),
                 )
+                _refresh_router_and_agent_model(app, model_id if is_default else None)
                 self._write_json(HTTPStatus.OK, _ok({"success": True}))
             except Exception as e:
                 logger.exception("Failed to update model")

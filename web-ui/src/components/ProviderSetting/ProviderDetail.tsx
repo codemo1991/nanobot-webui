@@ -95,18 +95,17 @@ export const ProviderDetail: React.FC<ProviderDetailProps> = ({ provider, onUpda
     setTesting(true)
     setTestingResult('idle')
     try {
-      const base = form.getFieldValue('apiBase') || getDefaultBase(pt)
-      const key = form.getFieldValue('apiKey')
-      const headers: Record<string, string> = {}
-      if (key) headers['Authorization'] = `Bearer ${key}`
-
-      const resp = await fetch(`${base}/models`, { headers })
-      if (resp.ok) {
+      const apiBase = form.getFieldValue('apiBase') || getDefaultBase(pt)
+      const apiKey = form.getFieldValue('apiKey') ?? ''
+      // 走后端代理请求 /models，避免浏览器直连第三方 API 触发 CORS 导致误报失败
+      const res = await api.testProviderConnection(provider.id, { apiBase, apiKey })
+      if (res.ok) {
         setTestingResult('success')
-        message.success('连接成功')
+        message.success(res.detail || '连接成功')
       } else {
         setTestingResult('error')
-        message.error(`连接失败: HTTP ${resp.status}`)
+        const hint = res.detail ? `: ${res.detail}` : ''
+        message.error(`连接失败 (HTTP ${res.status})${hint}`)
       }
     } catch {
       setTestingResult('error')
@@ -129,8 +128,15 @@ export const ProviderDetail: React.FC<ProviderDetailProps> = ({ provider, onUpda
   const handleDiscover = async () => {
     setDiscovering(true)
     try {
-      await api.discoverModels(provider.id)
-      message.success('模型检测完成')
+      const apiBase = form.getFieldValue('apiBase') || getDefaultBase(pt)
+      const apiKey = form.getFieldValue('apiKey') ?? ''
+      // POST 检测并写入数据库；传入当前表单中的地址与 Key（无需先点保存）
+      const discovered = await api.discoverAndSaveProviderModels(provider.id, { apiBase, apiKey })
+      if (!discovered?.length) {
+        message.warning('未检测到可用对话模型，请确认 API Base、Key 与服务商文档中的 /models 是否可用')
+      } else {
+        message.success(`已保存 ${discovered.length} 个模型`)
+      }
       await loadModels()
     } catch (e: any) {
       message.error(`模型检测失败: ${e.message}`)

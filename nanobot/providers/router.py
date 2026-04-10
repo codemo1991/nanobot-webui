@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from nanobot.providers.native_model_id import normalize_native_model_id, resolve_stored_model_id
+
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.storage.config_repository import ConfigRepository
@@ -221,8 +223,17 @@ class ModelRouter:
             logger.debug(f"Provider {provider_id} has no API key")
             return None
 
+        raw_model_id = resolve_stored_model_id(model)
+        native_model_id = normalize_native_model_id(
+            raw_model_id,
+            api_base=provider_cfg.get("api_base"),
+        )
+        if not native_model_id:
+            logger.debug(f"Model {model.get('id')} has empty resolved model id")
+            return None
+
         return ModelHandle(
-            model=model.get("litellm_id") or model.get("id") or "",  # Native model ID
+            model=native_model_id,
             api_key=provider_cfg["api_key"],
             api_base=provider_cfg.get("api_base"),
             provider=provider_instance,

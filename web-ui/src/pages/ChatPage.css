@@ -149,7 +149,6 @@
   gap: 8px;
   max-width: 85%;
   min-width: 0;
-  animation: fadeIn 0.3s ease-in;
 }
 
 .message-avatar-row {
@@ -478,6 +477,90 @@
 
 .loading-status .ant-spin {
   flex-shrink: 0;
+}
+
+/* 流式回复区：思考 + 工具步骤 + Claude Code 进度（与历史消息气泡区分） */
+.streaming-assistant-panel {
+  min-width: 0;
+}
+
+.streaming-thinking-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.claude-code-progress-collapse {
+  margin-top: 4px;
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 8px;
+}
+
+.claude-code-progress-collapse .ant-collapse-header {
+  padding: 6px 12px !important;
+  font-size: 12px;
+}
+
+.claude-code-progress-pre {
+  margin: 0;
+  max-height: 200px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 助手消息内嵌思考块（OpenAI 风格：默认折叠、左侧强调） */
+.assistant-reasoning-collapse {
+  margin-bottom: 12px;
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.04) 0%, rgba(15, 23, 42, 0.02) 100%);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  overflow: hidden;
+}
+
+.assistant-reasoning-collapse .ant-collapse-item {
+  border: none !important;
+}
+
+.assistant-reasoning-collapse .ant-collapse-header {
+  padding: 8px 12px !important;
+  align-items: center !important;
+  font-size: 13px;
+  color: rgba(0, 0, 0, 0.65);
+}
+
+.assistant-reasoning-collapse .ant-collapse-content-box {
+  padding: 0 12px 10px !important;
+}
+
+.assistant-reasoning-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+}
+
+.assistant-reasoning-icon {
+  color: #64748b;
+  font-size: 14px;
+}
+
+.assistant-reasoning-pre {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border-left: 3px solid #94a3b8;
+  background: rgba(255, 255, 255, 0.7);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: rgba(0, 0, 0, 0.72);
+  max-height: 320px;
+  overflow-y: auto;
 }
 
 /* Input Container */

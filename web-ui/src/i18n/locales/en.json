@@ -118,6 +118,7 @@
     "defaultTitle": "New Chat",
     "thinkingOrTool": "Thinking or calling tools…",
     "thinking": "Thinking…",
+    "reasoningCollapsed": "Reasoning",
     "callingTool": "Calling tool…",
     "toolArguments": "Arguments",
     "toolResult": "Result",
