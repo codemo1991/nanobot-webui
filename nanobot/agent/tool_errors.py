@@ -89,14 +89,23 @@ def is_retryable_result(result: str) -> bool:
 def is_tool_call_result_mismatch_error(exc: BaseException) -> bool:
     """
     判断是否为「assistant tool_calls 与 tool 消息不一致」类 API 错误。
-    MiniMax / 部分兼容 OpenAI 的网关会返回 400 + 2013。
+    - MiniMax：400 + 2013 / tool call and result not match
+    - OpenAI/DeepSeek：insufficient tool messages / must be followed by tool messages
     此类错误可通过补全缺失的 tool 消息或按 tool_calls 顺序重排后重试。
     """
     msg = str(exc).lower()
     if "2013" in msg:
         return True
+    # MiniMax / 网关
     if "tool call" in msg and "not match" in msg:
         return True
     if "tool_call" in msg and "result" in msg and ("match" in msg or "mismatch" in msg):
+        return True
+    # OpenAI API：An assistant message with 'tool_calls' must be followed by tool messages...
+    if "insufficient tool messages" in msg:
+        return True
+    if "must be followed by" in msg and "tool_calls" in msg:
+        return True
+    if "responding to each" in msg and "tool_call" in msg:
         return True
     return False

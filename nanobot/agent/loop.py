@@ -21,6 +21,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.providers.router import ModelRouter, ModelHandle
 from nanobot.providers.provider_manager import ProviderManager
 from nanobot.agent.context import ContextBuilder, repair_openai_tool_messages
+from nanobot.agent.dsml_tool_parser import coerce_llm_response_dsml_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.memory import RememberTool
@@ -3635,6 +3636,9 @@ class AgentLoop:
                                     )
                                     continue
                             raise inner_e
+
+                    # 部分模型把工具调用以 DSML 写在 content 里而非 tool_calls，转为可执行请求
+                    response = coerce_llm_response_dsml_tool_calls(response)
 
                     if idx > 0:
                         logger.info(f"[ModelFailover] 故障转移成功: {models_to_try[0]} -> {model_id}")
