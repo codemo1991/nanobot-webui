@@ -84,16 +84,19 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
     """Atomically write text using temp file + os.replace."""
     file_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=str(file_path.parent), prefix=f".{file_path.name}.tmp.", suffix="")
+    exc: BaseException | None = None
     try:
         with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(content)
         os.replace(tmp_path, file_path)
-    except Exception:
+    except BaseException as e:
+        exc = e
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
-        raise
+    if exc is not None:
+        raise exc
 
 
 def _security_scan(content: str) -> Optional[str]:
@@ -180,6 +183,8 @@ def _delete_skill(name: str, workspace: Path) -> dict[str, Any]:
 def _patch_skill(name: str, old_string: str, new_string: str, workspace: Path) -> dict[str, Any]:
     if not old_string:
         return {"success": False, "error": "old_string is required for patch."}
+    if new_string is None:
+        return {"success": False, "error": "new_string is required for patch."}
     if not _skill_exists(workspace, name):
         return {"success": False, "error": f"Skill '{name}' not found."}
     skill_md = _skill_path(workspace, name)
@@ -224,10 +229,10 @@ class SkillManagerTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "创建、编辑、删除工作区内的 Skill（存储在 {workspace}/skills/）。\n"
+            f"创建、编辑、删除工作区内的 Skill（存储在 {self.workspace}/skills/）。\n"
             "触发时机：完成复杂任务（5+工具调用）、修复错误、发现可复用工作流。\n"
             "动作：create（新建）/ edit（全文替换）/ delete（删除）/ patch（局部替换）/ write_file（辅助文件）。"
-        ).format(workspace=str(self.workspace))
+        )
 
     @property
     def parameters(self) -> dict:

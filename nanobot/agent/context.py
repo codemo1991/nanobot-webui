@@ -76,7 +76,6 @@ class ContextBuilder:
         self.skills = SkillsLoader(workspace)
         self.token_budget = {**TOKEN_BUDGET_DEFAULTS, **(token_budget or {})}
         self._agent_template_manager = agent_template_manager
-        self._skill_snapshot: str | None = None  # 冻结的 skills 索引快照
 
     def update_token_budget(self, **kwargs: int) -> None:
         """Update token budget settings at runtime."""
@@ -179,9 +178,15 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
 
 {skills_summary}""")
 
-        # Skill 创建引导（始终注入，提醒 agent 使用 skill_manage 创建/维护 skills）
-        guidance = SKILLS_GUIDANCE.replace("{workspace}", str(self.workspace))
-        parts.append(guidance)
+        # Skill creation guidance — only shown when skills directory is present
+        skills_dir = self.workspace / "skills"
+        if skills_dir.exists() and any(
+            (p / "SKILL.md").exists()
+            for p in skills_dir.iterdir()
+            if p.is_dir()
+        ):
+            guidance = SKILLS_GUIDANCE.replace("{workspace}", str(self.workspace))
+            parts.append(guidance)
 
         return "\n\n---\n\n".join(parts)
     
@@ -258,26 +263,8 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
         return "\n\n".join(parts) if parts else ""
 
     def invalidate_skill_snapshot(self) -> None:
-        """清除 skills 索引快照，使下一轮对话重新扫描 skills/ 目录。"""
-        self._skill_snapshot = None
-
-    def _build_skills_index(self) -> str:
-        """构建 skills 索引文本。返回冻结快照，支持 session 级缓存。"""
-        if self._skill_snapshot is not None:
-            return self._skill_snapshot
-
-        index_lines: list[str] = []
-        skills_dir = self.workspace / "skills"
-        if skills_dir.exists():
-            for skill_path in sorted(skills_dir.iterdir()):
-                if skill_path.is_dir():
-                    skill_md = skill_path / "SKILL.md"
-                    if skill_md.exists():
-                        index_lines.append(f"- **{skill_path.name}**")
-
-        snapshot = "\n".join(index_lines)
-        self._skill_snapshot = snapshot
-        return snapshot
+        """No-op: actual cache refresh is done via skills.refresh_cache() in SkillManagerTool."""
+        pass
 
     def build_messages(
         self,
