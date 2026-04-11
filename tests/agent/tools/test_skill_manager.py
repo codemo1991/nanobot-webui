@@ -2,7 +2,7 @@ import pytest
 from pathlib import Path
 from nanobot.agent.tools.skill_manager import (
     _validate_name, _validate_frontmatter, _atomic_write_text,
-    _create_skill, _delete_skill, _patch_skill, _write_skill_file,
+    _create_skill, _delete_skill, _patch_skill, _edit_skill, _write_skill_file,
     SkillManagerTool, _THREAT_PATTERNS,
 )
 
@@ -84,4 +84,39 @@ class TestDeleteSkill:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         result = _delete_skill("nonexistent", workspace)
+        assert result["success"] is False
+
+
+class TestEditSkill:
+    def test_edit_skill(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        skills_dir = workspace / "skills"
+        skills_dir.mkdir()
+        # 先创建
+        content1 = "---\nname: edit-test\ndescription: original\n---\nOriginal content"
+        _create_skill("edit-test", content1, workspace)
+        # 再编辑
+        content2 = "---\nname: edit-test\ndescription: updated\n---\nUpdated content"
+        result = _edit_skill("edit-test", content2, workspace)
+        assert result["success"] is True
+        skill_md = skills_dir / "edit-test" / "SKILL.md"
+        assert "Updated content" in skill_md.read_text()
+
+    def test_edit_nonexistent(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        content = "---\nname: x\ndescription: x\n---\nX"
+        result = _edit_skill("nonexistent", content, workspace)
+        assert result["success"] is False
+        assert "not found" in result["error"]
+
+    def test_edit_invalid_content(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        skills_dir = workspace / "skills"
+        skills_dir.mkdir()
+        (skills_dir / "e").mkdir()
+        (skills_dir / "e" / "SKILL.md").write_text("---\nname: e\ndescription: e\n---\nE")
+        result = _edit_skill("e", "No frontmatter", workspace)
         assert result["success"] is False

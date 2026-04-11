@@ -27,6 +27,8 @@ _THREAT_PATTERNS = [
     (re.compile(r'authorized_keys', re.I), "ssh_backdoor"),
     (re.compile(r'\bnc\s+-[lp]', re.I), "reverse_shell"),
     (re.compile(r'\$HOME/\.ssh|\~/\.ssh', re.I), "ssh_access"),
+    (re.compile(r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', re.I), "prompt_injection"),
+    (re.compile(r'system\s+prompt\s+override', re.I), "sys_prompt_override"),
 ]
 
 _INVISIBLE_CHARS = {'\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e'}
