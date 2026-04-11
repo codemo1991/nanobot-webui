@@ -26,6 +26,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.memory import RememberTool
 from nanobot.agent.tools.persist_self_improvement import PersistSelfImprovementTool
+from nanobot.agent.tools.skill_manager import SkillManagerTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
@@ -126,6 +127,24 @@ EXPAND_RATIO = 1.2
 
 # 哨兵：推入 inbound 队列使 run() 的 await get() 立即返回，从而干净退出循环
 _STOP_SENTINEL = object()
+
+
+def _accumulate_llm_usage_into(usage: dict[str, Any] | None, acc: dict[str, int]) -> None:
+    """将单次 LLM 调用的 usage 累加到 acc。
+
+    OpenAI 系为 prompt_tokens/completion_tokens；Anthropic 等为 input_tokens/output_tokens。
+    若仅有 total_tokens / tokens_used，则只累加总数（与旧行为一致）。
+    """
+    if not usage:
+        return
+    pt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    tt = int(usage.get("total_tokens") or usage.get("tokens_used") or 0)
+    if tt <= 0 and (pt > 0 or ct > 0):
+        tt = pt + ct
+    acc["prompt_tokens"] += max(0, pt)
+    acc["completion_tokens"] += max(0, ct)
+    acc["total_tokens"] += max(0, tt)
 
 
 @dataclass
@@ -348,6 +367,12 @@ class AgentLoop:
         self._chain_monitor = ExecutionChainMonitor.get_instance(db_path)
         self._chain_monitor.set_repository(repo)
         logger.info(f'[ExecutionChain] Monitor initialized with db: {db_path}')
+
+        # Skill review configuration
+        self._skill_review_enabled = True         # 总开关
+        self._skill_review_turn_interval = 10   # 每 N 轮自动触发 review（0=禁用）
+        self._user_turn_count = 0              # 用户轮次计数器
+        self._pending_manual_review = False     # 手动触发标志（用户说"总结经验"等）
 
         self._register_default_tools()
         # MCP 加载移到 run() 里直接 await，避免 create_task 调度到从未运行的 loop
@@ -1860,6 +1885,8 @@ class AgentLoop:
         # Memory tool (用户说「记住」时必须调用，否则不会真正写入)
         self.tools.register(RememberTool(workspace=ws))
         self.tools.register(PersistSelfImprovementTool(workspace=ws))
+        # Skill management tool (允许 agent 创建/编辑/删除可复用的 skills)
+        self.tools.register(SkillManagerTool(workspace=ws, context=self.context))
 
         # Shell tool
         self.tools.register(ExecTool(
@@ -2229,6 +2256,13 @@ class AgentLoop:
         # If the last assistant message has the LIMIT_REACHED_MARKER and the user
         # is asking to continue or expand capacity, handle accordingly.
         current_message = msg.content
+        # Skill review: manual trigger — user says "总结经验" etc.
+        _review_keywords = {"总结经验", "复盘", "retrospective", "总结教训",
+                           "从经验中学习", "自我完善", "分析今天的经验"}
+        self._pending_manual_review = any(
+            kw in (msg.content or "").lower() for kw in _review_keywords
+        )
+        self._user_turn_count += 1
         _user_cmd = msg.content.strip()
         _is_continue = _user_cmd.lower() in CONTINUE_KEYWORDS
         _is_expand = _user_cmd in EXPAND_KEYWORDS
@@ -2356,11 +2390,7 @@ class AgentLoop:
             return "I've completed processing but have no response to give."
 
         def _accumulate_usage(usage: dict[str, Any] | None) -> None:
-            if not usage:
-                return
-            usage_acc["prompt_tokens"] += max(0, int(usage.get("prompt_tokens", 0) or 0))
-            usage_acc["completion_tokens"] += max(0, int(usage.get("completion_tokens", 0) or 0))
-            usage_acc["total_tokens"] += max(0, int(usage.get("total_tokens", 0) or 0))
+            _accumulate_llm_usage_into(usage, usage_acc)
 
         def _emit(evt: dict[str, Any]) -> None:
             """安全发送进度事件（细粒度事件流，兼容 pi-agent 风格）。"""
@@ -3185,11 +3215,7 @@ class AgentLoop:
             return "Background task completed."
 
         def _accumulate_usage(usage: dict[str, Any] | None) -> None:
-            if not usage:
-                return
-            usage_acc["prompt_tokens"] += max(0, int(usage.get("prompt_tokens", 0) or 0))
-            usage_acc["completion_tokens"] += max(0, int(usage.get("completion_tokens", 0) or 0))
-            usage_acc["total_tokens"] += max(0, int(usage.get("total_tokens", 0) or 0))
+            _accumulate_llm_usage_into(usage, usage_acc)
 
         # 与 _process_message 一致：从消息或会话恢复 tool_mode / MCP 选择
         msg_tool_mode = msg.metadata.get("tool_mode") if msg.metadata else None
@@ -3374,6 +3400,9 @@ class AgentLoop:
             total_tokens=usage_acc["total_tokens"],
         )
         
+        # Skill review trigger — after session is saved, spawn background review
+        self._maybe_trigger_skill_review(session, session.get_history(max_messages=self.max_history_messages))
+
         # 结束执行链路监控
         try:
             self._chain_monitor.end_chain(status="completed")
@@ -3496,6 +3525,52 @@ class AgentLoop:
                 raise
             return None
     
+    # ---- Skill Review ----
+
+    def _maybe_trigger_skill_review(
+        self,
+        session,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Check if skill review should be triggered and spawn background review.
+
+        Trigger conditions:
+        - Manual: user said "总结经验" etc. (_pending_manual_review = True)
+        - Automatic: every N user turns (_user_turn_count >= interval)
+        """
+        if not getattr(self, "_skill_review_enabled", True):
+            return
+        interval = getattr(self, "_skill_review_turn_interval", 0)
+        if interval <= 0:
+            return
+
+        should_review = (
+            getattr(self, "_pending_manual_review", False) or
+            getattr(self, "_user_turn_count", 0) >= interval
+        )
+        if not should_review:
+            return
+
+        # Reset state
+        self._pending_manual_review = False
+        if getattr(self, "_user_turn_count", 0) >= interval:
+            self._user_turn_count = 0
+
+        # Spawn background review in daemon thread
+        try:
+            from nanobot.agent.skill_reviewer import spawn_skill_review
+            spawn_skill_review(
+                provider=self.provider,
+                model=self.subagent_model or self.model,
+                workspace=self.workspace,
+                context=self.context,
+                messages=messages,
+            )
+        except Exception as e:
+            logger.debug("[SkillReviewer] Failed to spawn review: %s", e)
+
+    # ---- Image Handling ----
+
     async def _handle_image_only(
         self,
         media: list[str],
