@@ -6,6 +6,7 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
+import yaml
 from typing import Any, Optional
 
 from nanobot.agent.tools.base import Tool
@@ -56,9 +57,8 @@ def _validate_frontmatter(content: str) -> Optional[str]:
         return "SKILL.md frontmatter is not closed."
     yaml_content = content[3:end_match.start() + 3]
     try:
-        import yaml
         parsed = yaml.safe_load(yaml_content)
-    except Exception:
+    except yaml.YAMLError:
         return "YAML frontmatter parse error."
     if not isinstance(parsed, dict):
         return "Frontmatter must be a YAML mapping."
@@ -197,7 +197,7 @@ def _patch_skill(name: str, old_string: str, new_string: str, workspace: Path) -
 def _write_skill_file(name: str, file_path: str, file_content: str, workspace: Path) -> dict[str, Any]:
     if not _skill_exists(workspace, name):
         return {"success": False, "error": f"Skill '{name}' not found."}
-    if ".." in file_path.split(os.sep):
+    if ".." in file_path.replace("\\", "/").split("/"):
         return {"success": False, "error": "Path traversal not allowed."}
     target = _skills_dir(workspace) / name / file_path
     try:
@@ -211,8 +211,9 @@ def _write_skill_file(name: str, file_path: str, file_content: str, workspace: P
 class SkillManagerTool(Tool):
     """Tool for creating, editing, deleting, and patching workspace skills."""
 
-    def __init__(self, workspace: Path | str, context: "ContextBuilder | None" = None):
-        super().__init__()
+    def __init__(self, workspace: Path | str, context: "ContextBuilder | None" = None,
+                 progress_callback=None, tool_id=None):
+        super().__init__(progress_callback=progress_callback, tool_id=tool_id)
         self.workspace = Path(workspace).resolve()
         self._context = context
 

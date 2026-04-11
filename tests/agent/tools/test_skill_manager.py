@@ -120,3 +120,67 @@ class TestEditSkill:
         (skills_dir / "e" / "SKILL.md").write_text("---\nname: e\ndescription: e\n---\nE")
         result = _edit_skill("e", "No frontmatter", workspace)
         assert result["success"] is False
+
+
+class TestPatchSkill:
+    def test_patch_skill(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        skills_dir = workspace / "skills"
+        skills_dir.mkdir()
+        content = "---\nname: patch-test\ndescription: test\n---\nHello World"
+        _create_skill("patch-test", content, workspace)
+        result = _patch_skill("patch-test", "World", "Nanobot", workspace)
+        assert result["success"] is True
+        skill_md = skills_dir / "patch-test" / "SKILL.md"
+        assert "Hello Nanobot" in skill_md.read_text()
+
+    def test_patch_old_string_not_found(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        skills_dir = workspace / "skills"
+        skills_dir.mkdir()
+        content = "---\nname: p\ndescription: p\n---\nTest"
+        _create_skill("p", content, workspace)
+        result = _patch_skill("p", "nonexistent string", "X", workspace)
+        assert result["success"] is False
+        assert "not found" in result["error"]
+
+
+class TestWriteSkillFile:
+    def test_write_skill_file(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        skills_dir = workspace / "skills"
+        skills_dir.mkdir()
+        content = "---\nname: wf-test\ndescription: test\n---\nTest"
+        _create_skill("wf-test", content, workspace)
+        result = _write_skill_file("wf-test", "references/example.md", "# Example\nReference doc", workspace)
+        assert result["success"] is True
+        assert (skills_dir / "wf-test" / "references" / "example.md").exists()
+
+    def test_write_skill_file_path_traversal(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        skills_dir = workspace / "skills"
+        skills_dir.mkdir()
+        content = "---\nname: wf2\ndescription: t\n---\nT"
+        _create_skill("wf2", content, workspace)
+        result = _write_skill_file("wf2", "../evil.md", "bad", workspace)
+        assert result["success"] is False
+
+    def test_write_skill_file_nonexistent_skill(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        result = _write_skill_file("no-such", "x.md", "x", workspace)
+        assert result["success"] is False
+        assert "not found" in result["error"]
+
+
+class TestValidateContentSize:
+    def test_content_too_large(self):
+        from nanobot.agent.tools.skill_manager import _validate_content_size
+        large = "x" * 50001
+        err = _validate_content_size(large)
+        assert err is not None
+        assert "50,000" in err
