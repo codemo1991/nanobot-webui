@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from nanobot.agent.tools.skill_manager import SkillManagerTool
+
 logger = logging.getLogger(__name__)
 
 # ---- Prompts ----
@@ -94,9 +96,8 @@ def spawn_skill_review(
         context: ContextBuilder instance (for refresh_cache after write)
         messages: Conversation history snapshot (list of message dicts)
     """
-    from nanobot.agent.tools.skill_manager import SkillManagerTool
-
     def _run():
+        logger.debug("[SkillReviewer] Daemon thread started, messages count=%d", len(messages))
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         reviewer = None
@@ -110,7 +111,7 @@ def spawn_skill_review(
             )
             loop.run_until_complete(reviewer.run())
         except Exception as e:
-            logger.debug("[SkillReviewer] Review failed: %s", e)
+            logger.warning("[SkillReviewer] Review crashed: %s", e)
         finally:
             if reviewer is not None:
                 try:
@@ -154,8 +155,6 @@ class _SkillReviewer:
 
     async def run(self) -> None:
         """Run one review cycle: call LLM, execute skill_manage if needed."""
-        from nanobot.agent.tools.skill_manager import SkillManagerTool
-
         messages = self._build_review_messages()
         max_iterations = 3
 
@@ -169,7 +168,7 @@ class _SkillReviewer:
                     stream=False,
                 )
             except Exception as e:
-                logger.debug("[SkillReviewer] LLM call failed: %s", e)
+                logger.warning("[SkillReviewer] LLM call failed: %s", e)
                 break
 
             # Check for tool calls
@@ -177,7 +176,7 @@ class _SkillReviewer:
             if not tool_calls:
                 # No tool calls — check if model said "Nothing to save"
                 content = getattr(response, "content", "") or ""
-                logger.debug("[SkillReviewer] Review done, no skill action: %s", content[:100])
+                logger.info("[SkillReviewer] Review done, no skill action: %s", content[:100])
                 break
 
             skill_calls = [tc for tc in tool_calls if self._get_tc_name(tc) == "skill_manage"]
@@ -190,6 +189,9 @@ class _SkillReviewer:
                 args = self._get_tc_args(tc)
                 action = args.get("action", "")
                 name = args.get("name", "?")
+                if not action or not name:
+                    logger.warning("[SkillReviewer] Skipping skill_manage: missing required args %s", args)
+                    continue
                 try:
                     result_str = await self._skill_tool.execute(**args)
                     result = json.loads(result_str)
@@ -204,9 +206,9 @@ class _SkillReviewer:
                             except Exception:
                                 pass
                     else:
-                        logger.debug("[SkillReviewer] skill_manage %s '%s' failed: %s", action, name, result.get("error", ""))
+                        logger.warning("[SkillReviewer] skill_manage %s '%s' rejected: %s", action, name, result.get("error", ""))
                 except Exception as e:
-                    logger.debug("[SkillReviewer] skill_manage execution error: %s", e)
+                    logger.warning("[SkillReviewer] skill_manage execution error: %s", e)
 
             # After processing skill calls, do NOT call LLM again
             # Single-shot review is sufficient
@@ -215,28 +217,30 @@ class _SkillReviewer:
     def _get_tc_name(self, tc) -> str:
         """Extract tool name from tool call object (handles OpenAI/Anthropic format)."""
         if isinstance(tc, dict):
-            fn = tc.get("function", {})
+            fn = tc.get("function", {}) or {}
             if isinstance(fn, dict):
                 return fn.get("name", "")
             return tc.get("name", "")
-        return getattr(tc, "name", "") or getattr(tc, "function", {}).get("name", "")
+        return getattr(tc, "name", "") or ""
 
     def _get_tc_args(self, tc) -> dict:
         """Extract arguments from tool call object."""
         if isinstance(tc, dict):
-            fn = tc.get("function", {})
+            fn = tc.get("function", {}) or {}
             if isinstance(fn, dict):
-                raw = fn.get("arguments", "{}")
+                raw = fn.get("arguments")
             else:
-                raw = tc.get("arguments", "{}")
+                raw = tc.get("arguments")
         else:
-            raw = getattr(tc, "arguments", "{}")
+            raw = getattr(tc, "arguments", None)
         if isinstance(raw, dict):
             return raw
-        try:
-            return json.loads(raw) if isinstance(raw, str) else {}
-        except Exception:
-            return {}
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {}
+        return {}
 
     def close(self) -> None:
         """Clean up resources."""

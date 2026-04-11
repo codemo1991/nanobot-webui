@@ -23,6 +23,29 @@ const { Text } = Typography
 // sessionStorage key 前缀
 const STORAGE_PREFIX = 'nanobot_streaming_'
 
+/** 用户主动选中的会话 ID，避免刷新/离开页面再回来时被「列表第一项」覆盖（流式会话往往排在最前） */
+const SELECTED_CHAT_SESSION_KEY = 'nanobot_selected_chat_session_id'
+
+function persistSelectedChatSessionId(sessionId: string | null) {
+  try {
+    if (sessionId) {
+      sessionStorage.setItem(SELECTED_CHAT_SESSION_KEY, sessionId)
+    } else {
+      sessionStorage.removeItem(SELECTED_CHAT_SESSION_KEY)
+    }
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+function readPersistedSelectedChatSessionId(): string | null {
+  try {
+    return sessionStorage.getItem(SELECTED_CHAT_SESSION_KEY)
+  } catch {
+    return null
+  }
+}
+
 // 流式状态存储键
 const getStreamingStateKey = (sessionId: string) => `${STORAGE_PREFIX}${sessionId}`
 
@@ -102,6 +125,10 @@ function ChatPage() {
   const [loading, setLoading] = useState(false)
   // 正在流式传输的会话 ID 集合（支持并行多会话独立流式）
   const [streamingSessionIds, setStreamingSessionIds] = useState<Set<string>>(new Set())
+  const streamingSessionIdsRef = useRef<Set<string>>(new Set())
+  streamingSessionIdsRef.current = streamingSessionIds
+  /** 本轮发送前 messages.length，用于识别「漏收 done」：切换会话时 WS 断开，服务端已落库助手消息但前端仍认为在流式中 */
+  const streamBaselineBySessionRef = useRef<Map<string, number>>(new Map())
   const [loadingSessions, setLoadingSessions] = useState(true)
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [editTitle, setEditTitle] = useState('')
@@ -153,6 +180,12 @@ function ChatPage() {
   const imageInputRef = useRef<HTMLInputElement>(null)
   // 追踪是否有活跃的流式请求
   const isStreamingRef = useRef(false)
+  // 每轮 render 与 streamingSessionIds 对齐：仅当「当前选中会话 ∈ 流式集合」才算正在流式。否则 saveStreamingState 的 effect 若先于会话切换 effect 执行，会把上一会话的 loading 误写入新会话的 sessionStorage，触发错误 tryReconnect + 卡住。
+  if (currentSession) {
+    isStreamingRef.current = streamingSessionIds.has(currentSession.id)
+  } else {
+    isStreamingRef.current = false
+  }
   // 追踪 session switch effect 上一次处理的 session ID（区分「会话切换」和「流式状态变更」）
   const prevSessionIdForEffectRef = useRef<string | null>(null)
   // 追踪页面是否刚恢复
@@ -193,6 +226,7 @@ function ChatPage() {
   const streamHandlerRef = useRef<(evt: StreamEvent) => void>(() => {})
   // Track the streaming assistant message ID to prevent duplicate rendering
   const streamingAssistantIdRef = useRef<string | null>(null)
+  const loadMessagesRef = useRef<(sessionId: string) => void>(() => {})
 
   // 使用任务轮询 hook，当页面从后台恢复时检查任务状态
   useTaskPolling({
@@ -275,6 +309,7 @@ function ChatPage() {
         clearStreamingState(sessionId)
         abortControllerRef.current = null
         removeFromStreamingSessionsRef.current(sessionId)
+        streamBaselineBySessionRef.current.delete(sessionId)
         const cancelAssistant = (event.event as { assistantMessage?: Message | null }).assistantMessage
         if (cancelAssistant) {
           setMessages(prev => {
@@ -339,6 +374,7 @@ function ChatPage() {
         abortControllerRef.current = null
         pendingUserMessageRef.current = ''  // 清除待发送消息
         removeFromStreamingSessionsRef.current(sessionId)
+        streamBaselineBySessionRef.current.delete(sessionId)
       }
       void loadSessions()
       return
@@ -360,6 +396,7 @@ function ChatPage() {
         setPollingTaskId(null)
         abortControllerRef.current = null
         removeFromStreamingSessionsRef.current(sessionId)
+        streamBaselineBySessionRef.current.delete(sessionId)
       }
       return
     }
@@ -377,6 +414,11 @@ function ChatPage() {
     onMessage: handleWsMessage,
     onConnect: () => {
       console.log('[WebSocket] Connected')
+      // 切回本会话并重连后补拉消息：若长任务在浏览其他会话时已完成，可能漏收 done
+      const sid = currentSessionIdRef.current
+      if (sid && streamingSessionIdsRef.current.has(sid)) {
+        void loadMessagesRef.current(sid)
+      }
     },
     onDisconnect: () => {
       console.log('[WebSocket] Disconnected')
@@ -544,16 +586,30 @@ function ChatPage() {
   // WebSocket 重连处理（刷新/切换 tab 后等待 WebSocket 自动重连，然后刷新数据）
   const tryReconnectChatStream = useCallback(async (sessionId: string) => {
     console.log('[WebSocket] Waiting for reconnection...')
-    // 等待一小段时间让 WebSocket 自动重连
-    await new Promise(resolve => setTimeout(resolve, 1000))
-    // 刷新数据
-    await loadMessages(sessionId)
-    await loadSessionTokenUsage(sessionId)
-    void loadSessions()
-    const now = Date.now()
-    if (now - lastStreamReconnectToastRef.current > 4000) {
-      lastStreamReconnectToastRef.current = now
-      antMessage.success(t('chat.streamReconnected'))
+    try {
+      // 等待一小段时间让 WebSocket 自动重连
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      // 刷新数据
+      await loadMessages(sessionId)
+      await loadSessionTokenUsage(sessionId)
+      void loadSessions()
+      const now = Date.now()
+      if (now - lastStreamReconnectToastRef.current > 4000) {
+        lastStreamReconnectToastRef.current = now
+        antMessage.success(t('chat.streamReconnected'))
+      }
+    } catch (e) {
+      console.error('[tryReconnectChatStream]', e)
+    } finally {
+      // 无论成功与否都清掉该会话的快照，并结束 loading；否则误触发重连后会一直卡在「加载中」直到用户点停止
+      clearStreamingState(sessionId)
+      if (currentSessionIdRef.current === sessionId) {
+        setLoading(false)
+        setStreamingThinking(false)
+        setStreamingToolSteps([])
+        setClaudeCodeProgress('')
+        isRestoringRef.current = false
+      }
     }
   }, [t])
 
@@ -687,9 +743,13 @@ function ChatPage() {
     }
   }, [currentSession, tryReconnectChatStream])
 
-  // 当流式状态变化时，自动保存到 sessionStorage
+  // 当流式状态变化时，自动保存到 sessionStorage（必须同时属于 streamingSessionIds，避免切到另一会话的第一帧误写入）
   useEffect(() => {
-    if (currentSession && isStreamingRef.current) {
+    if (
+      currentSession &&
+      isStreamingRef.current &&
+      streamingSessionIds.has(currentSession.id)
+    ) {
       saveStreamingState(currentSession.id, {
         toolSteps: streamingToolSteps,
         thinking: streamingThinking,
@@ -699,7 +759,7 @@ function ChatPage() {
         sessionId: currentSession.id,
       })
     }
-  }, [currentSession, streamingToolSteps, streamingThinking, claudeCodeProgress, loading])
+  }, [currentSession, streamingSessionIds, streamingToolSteps, streamingThinking, claudeCodeProgress, loading])
 
   useEffect(() => {
     loadSessions()
@@ -887,7 +947,9 @@ function ChatPage() {
       setSessions(data.items)
       // 必须用 ref：loadSessions 常从 handleWsMessage（空依赖）等闭包中调用，await 后 state 中的 currentSession 可能仍是旧值
       if (data.items.length > 0 && !currentSessionIdRef.current) {
-        handleSelectSession(data.items[0])
+        const savedId = readPersistedSelectedChatSessionId()
+        const fromPersist = savedId ? data.items.find((s) => s.id === savedId) : undefined
+        handleSelectSession(fromPersist ?? data.items[0])
       }
     } catch (error) {
       console.error('[loadSessions]', error)
@@ -916,6 +978,7 @@ function ChatPage() {
 
   // 切换会话时恢复 MCP 工具设置（warmup 由 toolMode 的 useEffect 统一处理，禁用工具时不预热）
   const handleSelectSession = (session: Session) => {
+    persistSelectedChatSessionId(session.id)
     isRestoringMcpRef.current = true
     setCurrentSession(session)
     setToolMode(session.toolMode || 'disable')
@@ -929,16 +992,6 @@ function ChatPage() {
     void api.updateSession(currentSession.id, toolMode, selectedMcpServers)
   }, [toolMode, selectedMcpServers]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const loadMessages = async (sessionId: string) => {
-    try {
-      const data = await api.getMessages(sessionId)
-      setMessages(data)
-    } catch (error) {
-      antMessage.error(t('chat.loadMessagesFailed'))
-      console.error(error)
-    }
-  }
-
   const loadSessionTokenUsage = async (sessionId: string) => {
     try {
       const usage = await api.getSessionTokenSummary(sessionId)
@@ -948,6 +1001,64 @@ function ChatPage() {
       setSessionTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 })
     }
   }
+
+  const loadMessages = async (sessionId: string) => {
+    try {
+      const data = await api.getMessages(sessionId)
+      setMessages(data)
+
+      // 切换会话时当前会话的 WebSocket 会断开，done 可能未送达；若 DB 已有人机各一条新消息则对齐流式状态
+      const baseline = streamBaselineBySessionRef.current.get(sessionId)
+      if (
+        baseline !== undefined &&
+        streamingSessionIdsRef.current.has(sessionId) &&
+        currentSessionIdRef.current === sessionId &&
+        data.length >= baseline + 2
+      ) {
+        const last = data[data.length - 1]
+        const lastUser = [...data].reverse().find(m => m.role === 'user')
+        if (
+          last.role === 'assistant' &&
+          !String(last.id).startsWith('temp-') &&
+          lastUser &&
+          last.sequence > lastUser.sequence
+        ) {
+          console.log('[Chat] Reconciled missed WebSocket done from messages API, session:', sessionId)
+          setLoading(false)
+          setStreamingThinking(false)
+          setStreamingToolSteps([])
+          setClaudeCodeProgress('')
+          isStreamingRef.current = false
+          streamingAssistantIdRef.current = last.id
+          currentTaskIdRef.current = null
+          setPollingTaskId(null)
+          clearStreamingState(sessionId)
+          abortControllerRef.current = null
+          pendingUserMessageRef.current = ''
+          removeFromStreamingSessionsRef.current(sessionId)
+          streamBaselineBySessionRef.current.delete(sessionId)
+          void loadSessionTokenUsage(sessionId)
+          void loadSessions()
+        }
+      }
+    } catch (error) {
+      antMessage.error(t('chat.loadMessagesFailed'))
+      console.error(error)
+    }
+  }
+
+  loadMessagesRef.current = loadMessages
+
+  // 长任务在后台完成时 done 可能已丢失，轮询消息列表直到 reconcile 成功或收到 WS done
+  useEffect(() => {
+    const sid = currentSession?.id
+    if (!sid || !loading) return
+    const t = window.setInterval(() => {
+      if (!streamingSessionIdsRef.current.has(sid)) return
+      void loadMessagesRef.current(sid)
+    }, 4000)
+    return () => clearInterval(t)
+  }, [currentSession?.id, loading])
 
   loadSessionsRef.current = () => {
     void loadSessions()
@@ -984,6 +1095,7 @@ function ChatPage() {
         if (nextSession) {
           handleSelectSession(nextSession)
         } else {
+          persistSelectedChatSessionId(null)
           setCurrentSession(null)
         }
       }
@@ -1027,6 +1139,7 @@ function ChatPage() {
     setLoading(false)
     if (sessionId) {
       removeFromStreamingSessionsRef.current(sessionId)
+      streamBaselineBySessionRef.current.delete(sessionId)
     }
     if (hadStream) {
       antMessage.info(t('chat.generationStopped'))
@@ -1099,6 +1212,8 @@ function ChatPage() {
       sequence: messages.length + 1,
       images: imagesToSend.length > 0 ? imagesToSend : undefined,
     }
+    // 记录发送前条数：用于 loadMessages 判断服务端是否已落库「用户+助手」以补收漏掉的 done
+    streamBaselineBySessionRef.current.set(sessionId, messages.length)
     setMessages(prev => [...prev, tempUserMsg])
 
     if (imagesToSend.length > 0) {
@@ -1115,6 +1230,7 @@ function ChatPage() {
       // 保持用户消息可见，只清除 loading 状态
       setLoading(false)
       removeFromStreamingSessionsRef.current(sessionId)
+      streamBaselineBySessionRef.current.delete(sessionId)
       bgSessionStatesRef.current.delete(sessionId)
       isStreamingRef.current = false
       antMessage.warning(t('chat.reconnecting'))
@@ -1128,6 +1244,7 @@ function ChatPage() {
       wsClearPendingRef.current?.()
       perSessionAbortControllers.current.delete(sessionId)
       removeFromStreamingSessionsRef.current(sessionId)
+      streamBaselineBySessionRef.current.delete(sessionId)
       bgSessionStatesRef.current.delete(sessionId)
       setLoading(false)
       isStreamingRef.current = false

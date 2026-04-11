@@ -29,7 +29,7 @@ except ImportError:
 
 
 def _get_default_trace_dir() -> Path:
-    return Path.home() / ".nanobot" / "traces"
+    return (Path.home() / ".nanobot" / "traces").resolve()
 
 
 def _safe_json_dumps(obj: Any) -> str:
@@ -52,8 +52,8 @@ class TraceEmitter:
     Files are rotated when they reach `rotation` bytes, and old files
     are deleted after `retention_days`.
 
-    Query methods read from the buffer (recent spans) and from disk files
-    (historical spans) without loading everything into memory.
+    查询「最近 span / 摘要」时会合并 **内存待落盘缓冲** 与 **磁盘 JSONL**（仅缓冲会在 flush 后清空，
+    若只读内存会导致 Web Trace 页空白，尽管文件已存在）。
 
     Args:
         trace_dir: Directory for trace files. Default: ~/.nanobot/traces/
@@ -71,7 +71,11 @@ class TraceEmitter:
         buffer_size: int = 50,
         enabled: bool = True,
     ):
-        self._trace_dir = Path(trace_dir) if trace_dir else _get_default_trace_dir()
+        self._trace_dir = (
+            Path(trace_dir).expanduser().resolve()
+            if trace_dir
+            else _get_default_trace_dir()
+        )
         self._rotation_bytes = self._parse_size(rotation)
         self._retention_days = retention_days
         self._buffer_size = buffer_size
@@ -91,6 +95,11 @@ class TraceEmitter:
             self._ensure_dir()
             self._start_flush_thread()
             self._cleanup_old_files()
+
+    @property
+    def trace_dir(self) -> Path:
+        """Span JSONL 输出目录（绝对路径）。"""
+        return self._trace_dir
 
     # ------------------------------------------------------------------
     # Configuration
@@ -130,6 +139,10 @@ class TraceEmitter:
             self._buffer.append(record)
             if len(self._buffer) >= self._buffer_size:
                 self._flush_unlocked()
+
+        # SSE 等观察者：在 span 结束时立即推送，不等待定时 flush（此前仅在落盘时通知）
+        obs_payload = {k: v for k, v in record.items() if k != "_emit_ts"}
+        self._notify_observers(obs_payload)
 
     def flush(self) -> None:
         """Synchronously flush buffered spans to disk."""
@@ -213,15 +226,53 @@ class TraceEmitter:
 
         return results[:limit]
 
-    def get_recent_spans(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Return the most recent spans from the buffer."""
+    def _recent_spans_from_disk(self, limit: int) -> list[dict[str, Any]]:
+        """从 JSONL 按文件时间顺序读取，保留全局最近的 ``limit`` 条 span。"""
+        if limit <= 0 or not self._trace_dir.is_dir():
+            return []
+        try:
+            files = sorted(
+                self._trace_dir.glob("trace_*.jsonl*"),
+                key=lambda p: (p.stat().st_mtime, str(p)),
+            )
+        except OSError:
+            return []
+        ring: deque[dict[str, Any]] = deque(maxlen=limit)
+        for fpath in files:
+            for line in self._read_lines(fpath):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                ring.append(rec)
+        return list(ring)
+
+    def _buffer_spans_snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
-            return list(self._buffer)[-limit:]
+            return [{k: v for k, v in s.items() if k != "_emit_ts"} for s in self._buffer]
+
+    def _merged_recent_spans(self, limit: int) -> list[dict[str, Any]]:
+        """合并磁盘已落盘与内存未 flush 的 span，按时间排序后取最近 ``limit`` 条。"""
+        if limit <= 0:
+            return []
+        disk = self._recent_spans_from_disk(limit)
+        buf = self._buffer_spans_snapshot()
+        merged = disk + buf
+        merged.sort(key=lambda s: (s.get("start_ms", 0), s.get("seq", 0)))
+        return merged[-limit:]
+
+    def get_recent_spans(self, limit: int = 100) -> list[dict[str, Any]]:
+        """返回最近的 span（内存缓冲 + 磁盘 JSONL，避免仅读空缓冲）。"""
+        return self._merged_recent_spans(limit)
 
     def get_summary(self) -> dict[str, Any]:
-        """Return aggregated metrics summary from the buffer."""
-        with self._lock:
-            spans = list(self._buffer)
+        """基于最近若干条 span（含磁盘）聚合指标。"""
+        spans = self._merged_recent_spans(1000)
 
         if not spans:
             return {
@@ -293,7 +344,6 @@ class TraceEmitter:
             line_count = 0
             with open(fpath, mode, encoding="utf-8") as f:
                 for record in batch:
-                    self._notify_observers(record)
                     # Remove internal field before writing
                     rec = {k: v for k, v in record.items() if k != "_emit_ts"}
                     f.write(_safe_json_dumps(rec) + "\n")

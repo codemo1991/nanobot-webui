@@ -33,9 +33,24 @@ LOG_FORMAT = (
 
 
 def _ensure_trace_id(record: dict[str, Any]) -> bool:
-    """Inject trace_id='' into extra so LOG_FORMAT never gets KeyError."""
-    record.setdefault("extra", {})  # defensive: ensure extra dict exists
-    record["extra"].setdefault("trace_id", "")
+    """为每条日志补全 extra['trace_id']，避免 LOG_FORMAT 缺键。
+
+    优先使用 loguru 已绑定的 trace_id；若为空则读取 nanobot.tracing 的当前
+    上下文（trace_context / span 激活时）。此前 trace_context 里对 logger.patch
+    的用法不会作用到全局 logger，此处统一从 contextvars 注入。
+    """
+    record.setdefault("extra", {})
+    extra = record["extra"]
+    try:
+        if not extra.get("trace_id"):
+            from nanobot.tracing.context import get_current_trace_id
+
+            ctx_tid = get_current_trace_id()
+            if ctx_tid:
+                extra["trace_id"] = ctx_tid
+        extra.setdefault("trace_id", "")
+    except Exception:
+        extra.setdefault("trace_id", "")
     return True
 
 def _buffer_sink(message: Any) -> None:

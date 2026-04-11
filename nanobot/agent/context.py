@@ -178,13 +178,9 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
 
 {skills_summary}""")
 
-        # Skill creation guidance — only shown when skills directory is present
+        # Skill creation guidance — shown once user has created at least one skill
         skills_dir = self.workspace / "skills"
-        if skills_dir.exists() and any(
-            (p / "SKILL.md").exists()
-            for p in skills_dir.iterdir()
-            if p.is_dir()
-        ):
+        if skills_dir.exists():
             guidance = SKILLS_GUIDANCE.replace("{workspace}", str(self.workspace))
             parts.append(guidance)
 

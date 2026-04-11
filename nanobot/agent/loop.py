@@ -2134,13 +2134,15 @@ class AgentLoop:
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a single inbound message.
-        
+
         Args:
             msg: The inbound message to process.
-        
+
         Returns:
             The response message, or None if no response needed.
         """
+        logger.info("[SkillReviewer] _process_message ENTRY: channel=%s, content=%r",
+                     msg.channel, (msg.content or "")[:30])
         # 开始执行链路监控
         chain = self._chain_monitor.start_chain(
             session_key=msg.session_key,
@@ -2262,6 +2264,9 @@ class AgentLoop:
         self._pending_manual_review = any(
             kw in (msg.content or "").lower() for kw in _review_keywords
         )
+        if self._pending_manual_review:
+            logger.info("[SkillReviewer] Keyword detected in user message, _pending_manual_review=True")
+        logger.info("[SkillReviewer] keyword detection done, pending=%s, about to process message", self._pending_manual_review)
         self._user_turn_count += 1
         _user_cmd = msg.content.strip()
         _is_continue = _user_cmd.lower() in CONTINUE_KEYWORDS
@@ -2358,6 +2363,7 @@ class AgentLoop:
                         last_user["content"] = f"{msg.content}\n\n[图片分析失败，请检查 vision 模板配置或 DashScope API Key]"
         
         # Agent loop
+        logger.info("[SkillReviewer] about to start agent loop, pending=%s", self._pending_manual_review)
         sk = msg.session_key
         iteration = 0
         final_content = None
@@ -3121,12 +3127,15 @@ class AgentLoop:
         except Exception as e:
             logger.error(f"[ExecutionChain] Failed to end chain: {e}")
 
+        # Skill review trigger — fire for ALL message types (text and image)
+        self._maybe_trigger_skill_review(session, session.get_history(max_messages=self.max_history_messages))
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content
         )
-    
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
@@ -3399,7 +3408,7 @@ class AgentLoop:
             completion_tokens=usage_acc["completion_tokens"],
             total_tokens=usage_acc["total_tokens"],
         )
-        
+
         # Skill review trigger — after session is saved, spawn background review
         self._maybe_trigger_skill_review(session, session.get_history(max_messages=self.max_history_messages))
 
@@ -3410,8 +3419,8 @@ class AgentLoop:
             logger.error(f"[ExecutionChain] Failed to end chain: {e}")
 
         return OutboundMessage(
-            channel=origin_channel,
-            chat_id=origin_chat_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
             content=final_content
         )
     
@@ -3535,39 +3544,58 @@ class AgentLoop:
         """Check if skill review should be triggered and spawn background review.
 
         Trigger conditions:
-        - Manual: user said "总结经验" etc. (_pending_manual_review = True)
-        - Automatic: every N user turns (_user_turn_count >= interval)
+        - Manual: user said "总结经验" etc. (_pending_manual_review = True) — always works
+        - Automatic: every N user turns (_user_turn_count >= interval) — requires interval > 0
         """
+        logger.info(
+            "[SkillReviewer] === BEFORE trigger: pending=%s, turn_count=%s, enabled=%s, interval=%s ===",
+            getattr(self, "_pending_manual_review", None),
+            getattr(self, "_user_turn_count", None),
+            getattr(self, "_skill_review_enabled", None),
+            getattr(self, "_skill_review_turn_interval", None),
+        )
         if not getattr(self, "_skill_review_enabled", True):
             return
-        interval = getattr(self, "_skill_review_turn_interval", 0)
-        if interval <= 0:
-            return
 
-        should_review = (
-            getattr(self, "_pending_manual_review", False) or
-            getattr(self, "_user_turn_count", 0) >= interval
-        )
+        is_manual = getattr(self, "_pending_manual_review", False)
+        interval = getattr(self, "_skill_review_turn_interval", 0)
+
+        # Manual trigger always works; automatic trigger requires interval > 0
+        should_review = is_manual or (interval > 0 and getattr(self, "_user_turn_count", 0) >= interval)
         if not should_review:
             return
 
         # Reset state
         self._pending_manual_review = False
+        if is_manual:
+            logger.info("[SkillReviewer] Manual review triggered (user said '总结经验' or similar).")
         if getattr(self, "_user_turn_count", 0) >= interval:
             self._user_turn_count = 0
+
+        # Resolve provider from router (web mode uses router + provider_manager, not self.provider)
+        effective_model = self.subagent_model or self.model
+        provider_instance = None
+        if self.router:
+            try:
+                handle = self.router.get(effective_model)
+                provider_instance = handle.provider
+            except Exception:
+                pass
+        if provider_instance is None:
+            provider_instance = self.provider
 
         # Spawn background review in daemon thread
         try:
             from nanobot.agent.skill_reviewer import spawn_skill_review
             spawn_skill_review(
-                provider=self.provider,
-                model=self.subagent_model or self.model,
+                provider=provider_instance,
+                model=effective_model,
                 workspace=self.workspace,
                 context=self.context,
                 messages=messages,
             )
         except Exception as e:
-            logger.debug("[SkillReviewer] Failed to spawn review: %s", e)
+            logger.warning("[SkillReviewer] Failed to spawn review: %s", e)
 
     # ---- Image Handling ----
 

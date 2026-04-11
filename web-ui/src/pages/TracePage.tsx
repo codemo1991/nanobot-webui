@@ -135,7 +135,15 @@ function TracePage() {
   ]
 
   return (
-    <div style={{ padding: 24 }}>
+    <div
+      style={{
+        flex: 1,
+        minHeight: 0,
+        overflowY: 'auto',
+        padding: 24,
+        boxSizing: 'border-box',
+      }}
+    >
       <div style={{ marginBottom: 24, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <h1>Trace 监控</h1>
         <Button icon={<ReloadOutlined />} onClick={loadData}>刷新</Button>
