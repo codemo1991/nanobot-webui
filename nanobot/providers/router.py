@@ -206,9 +206,17 @@ class ModelRouter:
 
         provider_id = model["provider_id"]
         provider_instance = self._get_provider_instance(provider_id)
+
+        # Fallback: OpenAI-compatible providers (minimax, gemini, zhipu, etc.)
+        # are stored with their own provider_id but use the OpenAI provider at runtime.
         if not provider_instance:
-            logger.debug(f"No provider instance registered for {provider_id}")
-            return None
+            provider_cfg = self.repo.get_provider(provider_id)
+            if provider_cfg and provider_cfg.get("provider_type") == "openai":
+                provider_instance = self._get_provider_instance("openai")
+                logger.debug(f"Routing {provider_id} via OpenAI-compatible fallback")
+            if not provider_instance:
+                logger.debug(f"No provider instance registered for {provider_id}")
+                return None
 
         provider_cfg = self.repo.get_provider(provider_id)
         if not provider_cfg:

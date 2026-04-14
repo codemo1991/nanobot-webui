@@ -1660,10 +1660,12 @@ class AgentLoop:
 
         effective_model = model or self.model
         provider = self.provider
+        _api_base = None
         if provider is None and self.router:
             try:
                 handle = self.router.get(effective_model)
                 provider = handle.provider
+                _api_base = handle.api_base
             except Exception as exc:
                 raise RuntimeError(f"No provider available for MCP sampling: {exc}")
 
@@ -1675,6 +1677,7 @@ class AgentLoop:
             messages=messages,
             max_tokens=max_tokens,
             temperature=0.7,
+            api_base=_api_base,
         )
         content = getattr(response, "content", "") or ""
         return CreateMessageResult(
@@ -3828,12 +3831,14 @@ class AgentLoop:
         for idx, model_id in enumerate(models_to_try):
             provider_instance = None
             native_model = None
+            _api_base = None
 
             try:
                 if self.router:
                     handle = self.router.get(model_id)
                     provider_instance = handle.provider
                     native_model = handle.model
+                    _api_base = handle.api_base
                 else:
                     provider_instance = self.provider
                     native_model = model_id
@@ -3861,6 +3866,7 @@ class AgentLoop:
                                 messages=messages,
                                 tools=tools,
                                 model=native_model,
+                                api_base=_api_base,
                             )
                             break
                         except Exception as inner_e:

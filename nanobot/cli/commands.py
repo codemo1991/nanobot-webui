@@ -399,6 +399,7 @@ def mirror_seal_stale(
                 model=handle.model,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                api_base=handle.api_base,
             )
             return resp
         except Exception:

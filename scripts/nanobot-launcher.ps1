@@ -126,6 +126,35 @@ function Test-NanobotHealth {
     return $LASTEXITCODE -eq 0
 }
 
+# Web UI 必需依赖（与 pyproject.toml 一致）；仅 --help 通过时仍可能缺包
+function Test-WebStackImports {
+    $null = & $VENV_PYTHON -c "import fastapi, uvicorn" 2>&1
+    return $LASTEXITCODE -eq 0
+}
+
+function Sync-ProjectEditableInstall {
+    if (-not (Test-Path (Join-Path $REPO_DIR "pyproject.toml"))) {
+        Write-Host "$LAUNCHER_TAG 未找到 pyproject.toml，无法同步依赖。" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "$LAUNCHER_TAG 正在根据 pyproject.toml 同步依赖: pip install -e ." -ForegroundColor Yellow
+    Push-Location $REPO_DIR
+    $pipOutput = & $VENV_PIP install -e . 2>&1
+    $pipExit = $LASTEXITCODE
+    $pipOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    Pop-Location
+    if ($pipExit -ne 0) {
+        Write-Host "$LAUNCHER_TAG pip install -e . 失败（exit $pipExit）。" -ForegroundColor Red
+        exit 1
+    }
+    if (-not (Test-WebStackImports)) {
+        Write-Host "$LAUNCHER_TAG 同步后仍无法 import fastapi/uvicorn，请检查 pyproject.toml 与网络。" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "$LAUNCHER_TAG Python 依赖已与项目声明对齐。" -ForegroundColor Green
+    Write-Host ""
+}
+
 # 修复损坏的 nanobot 安装：清除残留后重新安装
 function Repair-NanobotInstall {
     Write-Host "$LAUNCHER_TAG 正在修复 nanobot 安装..." -ForegroundColor Yellow
@@ -251,6 +280,10 @@ function Ensure-VenvReady {
         Write-Host "$LAUNCHER_TAG 检测到 nanobot 安装损坏，正在修复..." -ForegroundColor Yellow
         Repair-NanobotInstall
     }
+    elseif (-not (Test-WebStackImports)) {
+        Write-Host "$LAUNCHER_TAG 检测到 Web UI 依赖缺失（如 fastapi），与 pyproject 不同步。" -ForegroundColor Yellow
+        Sync-ProjectEditableInstall
+    }
 }
 
 Write-Banner
@@ -307,7 +340,13 @@ while ($true) {
 
             # 重新安装依赖（使用 venv 的 pip）
             Write-Host "$LAUNCHER_TAG Running: pip install -e . (in $REPO_DIR, venv)" -ForegroundColor DarkGray
-            & $VENV_PIP install -e . --quiet 2>&1 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+            $pipOutput = & $VENV_PIP install -e . --quiet 2>&1
+            $pipExit = $LASTEXITCODE
+            if ($pipExit -ne 0) {
+                $pipOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+                Write-Host "$LAUNCHER_TAG pip install failed (exit $pipExit)." -ForegroundColor Red
+                exit 1
+            }
 
             Pop-Location
         }

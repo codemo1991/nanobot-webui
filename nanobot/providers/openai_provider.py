@@ -35,8 +35,13 @@ class OpenAIProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        api_base: str | None = None,
     ) -> LLMResponse:
-        client = self._get_client()
+        # Per-call api_base override for OpenAI-compatible providers (minimax, etc.)
+        if api_base and api_base != self.api_base:
+            client = AsyncOpenAI(api_key=self.api_key or "", base_url=api_base)
+        else:
+            client = self._get_client()
         native_model = model or self.get_default_model()
 
         kwargs: dict[str, Any] = {

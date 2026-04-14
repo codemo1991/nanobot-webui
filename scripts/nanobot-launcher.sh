@@ -173,6 +173,27 @@ test_nanobot_health() {
     "$NANOBOT_EXE" --help &>/dev/null
 }
 
+# Web UI 必需依赖（与 pyproject.toml 一致）；仅 --help 通过时仍可能缺包
+test_web_stack_imports() {
+    "$VENV_PYTHON" -c "import fastapi, uvicorn" &>/dev/null
+}
+
+sync_project_editable_install() {
+    if [ ! -f "$REPO_DIR/pyproject.toml" ]; then
+        echo "[launcher] 未找到 pyproject.toml，无法同步依赖。"
+        exit 1
+    fi
+    echo "[launcher] 正在根据 pyproject.toml 同步依赖: pip install -e ."
+    if (cd "$REPO_DIR" && "$VENV_PIP" install -e . 2>&1 | sed 's/^/  /'); then
+        if ! test_web_stack_imports; then
+            echo "[launcher] 同步后仍无法 import fastapi/uvicorn，请检查 pyproject.toml 与网络。"
+            exit 1
+        fi
+        echo "[launcher] Python 依赖已与项目声明对齐。"
+        echo ""
+    fi
+}
+
 # 修复损坏的 nanobot 安装：清除残留后重新安装
 repair_nanobot_install() {
     echo "[launcher] 正在修复 nanobot 安装..."
@@ -254,16 +275,19 @@ ensure_venv_ready() {
         # 已安装但运行失败（如 ModuleNotFoundError）-> 执行修复
         echo "[launcher] 检测到 nanobot 安装损坏，正在修复..."
         repair_nanobot_install
+    elif ! test_web_stack_imports; then
+        echo "[launcher] 检测到 Web UI 依赖缺失（如 fastapi），与 pyproject 不同步。"
+        sync_project_editable_install
     fi
 }
 
 ensure_venv_ready
 
-    # 显示额外参数（如果有）
-    EXTRA_DISPLAY=""
-    if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
-        EXTRA_DISPLAY=" ${EXTRA_ARGS[*]:-}"
-    fi
+# 显示额外参数（如果有）
+EXTRA_DISPLAY=""
+if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+    EXTRA_DISPLAY=" ${EXTRA_ARGS[*]:-}"
+fi
 
 while true; do
     TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
@@ -323,10 +347,13 @@ while true; do
             ensure_frontend_built
 
             echo "[launcher] Running: pip install -e . (in $REPO_DIR, venv)"
-            # 使用 --no-deps 加速，主要目的是让 Python 识别代码变更
-            (cd "$REPO_DIR" && "$VENV_PIP" install -e . --no-deps --quiet 2>&1 | sed 's/^/  /') || \
-            (cd "$REPO_DIR" && "$VENV_PIP" install -e . --quiet 2>&1 | sed 's/^/  /')
-            echo "[launcher] pip install done (exit: $?)"
+            # 完整 editable 安装，确保 pyproject 新增依赖（如 fastapi）被装上；勿默认 --no-deps
+            if (cd "$REPO_DIR" && "$VENV_PIP" install -e . --quiet 2>&1 | sed 's/^/  /'); then
+                echo "[launcher] pip install done (ok)"
+            else
+                echo "[launcher] pip install failed"
+                exit 1
+            fi
         fi
 
         print_separator

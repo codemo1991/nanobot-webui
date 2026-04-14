@@ -44,6 +44,7 @@ class AzureProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        api_base: str | None = None,
     ) -> LLMResponse:
         client = self._get_client()
         # Azure uses deployment name as the model identifier
