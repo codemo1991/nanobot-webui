@@ -167,7 +167,7 @@ class NanobotWebAPI:
             init_system_schema(sys_conn)
             sys_conn.close()
         except Exception as e:
-            logger.warning("AgentLoop schema 初始化失败（可忽略，首次使用微内核时会重试）: %s", e)
+            logger.warning(f"AgentLoop schema 初始化失败（可忽略，首次使用微内核时会重试）: {e}")
         workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
         if workspace_db_path.exists():
             status_db_path = workspace_db_path
@@ -1026,7 +1026,7 @@ class NanobotWebAPI:
                     result[k.strip()] = v.strip()
             return result
         except Exception as e:
-            logger.warning("Mirror LLM analysis failed: %s", e)
+            logger.warning(f"Mirror LLM analysis failed: {e}")
             return None
 
     async def _run_shang_analysis(self, record: dict[str, Any]) -> dict[str, Any] | None:
@@ -1095,7 +1095,7 @@ class NanobotWebAPI:
                 analysis["bigFive"] = {"线索": result.get("大五线索", "")}
             return analysis if analysis else None
         except Exception as e:
-            logger.warning("Shang LLM analysis failed: %s", e)
+            logger.warning(f"Shang LLM analysis failed: {e}")
             return None
 
     async def generate_mirror_profile(self) -> dict[str, Any] | None:
@@ -1188,7 +1188,7 @@ class NanobotWebAPI:
             self.mirror.save_profile(profile)
             return profile
         except Exception as e:
-            logger.warning("Mirror profile generation failed: %s", e)
+            logger.warning(f"Mirror profile generation failed: {e}")
             return None
 
     def _parse_profile_from_text(self, text: str) -> dict[str, Any] | None:
@@ -1209,7 +1209,7 @@ class NanobotWebAPI:
         """
         将 base64 data URL 图片保存到当前 workspace 的 .nanobot/media 目录。
         与飞书等渠道一致，统一使用 workspace/.nanobot/media。
-        调用方负责在处理完成后清理这些文件。
+        文件长期保留，不再由调用方自动清理。
         """
         import base64
         import mimetypes
@@ -1266,16 +1266,9 @@ class NanobotWebAPI:
             extra["tool_mode"] = tool_mode
         if selected_mcp_servers:
             extra["selected_mcp_servers"] = selected_mcp_servers
-        try:
-            return await self._chat_with_progress(
-                session_id, content, progress_callback=None, media=media_paths, extra_metadata=extra or None,
-            )
-        finally:
-            for p in media_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
+        return await self._chat_with_progress(
+            session_id, content, progress_callback=None, media=media_paths, extra_metadata=extra or None,
+        )
 
     def _build_assistant_message(self, session_id: str, key: str) -> dict[str, Any] | None:
         """从 session 记录中构造 assistantMessage 字典（供 done 事件和 chat_sync 共用）。"""
@@ -1332,11 +1325,6 @@ class NanobotWebAPI:
         result_future: concurrent.futures.Future[dict[str, Any]] = concurrent.futures.Future()
 
         def on_complete(response_content: str, error: str | None = None) -> None:
-            for p in media_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
             if result_future.done():
                 return
             if error:
@@ -1372,11 +1360,6 @@ class NanobotWebAPI:
         if core_loop is None or not core_loop.is_running():
             # 降级：core_loop 未就绪时使用 asyncio.run
             logger.warning("[chat_sync] core_loop not ready, falling back to asyncio.run")
-            for p in media_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
             return asyncio.run(self._chat_with_progress(
                 session_id, content, progress_callback=None, media=[], extra_metadata=_extra or None,
             ))
@@ -3333,7 +3316,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                 except (BrokenPipeError, ConnectionResetError, OSError):
                                     break
                 except Exception as e:
-                    logger.warning("Trace stream error: %s", e)
+                    logger.warning(f"Trace stream error: {e}")
                 finally:
                     emitter.remove_observer(observer)
                 return
@@ -4407,7 +4390,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                             )
                             analysis_ok = llm_analysis is not None and bool(llm_analysis)
                         except Exception as e:
-                            logger.warning("Mirror analysis LLM call failed: %s", e)
+                            logger.warning(f"Mirror analysis LLM call failed: {e}")
                         break
                 data = app.mirror.seal_session(session_id, llm_analysis=llm_analysis)
                 data["analysisStatus"] = "success" if analysis_ok else "failed"
@@ -4439,7 +4422,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                     app.sessions.save(session)
                                     analysis_ok = True
                         except Exception as e:
-                            logger.warning("Mirror retry analysis failed: %s", e)
+                            logger.warning(f"Mirror retry analysis failed: {e}")
                         formatted = app.mirror._format_session_obj(session, stype, session_id)
                         formatted["analysisStatus"] = "success" if analysis_ok else "failed"
                         self._write_json(HTTPStatus.OK, _ok(formatted))
@@ -4547,11 +4530,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                         if updated:
                             data = updated
                 except Exception as e:
-                    logger.warning("Shang analysis failed (non-blocking): %s", e)
+                    logger.warning(f"Shang analysis failed (non-blocking): {e}")
                 try:
                     app.mirror.write_shang_record_to_memory(data)
                 except Exception as e:
-                    logger.warning("Shang write to memory failed: %s", e)
+                    logger.warning(f"Shang write to memory failed: {e}")
                 self._write_json(HTTPStatus.OK, _ok(data))
             except KeyError:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("SHANG_RECORD_NOT_FOUND", "赏记录不存在"))

@@ -141,6 +141,13 @@ class SpawnTool(Tool):
             "Set attach_media=true to forward media files to the subagent."
         )
 
+    def validate_params(self, params: dict[str, Any]) -> list[str]:
+        """Normalize template to lowercase before enum validation."""
+        params = dict(params)
+        if "template" in params and isinstance(params["template"], str):
+            params["template"] = params["template"].lower()
+        return super().validate_params(params)
+
     @property
     def parameters(self) -> dict[str, Any]:
         # 动态获取模板列表用于 enum

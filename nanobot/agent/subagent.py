@@ -28,6 +28,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool, EditFileTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
+from nanobot.utils.helpers import sanitize_args_for_log
 from nanobot.agent.prompts import get_template, build_system_prompt, get_tools_for_template
 from nanobot.config.subagent_summary_prompts_loader import (
     get_batch_system_prompt,
@@ -281,7 +282,7 @@ class SubagentManager:
             tm = self._agent_template_manager.get_model_for_template("vision")
             if tm:
                 effective_model = tm
-                logger.info("[run_vision_analysis] Using vision template model: %s", effective_model)
+                logger.info(f"[run_vision_analysis] Using vision template model: {effective_model}")
 
         backend = self._backend_resolver.resolve("vision", "native", media=media, model=effective_model)
         # 若 backend 为 native 但 model 非视觉模型，尝试用 dashscope_vision 兜底（需有 API key）
@@ -301,7 +302,7 @@ class SubagentManager:
                     backend = "dashscope_vision"
                     effective_model = "qwen-vl-plus"
                     logger.info("[run_vision_analysis] Original model doesn't support vision, fallback to dashscope_vision (qwen-vl-plus)")
-        logger.info("[run_vision_analysis] task_id=%s, backend=%s, model=%s", task_id, backend, effective_model)
+        logger.info(f"[run_vision_analysis] task_id={task_id}, backend={backend}, model={effective_model}")
 
         runner = self._backend_registry.get(backend)
         if runner and backend != "native":
@@ -1112,6 +1113,11 @@ class SubagentManager:
         """Internal implementation of subagent execution (traced)."""
         logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, backend: {backend}, memory: {enable_memory}), manager id: {id(self)}")
 
+        # Guard: provider must be available for native backend
+        if self.provider is None:
+            logger.error(f"Subagent [{task_id}] aborted: no LLM provider available")
+            raise RuntimeError("No LLM provider available for subagent execution")
+
         # Determine the effective model: template's model or fallback to self.model
         effective_model = self.model
         if self._agent_template_manager and template:
@@ -1314,7 +1320,7 @@ class SubagentManager:
 
                     voice_direct_result = None
                     for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments)
+                        args_str = json.dumps(sanitize_args_for_log(tool_call.arguments))
                         logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
                         result = await tools.execute(tool_call.name, tool_call.arguments)
                         messages.append({
@@ -1928,11 +1934,11 @@ class SubagentManager:
                 data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             if content and content.strip():
-                logger.info("DashScope subagent image call completed (model: %s)", model_name)
+                logger.info(f"DashScope subagent image call completed (model: {model_name})")
                 return content.strip()
             return None
         except Exception as e:
-            logger.warning("DashScope subagent image call failed (model: %s): %s", model_name, e)
+            logger.warning(f"DashScope subagent image call failed (model: {model_name}): {e}")
             return None
 
     def get_running_count(self) -> int:

@@ -70,7 +70,7 @@ class Runtime:
         try:
             return get_artifact_payload(self.conn, artifact_id)
         except json.JSONDecodeError as e:
-            logger.warning("Artifact %s payload JSON 解析失败: %s", artifact_id, e)
+            logger.warning(f"Artifact {artifact_id} payload JSON 解析失败: {e}")
         return None
 
     def build_context(self, task_id: str) -> dict:

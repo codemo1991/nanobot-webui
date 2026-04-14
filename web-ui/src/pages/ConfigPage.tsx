@@ -361,6 +361,12 @@ function SystemConfig() {
   const [workspaceModalVisible, setWorkspaceModalVisible] = useState(false)
   const [workspaceValue, setWorkspaceValue] = useState('')
   const [currentWorkspace, setCurrentWorkspace] = useState('')
+  const workspaceFolderInputRef = useRef<HTMLInputElement>(null)
+
+  const handleSelectWorkspaceFolder = () => {
+    workspaceFolderInputRef.current?.click()
+  }
+
   const [agentForm] = Form.useForm()
   const [concurrencyForm] = Form.useForm()
   const [memoryForm] = Form.useForm()
@@ -511,7 +517,38 @@ function SystemConfig() {
     }
     try {
       setLoading(true)
-      await api.switchWorkspace(workspaceValue.trim())
+      const result = await api.switchWorkspace(workspaceValue.trim()) as any
+      if (result?.needPrompt) {
+        Modal.confirm({
+          title: t('config.workspace.copyTitle') || '是否复制配置数据？',
+          content: result.hasDefaultDb
+            ? (t('config.workspace.copyContent') || '目标工作空间暂无数据。是否复制当前工作空间的配置（Agent 模板、日历、主提示词、记忆等）？\n注意：聊天记录始终独立，不会随配置复制。')
+            : (t('config.workspace.copyContentNoDefault') || '目标工作空间暂无数据，当前也没有默认数据可复制。将创建一个空白工作空间。'),
+          okText: result.hasDefaultDb
+            ? (t('config.workspace.copyYes') || '复制配置并切换')
+            : (t('config.workspace.copyYesNoDefault') || '空白切换'),
+          cancelText: result.hasDefaultDb
+            ? (t('config.workspace.copyNo') || '空白切换')
+            : undefined,
+          onOk: async () => {
+            await api.switchWorkspace(workspaceValue.trim(), true)
+            message.success(t('config.workspace.switchSuccess'))
+            setWorkspaceModalVisible(false)
+            setWorkspaceValue('')
+            window.location.reload()
+          },
+          onCancel: result.hasDefaultDb
+            ? async () => {
+                await api.switchWorkspace(workspaceValue.trim(), false)
+                message.success(t('config.workspace.switchSuccess'))
+                setWorkspaceModalVisible(false)
+                setWorkspaceValue('')
+                window.location.reload()
+              }
+            : undefined,
+        })
+        return
+      }
       message.success(t('config.workspace.switchSuccess'))
       setWorkspaceModalVisible(false)
       setWorkspaceValue('')
@@ -800,10 +837,61 @@ function SystemConfig() {
               label={t('config.workspace.path') || '路径'}
               required
             >
-              <Input
-                value={workspaceValue}
-                onChange={(e) => setWorkspaceValue(e.target.value)}
-                placeholder={t('config.workspace.pathPlaceholder') || '例如: ~/my-workspace'}
+              <Space.Compact style={{ width: '100%' }}>
+                <Input
+                  value={workspaceValue}
+                  onChange={(e) => setWorkspaceValue(e.target.value)}
+                  placeholder={t('config.workspace.pathPlaceholder') || '例如: ~/my-workspace'}
+                />
+                <Button
+                  icon={<FolderOpenOutlined />}
+                  onClick={handleSelectWorkspaceFolder}
+                >
+                  {t('config.workspace.selectFolder') || '选择文件夹'}
+                </Button>
+              </Space.Compact>
+              <Text type="secondary" style={{ fontSize: 12, marginTop: 4, display: 'block' }}>
+                {t('config.workspace.folderBrowserHint') || '部分浏览器可能仅显示文件夹名称，请手动补全为绝对路径。'}
+              </Text>
+              <Space size="small" style={{ marginTop: 8, flexWrap: 'wrap' }}>
+                <Button size="small" onClick={() => setWorkspaceValue('~/.nanobot/workspace')}>
+                  {t('config.workspace.defaultPath') || '默认路径'}
+                </Button>
+                {currentWorkspace && (
+                  <Button size="small" onClick={() => setWorkspaceValue(currentWorkspace)}>
+                    {t('config.workspace.currentPath') || '当前路径'}
+                  </Button>
+                )}
+              </Space>
+              <input
+                type="file"
+                ref={workspaceFolderInputRef}
+                {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                multiple
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  const files = e.target.files
+                  if (files && files.length > 0) {
+                    const firstFile = files[0] as any
+                    if (firstFile.path) {
+                      const fullPath = String(firstFile.path).replace(/\\/g, '/')
+                      if (firstFile.webkitRelativePath) {
+                        const relPath = String(firstFile.webkitRelativePath)
+                        const folderName = relPath.split('/')[0]
+                        // 从绝对路径中精确截取用户选择的根目录
+                        const rootDirPath = fullPath.substring(0, fullPath.length - relPath.length + folderName.length)
+                        setWorkspaceValue(rootDirPath)
+                      } else {
+                        const dirPath = fullPath.substring(0, fullPath.lastIndexOf('/'))
+                        setWorkspaceValue(dirPath)
+                      }
+                    } else if (firstFile.webkitRelativePath) {
+                      const folderName = firstFile.webkitRelativePath.split('/')[0]
+                      setWorkspaceValue(folderName)
+                    }
+                  }
+                  e.target.value = ''
+                }}
               />
             </Form.Item>
           </Form>
@@ -1469,10 +1557,15 @@ function McpConfig() {
   const normalizeMcpItem = (raw: unknown, explicitId?: string): McpServer | null => {
     if (!raw || typeof raw !== 'object') return null
     const o = raw as Record<string, unknown>
-    let id = explicitId || (typeof o.id === 'string' ? o.id.trim() : undefined)
+    const rawId = explicitId || (typeof o.id === 'string' ? o.id.trim() : undefined)
+    let id = rawId
     // Sanitize ID: replace invalid chars with underscore (same as backend)
     if (id) {
       id = id.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '')
+    }
+    // If sanitization emptied the id (e.g., pure Chinese chars), fall back to a safe derivation
+    if (!id && rawId) {
+      id = rawId.replace(/\s+/g, '-').toLowerCase().replace(/[^a-z0-9._-]/g, '') || 'mcp'
     }
     let name = typeof o.name === 'string' ? o.name.trim() : undefined
     const transportRaw = typeof o.transport === 'string' ? o.transport : typeof o.type === 'string' ? o.type : 'stdio'
@@ -1488,7 +1581,7 @@ function McpConfig() {
       url = typeof o.url === 'string' ? o.url.trim() : undefined
       if (!url) return null
     }
-    if (!name) name = id || 'unnamed'
+    if (!name) name = rawId || id || 'unnamed'
     if (!id) id = name.replace(/\s+/g, '-').toLowerCase().replace(/[^a-z0-9._-]/g, '') || 'mcp'
     // Extract env, headers, and tools
     const env = (o.env && typeof o.env === 'object') ? o.env as Record<string, string> : undefined

@@ -129,3 +129,4 @@ CREATE TABLE IF NOT EXISTS agentloop_events (
 CREATE INDEX IF NOT EXISTS idx_agentloop_events_trace ON agentloop_events(trace_id, created_at);
 -- 按 task_id 查询事件（调试/溯源）时避免全表扫描
 CREATE INDEX IF NOT EXISTS idx_agentloop_events_task ON agentloop_events(task_id);
+

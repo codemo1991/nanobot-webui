@@ -13,10 +13,11 @@ from nanobot.agent.tools.base import Tool
 
 # ---- 常量 ----
 VALID_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_\-\.]{0,63}$")
-MAX_DESCRIPTION_LENGTH = 80
-MAX_SKILL_CONTENT_CHARS = 50_000
+MAX_DESCRIPTION_LENGTH = 1024
+MAX_SKILL_CONTENT_CHARS = 100_000
 
-VALID_ACTIONS = ["create", "edit", "delete", "patch", "write_file"]
+VALID_ACTIONS = ["create", "edit", "delete", "patch", "write_file", "remove_file"]
+ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
 
 # ---- 安全扫描 ----
 _THREAT_PATTERNS = [
@@ -27,7 +28,7 @@ _THREAT_PATTERNS = [
     (re.compile(r'crontab\b', re.I), "persistence"),
     (re.compile(r'authorized_keys', re.I), "ssh_backdoor"),
     (re.compile(r'\bnc\s+-[lp]', re.I), "reverse_shell"),
-    (re.compile(r'\$HOME/\.ssh|\~/\.ssh', re.I), "ssh_access"),
+    (re.compile(r'\$HOME/\.ssh|\~/.\.ssh', re.I), "ssh_access"),
     (re.compile(r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', re.I), "prompt_injection"),
     (re.compile(r'system\s+prompt\s+override', re.I), "sys_prompt_override"),
 ]
@@ -38,11 +39,15 @@ _INVISIBLE_CHARS = {'\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u202a', 
 def _validate_name(name: str) -> Optional[str]:
     if not name:
         return "Skill name cannot be empty."
-    if not VALID_NAME_RE.match(name):
-        return (
-            "Invalid name. Use lowercase letters, numbers, hyphens, dots, and underscores. "
-            "Must start with alphanumeric. Max 64 characters."
-        )
+    parts = [p for p in name.replace("\\", "/").split("/") if p]
+    if not parts:
+        return "Invalid name."
+    for part in parts:
+        if not VALID_NAME_RE.match(part):
+            return (
+                "Invalid name segment. Each part must use lowercase letters, numbers, "
+                "hyphens, dots, and underscores. Must start with alphanumeric. Max 64 characters."
+            )
     return None
 
 
@@ -143,6 +148,11 @@ def _create_skill(name: str, content: str, workspace: Path) -> dict[str, Any]:
         shutil.rmtree(skill_md.parent, ignore_errors=True)
         return {"success": False, "error": scan_error}
 
+    # Create standard subdirectories (Hermes-Agent style) only after security scan passes
+    skill_dir = skill_md.parent
+    for subdir in ALLOWED_SUBDIRS:
+        (skill_dir / subdir).mkdir(parents=True, exist_ok=True)
+
     return {"success": True, "message": f"Skill '{name}' created.", "path": str(skill_md)}
 
 
@@ -213,6 +223,22 @@ def _write_skill_file(name: str, file_path: str, file_content: str, workspace: P
     return {"success": True, "message": f"File '{file_path}' written.", "path": str(target)}
 
 
+def _remove_skill_file(name: str, file_path: str, workspace: Path) -> dict[str, Any]:
+    if not _skill_exists(workspace, name):
+        return {"success": False, "error": f"Skill '{name}' not found."}
+    if ".." in file_path.replace("\\", "/").split("/"):
+        return {"success": False, "error": "Path traversal not allowed."}
+    target = _skills_dir(workspace) / name / file_path
+    try:
+        target.relative_to((_skills_dir(workspace) / name).resolve())
+    except ValueError:
+        return {"success": False, "error": "File must be inside skill directory."}
+    if not target.exists():
+        return {"success": False, "error": f"File '{file_path}' not found."}
+    target.unlink()
+    return {"success": True, "message": f"File '{file_path}' removed."}
+
+
 class SkillManagerTool(Tool):
     """Tool for creating, editing, deleting, and patching workspace skills."""
 
@@ -230,8 +256,9 @@ class SkillManagerTool(Tool):
     def description(self) -> str:
         return (
             f"创建、编辑、删除工作区内的 Skill（存储在 {self.workspace}/skills/）。\n"
-            "触发时机：完成复杂任务（5+工具调用）、修复错误、发现可复用工作流。\n"
-            "动作：create（新建）/ edit（全文替换）/ delete（删除）/ patch（局部替换）/ write_file（辅助文件）。"
+            "触发时机：完成复杂任务、修复错误、发现可复用工作流。\n"
+            "设计原则：一个 skill 只负责一类具体任务（小而精），支持 category/skill-name 分类目录。\n"
+            "动作：create（新建）/ edit（全文替换）/ delete（删除）/ patch（局部替换）/ write_file（辅助文件）/ remove_file（删除辅助文件）。"
         )
 
     @property
@@ -246,15 +273,15 @@ class SkillManagerTool(Tool):
                 },
                 "name": {
                     "type": "string",
-                    "description": "Skill 名称（小写、字母数字、-_. ，最大64字符）"
+                    "description": "Skill 名称（支持 category/skill-name 目录形式；每段只能包含小写、字母数字、-_. ；最大64字符）"
                 },
                 "content": {
                     "type": "string",
-                    "description": "SKILL.md 内容（create/edit 必须包含 YAML frontmatter）"
+                    "description": "SKILL.md 内容（create/edit 必须包含 YAML frontmatter；description 建议不超过1024字符）"
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "辅助文件路径（write_file 时必填，如 'references/example.md'）"
+                    "description": "辅助文件路径（write_file/remove_file 时必填，如 'references/example.md'、'scripts/helper.py'）"
                 },
                 "file_content": {
                     "type": "string",
@@ -292,6 +319,10 @@ class SkillManagerTool(Tool):
             if file_content is None:
                 return json.dumps({"success": False, "error": "file_content is required for write_file."})
             result = _write_skill_file(name, file_path, file_content, self.workspace)
+        elif action == "remove_file":
+            if not file_path:
+                return json.dumps({"success": False, "error": "file_path is required for remove_file."})
+            result = _remove_skill_file(name, file_path, self.workspace)
         else:
             return json.dumps({"success": False, "error": f"Unknown action '{action}'."})
 

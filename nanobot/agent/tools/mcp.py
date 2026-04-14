@@ -17,65 +17,6 @@ def _sanitize_tool_name(name: str) -> str:
     return _SAFE_NAME_PATTERN.sub("_", name) or "unnamed"
 
 
-class McpToolAdapter(Tool):
-    """
-    Adapts a single MCP server tool to the nanobot Tool interface.
-    Tool name is prefixed as mcp_{server_id}_{tool_name} to avoid collisions.
-    Names are sanitized to match ^[a-zA-Z0-9_-]+$ for DeepSeek/OpenAI compatibility.
-    """
-
-    def __init__(
-        self,
-        server_id: str,
-        tool_name: str,
-        description: str,
-        parameters: dict[str, Any],
-        session: Any,
-    ):
-        self._server_id = _sanitize_tool_name(server_id)
-        self._tool_name = tool_name  # Keep original for session.call_tool()
-        self._description = description or f"MCP tool {tool_name} from {server_id}"
-        self._parameters = parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}}
-        self._session = session
-
-    @property
-    def name(self) -> str:
-        return f"mcp_{self._server_id}_{_sanitize_tool_name(self._tool_name)}"
-
-    @property
-    def server_id(self) -> str | None:
-        return self._server_id
-
-    @property
-    def description(self) -> str:
-        return f"[MCP/{self._server_id}] {self._description}"
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        if "type" not in self._parameters:
-            self._parameters.setdefault("type", "object")
-        return self._parameters
-
-    async def execute(self, **kwargs: Any) -> str:
-        """Execute the MCP tool via the session."""
-        try:
-            result = await self._session.call_tool(self._tool_name, kwargs)
-            if getattr(result, "isError", False):
-                return f"MCP error: {getattr(result, 'content', result)}"
-            content = getattr(result, "content", None)
-            if content:
-                parts = []
-                for block in content:
-                    text = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else None)
-                    if text:
-                        parts.append(str(text))
-                return "\n".join(parts) if parts else "(no output)"
-            return "(no output)"
-        except Exception as e:
-            logger.exception(f"MCP tool error: {self._server_id}/{self._tool_name}")
-            return f"MCP tool error: {e}"
-
-
 class McpLazyToolAdapter(Tool):
     """
     懒加载 MCP 工具适配器。
@@ -103,8 +44,6 @@ class McpLazyToolAdapter(Tool):
         self._parameters = parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}}
         self._mcp_loader = mcp_loader
         self._lazy_tools = lazy_tools
-        self._session = None
-        self._lock = asyncio.Lock()
         self._disposed = False
 
     @property
@@ -134,39 +73,20 @@ class McpLazyToolAdapter(Tool):
         """确保 MCP 连接已建立。返回是否连接成功。"""
         if self._disposed:
             return False
-
-        # 如果已经有连接，直接返回
-        if self._session is not None:
-            return True
-
-        # 防止并发连接
-        async with self._lock:
-            # 双重检查
-            if self._session is not None or self._disposed:
-                return self._session is not None
-
-            try:
-                # 按需连接单个 MCP 服务器
-                result = await self._mcp_loader.connect_lazy(self._server_id, timeout=30.0)
-                if result is None:
-                    logger.warning(f"MCP {self._server_id}: failed to connect on first call")
-                    return False
-
-                self._session, tools = result
-
-                # 为同服务器的其他工具设置 session
-                for other_tool in self._lazy_tools.values():
-                    if other_tool is not self and other_tool._session is None:
-                        other_tool._session = self._session
-
-                # 更新本工具的 schema（如果原来是空的）
-                self._update_schema_from_discovered(tools)
-
-                logger.info(f"MCP {self._server_id}: connected on first tool call ({len(tools)} tools available)")
-                return True
-            except Exception as e:
-                logger.warning(f"MCP {self._server_id}: connection error on first call: {e}")
+        # 按需连接单个 MCP 服务器（loader 内部有并发锁）
+        try:
+            result = await self._mcp_loader.connect_lazy(self._server_id, timeout=30.0)
+            if result is None:
+                logger.warning(f"MCP {self._server_id}: failed to connect on first call")
                 return False
+            session, tools = result
+            # 更新本工具的 schema（如果原来是空的）
+            self._update_schema_from_discovered(tools)
+            logger.info(f"MCP {self._server_id}: connected on first tool call ({len(tools)} tools available)")
+            return True
+        except Exception as e:
+            logger.warning(f"MCP {self._server_id}: connection error on first call: {e}")
+            return False
 
     def _update_schema_from_discovered(self, discovered_tools: list[dict[str, Any]]) -> None:
         """
@@ -209,11 +129,6 @@ class McpLazyToolAdapter(Tool):
                     self._parameters = new_params
                 break
 
-    def _reset_session(self) -> None:
-        """重置本 server 所有懒加载工具的 session（用于断线重连）。"""
-        for t in self._lazy_tools.values():
-            t._session = None
-
     async def execute(self, **kwargs: Any) -> str:
         """执行 MCP 工具（懒加载，自动重连一次）。"""
         for attempt in range(2):
@@ -221,18 +136,8 @@ class McpLazyToolAdapter(Tool):
                 if not await self._ensure_connected():
                     return f"MCP {self._server_id}: 连接失败，请检查 MCP 配置。"
 
-                result = await self._session.call_tool(self._tool_name, kwargs)
-                if getattr(result, "isError", False):
-                    return f"MCP error: {getattr(result, 'content', result)}"
-                content = getattr(result, "content", None)
-                if content:
-                    parts = []
-                    for block in content:
-                        text = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else None)
-                        if text:
-                            parts.append(str(text))
-                    return "\n".join(parts) if parts else "(no output)"
-                return "(no output)"
+                result = await self._mcp_loader.call_tool(self._server_id, self._tool_name, kwargs)
+                return _format_mcp_result(result, self._server_id, self._tool_name)
 
             except Exception as e:
                 # 判断是否为连接断开类错误（MCP server 重启 / 网络抖动）
@@ -245,7 +150,11 @@ class McpLazyToolAdapter(Tool):
                     logger.warning(
                         f"[MCP] {self._server_id}/{self._tool_name}: 连接断开（{_err_type}），尝试重连…"
                     )
-                    self._reset_session()
+                    # 重置连接，下次 _ensure_connected 会重新建立
+                    try:
+                        await self._mcp_loader.disconnect_lazy(self._server_id)
+                    except Exception:
+                        pass
                     continue  # 重试一次
                 logger.exception(f"MCP tool error: {self._server_id}/{self._tool_name}")
                 return f"MCP tool error: {e}"
@@ -255,4 +164,38 @@ class McpLazyToolAdapter(Tool):
     def dispose(self) -> None:
         """标记该工具已废弃（配置删除时调用）。"""
         self._disposed = True
-        self._session = None
+
+
+def _format_mcp_result(result: Any, server_id: str, tool_name: str) -> str:
+    """Format an MCP CallToolResult into a string response."""
+    if getattr(result, "isError", False):
+        content = getattr(result, "content", result)
+        sanitized = _sanitize_error(str(content))
+        return f"MCP error: {sanitized}"
+    content = getattr(result, "content", None)
+    if content:
+        parts = []
+        for block in content:
+            text = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else None)
+            if text:
+                parts.append(str(text))
+        return "\n".join(parts) if parts else "(no output)"
+    return "(no output)"
+
+
+def _sanitize_error(text: str) -> str:
+    """Strip credential-like patterns from error text before returning to LLM."""
+    _CREDENTIAL_PATTERN = re.compile(
+        r"(?:"
+        r"ghp_[A-Za-z0-9_]{1,255}"
+        r"|sk-[A-Za-z0-9_]{1,255}"
+        r"|Bearer\s+\S+"
+        r"|token=[^\s&,;\"']{1,255}"
+        r"|key=[^\s&,;\"']{1,255}"
+        r"|API_KEY=[^\s&,;\"']{1,255}"
+        r"|password=[^\s&,;\"']{1,255}"
+        r"|secret=[^\s&,;\"']{1,255}"
+        r")",
+        re.IGNORECASE,
+    )
+    return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)

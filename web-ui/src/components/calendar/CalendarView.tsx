@@ -15,7 +15,6 @@ function CalendarView() {
     events,
     currentView,
     currentDate,
-    setCurrentDate,
     setCurrentView,
     setSelectedEvent,
     setEditingEventId,
@@ -109,11 +108,8 @@ function CalendarView() {
     })
   }, [updateEvent])
 
-  // Handle dates set (update current date in store)
-  const handleDatesSet = useCallback((dateInfo: { view: { type: string }, start: Date }) => {
-    setCurrentDate(dateInfo.start.toISOString())
-
-    // Map FullCalendar view types to our view types
+  // Handle dates set (sync FullCalendar view type to store)
+  const handleDatesSet = useCallback((dateInfo: { view: { type: string } }) => {
     const viewMap: Record<string, typeof currentView> = {
       dayGridMonth: 'dayGridMonth',
       timeGridWeek: 'timeGridWeek',
@@ -123,7 +119,7 @@ function CalendarView() {
     if (newView && newView !== currentView) {
       setCurrentView(newView)
     }
-  }, [setCurrentDate, setCurrentView, currentView])
+  }, [setCurrentView, currentView])
 
   return (
     <div className="calendar-view">

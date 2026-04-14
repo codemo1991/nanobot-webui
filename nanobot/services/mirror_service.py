@@ -302,7 +302,7 @@ class MirrorService:
                 else:
                     image_b_url = None
             except Exception as e:
-                logger.warning("Qwen-Image generation failed: %s", e)
+                logger.warning(f"Qwen-Image generation failed: {e}")
 
         record = {
             "id": record_id,
@@ -360,7 +360,7 @@ class MirrorService:
                     else:
                         image_b_url = url_b
             except Exception as e:
-                logger.warning("Qwen-Image regenerate failed: %s", e)
+                logger.warning(f"Qwen-Image regenerate failed: {e}")
 
         updates = {}
         if image_a_url is not None:

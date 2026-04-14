@@ -180,7 +180,7 @@ class TestWriteSkillFile:
 class TestValidateContentSize:
     def test_content_too_large(self):
         from nanobot.agent.tools.skill_manager import _validate_content_size
-        large = "x" * 50001
+        large = "x" * 100001
         err = _validate_content_size(large)
         assert err is not None
-        assert "50,000" in err
+        assert "100,000" in err

@@ -1424,6 +1424,18 @@ def copy_db_to_workspace(workspace: Path) -> bool:
         if shm_path.exists():
             shutil.copy2(shm_path, Path(str(target_path) + "-shm"))
 
+        # 复制完成后，清空聊天记录（确保 workspace 之间聊天隔离）
+        try:
+            conn = sqlite3.connect(str(target_path))
+            conn.execute("DELETE FROM chat_messages;")
+            conn.execute("DELETE FROM chat_sessions;")
+            conn.execute("DELETE FROM chat_session_token_totals;")
+            conn.commit()
+            conn.close()
+            logger.info(f"Cleared chat history in copied workspace db: {target_path}")
+        except Exception as e:
+            logger.warning(f"Failed to clear chat history after copy: {e}")
+
         # 清除新 workspace 的实例缓存，确保重新加载
         MemoryRepository.clear_instance(target_path)
 

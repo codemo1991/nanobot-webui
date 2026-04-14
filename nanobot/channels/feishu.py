@@ -411,10 +411,7 @@ class FeishuChannel(BaseChannel):
             )
 
             if not response.success():
-                logger.warning(
-                    "Feishu post message failed (code=%s msg=%s), falling back to text",
-                    response.code, response.msg,
-                )
+                logger.warning(f"Feishu post message failed (code={response.code} msg={response.msg}), falling back to text")
                 await self._send_text_fallback(msg.chat_id, body_text)
             else:
                 logger.debug(f"Feishu post message sent to {msg.chat_id}")
@@ -472,10 +469,7 @@ class FeishuChannel(BaseChannel):
                 ).build()
             response = self._client.im.v1.message.patch(request)
             if not response.success():
-                logger.debug(
-                    "Card patch failed: code=%s msg=%s",
-                    response.code, response.msg,
-                )
+                logger.debug(f"Card patch failed: code={response.code} msg={response.msg}")
                 return False
             return True
         except Exception as e:
@@ -656,10 +650,7 @@ class FeishuChannel(BaseChannel):
                 logger.debug(f"Progress card sent: {response.data.message_id}")
                 return response.data.message_id
             else:
-                logger.warning(
-                    "Failed to send progress card: code=%s msg=%s",
-                    response.code, response.msg,
-                )
+                logger.warning(f"Failed to send progress card: code={response.code} msg={response.msg}")
                 return None
         except Exception as e:
             logger.warning(f"Error sending progress card: {e}")
@@ -1074,10 +1065,7 @@ class FeishuChannel(BaseChannel):
             )
 
             if not response.success():
-                logger.warning(
-                    "Feishu image download failed: code=%s msg=%s (key=%s)",
-                    response.code, response.msg, image_key,
-                )
+                logger.warning(f"Feishu image download failed: code={response.code} msg={response.msg} (key={image_key})")
                 return None
 
             # lark-oapi 返回 response.file (file-like) 或 response.data
@@ -1092,7 +1080,7 @@ class FeishuChannel(BaseChannel):
                 logger.info(f"Feishu image downloaded: {save_path} ({len(data)} bytes)")
                 return str(save_path)
 
-            logger.warning("Feishu image response has no file data (key=%s)", image_key)
+            logger.warning(f"Feishu image response has no file data (key={image_key})")
             return None
 
         except Exception as e:
@@ -1171,7 +1159,7 @@ class FeishuChannel(BaseChannel):
                 logger.info(f"Feishu audio downloaded: {save_path} ({len(data)} bytes)")
                 return str(save_path)
 
-            logger.warning("Feishu audio response has no file data (key=%s)", file_key)
+            logger.warning(f"Feishu audio response has no file data (key={file_key})")
             return None
 
         except Exception as e:

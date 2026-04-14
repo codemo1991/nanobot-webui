@@ -38,7 +38,7 @@ def ensure_system_db_initialized() -> None:
     # ConfigRepository 和 CronRepository 的 __init__ 会执行 _init_tables，自动建表
     ConfigRepository(system_db)
     CronRepository(system_db)
-    logger.debug("System DB initialized: %s", system_db)
+    logger.debug(f"System DB initialized: {system_db}")
 
 
 def init_system_providers(repo: "ConfigRepository") -> None:
@@ -206,7 +206,7 @@ def get_effective_model() -> str:
     try:
         return router.get(default_profile).model
     except (KeyError, ValueError, AttributeError, TypeError, ModelNotFoundError) as e:
-        logger.debug("get_effective_model fallback: %s", e)
+        logger.debug(f"get_effective_model fallback: {e}")
         return "anthropic/claude-opus-4-6"
 
 

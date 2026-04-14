@@ -70,7 +70,7 @@ class Kernel:
                 artifacts=initial_artifacts,
                 workspace_root=self.workspace,
             )
-        logger.info("AgentLoop 已提交 trace=%s root_task=%s", trace_id, root_task_id)
+        logger.info(f"AgentLoop 已提交 trace={trace_id} root_task={root_task_id}")
         # 根任务已 READY，通知 worker 立即检查
         if self._task_ready_event is not None:
             self._task_ready_event.set()
@@ -91,7 +91,7 @@ class Kernel:
         # Fix #1: 每次运行前重置，支持内核实例复用（同一 Kernel 执行多个 trace）
         self.shutdown = False
 
-        logger.info("[Kernel.run_until_done] 开始, trace_id=%s", trace_id)
+        logger.info(f"[Kernel.run_until_done] 开始, trace_id={trace_id}")
 
         done_event = asyncio.Event()
         self.runtime.set_done_callback(lambda: done_event.set())
@@ -112,17 +112,14 @@ class Kernel:
                     "SELECT status FROM agentloop_traces WHERE trace_id = ?", (trace_id,)
                 ).fetchone()
                 if row and row["status"] in ("DONE", "FAILED", "CANCELED"):
-                    logger.info(
-                        "[Kernel.run_until_done] trace 完成, status=%s, trace_id=%s",
-                        row["status"], trace_id,
-                    )
+                    logger.info(f'[Kernel.run_until_done] trace 完成, status={row["status"]}, trace_id={trace_id}')
                     self.shutdown = True
                     break
 
                 if timeout_seconds is not None:
                     elapsed = time.monotonic() - start
                     if elapsed > timeout_seconds:
-                        logger.warning("AgentLoop trace %s 超时 (%.0fs)", trace_id, elapsed)
+                        logger.warning(f"AgentLoop trace {trace_id} 超时 ({elapsed:.0f}s)")
                         mark_trace_canceled(self.conn, trace_id, reason="TIMEOUT")
                         self.shutdown = True
                         break
@@ -146,7 +143,7 @@ class Kernel:
         finally:
             self.shutdown = True
             maintenance.cancel()
-            logger.debug("[Kernel.run_until_done] 等待 %d workers 结束", len(workers))
+            logger.debug(f"[Kernel.run_until_done] 等待 {len(workers)} workers 结束")
             await asyncio.gather(*workers, maintenance, return_exceptions=True)
             logger.info("[Kernel.run_until_done] 全部协程已结束")
 
@@ -182,17 +179,14 @@ class Kernel:
                     await asyncio.sleep(_WORKER_WAIT_TIMEOUT)
                     continue
 
-            logger.info(
-                "[Kernel worker-%d] 领取任务: %s, cap=%s, kind=%s",
-                worker_idx, task["task_id"], task["capability_name"], task["task_kind"],
-            )
+            logger.info(f'[Kernel worker-{worker_idx}] 领取任务: {task["task_id"]}, cap={task["capability_name"]}, kind={task["task_kind"]}')
             mark_task_running(self.conn, task["task_id"])
 
             try:
                 await self.runtime.execute_task(task)
-                logger.info("[Kernel worker-%d] 任务执行完成: %s", worker_idx, task["task_id"])
+                logger.info(f'[Kernel worker-{worker_idx}] 任务执行完成: {task["task_id"]}')
             except Exception as exc:
-                logger.exception("任务 %s 执行异常: %s", task["task_id"], exc)
+                logger.exception(f'任务 {task["task_id"]} 执行异常: {exc}')
                 self.runtime.handle_task_exception(task, exc)
 
     async def _maintenance_loop(self) -> None:
@@ -204,12 +198,12 @@ class Kernel:
             try:
                 recovered = recover_stale_tasks(self.conn, stale_seconds=_STALE_RUNNING_SECONDS)
                 if recovered:
-                    logger.info("[Kernel.maintenance] 恢复了 %d 个僵死任务", recovered)
+                    logger.info(f"[Kernel.maintenance] 恢复了 {recovered} 个僵死任务")
                     # 通知 worker 有新的 READY 任务
                     if self._task_ready_event is not None:
                         self._task_ready_event.set()
             except Exception as e:
-                logger.warning("[Kernel.maintenance] 维护异常: %s", e)
+                logger.warning(f"[Kernel.maintenance] 维护异常: {e}")
 
     async def run_forever(self, worker_count: int = 4) -> None:
         """持续运行 worker（用于多 trace 并发场景）。

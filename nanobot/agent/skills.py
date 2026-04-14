@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from dataclasses import dataclass, field
 
+import yaml
+
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
@@ -106,23 +108,30 @@ class SkillsLoader:
         self._cache_valid = True
     
     def _list_skill_dirs(self) -> list[dict[str, str]]:
-        """List all skill directories without filtering."""
+        """List all skill directories without filtering. Supports nested category paths."""
         skills = []
-        
-        if self.workspace_skills.exists():
-            for skill_dir in self.workspace_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists():
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
-        
-        if self.builtin_skills and self.builtin_skills.exists():
-            for skill_dir in self.builtin_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
-        
+        seen_names: set[str] = set()
+
+        def _collect(root: Path, source: str) -> None:
+            if not root.exists():
+                return
+            for skill_file in root.rglob("SKILL.md"):
+                skill_dir = skill_file.parent
+                # Compute name as relative path from root to skill_dir
+                try:
+                    rel = skill_dir.relative_to(root).as_posix()
+                    rel_parts = skill_dir.relative_to(root).parts
+                except ValueError:
+                    continue
+                if not rel or rel in seen_names:
+                    continue
+                if any(p in {"references", "templates", "scripts", "assets"} for p in rel_parts):
+                    continue
+                seen_names.add(rel)
+                skills.append({"name": rel, "path": str(skill_file), "source": source})
+
+        _collect(self.workspace_skills, "workspace")
+        _collect(self.builtin_skills, "builtin")
         return skills
     
     def _parse_skill_file(self, name: str, skill_info: dict) -> SkillMetadata | None:
@@ -144,7 +153,8 @@ class SkillsLoader:
             if len(description) > MAX_SHORT_DESCRIPTION_LENGTH:
                 short_desc = short_desc[:-3] + "..."
         
-        keywords = self._parse_keywords(raw_meta.get("keywords", ""))
+        raw_keywords = raw_meta.get("keywords") or raw_meta.get("triggers", "")
+        keywords = self._parse_keywords(raw_keywords)
         
         skill_meta = nanobot_meta
         available = self._check_requirements(skill_meta)
@@ -165,26 +175,35 @@ class SkillsLoader:
         )
     
     def _extract_frontmatter(self, content: str) -> dict:
-        """Extract frontmatter as dict from content."""
+        """Extract frontmatter as dict from content using YAML."""
         if not content.startswith("---"):
             return {}
-        
+
         match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
         if not match:
             return {}
-        
-        metadata = {}
-        for line in match.group(1).split("\n"):
-            if ":" in line:
-                key, value = line.split(":", 1)
-                metadata[key.strip()] = value.strip().strip('"\'')
-        
-        return metadata
+
+        yaml_text = match.group(1)
+        try:
+            metadata = yaml.safe_load(yaml_text) or {}
+            if not isinstance(metadata, dict):
+                return {}
+            return metadata
+        except yaml.YAMLError:
+            # Fallback to simple line parser for malformed frontmatter
+            metadata = {}
+            for line in yaml_text.split("\n"):
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    metadata[key.strip()] = value.strip().strip('"\'')
+            return metadata
     
-    def _parse_keywords(self, keywords_str: str) -> list[str]:
-        """Parse keywords from comma-separated string."""
+    def _parse_keywords(self, keywords_str: str | list[str]) -> list[str]:
+        """Parse keywords from comma-separated string or list."""
         if not keywords_str:
             return []
+        if isinstance(keywords_str, list):
+            return [str(k).strip().lower() for k in keywords_str if str(k).strip()]
         return [k.strip().lower() for k in keywords_str.split(",") if k.strip()]
     
     def refresh_cache(self) -> None:
@@ -480,26 +499,14 @@ class SkillsLoader:
     def get_skill_metadata(self, name: str) -> dict | None:
         """
         Get metadata from a skill's frontmatter.
-        
+
         Args:
             name: Skill name.
-        
+
         Returns:
             Metadata dict or None.
         """
         content = self.load_skill(name)
         if not content:
             return None
-        
-        if content.startswith("---"):
-            match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-            if match:
-                # Simple YAML parsing
-                metadata = {}
-                for line in match.group(1).split("\n"):
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip().strip('"\'')
-                return metadata
-        
-        return None
+        return self._extract_frontmatter(content)
