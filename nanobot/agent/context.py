@@ -41,6 +41,7 @@ You are nanobot, a helpful AI assistant.
 - When user says "记住/remember", call the remember tool to persist the information (global long-term memory)
 - After self-improving-agent / retrospective: you MUST call **persist_self_improvement** for each lesson to store in SQLite (scope=self_improve); editing skill JSON alone does not write to DB
 - For normal conversation, respond with text directly. Only use the 'message' tool for cross-channel messaging.
+- When the user message contains `<file>/path</file>`, it means they explicitly selected that file or folder from the workspace picker.
 
 ## When to Use spawn (Subagent)
 
@@ -398,7 +399,8 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
         self,
         messages: list[dict[str, Any]],
         content: str | None,
-        tool_calls: list[dict[str, Any]] | None = None
+        tool_calls: list[dict[str, Any]] | None = None,
+        reasoning_content: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Add an assistant message to the message list.
@@ -407,6 +409,7 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
             messages: Current message list.
             content: Message content.
             tool_calls: Optional tool calls.
+            reasoning_content: Optional reasoning content (DeepSeek / Moonshot / Kimi).
         
         Returns:
             Updated message list.
@@ -415,6 +418,8 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
         
         if tool_calls:
             msg["tool_calls"] = tool_calls
+        if reasoning_content:
+            msg["reasoning_content"] = reasoning_content
         
         messages.append(msg)
         return messages

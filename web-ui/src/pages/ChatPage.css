@@ -589,16 +589,109 @@
 }
 
 .chat-input {
-  flex: 1;
+  width: 100%;
   min-height: 36px;
 }
 
-.chat-input textarea {
-  border-radius: 8px;
+.chat-input-wrapper {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-input-editable {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
   font-size: 14px;
-  min-height: 36px !important;
-  line-height: 1.5;
+  line-height: 22px;
   padding: 6px 12px;
+  border: 1px solid #d9d9d9;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  box-sizing: border-box;
+  min-height: 36px;
+  max-height: 88px; /* 4 rows ≈ 22*4 */
+  overflow-y: auto;
+  outline: none;
+  background: #fff;
+  color: rgba(0, 0, 0, 0.85);
+  cursor: text;
+}
+
+.chat-input-editable:empty::before {
+  content: attr(data-placeholder);
+  color: rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+
+.chat-input-editable::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+
+.chat-input-editable:focus {
+  border-color: #1677ff;
+  box-shadow: 0 0 0 2px rgba(5, 145, 255, 0.1);
+}
+
+.chat-input-chip {
+  display: inline-block;
+  vertical-align: text-bottom;
+  background: #e6f7ff;
+  border: 1px solid #91d5ff;
+  color: #096dd9;
+  font-size: 14px;
+  line-height: 20px;
+  padding: 0 4px;
+  border-radius: 4px;
+  margin: 0 1px;
+  cursor: pointer;
+  user-select: none;
+  box-sizing: border-box;
+}
+
+.chat-input-chip:hover {
+  background: #bae7ff;
+  border-color: #69c0ff;
+}
+
+.chat-input-chip-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 4px;
+  font-size: 13px;
+  width: 14px;
+  height: 14px;
+  line-height: 14px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+
+.chat-input-chip:hover .chat-input-chip-close {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+/* File tag in messages */
+.message-file-tag {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  font-size: 14px;
+  line-height: 20px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  margin-right: 4px;
+}
+
+.message-wrapper.user .message-file-tag {
+  color: rgba(255, 255, 255, 0.95);
+  border-color: rgba(255, 255, 255, 0.4);
+  background: rgba(255, 255, 255, 0.15);
 }
 
 .send-button {
@@ -615,6 +708,13 @@
 }
 
 /* Image upload & preview */
+.pending-files-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px 0;
+}
+
 .pending-images-row {
   display: flex;
   flex-wrap: wrap;

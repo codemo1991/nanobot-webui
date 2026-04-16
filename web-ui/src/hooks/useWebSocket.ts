@@ -25,6 +25,7 @@ export interface UseWebSocketOptions {
   onError?: (error: Event) => void;
   reconnect?: boolean;
   reconnectInterval?: number;
+  maxReconnectAttempts?: number;
   heartbeatInterval?: number;  // 心跳间隔(ms)，默认 30s
 }
 
@@ -36,7 +37,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     onDisconnect,
     onError,
     reconnect = true,
-    reconnectInterval = 3000,
+    maxReconnectAttempts = 10,
     heartbeatInterval = 30000,  // 30秒心跳
   } = options;
 
@@ -48,6 +49,10 @@ export function useWebSocket(options: UseWebSocketOptions) {
   const [isConnected, setIsConnected] = useState(false);
   // Buffer for messages sent while WebSocket is reconnecting
   const pendingMessagesRef = useRef<object[]>([]);
+  // 重连尝试计数
+  const reconnectAttemptRef = useRef(0);
+  // 上次收到 pong 的时间
+  const lastPongAtRef = useRef<number>(0);
 
   // Use refs for callbacks to avoid reconnects when callback references change
   const onMessageRef = useRef(onMessage);
@@ -104,13 +109,20 @@ export function useWebSocket(options: UseWebSocketOptions) {
     }
     // Clear pending messages when disconnecting
     pendingMessagesRef.current = [];
+    reconnectAttemptRef.current = 0;
   }, [clearHeartbeat, clearReconnect]);
 
   const startHeartbeat = useCallback(() => {
     clearHeartbeat();
+    lastPongAtRef.current = Date.now();
     heartbeatIntervalRef.current = window.setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'ping' }));
+        // 若超过 2 个心跳周期未收到 pong，判定为半开连接，强制重连
+        if (Date.now() - lastPongAtRef.current > heartbeatInterval * 2) {
+          console.warn('[WebSocket] Missed pong, forcing reconnect')
+          wsRef.current.close()
+        }
       }
     }, heartbeatInterval);
   }, [clearHeartbeat, heartbeatInterval]);
@@ -140,6 +152,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     ws.onopen = () => {
       console.log('[WebSocket] Connected!');
       setIsConnected(true);
+      reconnectAttemptRef.current = 0;
       startHeartbeat();
       onConnectRef.current?.();
       // Flush any messages that were queued during reconnection
@@ -151,6 +164,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
       try {
         // 忽略 pong 响应（心跳回执）
         if (event.data === JSON.stringify({ type: 'pong' })) {
+          lastPongAtRef.current = Date.now();
           return;
         }
         const data = JSON.parse(event.data) as WsEvent;
@@ -167,18 +181,28 @@ export function useWebSocket(options: UseWebSocketOptions) {
 
       if (skipReconnectRef.current) {
         skipReconnectRef.current = false;
+        reconnectAttemptRef.current = 0;
         return;
       }
 
       // 自动重连（只在页面未卸载时）
       if (reconnect && !window.__wsUnloaded) {
+        if (reconnectAttemptRef.current >= maxReconnectAttempts) {
+          console.error('[WebSocket] Max reconnect attempts reached');
+          return;
+        }
         clearReconnect();
+        const attempt = reconnectAttemptRef.current;
+        // 指数退避 + 抖动: min(30s, 1s * 2^attempt) + random(0,1s)
+        const delay = Math.min(30000, 1000 * Math.pow(2, attempt)) + Math.random() * 1000;
+        reconnectAttemptRef.current = attempt + 1;
+        console.log(`[WebSocket] Reconnecting in ${Math.round(delay)}ms (attempt ${attempt + 1}/${maxReconnectAttempts})`);
         reconnectTimeoutRef.current = window.setTimeout(() => {
           // 检查 URL 是否变化，如果变化则不重连旧 URL
           if (urlRef.current === currentUrl) {
             connect();
           }
-        }, reconnectInterval);
+        }, delay);
       }
     };
 
@@ -188,7 +212,7 @@ export function useWebSocket(options: UseWebSocketOptions) {
     };
 
     wsRef.current = ws;
-  }, [reconnect, reconnectInterval, startHeartbeat, clearHeartbeat, clearReconnect]);
+  }, [reconnect, maxReconnectAttempts, startHeartbeat, clearHeartbeat, clearReconnect]);
 
   useEffect(() => {
     console.log('[WebSocket] Hook mounted, URL:', url);

@@ -1,5 +1,6 @@
 """Anthropic provider using native anthropic>=0.20 SDK."""
 
+import re
 from typing import Any
 
 from anthropic import AsyncAnthropic
@@ -33,8 +34,12 @@ class AnthropicProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
-        **kwargs: Any,
+        api_base: str | None = None,
+        stream_callback: Any | None = None,
     ) -> LLMResponse:
+        if stream_callback:
+            from loguru import logger
+            logger.warning("Anthropic provider does not support stream_callback yet")
         client = self._get_client()
         native_model = model or self.get_default_model()
 
@@ -71,18 +76,52 @@ class AnthropicProvider(LLMProvider):
             content = msg.get("content", "")
 
             if role == "system":
-                system = content
-            elif role in ("user", "assistant"):
-                result.append({"role": role, "content": content})
-            elif role == "tool":
+                if isinstance(content, list):
+                    text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                    system = "\n".join(text_parts)
+                else:
+                    system = content
+                continue
+
+            if role == "tool":
                 result.append({
                     "role": "user",
                     "content": [
                         {"type": "tool_result", "tool_use_id": msg.get("tool_call_id", ""), "content": content}
                     ],
                 })
+                continue
+
+            if role not in ("user", "assistant"):
+                continue
+
+            # Convert list content (multimodal) to Anthropic format
+            if isinstance(content, list):
+                anthropic_content: list[dict[str, Any]] = []
+                for block in content:
+                    btype = block.get("type")
+                    if btype == "text":
+                        anthropic_content.append({"type": "text", "text": block.get("text", "")})
+                    elif btype == "image_url":
+                        converted = self._convert_image_block(block)
+                        if converted:
+                            anthropic_content.append(converted)
+                result.append({"role": role, "content": anthropic_content})
+            else:
+                result.append({"role": role, "content": content})
 
         return system, result
+
+    def _convert_image_block(self, block: dict[str, Any]) -> dict[str, Any] | None:
+        """Convert OpenAI image_url block to Anthropic image block."""
+        url = (block.get("image_url") or {}).get("url", "")
+        m = re.match(r"data:(image/\w+);base64,(.+)", url, re.DOTALL)
+        if m:
+            return {
+                "type": "image",
+                "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)},
+            }
+        return {"type": "image", "source": {"type": "url", "url": url}}
 
     def _convert_tool(self, tool: dict[str, Any]) -> dict[str, Any]:
         """Convert OpenAI-format tool to Anthropic format."""

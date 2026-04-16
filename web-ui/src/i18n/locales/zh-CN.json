@@ -8,7 +8,8 @@
     "save": "保存",
     "delete": "删除",
     "edit": "编辑",
-    "loading": "加载中..."
+    "loading": "加载中...",
+    "insert": "插入"
   },
   "nav": {
     "chat": "聊天",
@@ -166,7 +167,12 @@
       "pendingTasksTitle": "后台任务进行中",
       "pendingTasksContent": "当前有 {{count}} 个 Claude Code 任务正在后台运行，继续发送消息可能会影响任务执行。\n\n第一个任务：{{prompt}}",
       "sendAnyway": "仍要发送"
-    }
+    },
+    "filePicker": "选择文件或文件夹",
+    "filePickerTitle": "选择文件或文件夹",
+    "emptyWorkspace": "工作区为空",
+    "loadWorkspaceError": "加载工作区失败",
+    "selectedPath": "已选择"
   },
   "system": {
     "title": "系统状态",

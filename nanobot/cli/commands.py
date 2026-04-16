@@ -206,6 +206,7 @@ def gateway(
     anthropic_provider = AnthropicProvider()
     deepseek_provider = DeepSeekProvider()
     azure_provider = AzureProvider()
+    moonshot_provider = OpenAIProvider()
 
     provider_manager = ProviderManager()
     provider_manager.register_all(
@@ -213,6 +214,7 @@ def gateway(
         anthropic=anthropic_provider,
         deepseek=deepseek_provider,
         azure=azure_provider,
+        moonshot=moonshot_provider,
     )
     provider_manager.update_from_config(config)
 
@@ -377,8 +379,9 @@ def mirror_seal_stale(
     anthropic_p = AnthropicProvider()
     deepseek_p = DeepSeekProvider()
     azure_p = AzureProvider()
+    moonshot_p = OpenAIProvider()
     pm = ProviderManager()
-    pm.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p)
+    pm.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p, moonshot=moonshot_p)
     pm.update_from_config(config)
 
     sessions = SessionManager(config.workspace_path)
@@ -390,7 +393,7 @@ def mirror_seal_stale(
         from nanobot.config.loader import get_config_repository
         repo = get_config_repository()
         router = ModelRouter(repo)
-        router.register_providers(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p)
+        router.register_providers(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p, moonshot=moonshot_p)
         router.update_from_config(config)
         try:
             handle = router.get(m)
@@ -557,8 +560,9 @@ def agent(
     anthropic_p = AnthropicProvider()
     deepseek_p = DeepSeekProvider()
     azure_p = AzureProvider()
+    moonshot_p = OpenAIProvider()
     pm = ProviderManager()
-    pm.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p)
+    pm.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p, moonshot=moonshot_p)
     pm.update_from_config(config)
 
     bus = MessageBus()
@@ -566,7 +570,7 @@ def agent(
 
     repo = get_config_repository()
     router = ModelRouter(repo)
-    router.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p)
+    router.register_all(openai=openai_p, anthropic=anthropic_p, deepseek=deepseek_p, azure=azure_p, moonshot=moonshot_p)
     router.update_from_config(config)
     default_profile = repo.get_config_value("agent", "default_profile", "smart")
     agent_loop = AgentLoop(

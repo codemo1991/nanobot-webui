@@ -1,8 +1,8 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useLocation } from 'react-router-dom'
 import { Layout, Input, Button, List, Typography, Avatar, Space, Spin, message as antMessage, Empty, Collapse, Tooltip, Image, Tag, Modal, Popconfirm, Checkbox, Popover } from 'antd'
-import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, MessageOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons'
+import { SendOutlined, PlusOutlined, DeleteOutlined, EditOutlined, RobotOutlined, UserOutlined, StopOutlined, PictureOutlined, CloseCircleOutlined, SyncOutlined, MessageOutlined, ReloadOutlined, SettingOutlined, FolderOpenOutlined } from '@ant-design/icons'
 import { api } from '../api'
 import type { Session, Message, ToolStep, TokenUsage, Task, TaskListResponse, StreamEvent, McpServer } from '../types'
 import { useWebSocket } from '../hooks/useWebSocket'
@@ -13,11 +13,12 @@ import { useTaskPolling } from '../hooks/useTaskPolling'
 import { requestNotificationPermission, notifyTaskComplete } from '../utils/notification'
 import { ToolStepsPanel } from '../components/ToolStepsPanel'
 import { AssistantMarkdownContent } from '../components/AssistantMarkdownContent'
+import WorkspaceFilePickerModal from '../components/WorkspaceFilePickerModal'
 
 const WS_BASE_URL = `ws://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8765`
 
 const { Header, Sider, Content } = Layout
-const { TextArea } = Input
+// TextArea removed in favor of contentEditable input
 const { Text } = Typography
 
 // sessionStorage key 前缀
@@ -44,6 +45,77 @@ function readPersistedSelectedChatSessionId(): string | null {
   } catch {
     return null
   }
+}
+
+function renderContentWithFileTags(content: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = []
+  const regex = /<file>(.*?)<\/file>/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(<span key={`t-${match.index}`}>{content.slice(lastIndex, match.index)}</span>)
+    }
+    nodes.push(
+      <Tag key={`f-${match.index}`} color="blue" className="message-file-tag" style={{ marginRight: 4 }}>
+        {match[1]}
+      </Tag>
+    )
+    lastIndex = regex.lastIndex
+  }
+  if (lastIndex < content.length) {
+    nodes.push(<span key="t-end">{content.slice(lastIndex)}</span>)
+  }
+  return nodes
+}
+
+function escapeHtml(str: string) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function inputToHTML(text: string) {
+  let html = ''
+  const regex = /<file>(.*?)<\/file>/g
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = regex.exec(text)) !== null) {
+    html += escapeHtml(text.slice(last, m.index)).replace(/\n/g, '<br>')
+    const path = escapeHtml(m[1])
+    html += `<span contenteditable="false" class="chat-input-chip" data-path="${path}">${path}<span class="chat-input-chip-close">×</span></span>`
+    last = m.index + m[0].length
+  }
+  html += escapeHtml(text.slice(last)).replace(/\n/g, '<br>')
+  return html
+}
+
+function editableToInput(el: HTMLDivElement) {
+  const clone = el.cloneNode(true) as HTMLDivElement
+  clone.querySelectorAll('.chat-input-chip').forEach(chip => {
+    const path = chip.getAttribute('data-path') || chip.textContent?.replace('×', '').trim() || ''
+    chip.replaceWith(document.createTextNode(`<file>${path}</file>`))
+  })
+  let text = ''
+  const walk = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      text += node.textContent || ''
+    } else if (node.nodeType === Node.ELEMENT_NODE) {
+      const tag = (node as HTMLElement).tagName
+      if (tag === 'BR') {
+        text += '\n'
+      } else {
+        node.childNodes.forEach(walk)
+        if (tag === 'DIV' || tag === 'P') {
+          text += '\n'
+        }
+      }
+    }
+  }
+  clone.childNodes.forEach(walk)
+  return text.replace(/\n+$/, '')
 }
 
 // 流式状态存储键
@@ -155,6 +227,18 @@ function ChatPage() {
   const pendingUserMessageRef = useRef<string>('')
   const [pendingImages, setPendingImages] = useState<string[]>([])
   const [imageSendStatus, setImageSendStatus] = useState<Record<number, 'sending' | 'sent' | 'error'>>({})
+  const inputRef = useRef<HTMLDivElement>(null)
+  const savedRangeRef = useRef<Range | null>(null)
+  const pendingFiles = useMemo(() => {
+    const files: string[] = []
+    const regex = /<file>(.*?)<\/file>/g
+    let m: RegExpExecArray | null
+    while ((m = regex.exec(input)) !== null) {
+      files.push(m[1])
+    }
+    return files
+  }, [input])
+  const [filePickerVisible, setFilePickerVisible] = useState(false)
   const [sessionTokenUsage, setSessionTokenUsage] = useState<TokenUsage>({
     promptTokens: 0,
     completionTokens: 0,
@@ -204,6 +288,9 @@ function ChatPage() {
   // 用于批量处理 tool_stream_chunk 的 debounce refs（按 sessionId 分组，16ms 批量 flush）
   const pendingChunksRef = useRef<Map<string, Array<{ toolId: string; chunk: string; isError: boolean; timestamp: number }>>>(new Map())
   const chunkFlushTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  // 用于批量处理 LLM text delta 的 debounce refs
+  const pendingTextDeltaRef = useRef('')
+  const textDeltaFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // 后台子 Agent 进度状态
   const [bgAgents, setBgAgents] = useState<Array<{
@@ -289,6 +376,29 @@ function ChatPage() {
     if (timer) { clearTimeout(timer); chunkFlushTimersRef.current.delete(sessionId) }
   }, [])
 
+  const flushTextDeltas = useCallback(() => {
+    const text = pendingTextDeltaRef.current
+    pendingTextDeltaRef.current = ''
+    textDeltaFlushTimerRef.current = null
+    if (!text) return
+    const sessionId = currentSessionIdRef.current
+    if (!sessionId) return
+    setMessages(prev => {
+      const tempAssistant = prev.find(m => m.id === 'temp-assistant')
+      if (tempAssistant) {
+        return prev.map(m => m.id === 'temp-assistant' ? { ...m, content: m.content + text } : m)
+      }
+      return [...prev, {
+        id: 'temp-assistant',
+        sessionId,
+        role: 'assistant',
+        content: text,
+        createdAt: new Date().toISOString(),
+        sequence: prev.length + 1,
+      }]
+    })
+  }, [])
+
   // WebSocket 消息处理：将 WsEvent 转换为 StreamEvent 并路由
   const handleWsMessage = useCallback((event: WsEvent) => {
     console.log('[handleWsMessage] received:', JSON.stringify(event))
@@ -334,13 +444,20 @@ function ChatPage() {
         setStreamingToolSteps([])
         setClaudeCodeProgress('')
 
-        // 直接用 assistantMessage 替换 temp 助手占位，保留 temp 用户消息（避免用户消息闪烁消失）
+        // 将真实 assistantMessage 数据合并到现有的 temp-assistant 中（避免 React key 变化导致整段内容重新挂载/闪烁）
         const assistantMsg = event.event.assistantMessage
         console.log('[handleWsMessage] setting messages, assistantMsg:', JSON.stringify(assistantMsg))
         setMessages(prev => {
-          // 只移除 temp- 开头的助手占位消息，保留用户的 temp 消息直到 loadMessages 取回真实数据
+          const idx = prev.findIndex(m => m.id === 'temp-assistant')
+          if (idx !== -1 && assistantMsg) {
+            const next = [...prev]
+            // 保留 temp-assistant 的 id 以避免 remount，但更新其余所有字段为真实消息数据
+            next[idx] = { ...assistantMsg, id: 'temp-assistant' }
+            streamingAssistantIdRef.current = assistantMsg.id
+            return next
+          }
+          // 兜底：没有 temp-assistant 时直接追加
           const withoutTempAssistant = prev.filter(m => !(m.id.startsWith('temp-') && m.role === 'assistant'))
-          // 添加真实 assistant 消息（来自 DB，有 sequence）
           if (assistantMsg) {
             streamingAssistantIdRef.current = assistantMsg.id
             return [...withoutTempAssistant, assistantMsg]
@@ -443,6 +560,10 @@ function ChatPage() {
     if (!sessionId) return
 
     if (evt.type === 'done') {
+      if (textDeltaFlushTimerRef.current) {
+        clearTimeout(textDeltaFlushTimerRef.current)
+        flushTextDeltas()
+      }
       bgSessionStatesRef.current.delete(sessionId)
       // Skip reload if handleWsMessage already added assistantMessage
       if (streamingAssistantIdRef.current) {
@@ -462,6 +583,17 @@ function ChatPage() {
     // 当前会话：更新 UI 状态
     if (evt.type === 'thinking') {
       setStreamingThinking(true)
+    } else if (evt.type === 'delta') {
+      pendingTextDeltaRef.current += (evt.text || '')
+      if (!textDeltaFlushTimerRef.current) {
+        textDeltaFlushTimerRef.current = setTimeout(() => flushTextDeltas(), 16)
+      }
+    } else if (evt.type === 'stream_end') {
+      if (textDeltaFlushTimerRef.current) {
+        clearTimeout(textDeltaFlushTimerRef.current)
+        flushTextDeltas()
+      }
+      setStreamingThinking(false)
     } else if (evt.type === 'tool_start' && evt.id && evt.name) {
       setStreamingThinking(false)
       if (evt.name === 'claude_code') {
@@ -1154,7 +1286,7 @@ function ChatPage() {
 
   const handleSend = useCallback(async () => {
     if (!currentSession) return
-    if (!input.trim() && !pendingImages.length) return
+    if (!input.trim() && !pendingImages.length && !pendingFiles.length) return
     // 若当前会话已在流式中则转为停止操作
     if (streamingSessionIds.has(currentSession.id)) {
       handleStop()
@@ -1186,6 +1318,10 @@ function ChatPage() {
     const userMessage = input.trim()
     const imagesToSend = [...pendingImages]
     setInput('')
+    if (inputRef.current) {
+      inputRef.current.innerHTML = ''
+    }
+    savedRangeRef.current = null
     setPendingImages([])
     setImageSendStatus({})
     setLoading(true)
@@ -1201,20 +1337,26 @@ function ChatPage() {
     abortControllerRef.current = controller
 
     streamingAssistantIdRef.current = null  // Reset before new stream
+    // 实际发送内容：输入框中已包含 <file>path</file>
+    const actualContent = userMessage
     // 跟踪待发送的用户消息，用于立即显示
-    pendingUserMessageRef.current = userMessage
+    pendingUserMessageRef.current = actualContent
     const tempUserMsg: Message = {
       id: `temp-${Date.now()}`,
       sessionId,
       role: 'user',
-      content: userMessage,
+      content: actualContent,
       createdAt: new Date().toISOString(),
       sequence: messages.length + 1,
       images: imagesToSend.length > 0 ? imagesToSend : undefined,
     }
     // 记录发送前条数：用于 loadMessages 判断服务端是否已落库「用户+助手」以补收漏掉的 done
     streamBaselineBySessionRef.current.set(sessionId, messages.length)
-    setMessages(prev => [...prev, tempUserMsg])
+    setMessages(prev => {
+      // 清理上一轮可能残留的 temp-assistant（避免新一轮流式追加到旧消息上）
+      const cleaned = prev.filter(m => m.id !== 'temp-assistant')
+      return [...cleaned, tempUserMsg]
+    })
 
     if (imagesToSend.length > 0) {
       const status: Record<number, 'sending' | 'sent' | 'error'> = {}
@@ -1259,12 +1401,165 @@ function ChatPage() {
     // 通过 WebSocket 发送消息
     sendFn({
       type: 'message',
-      content: userMessage,
+      content: actualContent,
       media: imagesToSend.length > 0 ? imagesToSend : undefined,
       toolMode,
       selectedMcpServers: toolMode === 'specified' ? selectedMcpServers : undefined,
     })
   }, [input, currentSession, pendingImages, t, toolMode, selectedMcpServers, tasks, messages, streamingSessionIds])
+
+  const handleFileInsert = useCallback((path: string) => {
+    if (!inputRef.current) {
+      const tag = `<file>${path}</file>`
+      setInput(prev => (prev ? `${prev} ${tag}` : tag))
+      setFilePickerVisible(false)
+      return
+    }
+    const el = inputRef.current
+    el.focus()
+    const sel = window.getSelection()
+    let range: Range | null = null
+    if (sel && sel.rangeCount > 0) {
+      const r = sel.getRangeAt(0)
+      if (el.contains(r.commonAncestorContainer)) {
+        range = r
+      }
+    }
+    if (!range && savedRangeRef.current) {
+      const saved = savedRangeRef.current
+      if (el.contains(saved.commonAncestorContainer)) {
+        range = saved
+      }
+    }
+    if (!range) {
+      range = document.createRange()
+      range.setStart(el, 0)
+      range.setEnd(el, 0)
+      const chipHtml = `<span contenteditable="false" class="chat-input-chip" data-path="${escapeHtml(path)}">${escapeHtml(path)}<span class="chat-input-chip-close">×</span></span>`
+      const fragment = range.createContextualFragment(chipHtml)
+      range.insertNode(fragment)
+      range.collapse(false)
+      const postText = el.textContent || ''
+      const postSpacer = postText && !postText.startsWith(' ') && !postText.startsWith('\n') ? ' ' : ''
+      if (postSpacer) {
+        range.insertNode(document.createTextNode(postSpacer))
+        range.collapse(false)
+      }
+      sel?.removeAllRanges()
+      sel?.addRange(range)
+    } else {
+      range.deleteContents()
+      const preRange = range.cloneRange()
+      preRange.setStart(el, 0)
+      preRange.setEnd(range.startContainer, range.startOffset)
+      const preText = preRange.toString()
+      const postRange = range.cloneRange()
+      postRange.setStart(range.endContainer, range.endOffset)
+      postRange.setEnd(el, el.childNodes.length)
+      const postText = postRange.toString()
+      const spacer = preText && !preText.endsWith(' ') && !preText.endsWith('\n') ? ' ' : ''
+      const postSpacer = postText && !postText.startsWith(' ') && !postText.startsWith('\n') ? ' ' : ''
+      if (spacer) {
+        range.insertNode(document.createTextNode(spacer))
+        range.collapse(false)
+      }
+      const chipHtml = `<span contenteditable="false" class="chat-input-chip" data-path="${escapeHtml(path)}">${escapeHtml(path)}<span class="chat-input-chip-close">×</span></span>`
+      const fragment = range.createContextualFragment(chipHtml)
+      range.insertNode(fragment)
+      range.collapse(false)
+      if (postSpacer) {
+        range.insertNode(document.createTextNode(postSpacer))
+        range.collapse(false)
+      }
+      sel!.removeAllRanges()
+      sel!.addRange(range)
+    }
+    setInput(editableToInput(el))
+    setFilePickerVisible(false)
+  }, [])
+
+  const handleEditableInput = () => {
+    if (!inputRef.current) return
+    setInput(editableToInput(inputRef.current))
+  }
+
+  const handleEditablePaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    const text = e.clipboardData.getData('text/plain')
+    if (!text) return
+    document.execCommand('insertText', false, text)
+  }
+
+  const handleEditableKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+      return
+    }
+    if (!inputRef.current) return
+    const sel = window.getSelection()
+    if (!sel || sel.rangeCount === 0) return
+    const range = sel.getRangeAt(0)
+
+    const isAtChipBoundary = (dir: 'before' | 'after') => {
+      if (!range.collapsed) return false
+      if (dir === 'before') {
+        if (range.startOffset !== 0) return false
+        const prev = range.startContainer.previousSibling
+        return prev && (prev as HTMLElement).classList?.contains('chat-input-chip')
+      } else {
+        const len = range.startContainer.textContent?.length || 0
+        if (range.startOffset !== len) return false
+        const next = range.startContainer.nextSibling
+        return next && (next as HTMLElement).classList?.contains('chat-input-chip')
+      }
+    }
+
+    if (e.key === 'Backspace' && isAtChipBoundary('before')) {
+      e.preventDefault()
+      range.startContainer.previousSibling!.remove()
+      handleEditableInput()
+      return
+    }
+    if (e.key === 'Delete' && isAtChipBoundary('after')) {
+      e.preventDefault()
+      range.startContainer.nextSibling!.remove()
+      handleEditableInput()
+      return
+    }
+  }
+
+  const handleEditableClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement
+    if (target.closest('.chat-input-chip-close')) {
+      const chip = target.closest('.chat-input-chip') as HTMLElement | null
+      if (chip && inputRef.current) {
+        chip.remove()
+        handleEditableInput()
+      }
+    }
+  }
+
+  const handleEditableBlur = () => {
+    const sel = window.getSelection()
+    if (sel && sel.rangeCount > 0 && inputRef.current) {
+      const r = sel.getRangeAt(0)
+      if (inputRef.current.contains(r.commonAncestorContainer)) {
+        savedRangeRef.current = r.cloneRange()
+      }
+    }
+  }
+
+  // 当 input 从外部变更（发送清空、删除 tag 等）时同步到 DOM
+  useEffect(() => {
+    if (!inputRef.current) return
+    // 若输入框正被聚焦，说明用户在主动输入，避免重写 innerHTML 导致光标跳动/IME 中断
+    if (document.activeElement === inputRef.current) return
+    const current = editableToInput(inputRef.current)
+    if (current !== input) {
+      inputRef.current.innerHTML = inputToHTML(input)
+    }
+  }, [input])
 
   const handleImageSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || [])
@@ -1283,14 +1578,8 @@ function ChatPage() {
     e.target.value = ''
   }, [pendingImages.length])
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
-    }
-  }
-
   return (
+    <>
     <Layout className="chat-page">
       <Sider width={280} theme="light" className="chat-sider">
         <div className="sider-header">
@@ -1448,7 +1737,7 @@ function ChatPage() {
                                 </Image.PreviewGroup>
                               </div>
                             )}
-                            <Text>{message.content}</Text>
+                            <div className="message-user-content">{renderContentWithFileTags(message.content)}</div>
                           </>
                         )}
                       </div>
@@ -1661,21 +1950,27 @@ function ChatPage() {
                 className="image-upload-button"
               />
             </Tooltip>
-            <TextArea
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={t('chat.inputPlaceholder')}
-              autoSize={{ minRows: 1, maxRows: 4 }}
-              disabled={!currentSession || loading}
-              className="chat-input"
-            />
+            <div className="chat-input-wrapper">
+              <div
+                ref={inputRef}
+                className="chat-input chat-input-editable"
+                contentEditable={!currentSession || loading ? false : true}
+                onInput={handleEditableInput}
+                onKeyDown={handleEditableKeyDown}
+                onPaste={handleEditablePaste}
+                onClick={handleEditableClick}
+                onBlur={handleEditableBlur}
+                data-placeholder={t('chat.inputPlaceholder')}
+                aria-placeholder={t('chat.inputPlaceholder')}
+                suppressContentEditableWarning
+              />
+            </div>
             <Button
               type="primary"
               icon={(loading || runningBgAgentsCount > 0) ? <StopOutlined /> : <SendOutlined />}
               onClick={(loading || runningBgAgentsCount > 0) ? handleStop : handleSend}
               danger={loading || runningBgAgentsCount > 0}
-              disabled={(!currentSession || (!input.trim() && pendingImages.length === 0)) && !loading && runningBgAgentsCount === 0}
+              disabled={(!currentSession || (!input.trim() && pendingImages.length === 0 && pendingFiles.length === 0)) && !loading && runningBgAgentsCount === 0}
               className="send-button"
             >
               {(loading || runningBgAgentsCount > 0) ? t('chat.stop') : t('chat.send')}
@@ -1743,7 +2038,17 @@ function ChatPage() {
                 />
               </Tooltip>
             </Popover>
-            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+            <Tooltip title={t('chat.filePicker')}>
+              <Button
+                type="text"
+                icon={<FolderOpenOutlined />}
+                onClick={() => setFilePickerVisible(true)}
+                disabled={!currentSession || loading}
+                className="file-picker-button"
+                style={{ fontSize: 16, marginLeft: 4 }}
+              />
+            </Tooltip>
+            <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap', marginLeft: 'auto' }}>
               {t('chat.tokenUsageInline', {
                 input: formatTokenNumber(sessionTokenUsage.promptTokens),
                 output: formatTokenNumber(sessionTokenUsage.completionTokens),
@@ -1754,6 +2059,13 @@ function ChatPage() {
         </div>
       </Layout>
     </Layout>
+
+    <WorkspaceFilePickerModal
+      open={filePickerVisible}
+      onClose={() => setFilePickerVisible(false)}
+      onInsert={handleFileInsert}
+    />
+    </>
   )
 }
 

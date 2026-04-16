@@ -236,7 +236,7 @@ SYSTEM_PROVIDERS = [
         "id": "moonshot",
         "display_name": "Moonshot AI",
         "provider_type": "openai",
-        "api_base": "https://api.moonshot.cn",
+        "api_base": "https://api.moonshot.ai/v1",
         "default_model": "moonshot-v1-auto",
         "models": [
             {"id": "moonshot-v1-auto", "name": "moonshot-v1-auto", "model_type": "chat", "context_window": 32768, "supports_function_calling": True, "supports_vision": False, "max_tokens": 4096},

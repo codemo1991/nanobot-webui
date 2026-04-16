@@ -20,6 +20,8 @@ class FakeProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        api_base: str | None = None,
+        stream_callback: Any | None = None,
     ) -> LLMResponse:
         self.calls.append(messages)
         last = messages[-1]["content"]
@@ -45,9 +47,9 @@ async def test_process_direct_respects_session_key(monkeypatch, tmp_path: Path) 
     second = await loop.process_direct("second", session_key="cli:alpha")
     third = await loop.process_direct("third", session_key="cli:beta")
 
-    assert first == "echo:first"
-    assert second == "echo:second"
-    assert third == "echo:third"
+    assert first.content == "echo:first"
+    assert second.content == "echo:second"
+    assert third.content == "echo:third"
 
     second_call = provider.calls[1]
     assert any(msg["role"] == "user" and msg["content"] == "first" for msg in second_call)

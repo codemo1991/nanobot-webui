@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import mimetypes
 import threading
@@ -262,10 +263,16 @@ class SubagentManager:
         media: list[str],
         origin_channel: str = "web",
         origin_chat_id: str = "direct",
+        model: str | None = None,
+        timeout: float = 120.0,
     ) -> str | None:
         """
         同步运行 vision 子 agent 进行图片分析，使用子 agent 配置（模板 model、backend、system_prompt）。
         供主 loop 在需要图片分析时调用，避免 inline recognition 固定单一解读方式。
+
+        Args:
+            model: 可选，外部指定的模型 ID（优先级最高）。
+            timeout: 主线程等待结果的最大秒数。
 
         Returns:
             图片分析结果文本，失败时返回 None。
@@ -276,13 +283,15 @@ class SubagentManager:
         origin_key = f"{origin_channel}:{origin_chat_id}"
         task_id = f"vision-inline-{uuid.uuid4().hex[:8]}"
 
-        # 使用 vision 模板的 model，或 subagent 默认 model
-        effective_model = self.model
-        if self._agent_template_manager:
+        # 优先级：外部指定 model > vision 模板 model > subagent 默认 model
+        effective_model = model or self.model
+        if not model and self._agent_template_manager:
             tm = self._agent_template_manager.get_model_for_template("vision")
             if tm:
                 effective_model = tm
                 logger.info(f"[run_vision_analysis] Using vision template model: {effective_model}")
+        if model:
+            logger.info(f"[run_vision_analysis] Using explicit vision model: {effective_model}")
 
         backend = self._backend_resolver.resolve("vision", "native", media=media, model=effective_model)
         # 若 backend 为 native 但 model 非视觉模型，尝试用 dashscope_vision 兜底（需有 API key）
@@ -304,24 +313,59 @@ class SubagentManager:
                     logger.info("[run_vision_analysis] Original model doesn't support vision, fallback to dashscope_vision (qwen-vl-plus)")
         logger.info(f"[run_vision_analysis] task_id={task_id}, backend={backend}, model={effective_model}")
 
-        runner = self._backend_registry.get(backend)
-        if runner and backend != "native":
-            await runner(
-                task_id, task, task[:50], origin,
-                template="vision", batch_id=None, subagent_manager=self,
-                media=media, model=effective_model,
-            )
-        else:
-            await self._run_subagent(
-                task_id, task, task[:50], origin,
-                template="vision", media=media, backend="native",
-            )
+        # 在独立线程中运行，避免被主请求取消/超时所中断
+        loop = asyncio.get_running_loop()
+        future: concurrent.futures.Future[str | None] = concurrent.futures.Future()
+        self._running_tasks[task_id] = (origin_key, None)
 
-        if self.sessions:
-            session = self.sessions.get_or_create(origin_key)
-            if task_id in session.subagent_results:
-                return session.subagent_results[task_id].get("result")
-        return None
+        def _run_in_thread():
+            sub_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(sub_loop)
+            try:
+                runner = self._backend_registry.get(backend)
+                if runner and backend != "native":
+                    sub_loop.run_until_complete(
+                        runner(
+                            task_id, task, task[:50], origin,
+                            template="vision", batch_id=None, subagent_manager=self,
+                            media=media, model=effective_model,
+                        )
+                    )
+                else:
+                    sub_loop.run_until_complete(
+                        self._run_subagent(
+                            task_id, task, task[:50], origin,
+                            template="vision", media=media, backend="native",
+                        )
+                    )
+                if self.sessions:
+                    session = self.sessions.get_or_create(origin_key)
+                    result = session.subagent_results.get(task_id, {}).get("result")
+                    future.set_result(result)
+                else:
+                    future.set_result(None)
+            except Exception as e:
+                logger.error(f"[run_vision_analysis] Thread failed: {e}")
+                future.set_exception(e)
+            finally:
+                self._running_tasks.pop(task_id, None)
+                sub_loop.close()
+
+        threading.Thread(target=_run_in_thread, daemon=True).start()
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future, loop=loop),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[run_vision_analysis] Timeout after {timeout}s")
+            self._running_tasks.pop(task_id, None)
+            return None
+        except asyncio.CancelledError:
+            logger.info(f"[run_vision_analysis] Cancelled by parent")
+            self._running_tasks.pop(task_id, None)
+            raise
 
     async def spawn(
         self,

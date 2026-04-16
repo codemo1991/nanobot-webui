@@ -59,6 +59,9 @@ def create_provider_instance(
     if provider_type_lower == "azure":
         return AzureProvider(api_key=api_key, api_base=api_base)
 
+    if provider_type_lower == "moonshot":
+        return OpenAIProvider(api_key=api_key, api_base=api_base)
+
     # Fallback: treat as OpenAI-compatible
     logger.warning(f"Unknown provider type '{provider_type}', falling back to OpenAIProvider")
     return OpenAIProvider(api_key=api_key, api_base=api_base)
@@ -93,6 +96,7 @@ class ProviderManager:
         anthropic: "LLMProvider | None" = None,
         deepseek: "LLMProvider | None" = None,
         azure: "LLMProvider | None" = None,
+        moonshot: "LLMProvider | None" = None,
     ) -> None:
         """Register all provider instances at once."""
         if openai:
@@ -103,6 +107,8 @@ class ProviderManager:
             self._providers["deepseek"] = deepseek
         if azure:
             self._providers["azure"] = azure
+        if moonshot:
+            self._providers["moonshot"] = moonshot
 
     def register_with_router(self, router: "ModelRouter") -> None:
         """Register all held provider instances with the ModelRouter."""
@@ -111,6 +117,7 @@ class ProviderManager:
             anthropic=self._providers.get("anthropic"),
             deepseek=self._providers.get("deepseek"),
             azure=self._providers.get("azure"),
+            moonshot=self._providers.get("moonshot"),
         )
         logger.info("ProviderManager: all providers registered with router")
 
@@ -198,7 +205,7 @@ class ProviderManager:
         With native providers, each provider holds its own api_key — just update
         the instances directly.
         """
-        for provider_id in ("anthropic", "openai", "deepseek"):
+        for provider_id in ("anthropic", "openai", "deepseek", "moonshot"):
             pc = getattr(config.providers, provider_id, None)
             if pc and getattr(pc, "api_key", None):
                 self.update_provider_config(

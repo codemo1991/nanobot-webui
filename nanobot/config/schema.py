@@ -141,6 +141,7 @@ class ProvidersConfig(BaseModel):
     ollama: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
     vllm: ProviderConfig = Field(default_factory=ProviderConfig)
+    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
 class MirrorConfig(BaseModel):
@@ -270,11 +271,12 @@ class Config(BaseSettings):
         ("vllm/", "vllm"): "vllm",
         ("ollama/", "ollama"): "ollama",
         ("minimax/", "minimax"): "minimax",
+        ("moonshot/", "kimi", "moonshot"): "moonshot",
     }
     
     _FALLBACK_PROVIDER_ORDER: list[str] = [
         "openrouter", "deepseek", "anthropic", "openai",
-        "gemini", "zhipu", "dashscope", "groq", "vllm", "ollama", "minimax"
+        "gemini", "zhipu", "dashscope", "groq", "vllm", "ollama", "minimax", "moonshot"
     ]
     
     _MODEL_API_BASE_MAP: dict[str, str | None] = {
@@ -289,6 +291,7 @@ class Config(BaseSettings):
         "vllm": None,
         "ollama": "http://localhost:11434/v1",  # Ollama 默认 OpenAI 兼容端点
         "minimax": "https://api.minimax.chat/v1",
+        "moonshot": "https://api.moonshot.ai/v1",
     }
 
     def _get_provider_for_model(self, model: str | None) -> str | None:

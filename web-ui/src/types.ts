@@ -72,6 +72,8 @@ export interface ChatResponse {
 export type StreamEvent =
   | { type: 'start'; session_id: string }
   | { type: 'thinking' }
+  | { type: 'delta'; text: string; stream_id?: string }
+  | { type: 'stream_end'; stream_id?: string }
   | { type: 'tool_start'; id: string; name: string; arguments: Record<string, unknown> }
   | { type: 'tool_progress'; tool_id: string; status: 'running' | 'waiting'; detail: string; progress_percent?: number }
   | { type: 'tool_stream_chunk'; tool_id: string; chunk: string; is_error?: boolean }
@@ -664,4 +666,11 @@ export interface Anomaly {
   severity: number
   suggestion: string
   span_count: number
+}
+
+export interface WorkspaceTreeEntry {
+  name: string
+  type: 'file' | 'dir'
+  absolute_path: string
+  has_children: boolean
 }

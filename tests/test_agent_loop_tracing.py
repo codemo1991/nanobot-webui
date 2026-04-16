@@ -11,7 +11,7 @@ class FakeProvider:
     def get_default_model(self) -> str:
         return "fake-model"
 
-    async def chat(self, messages, tools=None, model=None, max_tokens=4096, temperature=0.7):
+    async def chat(self, messages, tools=None, model=None, max_tokens=4096, temperature=0.7, api_base=None, stream_callback=None):
         return MagicMock(content="echo response", finish_reason="stop")
 
 

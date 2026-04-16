@@ -41,6 +41,7 @@ from nanobot.agent.tool_errors import (
     is_tool_call_result_mismatch_error,
 )
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.consolidator import Consolidator
 from nanobot.session.manager import SessionManager
 from nanobot.tracing import span, trace_context
 from nanobot.utils.helpers import parse_session_key, sanitize_args_for_log
@@ -356,6 +357,20 @@ class AgentLoop:
         # 如果传入了独立的 subagent_model，更新 SubagentManager 使用它
         if subagent_model:
             self.subagents.model = subagent_model
+
+        # 初始化 Consolidator（运行时 token-budget 归档）
+        consolidator_provider = self.provider
+        if consolidator_provider is None and self.router is not None:
+            try:
+                consolidator_provider = self.router.get(self.model).provider
+            except Exception:
+                pass
+        self._consolidator = Consolidator(
+            provider=consolidator_provider,
+            model=self.model,
+            context_window=getattr(self, "context_window_tokens", 65536),
+            max_completion=getattr(self, "max_tokens", 8192),
+        )
 
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None  # 由 run() 启动时赋值
@@ -1742,6 +1757,16 @@ class AgentLoop:
         self.subagent_model = subagent_model
         self.subagents.model = subagent_model if subagent_model else self.model
 
+    def _get_vision_model(self) -> str | None:
+        """Resolve the dedicated vision profile model, if configured."""
+        if not self.router:
+            return None
+        try:
+            handle = self.router.get("vision")
+            return handle.model
+        except Exception:
+            return None
+
     def _is_vision_model(self, model: str) -> bool:
         """Check if a model supports vision/images."""
         if not model:
@@ -1790,30 +1815,16 @@ class AgentLoop:
         return str(path).lower().endswith(('.mp3', '.wav', '.ogg', '.m4a', '.opus', '.webm', '.aac'))
 
     def _build_user_message_kwargs_from_media_paths(self, media: list[str] | None) -> dict[str, Any]:
-        """从本地媒体路径构建用户消息的附加字段（与 _process_message 落库逻辑一致，含图片 base64）。"""
+        """从本地媒体路径构建用户消息的附加字段，仅保存图片路径（不再存 base64，避免数据库膨胀）。"""
         out: dict[str, Any] = {}
         if not media:
             return out
-        import base64
 
         user_images: list[str] = []
         for media_path in media:
             if not self._is_image_file(media_path):
                 continue
-            try:
-                with open(media_path, "rb") as f:
-                    img_data = base64.b64encode(f.read()).decode("utf-8")
-                ext = Path(media_path).suffix.lower()
-                mime_type = "image/jpeg"
-                if ext in [".png"]:
-                    mime_type = "image/png"
-                elif ext in [".gif"]:
-                    mime_type = "image/gif"
-                elif ext in [".webp"]:
-                    mime_type = "image/webp"
-                user_images.append(f"data:{mime_type};base64,{img_data}")
-            except Exception as e:
-                logger.warning(f"Failed to read media file {media_path}: {e}")
+            user_images.append(media_path)
         if user_images:
             out["images"] = user_images
         return out
@@ -1912,7 +1923,7 @@ class AgentLoop:
                 f"[图片来源分析结果（来自 {vision_label}）]\n"
                 f"{vision_result}"
             )
-            session.add_message("user", inject_content)
+            session.add_message("user", inject_content, internal=True)
             self.sessions.save(session)
             logger.info("[VisionInject] Saved vision inject to session")
 
@@ -2453,11 +2464,19 @@ class AgentLoop:
         if image_files:
             logger.info(f"[Image] Found {len(image_files)} image file(s), will pass base64 to main agent first")
         
+        # 运行时归档：如果历史消息过长，先压缩旧消息
+        if self._consolidator:
+            try:
+                await self._consolidator.maybe_consolidate(session)
+            except Exception as e:
+                logger.warning(f"[Consolidator] Failed to consolidate: {e}")
+
         # Agent loop
         logger.info(f"[SkillReviewer] about to start agent loop, pending={self._pending_manual_review}")
         sk = msg.session_key
         iteration = 0
         final_content = None
+        last_reasoning_content: str | None = None
         exit_reason: str | None = None  # "time" | "iterations" | "loop" | None=normal
         tool_steps: list[dict[str, Any]] = []
         vision_fallback_done = False
@@ -2565,7 +2584,7 @@ class AgentLoop:
                     inject_content = "\n".join(parts)
                     messages.append({"role": "user", "content": inject_content})
                     # 同步到 session，确保后续 build_messages 能看到注入的内容
-                    session.add_message("user", inject_content)
+                    session.add_message("user", inject_content, internal=True)
                     self.sessions.save(session)
                     logger.info(f"[SubagentInject] Injected {len(to_inject)} subagent results into messages: {to_inject}")
 
@@ -2583,6 +2602,7 @@ class AgentLoop:
                         self._call_llm_with_failover(
                             messages=messages,
                             tools=selected_tools,
+                            stream_callback=lambda chunk: _emit({"type": "delta", "text": chunk}),
                         )
                     )
                     loop_start_llm = time.monotonic()
@@ -2617,6 +2637,7 @@ class AgentLoop:
                                 self._cancel_event.clear()
                             raise asyncio.CancelledError("Request cancelled by user")
                     response, _ = await llm_task
+                    _emit({"type": "stream_end"})
                 except asyncio.CancelledError:
                     raise
                 except asyncio.TimeoutError:
@@ -2696,8 +2717,9 @@ class AgentLoop:
                     for tc in tool_calls_deduped
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+                    messages, response.content, tool_call_dicts, reasoning_content=response.reasoning_content
                 )
+                last_reasoning_content = response.reasoning_content
 
                 # Execute tools and collect steps for UI display
                 loop_detected = False
@@ -2993,6 +3015,7 @@ class AgentLoop:
                 if loop_detected:
                     exit_reason = "loop"
                     _emit({"type": "turn_end", "iteration": iteration})
+                    final_content = "[检测到重复工具调用，已停止循环。请尝试更具体地描述您的需求。]"
                     break
 
                 # 有 tool calls 且未 break：本轮结束，继续下一轮
@@ -3019,6 +3042,7 @@ class AgentLoop:
                         img_desc = await self.subagents.run_vision_analysis(
                             task=task_text, media=image_files,
                             origin_channel=channel, origin_chat_id=chat_id,
+                            model=self._get_vision_model(),
                         )
                         if progress_cb:
                             try:
@@ -3038,6 +3062,7 @@ class AgentLoop:
 
                 # No tool calls, we're done
                 final_content = response.content
+                last_reasoning_content = response.reasoning_content
                 _emit({"type": "turn_end", "iteration": iteration})
                 break
 
@@ -3079,7 +3104,7 @@ class AgentLoop:
                         inject_content = "\n".join(parts)
                         messages.append({"role": "user", "content": inject_content})
                         # 关键：同步到 session，确保后续 LLM 调用的 build_messages 能看到注入的内容
-                        session.add_message("user", inject_content)
+                        session.add_message("user", inject_content, internal=True)
                         self.sessions.save(session)
                         logger.info(f"[BatchMode] Injected {len(to_inject)} subagent results before return")
                 except asyncio.TimeoutError:
@@ -3089,6 +3114,7 @@ class AgentLoop:
                 # 没有 vision 需要等待，直接返回（其他类型的 spawn 结果会通过 announce 机制处理）
                 logger.info(f"[BatchMode] Non-blocking mode: spawn {len(spawned_task_ids)} tasks, returning immediately")
                 final_content = response.content if response.content else f"任务已启动，正在后台处理中 (id: {spawned_task_ids[0]})..."
+                last_reasoning_content = response.reasoning_content
                 exit_reason = "spawn_nonblocking"
             # 如果有注入过结果，_injected_subagent_task_ids 非空，继续下面的综合流程（不覆盖 response.content）
 
@@ -3112,6 +3138,7 @@ class AgentLoop:
                         self._call_llm_with_failover(
                             messages=messages,
                             tools=None,
+                            stream_callback=lambda chunk: _emit({"type": "delta", "text": chunk}),
                         )
                     )
                     synth_start = time.monotonic()
@@ -3140,6 +3167,7 @@ class AgentLoop:
                             self._cancel_event.clear()
                             raise asyncio.CancelledError("Request cancelled by user")
                     synth, _ = await synth_task
+                    _emit({"type": "stream_end"})
                     _accumulate_usage(synth.usage)
                     # 记录 LLM 调用指标
                     if self._status_service and synth.usage:
@@ -3210,6 +3238,7 @@ class AgentLoop:
             final_content,
             tool_steps=tool_steps,
             token_usage=usage_acc.copy(),
+            reasoning_content=last_reasoning_content,
         )
         self.sessions.save(session)
         self.sessions.increment_token_usage(
@@ -3244,6 +3273,7 @@ class AgentLoop:
                 img_desc = await self.subagents.run_vision_analysis(
                     task=msg.content.strip() or "请详细分析这些图片的内容。",
                     media=image_files, origin_channel=channel, origin_chat_id=chat_id,
+                    model=self._get_vision_model(),
                 )
                 if img_desc and img_desc.strip():
                     final_content = f"{final_content or ''}\n\n---\n\n[Vision 子 Agent 分析结果]\n{img_desc.strip()}"
@@ -3336,6 +3366,7 @@ class AgentLoop:
         # Agent loop (limited for announce handling)
         iteration = 0
         final_content = None
+        last_reasoning_content: str | None = None
         tool_steps: list[dict[str, Any]] = []
         usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         loop_start = time.monotonic()
@@ -3395,6 +3426,7 @@ class AgentLoop:
                     self._call_llm_with_failover(
                         messages=messages,
                         tools=selected_tools,
+                        stream_callback=lambda chunk: _emit({"type": "delta", "text": chunk}),
                     )
                 )
                 loop_start_llm = time.monotonic()
@@ -3425,6 +3457,7 @@ class AgentLoop:
                         self._cancelled_sessions.discard(session_key)
                         raise asyncio.CancelledError("Request cancelled by user")
                 response, _ = await llm_task
+                _emit({"type": "stream_end"})
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
@@ -3459,8 +3492,9 @@ class AgentLoop:
                     for tc in tool_calls_deduped
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+                    messages, response.content, tool_call_dicts, reasoning_content=response.reasoning_content
                 )
+                last_reasoning_content = response.reasoning_content
 
                 for tool_call in tool_calls_deduped:
                     call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
@@ -3489,9 +3523,13 @@ class AgentLoop:
                         "result": _truncate(result),
                     })
                 if loop_detected:
+                    exit_reason = "loop"
+                    _emit({"type": "turn_end", "iteration": iteration})
+                    final_content = "[检测到重复工具调用，已停止循环。请尝试更具体地描述您的需求。]"
                     break
             else:
                 final_content = response.content
+                last_reasoning_content = response.reasoning_content
                 break
 
         if final_content is None:
@@ -3500,7 +3538,9 @@ class AgentLoop:
                 synth, _ = await self._call_llm_with_failover(
                     messages=messages,
                     tools=None,
+                    stream_callback=lambda chunk: _emit({"type": "delta", "text": chunk}),
                 )
+                _emit({"type": "stream_end"})
                 _accumulate_usage(synth.usage)
                 # 记录 LLM 调用指标
                 if self._status_service and synth.usage:
@@ -3533,6 +3573,7 @@ class AgentLoop:
             final_content,
             tool_steps=tool_steps,
             token_usage=usage_acc.copy(),
+            reasoning_content=last_reasoning_content,
         )
         self.sessions.save(session)
         self.sessions.increment_token_usage(
@@ -3786,6 +3827,7 @@ class AgentLoop:
             media=media,
             origin_channel=channel,
             origin_chat_id=chat_id,
+            model=self._get_vision_model(),
         )
         if desc:
             if session:
@@ -3820,6 +3862,7 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         max_attempts_per_model: int = 2,
+        stream_callback: Any | None = None,
     ) -> tuple[Any, str]:
         """调用 LLM 并支持模型故障转移。返回 (response, used_model)。"""
         from nanobot.providers.base import LLMResponse
@@ -3867,6 +3910,7 @@ class AgentLoop:
                                 tools=tools,
                                 model=native_model,
                                 api_base=_api_base,
+                                stream_callback=stream_callback,
                             )
                             break
                         except Exception as inner_e:
@@ -3891,26 +3935,53 @@ class AgentLoop:
                 except Exception as e:
                     last_error = e
 
-                    if is_retryable_error(e):
-                        error_type = type(e).__name__
+                    # 带图失败时，尝试去掉图片后重试一次
+                    from nanobot.providers.base import LLMProvider
+                    stripped = LLMProvider._strip_image_content(messages)
+                    if stripped is not None:
+                        logger.warning(
+                            f"[ModelFailover] 模型 {model_id} 失败 ({type(e).__name__})，"
+                            "尝试去掉图片后重试..."
+                        )
+                        try:
+                            response = await provider_instance.chat(
+                                messages=stripped,
+                                tools=tools,
+                                model=native_model,
+                                api_base=_api_base,
+                                stream_callback=stream_callback,
+                            )
+                            response = coerce_llm_response_dsml_tool_calls(response)
+                            if idx > 0:
+                                logger.info(f"[ModelFailover] 故障转移成功: {models_to_try[0]} -> {model_id}")
+                            return response, native_model
+                        except Exception as retry_e:
+                            last_error = retry_e
+                            logger.warning(
+                                f"[ModelFailover] 去图重试仍失败 ({type(retry_e).__name__}): "
+                                f"{str(retry_e)[:100]}"
+                            )
+
+                    if is_retryable_error(last_error):
+                        error_type = type(last_error).__name__
                         logger.warning(
                             f"[ModelFailover] 模型 {model_id} 失败 ({error_type}): "
-                            f"{str(e)[:100]}"
+                            f"{str(last_error)[:100]}"
                         )
                         if idx == len(models_to_try) - 1 and attempt == max_attempts_per_model - 1:
                             # 所有模型都失败，返回错误响应
-                            error_msg = f"所有模型均不可用。尝试的模型: {', '.join(models_to_try)}。错误: {str(e)[:200]}"
+                            error_msg = f"所有模型均不可用。尝试的模型: {', '.join(models_to_try)}。错误: {str(last_error)[:200]}"
                             logger.error(f"[ModelFailover] {error_msg}")
                             return LLMResponse(
-                                content=f"模型服务暂时不可用，请检查配置或稍后重试。详情: {str(e)[:150]}",
+                                content=f"模型服务暂时不可用，请检查配置或稍后重试。详情: {str(last_error)[:150]}",
                                 finish_reason="error",
                             ), native_model or model_id
                         break
                     else:
                         # 不可恢复的错误，记录并尝试下一个模型
-                        error_type = type(e).__name__
-                        logger.warning(f"[ModelFailover] 模型 {model_id} 不可恢复错误 ({error_type}): {str(e)[:100]}")
-                        error_messages.append(f"{model_id}: {e}")
+                        error_type = type(last_error).__name__
+                        logger.warning(f"[ModelFailover] 模型 {model_id} 不可恢复错误 ({error_type}): {str(last_error)[:100]}")
+                        error_messages.append(f"{model_id}: {last_error}")
                         break
 
         # 所有模型都无法使用，返回错误响应

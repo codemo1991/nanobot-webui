@@ -155,6 +155,7 @@ class MirrorService:
                 **({"toolSteps": m["tool_steps"]} if m.get("tool_steps") else {}),
             }
             for m in messages
+            if not m.get("internal")
         ]
 
     def seal_session(

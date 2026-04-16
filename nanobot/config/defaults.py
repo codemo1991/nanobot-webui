@@ -33,6 +33,13 @@ DEFAULT_PROFILES = [
         "model_chain": "claude-haiku-4-5,gpt-4o-mini",
         "enabled": True,
     },
+    {
+        "id": "vision",
+        "name": "视觉分析",
+        "description": "图像识别与理解，适合图片分析和视觉问答",
+        "model_chain": "gpt-4o,claude-sonnet-4-6,gemini-2.5-pro",
+        "enabled": True,
+    },
 ]
 
 

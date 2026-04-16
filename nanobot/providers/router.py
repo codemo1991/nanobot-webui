@@ -63,6 +63,7 @@ class ModelRouter:
         anthropic: "LLMProvider | None" = None,
         deepseek: "LLMProvider | None" = None,
         azure: "LLMProvider | None" = None,
+        moonshot: "LLMProvider | None" = None,
     ) -> None:
         """Register native provider instances for routing."""
         if openai:
@@ -73,6 +74,8 @@ class ModelRouter:
             self._providers["deepseek"] = deepseek
         if azure:
             self._providers["azure"] = azure
+        if moonshot:
+            self._providers["moonshot"] = moonshot
         self.clear_cache()
         logger.debug("ModelRouter: providers registered")
 
@@ -82,9 +85,10 @@ class ModelRouter:
         anthropic: "LLMProvider | None" = None,
         deepseek: "LLMProvider | None" = None,
         azure: "LLMProvider | None" = None,
+        moonshot: "LLMProvider | None" = None,
     ) -> None:
         """Register all native provider instances. Convenience alias for register_providers."""
-        self.register_providers(openai=openai, anthropic=anthropic, deepseek=deepseek, azure=azure)
+        self.register_providers(openai=openai, anthropic=anthropic, deepseek=deepseek, azure=azure, moonshot=moonshot)
 
     def update_from_config(self, config: Any) -> None:
         """
@@ -94,7 +98,7 @@ class ModelRouter:
         With native providers, credentials are already set on instances at startup.
         This method just updates them from the config object.
         """
-        for provider_id in ("anthropic", "openai", "deepseek"):
+        for provider_id in ("anthropic", "openai", "deepseek", "moonshot"):
             pc = getattr(config.providers, provider_id, None)
             if pc and getattr(pc, "api_key", None):
                 provider = self._providers.get(provider_id)

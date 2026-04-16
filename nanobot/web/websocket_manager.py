@@ -50,6 +50,21 @@ class WebSocketManager:
             self.unregister(key, ws)
             return False
 
+    async def send_delta(
+        self,
+        key: str,
+        delta: str,
+        stream_end: bool = False,
+        stream_id: str | None = None,
+    ) -> bool:
+        """Send incremental delta to a WebSocket connection."""
+        event: dict[str, Any] = {"type": "delta", "text": delta}
+        if stream_end:
+            event = {"type": "stream_end"}
+        if stream_id is not None:
+            event["stream_id"] = stream_id
+        return await self.send(key, {"type": "event", "event": event})
+
     def is_connected(self, key: str) -> bool:
         """检查是否有活跃连接"""
         return key in self._connections

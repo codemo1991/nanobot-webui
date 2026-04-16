@@ -36,6 +36,13 @@ def is_minimax_openai_base(api_base: str | None) -> bool:
     return "minimax.chat" in b or "minimax.io" in b
 
 
+def is_kimi_code_base(api_base: str | None) -> bool:
+    if not api_base:
+        return False
+    b = api_base.lower()
+    return "api.kimi.com" in b or "kimi.com/coding" in b
+
+
 def probe_openai_compatible_connection(
     api_base: str,
     api_key: str,
@@ -58,6 +65,8 @@ def probe_openai_compatible_connection(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    if is_kimi_code_base(base):
+        headers["User-Agent"] = "RooCode/3.0.0"
 
     try:
         with httpx.Client(timeout=timeout) as client:
@@ -65,17 +74,18 @@ def probe_openai_compatible_connection(
             if r.status_code == 200:
                 return {"ok": True, "status": 200, "detail": "连接成功"}
 
-            if r.status_code != 404 or not is_minimax_openai_base(base):
+            if r.status_code != 404 or not (is_minimax_openai_base(base) or is_kimi_code_base(base)):
                 return {
                     "ok": False,
                     "status": r.status_code,
                     "detail": (r.text or "")[:500] or f"HTTP {r.status_code}",
                 }
 
-            # MiniMax：部分环境无模型列表接口，用对话接口验证
+            # MiniMax / Kimi Code：部分环境无模型列表接口，用对话接口验证
             chat_url = base + "/chat/completions"
             last_err = ""
-            for model in MINIMAX_PROBE_MODELS:
+            probe_models = MINIMAX_PROBE_MODELS if is_minimax_openai_base(base) else ["kimi-k2.5", "kimi-for-coding", "moonshot-v1-auto"]
+            for model in probe_models:
                 body = {
                     "model": model,
                     "messages": [{"role": "user", "content": "."}],

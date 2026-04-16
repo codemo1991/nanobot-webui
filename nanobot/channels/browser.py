@@ -1,8 +1,12 @@
 """Browser/WebUI channel using WebSocket."""
 
 import asyncio
+import base64
 import functools
+import mimetypes
 import queue
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -76,6 +80,44 @@ class BrowserChannel(BaseChannel):
         key = f"browser:{msg.chat_id}"
         await self.ws_manager.send(key, {"type": "message", "content": msg.content})
 
+    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+        """Send incremental text delta to client."""
+        key = f"browser:{chat_id}"
+        meta = metadata or {}
+        stream_end = meta.get("_stream_end", False)
+        stream_id = meta.get("_stream_id")
+        await self.ws_manager.send_delta(key, delta, stream_end=stream_end, stream_id=stream_id)
+
+    def _save_base64_media(self, media: list[str] | None) -> list[str]:
+        """将 base64 data URL 保存到 workspace/.nanobot/media，返回本地文件路径列表。"""
+        if not media:
+            return []
+        workspace = getattr(self.agent, "workspace", None)
+        if workspace:
+            media_dir = Path(workspace).expanduser().resolve() / ".nanobot" / "media"
+        else:
+            media_dir = Path.home() / ".nanobot" / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+
+        paths: list[str] = []
+        for item in media:
+            if not item.startswith("data:"):
+                paths.append(item)
+                continue
+            try:
+                header, b64data = item.split(",", 1)
+                mime = header.split(";")[0].split(":")[1]
+                ext = mimetypes.guess_extension(mime) or ".jpg"
+                if ext == ".jpe":
+                    ext = ".jpg"
+                tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False, dir=media_dir)
+                tmp.write(base64.b64decode(b64data))
+                tmp.close()
+                paths.append(tmp.name)
+            except Exception as e:
+                logger.warning(f"[Browser] Failed to save base64 media: {e}")
+        return paths
+
     async def _handle_connection(self, websocket: WebSocket, session_id: str):
         """Handle individual WebSocket connection."""
         await websocket.accept()
@@ -85,10 +127,25 @@ class BrowserChannel(BaseChannel):
 
         # Per-connection event queue
         evt_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+        # Dedicated queue for high-frequency delta events
+        delta_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
 
         def on_progress(evt: dict) -> None:
             """Progress callback, writes synchronously to queue (consistent with SSE)."""
             logger.debug(f"[Browser] on_progress fired: type={evt.get('type')}, qsize_before={evt_queue.qsize()}")
+            # 高频 delta 事件进入专用队列，避免 create_task 风暴和 evt_queue 瓶颈
+            if evt.get("type") == "delta":
+                try:
+                    delta_queue.put_nowait({"type": "delta", "text": evt.get("text", "")})
+                except asyncio.QueueFull:
+                    logger.warning(f"[Browser] Delta queue full, dropping delta")
+                return
+            if evt.get("type") == "stream_end":
+                try:
+                    delta_queue.put_nowait({"type": "stream_end"})
+                except asyncio.QueueFull:
+                    pass
+                return
             try:
                 evt_queue.put_nowait(evt)
                 logger.debug(f"[Browser] on_progress queued OK, qsize_now={evt_queue.qsize()}")
@@ -106,6 +163,25 @@ class BrowserChannel(BaseChannel):
             except (WebSocketDisconnect, RuntimeError) as e:
                 logger.warning(f"[Browser] safe_send FAILED: {e}")
                 return False
+
+        async def drain_deltas():
+            """Background task: drain delta queue -> push WebSocket."""
+            logger.debug(f"[Browser] drain_deltas task started for session={session_id}")
+            while True:
+                try:
+                    evt = await delta_queue.get()
+                    if evt["type"] == "stream_end":
+                        if not await self.send_delta(session_id, "", stream_end=True):
+                            break
+                    else:
+                        if not await self.send_delta(session_id, evt.get("text", "")):
+                            break
+                except asyncio.CancelledError:
+                    logger.info(f"[Browser] drain_deltas: cancelled")
+                    break
+                except Exception as e:
+                    logger.warning(f"[Browser] drain_deltas error: {e}")
+                    break
 
         async def drain_events():
             """Background task: drain queue -> push WebSocket."""
@@ -159,6 +235,7 @@ class BrowserChannel(BaseChannel):
 
         drain_subagent_task = asyncio.create_task(drain_subagent_events())
         drain_task = asyncio.create_task(drain_events())
+        delta_drain_task = asyncio.create_task(drain_deltas())
 
         try:
             while True:
@@ -168,7 +245,7 @@ class BrowserChannel(BaseChannel):
 
                 if msg_type == "message":
                     content = data.get("content", "")
-                    media = data.get("media")
+                    media = self._save_base64_media(data.get("media"))
                     # 与 WebUI 约定：toolMode / selectedMcpServers，供 Agent 按 tool_mode 决定是否加载 MCP
                     extra_meta: dict[str, Any] = {}
                     _tm = data.get("toolMode") or data.get("tool_mode")
@@ -305,12 +382,17 @@ class BrowserChannel(BaseChannel):
         finally:
             drain_task.cancel()
             drain_subagent_task.cancel()
+            delta_drain_task.cancel()
             try:
                 await drain_task
             except asyncio.CancelledError:
                 pass
             try:
                 await drain_subagent_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await delta_drain_task
             except asyncio.CancelledError:
                 pass
             self.ws_manager.unregister(key, websocket)

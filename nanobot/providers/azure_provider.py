@@ -45,7 +45,10 @@ class AzureProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         api_base: str | None = None,
+        stream_callback: Any | None = None,
     ) -> LLMResponse:
+        if stream_callback:
+            logger.warning("Azure provider does not support stream_callback yet")
         client = self._get_client()
         # Azure uses deployment name as the model identifier
         deployment = model or self.azure_deployment or self.get_default_model()

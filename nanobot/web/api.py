@@ -131,12 +131,14 @@ class NanobotWebAPI:
         anthropic_provider = AnthropicProvider()
         deepseek_provider = DeepSeekProvider()
         azure_provider = AzureProvider()
+        moonshot_provider = OpenAIProvider()
 
         self.provider_manager.register_all(
             openai=openai_provider,
             anthropic=anthropic_provider,
             deepseek=deepseek_provider,
             azure=azure_provider,
+            moonshot=moonshot_provider,
         )
 
         # Check if we have any usable models
@@ -733,6 +735,33 @@ class NanobotWebAPI:
         from nanobot.agent.subagent_progress import SubagentProgressBus
         SubagentProgressBus.get().unsubscribe(f"browser:{session_id}", q)
 
+    def _images_paths_to_data_urls(self, image_paths: list[str]) -> list[str]:
+        """将本地图片路径列表转为 base64 data URL，供前端直接显示。"""
+        import base64
+        import mimetypes
+        from pathlib import Path
+
+        out: list[str] = []
+        for path in image_paths:
+            try:
+                p = Path(path)
+                if not p.is_file():
+                    continue
+                mime, _ = mimetypes.guess_type(str(p))
+                if not mime:
+                    ext = p.suffix.lower()
+                    mime = {
+                        ".png": "image/png",
+                        ".gif": "image/gif",
+                        ".webp": "image/webp",
+                        ".bmp": "image/bmp",
+                    }.get(ext, "image/jpeg")
+                b64 = base64.b64encode(p.read_bytes()).decode()
+                out.append(f"data:{mime};base64,{b64}")
+            except Exception as e:
+                logger.warning(f"[get_messages] Failed to read image {path}: {e}")
+        return out
+
     def get_messages(self, session_id: str, before: int | None, limit: int) -> list[dict[str, Any]]:
         key = self.to_session_key(session_id)
         session = self.sessions.get(key)
@@ -740,34 +769,31 @@ class NanobotWebAPI:
             raise KeyError("session not found")
 
         messages = self.sessions.get_messages(key=key, limit=limit, before_sequence=before)
-        return [
-            {
+        result: list[dict[str, Any]] = []
+        for m in messages:
+            if m.get("internal"):
+                continue
+            msg: dict[str, Any] = {
                 "id": f"msg_{m['sequence']}",
                 "sessionId": session_id,
                 "role": m["role"],
                 "content": m["content"],
                 "createdAt": m["timestamp"],
                 "sequence": m["sequence"],
-                **({"toolSteps": m["tool_steps"]} if m.get("tool_steps") else {}),
-                **(
-                    {
-                        "tokenUsage": {
-                            "promptTokens": int(m["token_usage"].get("prompt_tokens", 0) or 0),
-                            "completionTokens": int(m["token_usage"].get("completion_tokens", 0) or 0),
-                            "totalTokens": int(m["token_usage"].get("total_tokens", 0) or 0),
-                        }
-                    }
-                    if m.get("token_usage")
-                    else {}
-                ),
-                **(
-                    {"images": m["images"]}
-                    if m.get("images")
-                    else {}
-                ),
             }
-            for m in messages
-        ]
+            if m.get("tool_steps"):
+                msg["toolSteps"] = m["tool_steps"]
+            if m.get("token_usage"):
+                tu = m["token_usage"]
+                msg["tokenUsage"] = {
+                    "promptTokens": int(tu.get("prompt_tokens", 0) or 0),
+                    "completionTokens": int(tu.get("completion_tokens", 0) or 0),
+                    "totalTokens": int(tu.get("total_tokens", 0) or 0),
+                }
+            if m.get("images"):
+                msg["images"] = self._images_paths_to_data_urls(m["images"])
+            result.append(msg)
+        return result
 
     def get_session_token_summary(self, session_id: str) -> dict[str, int]:
         key = self.to_session_key(session_id)
@@ -3024,6 +3050,37 @@ class NanobotWebAPI:
             logger.exception(f"Failed to export config")
             return {}
 
+    def get_workspace_tree(self, path: str | None = None) -> list[dict[str, Any]]:
+        """Get directory tree entries for a workspace path."""
+        workspace = Path(self.agent.workspace).expanduser().resolve()
+        target = workspace
+        if path:
+            raw = Path(path)
+            if raw.is_absolute():
+                target = raw.expanduser().resolve()
+            else:
+                target = (workspace / raw).expanduser().resolve()
+            # Security: block traversal outside workspace
+            try:
+                target.relative_to(workspace)
+            except ValueError:
+                raise ValueError("Path traversal not allowed") from None
+        if not target.exists() or not target.is_dir():
+            raise ValueError(f"Directory does not exist: {target}")
+        entries = []
+        for child in sorted(target.iterdir(), key=lambda c: (c.is_file(), c.name.lower())):
+            try:
+                has_children = child.is_dir() and any(child.iterdir()) if child.is_dir() else False
+            except PermissionError:
+                has_children = child.is_dir()
+            entries.append({
+                "name": child.name,
+                "type": "dir" if child.is_dir() else "file",
+                "absolute_path": str(child.expanduser().resolve()),
+                "has_children": has_children,
+            })
+        return entries
+
     def upload_skill(self, form: cgi.FieldStorage) -> dict[str, Any]:
         """
         Upload a custom skill from folder (multiple files) to workspace/skills/.
@@ -3568,6 +3625,18 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/calendar/jobs":
                 jobs = app.get_calendar_jobs()
                 self._write_json(HTTPStatus.OK, _ok(jobs))
+                return
+
+            if path == "/api/v1/workspace/tree":
+                tree_path = query.get("path", [None])[0]
+                try:
+                    tree = app.get_workspace_tree(tree_path)
+                    self._write_json(HTTPStatus.OK, _ok(tree))
+                except ValueError as e:
+                    self._write_json(HTTPStatus.BAD_REQUEST, _err("INVALID_PATH", str(e)))
+                except Exception as e:
+                    logger.exception("Failed to get workspace tree")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TREE_ERROR", str(e)))
                 return
 
             if path == "/api/v1/system/status":

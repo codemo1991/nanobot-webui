@@ -566,6 +566,10 @@ export const api = {
       method: 'DELETE',
     }),
 
+  // Workspace
+  getWorkspaceTree: (path?: string) =>
+    request<import('./types').WorkspaceTreeEntry[]>(`/workspace/tree${path ? `?path=${encodeURIComponent(path)}` : ''}`),
+
   // System
   getSystemStatus: () => request<import('./types').SystemStatus>('/system/status'),
 

@@ -8,7 +8,8 @@
     "save": "Save",
     "delete": "Delete",
     "edit": "Edit",
-    "loading": "Loading..."
+    "loading": "Loading...",
+    "insert": "Insert"
   },
   "nav": {
     "chat": "Chat",
@@ -166,7 +167,12 @@
       "pendingTasksTitle": "Background Tasks Running",
       "pendingTasksContent": "There are {{count}} Claude Code tasks running in the background. Sending new messages may affect task execution.\n\nFirst task: {{prompt}}",
       "sendAnyway": "Send Anyway"
-    }
+    },
+    "filePicker": "Select File or Folder",
+    "filePickerTitle": "Select File or Folder",
+    "emptyWorkspace": "Workspace is empty",
+    "loadWorkspaceError": "Failed to load workspace",
+    "selectedPath": "Selected"
   },
   "system": {
     "title": "System Status",
