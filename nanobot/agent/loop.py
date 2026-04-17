@@ -265,6 +265,7 @@ class AgentLoop:
         self._enable_smart_parallel = enable_smart_parallel
         self._smart_parallel_model = smart_parallel_model
         self._status_service = status_service
+        self._tool_execution_times: dict[int, float] = {}
 
         # 微内核委托配置
         self._microkernel_escalation_enabled = microkernel_escalation_enabled
@@ -1322,6 +1323,7 @@ class AgentLoop:
 
         # execution_time 计算在 span 外，以便后续日志和指标记录使用
         execution_time = time.time() - tool_start_time
+        self._tool_execution_times[id(tool_call)] = execution_time
         tool_span.set_attr("duration_s", round(execution_time, 3))
         tool_span.set_attr("result_preview", str(result)[:200] if result else None)
         logger.info(f"[ToolExecution] Tool '{tool_call.name}' completed in {execution_time:.2f}s, error: {tool_execution_error is not None}")
@@ -2745,10 +2747,16 @@ class AgentLoop:
                                 messages, tc.id, tc.name,
                                 "已跳过：本回合已执行过类似的视觉分析任务，请使用之前的识别结果。",
                             )
+                            _duration = self._tool_execution_times.pop(id(tc), 0)
+                            _end = int(time.time() * 1000)
+                            _start = _end - max(int(_duration * 1000), 1)
                             tool_steps.append({
                                 "name": tc.name,
                                 "arguments": tc.arguments,
                                 "result": "已跳过：本回合已执行过类似的视觉分析任务，请使用之前的识别结果。",
+                                "status": "completed",
+                                "startTime": _start,
+                                "endTime": _end,
                             })
                     loop_detected = True
                     exit_reason = "loop"
@@ -2940,10 +2948,16 @@ class AgentLoop:
                             messages, tool_call.id, tool_call.name, result
                         )
                         # 记录到 tool_steps（用于后续综合）
+                        _duration = self._tool_execution_times.pop(id(tool_call), 0)
+                        _end = int(time.time() * 1000)
+                        _start = _end - max(int(_duration * 1000), 1)
                         tool_steps.append({
                             "name": tool_call.name,
                             "arguments": tool_call.arguments,
                             "result": _truncate(result),
+                            "status": "completed",
+                            "startTime": _start,
+                            "endTime": _end,
                         })
                         # 非 Batch 路径也需记录 task_id，否则 Round 2 无法等待/注入（vision -> claude_code 链式调用）
                         task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
@@ -2960,10 +2974,16 @@ class AgentLoop:
                         messages = self.context.add_tool_result(
                             messages, tool_call.id, tool_call.name, result
                         )
+                        _duration = self._tool_execution_times.pop(id(tool_call), 0)
+                        _end = int(time.time() * 1000)
+                        _start = _end - max(int(_duration * 1000), 1)
                         tool_steps.append({
                             "name": tool_call.name,
                             "arguments": tool_call.arguments,
                             "result": _truncate(result),
+                            "status": "completed",
+                            "startTime": _start,
+                            "endTime": _end,
                         })
                         continue
 
@@ -3006,10 +3026,16 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
                     truncated = _truncate(result)
+                    _duration = self._tool_execution_times.pop(id(tool_call), 0)
+                    _end = int(time.time() * 1000)
+                    _start = _end - max(int(_duration * 1000), 1)
                     tool_steps.append({
                         "name": tool_call.name,
                         "arguments": tool_call.arguments,
                         "result": truncated,
+                        "status": "completed",
+                        "startTime": _start,
+                        "endTime": _end,
                     })
 
                 if loop_detected:
@@ -3296,7 +3322,11 @@ class AgentLoop:
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
-            content=final_content
+            content=final_content,
+            metadata={
+                "tool_steps": tool_steps,
+                "reasoning_content": last_reasoning_content or "",
+            },
         )
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -3517,10 +3547,16 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    _duration = self._tool_execution_times.pop(id(tool_call), 0)
+                    _end = int(time.time() * 1000)
+                    _start = _end - max(int(_duration * 1000), 1)
                     tool_steps.append({
                         "name": tool_call.name,
                         "arguments": tool_call.arguments,
                         "result": _truncate(result),
+                        "status": "completed",
+                        "startTime": _start,
+                        "endTime": _end,
                     })
                 if loop_detected:
                     exit_reason = "loop"
@@ -3595,7 +3631,11 @@ class AgentLoop:
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
-            content=final_content
+            content=final_content,
+            metadata={
+                "tool_steps": tool_steps,
+                "reasoning_content": last_reasoning_content or "",
+            },
         )
     
     async def process_direct(

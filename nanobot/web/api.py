@@ -1298,17 +1298,22 @@ class NanobotWebAPI:
 
     def _build_assistant_message(self, session_id: str, key: str) -> dict[str, Any] | None:
         """从 session 记录中构造 assistantMessage 字典（供 done 事件和 chat_sync 共用）。"""
-        messages = self.sessions.get_messages(key=key, limit=2)
-        assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+        # 优先从缓存读取最新的 assistant 消息，避免 get_messages 查到旧数据
+        session = self.sessions.get(key)
+        if session and session.messages:
+            assistant = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
+        else:
+            messages = self.sessions.get_messages(key=key, limit=2)
+            assistant = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
         if not assistant:
             return None
         return {
-            "id": f"msg_{assistant['sequence']}",
+            "id": f"msg_{assistant.get('sequence', 0)}",
             "sessionId": session_id,
             "role": assistant["role"],
             "content": assistant["content"],
             "createdAt": assistant["timestamp"],
-            "sequence": assistant["sequence"],
+            "sequence": assistant.get("sequence", 0),
             **({"toolSteps": assistant["tool_steps"]} if assistant.get("tool_steps") else {}),
             **(
                 {

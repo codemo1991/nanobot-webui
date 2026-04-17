@@ -118,6 +118,117 @@ function editableToInput(el: HTMLDivElement) {
   return text.replace(/\n+$/, '')
 }
 
+function getInputOffset(el: HTMLDivElement, range: Range): number {
+  const clone = el.cloneNode(true) as HTMLDivElement
+
+  function getPath(root: Node, target: Node): number[] | null {
+    if (root === target) return []
+    for (let i = 0; i < root.childNodes.length; i++) {
+      const child = root.childNodes[i]
+      const subPath = getPath(child, target)
+      if (subPath !== null) {
+        return [i, ...subPath]
+      }
+    }
+    return null
+  }
+
+  const path = getPath(el, range.startContainer)
+  if (!path) return 0
+
+  let clonedNode: Node = clone
+  for (const idx of path) {
+    clonedNode = clonedNode.childNodes[idx]
+  }
+
+  if (clonedNode.nodeType === Node.TEXT_NODE) {
+    const text = clonedNode as Text
+    text.textContent = text.textContent?.slice(0, range.startOffset) || ''
+  } else if (clonedNode.nodeType === Node.ELEMENT_NODE && range.startOffset < clonedNode.childNodes.length) {
+    while (clonedNode.childNodes.length > range.startOffset) {
+      clonedNode.removeChild(clonedNode.lastChild!)
+    }
+  }
+
+  function removeAfter(node: Node, root: Node) {
+    if (node === root) return
+    const parent = node.parentNode!
+    let sibling = node.nextSibling
+    while (sibling) {
+      const next = sibling.nextSibling
+      parent.removeChild(sibling)
+      sibling = next
+    }
+    removeAfter(parent, root)
+  }
+  removeAfter(clonedNode, clone)
+
+  return editableToInput(clone).length
+}
+
+function setCursorAtOffset(el: HTMLDivElement, targetOffset: number) {
+  const sel = window.getSelection()
+  const range = document.createRange()
+
+  function walk(node: Node): boolean {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const len = node.textContent?.length || 0
+      if (targetOffset <= len) {
+        range.setStart(node, targetOffset)
+        range.setEnd(node, targetOffset)
+        return true
+      }
+      targetOffset -= len
+      return false
+    }
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const elem = node as HTMLElement
+      if (elem.classList?.contains('chat-input-chip')) {
+        const path = elem.getAttribute('data-path') || ''
+        const len = `<file>${path}</file>`.length
+        if (targetOffset <= len) {
+          range.setStartAfter(node)
+          range.setEndAfter(node)
+          return true
+        }
+        targetOffset -= len
+        return false
+      }
+      if (elem.tagName === 'BR') {
+        if (targetOffset <= 1) {
+          range.setStartBefore(node)
+          range.setEndBefore(node)
+          return true
+        }
+        targetOffset -= 1
+        return false
+      }
+      for (const child of Array.from(node.childNodes)) {
+        if (walk(child)) return true
+      }
+      if (elem.tagName === 'DIV' || elem.tagName === 'P') {
+        if (targetOffset <= 1) {
+          range.setStartAfter(node)
+          range.setEndAfter(node)
+          return true
+        }
+        targetOffset -= 1
+      }
+    }
+    return false
+  }
+
+  if (walk(el)) {
+    sel?.removeAllRanges()
+    sel?.addRange(range)
+  } else {
+    range.selectNodeContents(el)
+    range.collapse(false)
+    sel?.removeAllRanges()
+    sel?.addRange(range)
+  }
+}
+
 // 流式状态存储键
 const getStreamingStateKey = (sessionId: string) => `${STORAGE_PREFIX}${sessionId}`
 
@@ -229,6 +340,7 @@ function ChatPage() {
   const [imageSendStatus, setImageSendStatus] = useState<Record<number, 'sending' | 'sent' | 'error'>>({})
   const inputRef = useRef<HTMLDivElement>(null)
   const savedRangeRef = useRef<Range | null>(null)
+  const savedCursorOffsetRef = useRef<number | null>(null)
   const pendingFiles = useMemo(() => {
     const files: string[] = []
     const regex = /<file>(.*?)<\/file>/g
@@ -445,7 +557,11 @@ function ChatPage() {
         setClaudeCodeProgress('')
 
         // 将真实 assistantMessage 数据合并到现有的 temp-assistant 中（避免 React key 变化导致整段内容重新挂载/闪烁）
-        const assistantMsg = event.event.assistantMessage
+        let assistantMsg = event.event.assistantMessage as Message | null | undefined
+        // 防御性合并：如果后端 assistantMsg 缺少 toolSteps，但前端有正在展示的流式 toolSteps，则保留它们
+        if (assistantMsg && !assistantMsg.toolSteps && streamingToolStepsRef.current.length > 0) {
+          assistantMsg = { ...assistantMsg, toolSteps: streamingToolStepsRef.current }
+        }
         console.log('[handleWsMessage] setting messages, assistantMsg:', JSON.stringify(assistantMsg))
         setMessages(prev => {
           const idx = prev.findIndex(m => m.id === 'temp-assistant')
@@ -1136,7 +1252,21 @@ function ChatPage() {
 
   const loadMessages = async (sessionId: string) => {
     try {
-      const data = await api.getMessages(sessionId)
+      let data = await api.getMessages(sessionId)
+      // 防御性合并：若 API 返回的 assistant 消息缺少 toolSteps，但 sessionStorage 中有保存，则恢复
+      const savedState = loadStreamingState(sessionId)
+      if (savedState && savedState.toolSteps && savedState.toolSteps.length > 0) {
+        const lastAssistantIndex = data.length - 1
+        if (
+          lastAssistantIndex >= 0 &&
+          data[lastAssistantIndex].role === 'assistant' &&
+          (!data[lastAssistantIndex].toolSteps || data[lastAssistantIndex].toolSteps!.length === 0)
+        ) {
+          data = data.map((m, idx) =>
+            idx === lastAssistantIndex ? { ...m, toolSteps: savedState.toolSteps } : m
+          )
+        }
+      }
       setMessages(data)
 
       // 切换会话时当前会话的 WebSocket 会断开，done 可能未送达；若 DB 已有人机各一条新消息则对齐流式状态
@@ -1322,6 +1452,7 @@ function ChatPage() {
       inputRef.current.innerHTML = ''
     }
     savedRangeRef.current = null
+    savedCursorOffsetRef.current = null
     setPendingImages([])
     setImageSendStatus({})
     setLoading(true)
@@ -1409,74 +1540,35 @@ function ChatPage() {
   }, [input, currentSession, pendingImages, t, toolMode, selectedMcpServers, tasks, messages, streamingSessionIds])
 
   const handleFileInsert = useCallback((path: string) => {
+    setFilePickerVisible(false)
     if (!inputRef.current) {
       const tag = `<file>${path}</file>`
       setInput(prev => (prev ? `${prev} ${tag}` : tag))
-      setFilePickerVisible(false)
       return
     }
     const el = inputRef.current
+    const offset = savedCursorOffsetRef.current ?? 0
+    const clampedOffset = Math.max(0, Math.min(offset, input.length))
+
+    const tag = `<file>${path}</file>`
+    const before = input.slice(0, clampedOffset)
+    const after = input.slice(clampedOffset)
+    const needSpaceBefore = before.length > 0 && !before.endsWith(' ') && !before.endsWith('\n')
+    const needSpaceAfter = after.length > 0 && !after.startsWith(' ') && !after.startsWith('\n')
+    const spacerBefore = needSpaceBefore ? ' ' : ''
+    const spacerAfter = needSpaceAfter ? ' ' : ''
+    const newInput = before + spacerBefore + tag + spacerAfter + after
+
+    setInput(newInput)
+    el.innerHTML = inputToHTML(newInput)
+
+    const chipEndOffset = clampedOffset + spacerBefore.length + tag.length
     el.focus()
-    const sel = window.getSelection()
-    let range: Range | null = null
-    if (sel && sel.rangeCount > 0) {
-      const r = sel.getRangeAt(0)
-      if (el.contains(r.commonAncestorContainer)) {
-        range = r
-      }
-    }
-    if (!range && savedRangeRef.current) {
-      const saved = savedRangeRef.current
-      if (el.contains(saved.commonAncestorContainer)) {
-        range = saved
-      }
-    }
-    if (!range) {
-      range = document.createRange()
-      range.setStart(el, 0)
-      range.setEnd(el, 0)
-      const chipHtml = `<span contenteditable="false" class="chat-input-chip" data-path="${escapeHtml(path)}">${escapeHtml(path)}<span class="chat-input-chip-close">×</span></span>`
-      const fragment = range.createContextualFragment(chipHtml)
-      range.insertNode(fragment)
-      range.collapse(false)
-      const postText = el.textContent || ''
-      const postSpacer = postText && !postText.startsWith(' ') && !postText.startsWith('\n') ? ' ' : ''
-      if (postSpacer) {
-        range.insertNode(document.createTextNode(postSpacer))
-        range.collapse(false)
-      }
-      sel?.removeAllRanges()
-      sel?.addRange(range)
-    } else {
-      range.deleteContents()
-      const preRange = range.cloneRange()
-      preRange.setStart(el, 0)
-      preRange.setEnd(range.startContainer, range.startOffset)
-      const preText = preRange.toString()
-      const postRange = range.cloneRange()
-      postRange.setStart(range.endContainer, range.endOffset)
-      postRange.setEnd(el, el.childNodes.length)
-      const postText = postRange.toString()
-      const spacer = preText && !preText.endsWith(' ') && !preText.endsWith('\n') ? ' ' : ''
-      const postSpacer = postText && !postText.startsWith(' ') && !postText.startsWith('\n') ? ' ' : ''
-      if (spacer) {
-        range.insertNode(document.createTextNode(spacer))
-        range.collapse(false)
-      }
-      const chipHtml = `<span contenteditable="false" class="chat-input-chip" data-path="${escapeHtml(path)}">${escapeHtml(path)}<span class="chat-input-chip-close">×</span></span>`
-      const fragment = range.createContextualFragment(chipHtml)
-      range.insertNode(fragment)
-      range.collapse(false)
-      if (postSpacer) {
-        range.insertNode(document.createTextNode(postSpacer))
-        range.collapse(false)
-      }
-      sel!.removeAllRanges()
-      sel!.addRange(range)
-    }
-    setInput(editableToInput(el))
-    setFilePickerVisible(false)
-  }, [])
+    setCursorAtOffset(el, chipEndOffset)
+
+    savedCursorOffsetRef.current = null
+    savedRangeRef.current = null
+  }, [input])
 
   const handleEditableInput = () => {
     if (!inputRef.current) return
@@ -1546,6 +1638,7 @@ function ChatPage() {
       const r = sel.getRangeAt(0)
       if (inputRef.current.contains(r.commonAncestorContainer)) {
         savedRangeRef.current = r.cloneRange()
+        savedCursorOffsetRef.current = getInputOffset(inputRef.current, r)
       }
     }
   }
@@ -2042,6 +2135,16 @@ function ChatPage() {
               <Button
                 type="text"
                 icon={<FolderOpenOutlined />}
+                onMouseDown={() => {
+                  const sel = window.getSelection()
+                  if (sel && sel.rangeCount > 0 && inputRef.current) {
+                    const r = sel.getRangeAt(0)
+                    if (inputRef.current.contains(r.commonAncestorContainer)) {
+                      savedRangeRef.current = r.cloneRange()
+                      savedCursorOffsetRef.current = getInputOffset(inputRef.current, r)
+                    }
+                  }
+                }}
                 onClick={() => setFilePickerVisible(true)}
                 disabled={!currentSession || loading}
                 className="file-picker-button"

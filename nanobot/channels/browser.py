@@ -277,19 +277,32 @@ class BrowserChannel(BaseChannel):
                         # Build assistantMessage from session (mirrors SSE done event)
                         assistant_msg = None
                         try:
-                            messages = self.agent.sessions.get_messages(key=f"browser:{session_id}", limit=2)
-                            assistant = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
+                            # 优先从缓存读取最新的 assistant 消息，避免 get_messages 查到旧数据
+                            session = self.agent.sessions.get(key=f"browser:{session_id}")
+                            if session and session.messages:
+                                assistant = next(
+                                    (m for m in reversed(session.messages) if m.get("role") == "assistant"),
+                                    None,
+                                )
+                            else:
+                                messages = self.agent.sessions.get_messages(key=f"browser:{session_id}", limit=2)
+                                assistant = next(
+                                    (m for m in reversed(messages) if m.get("role") == "assistant"),
+                                    None,
+                                )
                             if assistant:
                                 assistant_msg = {
-                                    "id": f"msg_{assistant['sequence']}",
+                                    "id": f"msg_{assistant.get('sequence', 0)}",
                                     "sessionId": session_id,
                                     "role": assistant["role"],
                                     "content": assistant["content"],
                                     "createdAt": assistant["timestamp"],
-                                    "sequence": assistant["sequence"],
+                                    "sequence": assistant.get("sequence", 0),
                                 }
-                                if assistant.get("tool_steps"):
-                                    assistant_msg["toolSteps"] = assistant["tool_steps"]
+                                # 优先使用 response.metadata 中的 tool_steps（ freshest ）
+                                tool_steps = (response.metadata.get("tool_steps") if response and response.metadata else None) or assistant.get("tool_steps")
+                                if tool_steps:
+                                    assistant_msg["toolSteps"] = tool_steps
                                 if assistant.get("token_usage"):
                                     tu = assistant["token_usage"]
                                     assistant_msg["tokenUsage"] = {

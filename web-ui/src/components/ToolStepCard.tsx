@@ -119,14 +119,14 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     if (status === 'completed') {
       return (
         <span className="tool-status-badge done">
-          ✅ Done {durationStr ?? '--'}
+          ✅ Done{durationStr ? ` ${durationStr}` : ''}
         </span>
       )
     }
     if (status === 'error') {
       return (
         <span className="tool-status-badge error">
-          ❌ Error {durationStr ?? '--'}
+          ❌ Error{durationStr ? ` ${durationStr}` : ''}
         </span>
       )
     }
