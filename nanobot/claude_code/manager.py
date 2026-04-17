@@ -34,14 +34,16 @@ class ClaudeCodeManager:
         workspace: Path,
         bus: MessageBus,
         result_dir: Path | None = None,
-        default_timeout: int = 300,
+        default_timeout: int = 3600,
         max_concurrent_tasks: int = 3,
+        sessions: Any = None,
     ):
         self.workspace = Path(workspace)
         self.bus = bus
         self.result_dir = result_dir or self.workspace / ".claude-results"
         self.default_timeout = default_timeout
         self.max_concurrent_tasks = max_concurrent_tasks
+        self.sessions = sessions
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_origins: dict[str, dict[str, str]] = {}
         self._watcher: "ResultWatcher | None" = None
@@ -133,6 +135,13 @@ class ClaudeCodeManager:
         )
         self._watcher.start()
         self._started = True
+
+        # Recover tasks after event loop is running
+        try:
+            self._recover_tasks()
+        except Exception as e:
+            logger.warning(f"[ClaudeCodeManager] Failed to recover tasks on watcher start: {e}")
+        
         logger.info(f"Claude Code watcher started, watching {self.result_dir}")
     
     def stop_watcher(self) -> None:
@@ -640,6 +649,21 @@ class ClaudeCodeManager:
         task_meta_path = self.result_dir / f"{task_id}.meta.json"
         task_meta_path.write_text(json.dumps(task_meta, ensure_ascii=False), encoding="utf-8")
         
+        # Persist task to DB before starting
+        session_key = f"{origin_channel}:{origin_chat_id}"
+        if self.sessions:
+            try:
+                self.sessions.save_claude_task(
+                    task_id=task_id,
+                    session_key=session_key,
+                    pid=None,
+                    status="running",
+                    prompt=task_meta["prompt"],
+                    workdir=str(cwd),
+                )
+            except Exception as e:
+                logger.warning(f"[ClaudeCodeManager] Failed to persist task {task_id}: {e}")
+        
         bg_task = asyncio.create_task(
             self._run_claude_code(
                 task_id=task_id,
@@ -713,6 +737,33 @@ class ClaudeCodeManager:
                     env=env,
                 )
             
+            # Persist PID immediately after process starts
+            if process.pid:
+                try:
+                    meta = json.loads(task_meta_path.read_text(encoding="utf-8"))
+                    meta["pid"] = process.pid
+                    task_meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+                if self.sessions:
+                    try:
+                        self.sessions.update_claude_task(task_id, status="running")
+                        # Note: we don't have a dedicated update_pid method; 
+                        # save_claude_task will upsert with full data on next save.
+                        # For immediate PID persistence, we re-save the full record:
+                        origin = self._task_origins.get(task_id, {})
+                        session_key = f"{origin.get('channel', 'cli')}:{origin.get('chat_id', 'direct')}"
+                        self.sessions.save_claude_task(
+                            task_id=task_id,
+                            session_key=session_key,
+                            pid=process.pid,
+                            status="running",
+                            prompt=prompt[:200] + "..." if len(prompt) > 200 else prompt,
+                            workdir=str(workdir),
+                        )
+                    except Exception as e:
+                        logger.warning(f"[ClaudeCodeManager] Failed to update PID for {task_id}: {e}")
+            
             # Stream stdout for progress updates
             stdout_lines: list[str] = []
             stderr_lines: list[str] = []
@@ -738,20 +789,26 @@ class ClaudeCodeManager:
                             logger.warning(f"Progress callback error: {e}")
             
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        read_stream(process.stdout, stdout_lines, "stdout"),
-                        read_stream(process.stderr, stderr_lines, "stderr"),
-                        process.wait(),
-                    ),
-                    timeout=timeout
+                await asyncio.gather(
+                    read_stream(process.stdout, stdout_lines, "stdout"),
+                    read_stream(process.stderr, stderr_lines, "stderr"),
+                    process.wait(),
                 )
             except asyncio.TimeoutError:
+                # This branch is kept for safety, though we no longer wrap process.wait() in wait_for.
+                # It may be triggered by external cancellation wrappers.
                 process.kill()
                 await process.wait()
                 logger.warning(f"Claude Code [{task_id}] timed out after {timeout}s")
                 await self._write_timeout_result(task_id, timeout)
                 return
+            
+            # Fallback: if hook did not write result file, use stdout as fallback
+            result_path = self.result_dir / f"{task_id}.json"
+            if not result_path.exists():
+                fallback_output = "\n".join(stdout_lines[-200:])
+                status = "done" if process.returncode == 0 else "error"
+                self._atomic_write_result(task_id, fallback_output, status)
             
             if process.returncode != 0:
                 stderr_text = "\n".join(stderr_lines)
@@ -915,19 +972,30 @@ if __name__ == "__main__":
         }
         result_path = self.result_dir / f"{task_id}.json"
         result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        if self.sessions:
+            try:
+                self.sessions.update_claude_task(task_id, status="timeout")
+            except Exception as e:
+                logger.warning(f"[ClaudeCodeManager] Failed to update DB timeout for {task_id}: {e}")
     
     async def _write_error_result(self, task_id: str, code: int, error: str) -> None:
         """Write an error result file."""
         origin = self._task_origins.pop(task_id, {})
+        result_text = f"Error (code {code}): {error}"
         result = {
             "task_id": task_id,
             "timestamp": datetime.now().isoformat(),
-            "output": f"Error (code {code}): {error}",
+            "output": result_text,
             "status": "error",
             "origin": origin,
         }
         result_path = self.result_dir / f"{task_id}.json"
         result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        if self.sessions:
+            try:
+                self.sessions.update_claude_task(task_id, status="error", result=result_text)
+            except Exception as e:
+                logger.warning(f"[ClaudeCodeManager] Failed to update DB error for {task_id}: {e}")
 
     async def _write_success_result(self, task_id: str, output: str) -> None:
         """Write a success result file."""
@@ -941,6 +1009,11 @@ if __name__ == "__main__":
         }
         result_path = self.result_dir / f"{task_id}.json"
         result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        if self.sessions:
+            try:
+                self.sessions.update_claude_task(task_id, status="done", result=output)
+            except Exception as e:
+                logger.warning(f"[ClaudeCodeManager] Failed to update DB success for {task_id}: {e}")
 
     async def _write_cancelled_result(self, task_id: str) -> None:
         """Write a cancelled result file."""
@@ -954,11 +1027,158 @@ if __name__ == "__main__":
         }
         result_path = self.result_dir / f"{task_id}.json"
         result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        if self.sessions:
+            try:
+                self.sessions.update_claude_task(task_id, status="cancelled", result="Task was cancelled by user")
+            except Exception as e:
+                logger.warning(f"[ClaudeCodeManager] Failed to update DB cancelled for {task_id}: {e}")
 
     def _handle_result(self, result: dict[str, Any]) -> None:
         """Handle a result from the watcher."""
         task_id = result.get("task_id", "")
         self._task_origins.pop(task_id, None)
+
+    def _atomic_write_result(self, task_id: str, output: str, status: str) -> None:
+        """Atomically write a result file to avoid race conditions with hook."""
+        origin = self._task_origins.get(task_id, {})
+        result = {
+            "task_id": task_id,
+            "timestamp": datetime.now().isoformat(),
+            "output": output,
+            "status": status,
+            "origin": origin,
+        }
+        result_path = self.result_dir / f"{task_id}.json"
+        temp_path = self.result_dir / f".{task_id}.json.tmp"
+        try:
+            temp_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(result_path)
+        except Exception as e:
+            logger.warning(f"[ClaudeCodeManager] Failed atomic write for {task_id}: {e}")
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
+    def _write_lost_result_sync(self, task_id: str) -> None:
+        """Synchronous version for use when no event loop is running."""
+        origin = self._task_origins.pop(task_id, {})
+        result = {
+            "task_id": task_id,
+            "timestamp": datetime.now().isoformat(),
+            "output": "Task was lost (backend restarted and process output was not recovered)",
+            "status": "lost",
+            "origin": origin,
+        }
+        self.result_dir.mkdir(parents=True, exist_ok=True)
+        result_path = self.result_dir / f"{task_id}.json"
+        result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        if self.sessions:
+            try:
+                self.sessions.update_claude_task(task_id, status="lost", result=result["output"])
+            except Exception as e:
+                logger.warning(f"[ClaudeCodeManager] Failed to update DB lost for {task_id}: {e}")
+
+    async def _write_lost_result(self, task_id: str) -> None:
+        """Write a 'lost' result when the process disappeared without producing output."""
+        self._write_lost_result_sync(task_id)
+
+    def _recover_tasks(self) -> None:
+        """Scan DB for running tasks and re-attach or reconcile on startup."""
+        if not self.sessions:
+            return
+        try:
+            running = self.sessions.get_claude_tasks_by_status("running")
+        except Exception as e:
+            logger.warning(f"[ClaudeCodeManager] Failed to query running tasks: {e}")
+            return
+
+        for task in running:
+            task_id = task["task_id"]
+            pid = task.get("pid")
+            result_path = self.result_dir / f"{task_id}.json"
+
+            is_alive = False
+            if pid:
+                try:
+                    import psutil
+                    proc = psutil.Process(pid)
+                    is_alive = proc.is_running()
+                    # Guard against PID reuse: compare create_time with task timestamp
+                    if is_alive:
+                        try:
+                            meta_path = self.result_dir / f"{task_id}.meta.json"
+                            if meta_path.exists():
+                                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                                start_ts = datetime.fromisoformat(meta.get("timestamp", "1970-01-01T00:00:00"))
+                                proc_create = datetime.fromtimestamp(proc.create_time())
+                                if abs((proc_create - start_ts).total_seconds()) > 60:
+                                    logger.warning(f"[ClaudeCodeManager] PID {pid} reused for task {task_id}, treating as dead")
+                                    is_alive = False
+                        except Exception:
+                            pass
+                except ImportError:
+                    try:
+                        os.kill(pid, 0)
+                        is_alive = True
+                    except (OSError, ProcessLookupError):
+                        pass
+                except psutil.NoSuchProcess:
+                    pass
+
+            if is_alive:
+                logger.info(f"[ClaudeCodeManager] Re-attaching to running task {task_id} (pid {pid})")
+                origin = {"channel": task.get("session_key", "").split(":", 1)[0] or "cli",
+                          "chat_id": task.get("session_key", "").split(":", 1)[1] if ":" in task.get("session_key", "") else "direct"}
+                self._task_origins[task_id] = origin
+                bg_task = asyncio.create_task(self._reattach_wait(pid, task_id))
+                self._running_tasks[task_id] = bg_task
+                bg_task.add_done_callback(lambda t, tid=task_id: self._running_tasks.pop(tid, None))
+            elif result_path.exists():
+                try:
+                    res = json.loads(result_path.read_text(encoding="utf-8"))
+                    status = res.get("status", "done")
+                    self.sessions.update_claude_task(task_id, status=status, result=res.get("output"))
+                    logger.info(f"[ClaudeCodeManager] Recovered finished task {task_id} as {status}")
+                except Exception:
+                    self.sessions.update_claude_task(task_id, status="lost")
+            else:
+                logger.warning(f"[ClaudeCodeManager] Task {task_id} lost (pid {pid} dead, no result file)")
+                try:
+                    asyncio.get_running_loop()
+                    asyncio.create_task(self._write_lost_result(task_id))
+                except RuntimeError:
+                    self._write_lost_result_sync(task_id)
+
+    async def _reattach_wait(self, pid: int, task_id: str) -> None:
+        """Wait for a re-attached OS process to finish and update state."""
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            await asyncio.to_thread(proc.wait)
+        except Exception:
+            # Fallback: poll until PID disappears
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except (OSError, ProcessLookupError):
+                    break
+                await asyncio.sleep(1.0)
+
+        result_path = self.result_dir / f"{task_id}.json"
+        if result_path.exists():
+            try:
+                res = json.loads(result_path.read_text(encoding="utf-8"))
+                status = res.get("status", "done")
+                if self.sessions:
+                    self.sessions.update_claude_task(task_id, status=status, result=res.get("output"))
+            except Exception:
+                if self.sessions:
+                    self.sessions.update_claude_task(task_id, status="lost")
+        else:
+            await self._write_lost_result(task_id)
     
     def get_running_count(self) -> int:
         """Return the number of currently running tasks."""
@@ -1111,6 +1331,23 @@ if __name__ == "__main__":
         task = self._running_tasks.get(task_id)
         if task and not task.done():
             task.cancel()
+            # Also terminate the underlying OS process if possible
+            try:
+                meta_path = self.result_dir / f"{task_id}.meta.json"
+                if meta_path.exists():
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    pid = meta.get("pid")
+                    if pid:
+                        try:
+                            import psutil
+                            psutil.Process(pid).terminate()
+                        except Exception:
+                            try:
+                                os.kill(pid, 15)  # SIGTERM
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning(f"[ClaudeCodeManager] Failed to terminate process for {task_id}: {e}")
             # Write cancelled result file synchronously
             try:
                 origin = self._task_origins.pop(task_id, {})
@@ -1125,6 +1362,11 @@ if __name__ == "__main__":
                 result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
             except Exception as e:
                 logger.warning(f"Failed to write cancelled result file: {e}")
+            if self.sessions:
+                try:
+                    self.sessions.update_claude_task(task_id, status="cancelled", result="Task was cancelled by user")
+                except Exception as e:
+                    logger.warning(f"[ClaudeCodeManager] Failed to update DB cancelled for {task_id}: {e}")
             logger.info(f"Claude Code task [{task_id}] cancelled")
             return True
         return False

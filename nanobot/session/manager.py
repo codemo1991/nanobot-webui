@@ -172,6 +172,21 @@ class SessionManager:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(session_key) REFERENCES chat_sessions(key) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS claude_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    session_key TEXT,
+                    pid INTEGER,
+                    status TEXT,
+                    prompt TEXT,
+                    workdir TEXT,
+                    result TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_claude_tasks_status ON claude_tasks(status);
+                CREATE INDEX IF NOT EXISTS idx_claude_tasks_session ON claude_tasks(session_key);
                 """
             )
     
@@ -662,3 +677,81 @@ class SessionManager:
                 """,
                 (updated_at,),
             )
+
+    # -- Claude Task persistence helpers -------------------------------------
+
+    def save_claude_task(
+        self,
+        task_id: str,
+        session_key: str,
+        pid: int | None,
+        status: str,
+        prompt: str,
+        workdir: str,
+        result: str | None = None,
+    ) -> None:
+        """Persist or upsert a Claude task record."""
+        updated_at = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO claude_tasks (
+                    task_id, session_key, pid, status, prompt, workdir, result, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    session_key = excluded.session_key,
+                    pid = excluded.pid,
+                    status = excluded.status,
+                    prompt = excluded.prompt,
+                    workdir = excluded.workdir,
+                    result = excluded.result,
+                    updated_at = excluded.updated_at
+                """,
+                (task_id, session_key, pid, status, prompt, workdir, result, updated_at, updated_at),
+            )
+
+    def update_claude_task(
+        self,
+        task_id: str,
+        status: str,
+        result: str | None = None,
+    ) -> None:
+        """Update status and optional result of a Claude task."""
+        updated_at = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE claude_tasks
+                SET status = ?, result = COALESCE(?, result), updated_at = ?
+                WHERE task_id = ?
+                """,
+                (status, result, updated_at, task_id),
+            )
+
+    def get_claude_tasks_by_status(self, status: str) -> list[dict[str, Any]]:
+        """Retrieve all Claude tasks with the given status."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT task_id, session_key, pid, status, prompt, workdir, result, created_at, updated_at
+                FROM claude_tasks
+                WHERE status = ?
+                ORDER BY created_at DESC
+                """,
+                (status,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_claude_task(self, task_id: str) -> dict[str, Any] | None:
+        """Retrieve a single Claude task by ID."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT task_id, session_key, pid, status, prompt, workdir, result, created_at, updated_at
+                FROM claude_tasks
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        return dict(row) if row else None

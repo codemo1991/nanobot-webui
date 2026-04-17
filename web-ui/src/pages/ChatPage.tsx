@@ -594,6 +594,14 @@ function ChatPage() {
           return newStatus
         })
       }
+      // 在清空前，把当前 toolSteps 快照到 bgSessionStatesRef，供后续 loadMessages 兜底恢复
+      if (streamingToolStepsRef.current.length > 0) {
+        bgSessionStatesRef.current.set(sessionId, {
+          toolSteps: [...streamingToolStepsRef.current],
+          thinking: streamingThinkingRef.current,
+          progress: claudeCodeProgressRef.current,
+        })
+      }
       // 清理流式状态
       if (sessionId === currentSessionIdRef.current) {
         isStreamingRef.current = false
@@ -916,8 +924,11 @@ function ChatPage() {
 
       if (document.visibilityState === 'hidden') {
         // 页面隐藏时，保存当前流式状态
-        // 只有当有活跃流式请求时才保存
-        if (isStreamingRef.current && currentSession) {
+        // 只要界面上还有工具面板/思考/loading 就保存，避免 isStreamingRef 竞态导致漏存
+        if (
+          currentSession &&
+          (streamingToolSteps.length > 0 || streamingThinking || loading)
+        ) {
           saveStreamingState(currentSession.id, {
             toolSteps: streamingToolSteps,
             thinking: streamingThinking,
@@ -926,7 +937,7 @@ function ChatPage() {
             taskId: currentTaskIdRef.current || undefined,
             sessionId: currentSession.id,
           })
-          console.log('Saved streaming state to sessionStorage (hidden)')
+          console.log('Saved streaming state to sessionStorage (hidden)', streamingToolSteps.length)
         }
       } else if (document.visibilityState === 'visible') {
         // 页面变为可见时，尝试恢复流式状态
@@ -1253,18 +1264,33 @@ function ChatPage() {
   const loadMessages = async (sessionId: string) => {
     try {
       let data = await api.getMessages(sessionId)
-      // 防御性合并：若 API 返回的 assistant 消息缺少 toolSteps，但 sessionStorage 中有保存，则恢复
-      const savedState = loadStreamingState(sessionId)
-      if (savedState && savedState.toolSteps && savedState.toolSteps.length > 0) {
-        const lastAssistantIndex = data.length - 1
-        if (
-          lastAssistantIndex >= 0 &&
-          data[lastAssistantIndex].role === 'assistant' &&
-          (!data[lastAssistantIndex].toolSteps || data[lastAssistantIndex].toolSteps!.length === 0)
-        ) {
-          data = data.map((m, idx) =>
-            idx === lastAssistantIndex ? { ...m, toolSteps: savedState.toolSteps } : m
-          )
+      // 诊断日志：检查 API 返回的最新 assistant 是否带了 toolSteps
+      const lastAssistantForDebug = [...data].reverse().find(m => m.role === 'assistant')
+      console.log('[loadMessages] lastAssistant toolSteps?', lastAssistantForDebug?.toolSteps?.length ?? 'missing')
+
+      // 防御性合并：若 API 返回的 assistant 消息缺少 toolSteps，尝试从 sessionStorage / bgSessionStatesRef / 当前 ref 恢复
+      let restoredToolSteps = loadStreamingState(sessionId)?.toolSteps
+      if (!restoredToolSteps || restoredToolSteps.length === 0) {
+        const bgState = bgSessionStatesRef.current.get(sessionId)
+        if (bgState && bgState.toolSteps && bgState.toolSteps.length > 0) {
+          restoredToolSteps = bgState.toolSteps
+        }
+      }
+      if (!restoredToolSteps || restoredToolSteps.length === 0) {
+        if (streamingToolStepsRef.current.length > 0) {
+          restoredToolSteps = streamingToolStepsRef.current
+        }
+      }
+      if (restoredToolSteps && restoredToolSteps.length > 0) {
+        const revAssistantIdx = [...data].reverse().findIndex(m => m.role === 'assistant')
+        if (revAssistantIdx !== -1) {
+          const actualIndex = data.length - 1 - revAssistantIdx
+          if (!data[actualIndex].toolSteps || data[actualIndex].toolSteps!.length === 0) {
+            data = data.map((m, idx) =>
+              idx === actualIndex ? { ...m, toolSteps: restoredToolSteps } : m
+            )
+            console.log('[loadMessages] restored toolSteps from fallback', restoredToolSteps.length)
+          }
         }
       }
       setMessages(data)

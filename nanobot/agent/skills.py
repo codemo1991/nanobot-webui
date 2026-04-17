@@ -495,6 +495,32 @@ class SkillsLoader:
             name for name, meta in self._metadata_cache.items()
             if meta.always and meta.available
         ]
+
+    def get_active_skills_for_message(self, user_message: str, max_skills: int = 8) -> list[str]:
+        """Return the list of skill names that would be loaded into system prompt for this message."""
+        self._ensure_cache()
+        if not self._metadata_cache:
+            return []
+        matched = self.match_skills_by_keywords(user_message, top_n=3)
+        always_skills = [name for name, meta in self._metadata_cache.items() if meta.always and meta.available]
+        # preserve order, dedup
+        seen: set[str] = set()
+        active: list[str] = []
+        for name in list(matched) + list(always_skills):
+            if name in seen:
+                continue
+            seen.add(name)
+            meta = self._metadata_cache.get(name)
+            if meta and meta.available:
+                active.append(name)
+        # fill up to max_skills with other available skills
+        other_skills = [
+            name for name, meta in self._metadata_cache.items()
+            if name not in seen and meta.available
+        ]
+        while len(active) < max_skills and other_skills:
+            active.append(other_skills.pop(0))
+        return active
     
     def get_skill_metadata(self, name: str) -> dict | None:
         """

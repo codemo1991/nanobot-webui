@@ -207,7 +207,7 @@ class BrowserChannel(BaseChannel):
         # Subscribe to subagent progress events via SubagentProgressBus
         from nanobot.agent.subagent_progress import SubagentProgressBus
         origin_key = f"browser:{session_id}"
-        subagent_queue: queue.Queue = SubagentProgressBus.get().subscribe(origin_key, replay=False)
+        subagent_queue: queue.Queue = SubagentProgressBus.get().subscribe(origin_key, replay=True)
 
         async def drain_subagent_events():
             """Forward subagent progress events to WebSocket."""
@@ -217,13 +217,16 @@ class BrowserChannel(BaseChannel):
                 while True:
                     try:
                         # Use run_in_executor to avoid blocking the asyncio event loop
-                        evt = await loop.run_in_executor(None, functools.partial(subagent_queue.get, timeout=0.5))
+                        evt = await loop.run_in_executor(None, functools.partial(subagent_queue.get, timeout=0.1))
                         logger.debug(f"[Browser] Subagent event: type={evt.get('type')}, task_id={evt.get('task_id', '')}")
                         if not await safe_send({"type": "event", "event": evt}):
                             logger.warning(f"[Browser] Subagent drain: safe_send False, breaking")
                             break
                     except queue.Empty:
                         pass
+                    except RuntimeError as e:
+                        logger.warning(f"[Browser] Subagent drain runtime error: {e}")
+                        break
                     except asyncio.CancelledError:
                         logger.info(f"[Browser] Subagent drain: cancelled")
                         raise
@@ -259,18 +262,19 @@ class BrowserChannel(BaseChannel):
                     # Directly call agent with progress_callback
                     try:
                         logger.info(f"[Browser] Calling agent.process_direct for session={session_id}")
-                        response = await asyncio.wait_for(
-                            self.agent.process_direct(
-                                content=content,
-                                session_key=f"browser:{session_id}",
-                                channel="browser",
-                                progress_callback=on_progress,
-                                media=media,
-                                extra_metadata=extra_meta or None,
-                                raise_on_cancel=True,
-                            ),
-                            timeout=self.config.agent_timeout,
+                        _process = self.agent.process_direct(
+                            content=content,
+                            session_key=f"browser:{session_id}",
+                            channel="browser",
+                            progress_callback=on_progress,
+                            media=media,
+                            extra_metadata=extra_meta or None,
+                            raise_on_cancel=True,
                         )
+                        if self.config.agent_timeout > 0:
+                            response = await asyncio.wait_for(_process, timeout=self.config.agent_timeout)
+                        else:
+                            response = await _process
                         resp_content = response.content if response else ""
                         logger.info(f"[Browser] Agent returned response (len={len(resp_content)})")
 
@@ -326,19 +330,26 @@ class BrowserChannel(BaseChannel):
                         logger.info(f"[Browser] Agent cancelled (user stop), notifying client")
                         assistant_msg = None
                         try:
-                            messages = self.agent.sessions.get_messages(key=f"browser:{session_id}", limit=4)
-                            assistant = next(
-                                (m for m in reversed(messages) if m.get("role") == "assistant"),
-                                None,
-                            )
+                            session = self.agent.sessions.get(key=f"browser:{session_id}")
+                            if session and session.messages:
+                                assistant = next(
+                                    (m for m in reversed(session.messages) if m.get("role") == "assistant"),
+                                    None,
+                                )
+                            else:
+                                messages = self.agent.sessions.get_messages(key=f"browser:{session_id}", limit=4)
+                                assistant = next(
+                                    (m for m in reversed(messages) if m.get("role") == "assistant"),
+                                    None,
+                                )
                             if assistant:
                                 assistant_msg = {
-                                    "id": f"msg_{assistant['sequence']}",
+                                    "id": f"msg_{assistant.get('sequence', 0)}",
                                     "sessionId": session_id,
                                     "role": assistant["role"],
                                     "content": assistant["content"],
                                     "createdAt": assistant["timestamp"],
-                                    "sequence": assistant["sequence"],
+                                    "sequence": assistant.get("sequence", 0),
                                 }
                                 if assistant.get("tool_steps"):
                                     assistant_msg["toolSteps"] = assistant["tool_steps"]
@@ -358,13 +369,24 @@ class BrowserChannel(BaseChannel):
                             break
                         continue
                     except asyncio.TimeoutError:
+                        timeout_msg = (
+                            f"⏳ 当前任务处理时间较长（已超过 {self.config.agent_timeout} 秒）。"
+                            "如有 Claude Code 任务正在执行，它将继续在后台运行，完成后将自动通知你。"
+                        )
                         logger.error(f"[Browser] Agent call timed out after {self.config.agent_timeout}s")
+                        # Persist timeout message to session so the conversation can continue
+                        try:
+                            session = self.agent.sessions.get_or_create(f"browser:{session_id}")
+                            session.add_message("assistant", timeout_msg)
+                            self.agent.sessions.save(session)
+                        except Exception as _e:
+                            logger.warning(f"[Browser] Failed to save timeout message: {_e}")
                         if not await safe_send({
-                            "type": "error",
-                            "error": f"Agent call timed out after {self.config.agent_timeout}s"
+                            "type": "event",
+                            "event": {"type": "done", "content": timeout_msg, "assistantMessage": None}
                         }):
                             break
-                        break
+                        continue
                     except Exception as e:
                         logger.error(f"[Browser] Agent error: {e}")
                         if not await safe_send({

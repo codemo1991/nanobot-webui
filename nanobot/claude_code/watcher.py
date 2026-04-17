@@ -52,6 +52,20 @@ class ResultWatcher(FileSystemEventHandler):
         self._observer.schedule(self, str(self.result_dir), recursive=False)
         self._observer.start()
         self._started = True
+        
+        # Scan existing result files to avoid missing files created while watcher was down
+        for path in self.result_dir.glob("*.json"):
+            if path.name.endswith(".meta.json") or path.name.endswith(".hook.json"):
+                continue
+            if path.name.startswith("."):
+                continue
+            try:
+                result = self._read_result(path)
+                if result:
+                    self._handle_result(result)
+            except Exception as e:
+                logger.warning(f"ResultWatcher failed to process existing file {path}: {e}")
+        
         logger.debug(f"ResultWatcher started on {self.result_dir}")
     
     def stop(self) -> None:

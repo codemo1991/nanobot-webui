@@ -3,6 +3,7 @@
 import asyncio
 import difflib
 import json
+import os
 import re
 import threading
 import time
@@ -310,6 +311,7 @@ class AgentLoop:
             bus=bus,
             default_timeout=self.claude_code_config.default_timeout,
             max_concurrent_tasks=self.claude_code_config.max_concurrent_tasks,
+            sessions=self.sessions,
         )
 
         # 子 agent 模板：未传入时自动创建 AgentTemplateManager，其从 SQLite 数据库加载模板（workspace/.nanobot/chat.db 或 ~/.nanobot/chat.db），确保所有渠道（Web/飞书/CLI 等）行为一致
@@ -384,6 +386,21 @@ class AgentLoop:
         self._mcp_server_scopes: dict[str, list[str]] = {}  # server_id → scope keywords
         self._cancel_event = asyncio.Event()
         self._cancelled_sessions: set[str] = set()  # 按 session 取消，支持多会话并发
+
+        # Runtime checkpoint for crash recovery
+        self._RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
+
+        # Pending message queues per session
+        self._pending_queues: dict[str, asyncio.Queue] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
+
+        # Background task scheduler
+        self._background_tasks: list[asyncio.Task] = []
+
+        # Concurrency gate
+        _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
+        self._concurrency_gate: asyncio.Semaphore | None = asyncio.Semaphore(_max) if _max > 0 else None
+
         # 初始化执行链路监控
         from nanobot.monitoring.execution_chain import ExecutionChainMonitor
         from nanobot.storage.execution_chain_repository import ExecutionChainRepository
@@ -1099,12 +1116,11 @@ class AgentLoop:
                 session = self.sessions.get(session_key) or self.sessions.get_or_create(session_key)
                 await self._inject_vision_into_spawn_others(results, spawn_others, session, session_key)
 
-            # 阶段 3: 执行 spawn_others 和 exec_others
+            # 阶段 3: 执行 spawn_others 和 exec_others（使用原生 progress，单个工具完成即实时推送）
             for tool_call in spawn_others + exec_others:
                 await self._check_cancelled(session_key)
-                result = await self._execute_single_tool(tool_call, _run_progress)
+                result = await self._execute_single_tool(tool_call, progress)
                 results.append((tool_call, result))
-            _flush_buffered()
 
             return results
 
@@ -2102,6 +2118,24 @@ class AgentLoop:
             # 取出 on_complete 回调（Web Gateway 模式下由 chat_stream() 注入）
             on_complete = msg.metadata.get("on_complete") if msg.metadata else None
 
+            # Pending queue: if session is already being processed, enqueue and continue
+            effective_key = msg.session_key
+            _pending_lock = self._session_locks.get(effective_key)
+            if _pending_lock and _pending_lock.locked():
+                q = self._pending_queues.setdefault(effective_key, asyncio.Queue(maxsize=10))
+                try:
+                    q.put_nowait(msg)
+                    logger.debug(f"[PendingQueue] Message queued for {effective_key}")
+                    continue
+                except asyncio.QueueFull:
+                    logger.warning(f"[PendingQueue] Queue full for {effective_key}, dropping oldest message")
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(msg)
+                    except asyncio.QueueEmpty:
+                        pass
+                    continue
+
             async with trace_context(
                 msg.session_key,
                 "agent.turn",
@@ -2112,10 +2146,18 @@ class AgentLoop:
                 },
             ):
                 try:
-                    response = await asyncio.wait_for(
-                        self._process_message(msg),
-                        timeout=self.message_timeout,
-                    )
+                    gate = self._concurrency_gate
+                    if gate:
+                        async with gate:
+                            response = await asyncio.wait_for(
+                                self._process_message(msg),
+                                timeout=self.message_timeout,
+                            )
+                    else:
+                        response = await asyncio.wait_for(
+                            self._process_message(msg),
+                            timeout=self.message_timeout,
+                        )
                     if on_complete:
                         try:
                             on_complete(response.content if response else "")
@@ -2144,6 +2186,7 @@ class AgentLoop:
                         _sess = self.sessions.get_or_create(_sk)
                         _sess.add_message("assistant", "用户已取消操作。")
                         self.sessions.save(_sess)
+                        self._set_runtime_checkpoint(_sess, {"cancelled": True})
                     except Exception as _e:
                         logger.warning(f"[AgentLoop] Failed to save cancel placeholder: {_e}")
                     if on_complete:
@@ -2178,6 +2221,7 @@ class AgentLoop:
                         session.add_message("user", msg.content)
                         session.add_message("assistant", timeout_text)
                         self.sessions.save(session)
+                        self._set_runtime_checkpoint(session, {"timeout": True})
                     except Exception as _e:
                         logger.warning(f"Failed to save session on timeout: {_e}")
                     if on_complete:
@@ -2274,8 +2318,104 @@ class AgentLoop:
             self._cancelled_sessions.discard(session_key)
         logger.debug(f"Resetting cancel state, session_key={session_key}, cancelled_sessions={self._cancelled_sessions}")
         self._cancel_event.clear()
-    
+
+    def _schedule_background(self, coro) -> None:
+        """Schedule a background coroutine and track it for cleanup."""
+        async def _bg_wrapper():
+            try:
+                await coro
+            except Exception as e:
+                logger.warning(f"[Background] Task failed: {e}")
+        task = asyncio.create_task(_bg_wrapper())
+        self._background_tasks.append(task)
+        task.add_done_callback(lambda t: self._background_tasks.remove(t) if t in self._background_tasks else None)
+
+    def _set_runtime_checkpoint(self, session: "Session", payload: dict[str, Any] | None = None) -> None:
+        """Persist a checkpoint of the current session state."""
+        try:
+            session.metadata[self._RUNTIME_CHECKPOINT_KEY] = {
+                "messages": [m.copy() for m in session.messages],
+                "payload": payload or {},
+                "timestamp": time.time(),
+            }
+            self.sessions.save(session)
+        except Exception as e:
+            logger.warning(f"[Checkpoint] Failed to set checkpoint: {e}")
+
+    def _clear_runtime_checkpoint(self, session: "Session") -> None:
+        """Clear the runtime checkpoint after a successful turn."""
+        if self._RUNTIME_CHECKPOINT_KEY in session.metadata:
+            session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+            try:
+                self.sessions.save(session)
+            except Exception as e:
+                logger.warning(f"[Checkpoint] Failed to clear checkpoint: {e}")
+
+    @staticmethod
+    def _find_overlap(existing: list[dict], restored: list[dict]) -> int:
+        """Find the number of overlapping messages between existing and restored."""
+        max_overlap = min(len(existing), len(restored))
+        for i in range(max_overlap):
+            e = existing[i]
+            r = restored[i]
+            if e.get("role") != r.get("role") or e.get("content") != r.get("content"):
+                return i
+            # Also compare tool_calls presence to avoid mismatch with assistant messages
+            if bool(e.get("tool_calls")) != bool(r.get("tool_calls")):
+                return i
+        return max_overlap
+
+    def _restore_runtime_checkpoint(self, session: "Session") -> bool:
+        """Restore session messages from a runtime checkpoint if present."""
+        checkpoint = session.metadata.pop(self._RUNTIME_CHECKPOINT_KEY, None)
+        if not checkpoint:
+            return False
+        try:
+            restored = checkpoint.get("messages", [])
+            overlap = self._find_overlap(session.messages, restored)
+            session.messages.extend(restored[overlap:])
+            self.sessions.save(session)
+            logger.info(f"[Checkpoint] Restored {len(restored) - overlap} messages for session {session.key}")
+            return True
+        except Exception as e:
+            logger.warning(f"[Checkpoint] Failed to restore checkpoint: {e}")
+            return False
+
+    async def _drain_pending(self, session_key: str) -> list[Any]:
+        """Drain pending messages for a session and re-inject them into the bus."""
+        q = self._pending_queues.pop(session_key, None)
+        if not q:
+            return []
+        msgs = []
+        while not q.empty():
+            try:
+                msgs.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if msgs:
+            logger.info(f"[PendingQueue] Drained {len(msgs)} pending messages for {session_key}")
+            for m in msgs:
+                try:
+                    await self.bus.publish_inbound(m)
+                except Exception as e:
+                    logger.warning(f"[PendingQueue] Failed to re-inject pending message: {e}")
+        return msgs
+
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+        """Wrapper that serializes per-session processing and handles pending queues."""
+        lock = self._session_locks.setdefault(msg.session_key, asyncio.Lock())
+        await lock.acquire()
+        try:
+            # Yield control so any background tasks (e.g. subagent spawn) can start promptly
+            await asyncio.sleep(0)
+            return await self._process_message_core(msg)
+        finally:
+            # Drain pending messages before releasing lock to prevent race conditions
+            # where a newly arriving message could be processed before pending ones.
+            await self._drain_pending(msg.session_key)
+            lock.release()
+
+    async def _process_message_core(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a single inbound message.
 
@@ -2286,6 +2426,7 @@ class AgentLoop:
             The response message, or None if no response needed.
         """
         logger.info(f'[SkillReviewer] _process_message ENTRY: channel={msg.channel}, content={(msg.content or "")[:30]}')
+        self._tool_execution_times.clear()
         # 开始执行链路监控
         chain = self._chain_monitor.start_chain(
             session_key=msg.session_key,
@@ -2320,6 +2461,7 @@ class AgentLoop:
             session = self.sessions.get_or_create(msg.session_key)
             session.clear()
             session.subagent_results.clear()
+            self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
             logger.info(f"Session {msg.session_key} cleared by /clear command")
             try:
@@ -2334,6 +2476,10 @@ class AgentLoop:
 
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
+
+        # Restore any runtime checkpoint from a previous crash/interruption
+        if self._restore_runtime_checkpoint(session):
+            logger.info(f"[Checkpoint] Session {msg.session_key} restored from checkpoint")
 
         # Restore tool mode from session metadata if not set on this message
         # (tool_mode is only passed on the FIRST message of a session;
@@ -2466,12 +2612,12 @@ class AgentLoop:
         if image_files:
             logger.info(f"[Image] Found {len(image_files)} image file(s), will pass base64 to main agent first")
         
-        # 运行时归档：如果历史消息过长，先压缩旧消息
+        # 运行时归档：如果历史消息过长，先压缩旧消息（后台执行，不阻塞响应）
         if self._consolidator:
             try:
-                await self._consolidator.maybe_consolidate(session)
+                self._schedule_background(self._consolidator.maybe_consolidate(session))
             except Exception as e:
-                logger.warning(f"[Consolidator] Failed to consolidate: {e}")
+                logger.warning(f"[Consolidator] Failed to schedule consolidation: {e}")
 
         # Agent loop
         logger.info(f"[SkillReviewer] about to start agent loop, pending={self._pending_manual_review}")
@@ -2485,6 +2631,45 @@ class AgentLoop:
         usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         loop_start = time.monotonic()
         tool_result_max_len = self.tool_result_max_length
+
+        # 记录本轮加载的 skills 和 MCP 到 tool_steps，让用户感知环境上下文
+        _context_parts: list[str] = []
+        try:
+            _active_skills = self.context.skills.get_active_skills_for_message(msg.content or "")
+            if _active_skills:
+                _skill_lines: list[str] = []
+                for _s in _active_skills:
+                    _meta = self.context.skills._metadata_cache.get(_s)
+                    _desc = _meta.short_description or _meta.description if _meta else _s
+                    _skill_lines.append(f"- {_s}: {_desc}")
+                _context_parts.append(f"Active Skills ({len(_active_skills)})\n" + "\n".join(_skill_lines))
+        except Exception as _e:
+            logger.debug(f"[ContextStep] Failed to collect skills: {_e}")
+        try:
+            _mcp_tool_names = [n for n in self.tools.tool_names if n.startswith("mcp_")]
+            if _mcp_tool_names:
+                _mcp_servers: set[str] = set()
+                for _t in _mcp_tool_names:
+                    _parts = _t.split("_", 2)
+                    if len(_parts) >= 2:
+                        _mcp_servers.add(_parts[1])
+                _context_parts.append(
+                    f"MCP Tools Enabled\n"
+                    f"- Servers: {', '.join(sorted(_mcp_servers))}\n"
+                    f"- Tools: {len(_mcp_tool_names)}"
+                )
+        except Exception as _e:
+            logger.debug(f"[ContextStep] Failed to collect MCP info: {_e}")
+        if _context_parts:
+            _ts = int(time.time() * 1000)
+            tool_steps.append({
+                "name": "context",
+                "arguments": {},
+                "result": "\n\n".join(_context_parts),
+                "status": "completed",
+                "startTime": _ts,
+                "endTime": _ts,
+            })
 
         # Batch 模式：记录本轮 spawn 的 task_id，等待完成后聚合返回
         spawned_task_ids: list[str] = []
@@ -2881,22 +3066,21 @@ class AgentLoop:
                             for tc in exec_image:
                                 exec_results.append((tc, "已跳过：spawn vision 任务正在执行中"))
                         else:
-                            # spawn(vision) 已完成或没有 spawn(vision)，执行 exec_image
+                            # spawn(vision) 已完成或没有 spawn(vision)，执行 exec_image（实时 progress）
                             for tc in exec_image:
-                                result = await self._execute_single_tool(tc, _progress)
+                                result = await self._execute_single_tool(tc, progress)
                                 exec_results.append((tc, result))
                                 logger.info(f"[BatchMode] Exec image completed")
-                    _flush_buffered_events()
 
                     # 阶段 2.5: 若有 spawn_vision 和 spawn_other，等待 vision 完成并注入结果
                     # 使用统一的 helper，避免与 _execute_tool_parallel 路径重复
                     if spawn_vision and spawn_other:
                         await self._inject_vision_into_spawn_others(spawn_results, spawn_other, session, session_key)
 
-                    # 阶段 3: exec(非图片) 和 spawn(非 vision) 并行执行
+                    # 阶段 3: exec(非图片) 和 spawn(非 vision) 并行执行（实时 progress）
                     parallel_tasks = []
                     for tc in spawn_other + exec_other:
-                        parallel_tasks.append(self._execute_single_tool(tc, _progress))
+                        parallel_tasks.append(self._execute_single_tool(tc, progress))
 
                     if parallel_tasks:
                         parallel_results = await self._gather_awaitables_with_cancel_poll(
@@ -3267,6 +3451,7 @@ class AgentLoop:
             reasoning_content=last_reasoning_content,
         )
         self.sessions.save(session)
+        self._set_runtime_checkpoint(session, {"turn_completed": True})
         self.sessions.increment_token_usage(
             session.key,
             prompt_tokens=usage_acc["prompt_tokens"],
@@ -3319,6 +3504,8 @@ class AgentLoop:
         # Skill review trigger — fire for ALL message types (text and image)
         self._maybe_trigger_skill_review(session, session.get_history(max_messages=self.max_history_messages))
 
+        self._clear_runtime_checkpoint(session)
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -3337,6 +3524,7 @@ class AgentLoop:
         the response back to the correct destination.
         """
         logger.info(f"[SystemMessage] Processing system message from sender={msg.sender_id}, chat_id={msg.chat_id}")
+        self._tool_execution_times.clear()
 
         # Parse origin from chat_id (format: "channel:chat_id")
         if ":" in msg.chat_id:

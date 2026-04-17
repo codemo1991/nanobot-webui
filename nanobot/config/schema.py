@@ -54,7 +54,7 @@ class BrowserConfig(BaseModel):
     enabled: bool = True  # Web UI 默认启用
     host: str = "127.0.0.1"  # WebSocket server host
     port: int = 8765  # WebSocket server port
-    agent_timeout: float = 300.0  # Agent call timeout in seconds
+    agent_timeout: float = 0.0  # Agent call timeout in seconds (0 = no timeout for WebSocket)
     allow_from: list[str] = Field(default_factory=list)  # Allowed session IDs (empty = public)
 
 

@@ -121,7 +121,45 @@ class AnthropicProvider(LLMProvider):
                 "type": "image",
                 "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)},
             }
-        return {"type": "image", "source": {"type": "url", "url": url}}
+        # Anthropic does not support remote URL images; try to fetch and base64-encode
+        try:
+            import base64
+            import mimetypes
+            from pathlib import Path
+
+            # Local file path
+            p = Path(url)
+            if p.is_file():
+                mime, _ = mimetypes.guess_type(str(p))
+                if not mime:
+                    ext = p.suffix.lower()
+                    mime = {
+                        ".png": "image/png",
+                        ".gif": "image/gif",
+                        ".webp": "image/webp",
+                        ".bmp": "image/bmp",
+                    }.get(ext, "image/jpeg")
+                data = base64.b64encode(p.read_bytes()).decode()
+                return {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": data},
+                }
+
+            # Remote URL
+            import httpx
+
+            resp = httpx.get(url, timeout=30)
+            resp.raise_for_status()
+            mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            data = base64.b64encode(resp.content).decode()
+            return {
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": data},
+            }
+        except Exception as e:
+            from loguru import logger
+            logger.warning(f"[AnthropicProvider] Failed to convert image block (url={url[:80]}...): {e}")
+            return None
 
     def _convert_tool(self, tool: dict[str, Any]) -> dict[str, Any]:
         """Convert OpenAI-format tool to Anthropic format."""

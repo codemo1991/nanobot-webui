@@ -13,6 +13,7 @@ import {
   LoadingOutlined,
   PauseCircleOutlined,
   ToolOutlined,
+  InfoCircleOutlined,
   DownOutlined,
   RightOutlined,
 } from '@ant-design/icons'
@@ -109,6 +110,9 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
     : null
 
   const StatusBadge = () => {
+    if (step.name === 'context') {
+      return null
+    }
     if (status === 'running') {
       return (
         <span className="tool-status-badge running">
@@ -208,8 +212,8 @@ export const ToolStepCard: React.FC<ToolStepCardProps> = memo(({
           <span className="tool-step-icon" style={{ color: config.color }}>
             {config.icon}
           </span>
-          <ToolOutlined />
-          <Text strong>{step.name}</Text>
+          {step.name === 'context' ? <InfoCircleOutlined style={{ color: '#1890ff' }} /> : <ToolOutlined />}
+          <Text strong>{step.name === 'context' ? '环境上下文' : step.name}</Text>
           <StatusBadge />
         </Space>
         <Button

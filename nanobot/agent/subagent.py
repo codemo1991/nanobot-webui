@@ -83,6 +83,7 @@ class SubagentManager:
         self._claude_code_manager = claude_code_manager
         self._claude_code_permission_mode = claude_code_permission_mode
         self._running_tasks: dict[str, tuple[str | None, Any]] = {}  # task_id -> (origin_key, task)
+        self._session_tasks: dict[str, set[str]] = {}  # origin_key -> set[task_id]
         self._status_service = status_service
         self._agent_template_manager = agent_template_manager
 
@@ -223,39 +224,134 @@ class SubagentManager:
 
 
     def cancel_task(self, task_id: str) -> bool:
-        """取消指定的子代理任务。仅从追踪列表移除，不释放信号量（由任务线程在 finally 中释放，避免双重释放）。"""
-        if task_id in self._running_tasks:
-            logger.info(f"[SubagentManager] Cancelling task: {task_id}")
-            orig_key, _ = self._running_tasks.get(task_id, (None, None))
-            self._running_tasks.pop(task_id, None)
-            if orig_key and hasattr(self, "_session_cancelled"):
-                self._session_cancelled.add(orig_key)
-            logger.info(f"[SubagentManager] Task {task_id} cancelled (thread will release semaphore on exit)")
-            return True
+        """取消指定的子代理任务。调用 asyncio.Task.cancel() 实现真正停止。"""
+        entry = self._running_tasks.get(task_id)
+        if entry:
+            orig_key, task = entry
+            if task is not None and not task.done():
+                logger.info(f"[SubagentManager] Cancelling task: {task_id}")
+                task.cancel()
+                if orig_key and hasattr(self, "_session_cancelled"):
+                    self._session_cancelled.add(orig_key)
+                logger.info(f"[SubagentManager] Task {task_id} cancelled")
+                return True
+            # vision-inline uses None as task (thread-based)
+            if task is None:
+                logger.info(f"[SubagentManager] Cancelling thread-based task: {task_id}")
+                self._running_tasks.pop(task_id, None)
+                if orig_key and hasattr(self, "_session_cancelled"):
+                    self._session_cancelled.add(orig_key)
+                return True
         return False
 
     def cancel_by_session(self, channel: str, chat_id: str) -> int:
-        """取消指定 session 的所有子代理任务，返回取消的任务数量。仅移除追踪，不释放信号量。"""
+        """取消指定 session 的所有子代理任务，返回取消的任务数量。"""
         origin_key = f"{channel}:{chat_id}"
         if hasattr(self, "_session_cancelled"):
             self._session_cancelled.add(origin_key)
         cancelled = 0
-        for task_id, (orig_key, _) in list(self._running_tasks.items()):
+        for task_id, (orig_key, task) in list(self._running_tasks.items()):
             if orig_key == origin_key:
-                logger.info(f"[SubagentManager] Cancelling task {task_id} for session {origin_key}")
-                self._running_tasks.pop(task_id, None)
-                # 不在此处 release，避免双重释放
-                cancelled += 1
+                if self.cancel_task(task_id):
+                    cancelled += 1
         if cancelled > 0:
             logger.info(f"[SubagentManager] Cancelled {cancelled} tasks for session {origin_key}")
         return cancelled
 
     def cancel_all_tasks(self) -> int:
         """取消所有子代理任务，返回取消的任务数量"""
-        count = len(self._running_tasks)
+        count = 0
         for task_id in list(self._running_tasks.keys()):
-            self.cancel_task(task_id)
+            if self.cancel_task(task_id):
+                count += 1
         return count
+
+    async def _run_subagent_task(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: dict[str, str],
+        template: str,
+        session_id: str | None,
+        enable_memory: bool,
+        media: list[str] | None,
+        backend: str,
+        batch_id: str | None,
+        parent_span_id: str | None,
+    ) -> None:
+        """Wrapper around _run_subagent that handles cleanup and progress events."""
+        origin_key = f"{origin['channel']}:{origin['chat_id']}"
+        bus = SubagentProgressBus.get()
+        cancelled_by_user = False
+        try:
+            await self._run_subagent(
+                task_id, task, label, origin,
+                template=template, session_id=session_id,
+                enable_memory=enable_memory, media=media,
+                backend=backend, batch_id=batch_id,
+                parent_span_id=parent_span_id,
+            )
+            logger.info(f"[SubagentProgress] Subagent task {task_id} completed successfully")
+            self._complete_subagent_node(task_id, status="completed", result="Task completed")
+        except asyncio.CancelledError:
+            cancelled_by_user = True
+            logger.info(f"[SubagentProgress] Subagent task {task_id} was cancelled")
+            self._complete_subagent_node(task_id, status="cancelled", result="任务已被用户取消。")
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "cancelled",
+                "summary": "任务已被用户取消。",
+                "result": "任务已被用户取消。",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            raise  # re-raise so asyncio marks the task as cancelled
+        except Exception as e:
+            logger.error(f"[SubagentProgress] Subagent task {task_id} failed: {e}")
+            self._complete_subagent_node(task_id, status="failed", result=str(e))
+            error_result = f"任务执行失败: {str(e)}"
+            bus.push(origin_key, {
+                "type": "subagent_end",
+                "task_id": task_id,
+                "label": label,
+                "status": "error",
+                "summary": error_result[:300],
+                "result": error_result,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        finally:
+            # Release semaphore and cleanup
+            try:
+                self._subagent_semaphore.release()
+            except ValueError:
+                pass
+            self._running_tasks.pop(task_id, None)
+            # Clean up _session_tasks to prevent memory leak
+            self._session_tasks.setdefault(origin_key, set()).discard(task_id)
+            if not self._session_tasks.get(origin_key):
+                self._session_tasks.pop(origin_key, None)
+            logger.info(f"[SubagentProgress] Semaphore released and task {task_id} removed from _running_tasks")
+            # If no remaining subagents for this session, push stream_done
+            remaining = sum(1 for ok, _ in self._running_tasks.values() if ok == origin_key)
+            if remaining == 0 and not cancelled_by_user:
+                try:
+                    bus.push(origin_key, {"type": "stream_done"})
+                    logger.info(f"[SubagentProgress] Pushed stream_done for origin_key: {origin_key}")
+                except Exception as e:
+                    logger.warning(f"[SubagentProgress] Failed to push stream_done: {e}")
+            # Handle batch aggregation
+            if batch_id:
+                with self._batch_lock:
+                    tasks = self._batch_tasks.get(batch_id, set())
+                    tasks.discard(task_id)
+                    if not tasks:
+                        self._batch_tasks.pop(batch_id, None)
+                        try:
+                            bus.push(origin_key, {"type": "batch_complete", "batch_id": batch_id})
+                        except Exception:
+                            pass
 
     async def run_vision_analysis(
         self,
@@ -458,12 +554,7 @@ class SubagentManager:
 
         logger.info(f"[SubagentProgress] SubagentManager id: {id(self)}, _running_tasks before: {list(self._running_tasks.keys())}")
 
-        # 在独立线程中运行子代理任务，避免被主请求的事件循环关闭取消
-        # 保存信号量和任务引用，用于在线程完成后清理
-        semaphore = self._subagent_semaphore
-        running_tasks_ref = self._running_tasks
-
-        # Capture parent span for tracing before starting thread
+        # Capture parent span for tracing before starting task
         parent_span_id = None
         try:
             from nanobot.tracing.context import get_current_span_id
@@ -471,67 +562,36 @@ class SubagentManager:
         except Exception:
             pass  # Tracing not available, proceed without parent span
 
-        def run_in_thread():
-            """在独立线程的事件循环中运行子代理任务"""
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            bus = SubagentProgressBus.get()
-            origin_key = f"{origin['channel']}:{origin['chat_id']}"
-            try:
-                loop.run_until_complete(
-                    self._run_subagent(
-                        task_id, task, display_label, origin,
-                        template=template, session_id=session_id,
-                        enable_memory=enable_memory, media=media,
-                        backend=resolved_backend, batch_id=batch_id,
-                        parent_span_id=parent_span_id,
-                    )
-                )
-                logger.info(f"[SubagentProgress] Thread-based subagent task {task_id} completed successfully")
-                # 完成子 Agent 执行节点
-                self._complete_subagent_node(task_id, status="completed", result="Task completed")
-            except Exception as e:
-                logger.error(f"[SubagentProgress] Thread-based subagent task {task_id} failed: {e}")
-                # 完成子 Agent 执行节点（失败状态）
-                self._complete_subagent_node(task_id, status="failed", result=str(e))
-                # 确保即使失败也发送 subagent_end 事件
-                try:
-                    error_result = f"任务执行失败: {str(e)}"
-                    bus.push(origin_key, {
-                        "type": "subagent_end",
-                        "task_id": task_id,
-                        "label": display_label,
-                        "status": "error",
-                        "summary": error_result[:300],
-                        "result": error_result,  # 完整错误信息供前端使用
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    logger.info(f"[SubagentProgress] Pushed subagent_end event for failed task {task_id}")
-                except Exception as push_err:
-                    logger.error(f"[SubagentProgress] Failed to push subagent_end for failed task: {push_err}")
-            finally:
-                # 释放信号量并清理
-                semaphore.release()
-                running_tasks_ref.pop(task_id, None)
-                logger.info(f"[SubagentProgress] Semaphore released and task {task_id} removed from _running_tasks")
-                # 若该 session 已无运行中的子 agent，推送 stream_done 以便 SSE 自动断开
-                remaining = sum(1 for ok, _ in running_tasks_ref.values() if ok == origin_key)
-                if remaining == 0:
-                    try:
-                        bus.push(origin_key, {"type": "stream_done"})
-                        logger.info(f"[SubagentProgress] Pushed stream_done for origin_key: {origin_key}")
-                    except Exception as e:
-                        logger.warning(f"[SubagentProgress] Failed to push stream_done: {e}")
-                # Close the event loop
-                loop.close()
-
-        thread = threading.Thread(target=run_in_thread, daemon=True)
-        thread.start()
-
-        # 由于任务在线程中运行，存储 origin_key 以便后续按 session 取消
         origin_key = f"{origin_channel}:{origin_chat_id}"
-        self._running_tasks[task_id] = (origin_key, None)  # 存储 (origin_key, 占位)
-        logger.info(f"[SubagentProgress] SubagentManager id: {id(self)}, _running_tasks after (thread-based): {list(self._running_tasks.keys())}")
+        bg_task = asyncio.create_task(
+            self._run_subagent_task(
+                task_id=task_id,
+                task=task,
+                label=display_label,
+                origin=origin,
+                template=template,
+                session_id=session_id,
+                enable_memory=enable_memory,
+                media=media,
+                backend=resolved_backend,
+                batch_id=batch_id,
+                parent_span_id=parent_span_id,
+            )
+        )
+        self._running_tasks[task_id] = (origin_key, bg_task)
+        self._session_tasks.setdefault(origin_key, set()).add(task_id)
+
+        # Yield control so the background task gets a chance to start immediately.
+        # Without this, the caller's synchronous code may starve the new task.
+        await asyncio.sleep(0)
+
+        def _log_task_exception(t: asyncio.Task) -> None:
+            exc = t.exception()
+            if exc is not None:
+                logger.error(f"[SubagentProgress] Task {task_id} raised unhandled exception: {exc}", exc_info=exc)
+        bg_task.add_done_callback(_log_task_exception)
+
+        logger.info(f"[SubagentProgress] SubagentManager id: {id(self)}, _running_tasks after: {list(self._running_tasks.keys())}")
 
         # 记录子Agent spawn次数
         if self._status_service:
@@ -539,12 +599,6 @@ class SubagentManager:
                 self._status_service.increment_subagent_spawn()
             except Exception:
                 pass
-
-        # 对于线程方式运行的任务，不需要 asyncio task 回调
-        # 信号量释放和清理由线程内部处理
-
-        # 在返回前检查任务状态
-        logger.info(f"[SubagentProgress] Before return: thread-based task {task_id} started")
 
         if not session_id or not self.sessions or not self.sessions.get(session_id):
             logger.info(f"Spawned subagent [{task_id}]: {display_label}")
@@ -630,15 +684,29 @@ class SubagentManager:
                 pass
 
         async def _run_and_maybe_wait_late() -> dict[str, Any]:
-            """运行 run_task；超时后用 shield 保护，后台完成后可再通知。"""
-            return await self._claude_code_manager.run_task(
-                prompt=task,
-                workdir=None,
-                permission_mode=perm_mode,
-                enable_subagents=True,
-                timeout=timeout_sec * 2,  # 内部超时设大，由外层 wait_for 控制
-                progress_callback=_progress_callback,
-            )
+            """在独立线程的事件循环中运行 run_task，避免 anyio / claude-agent-sdk 与主事件 loop 冲突。"""
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+
+            def _thread_target() -> None:
+                try:
+                    result = asyncio.run(
+                        self._claude_code_manager.run_task(
+                            prompt=task,
+                            workdir=None,
+                            permission_mode=perm_mode,
+                            enable_subagents=True,
+                            timeout=timeout_sec * 2,
+                            progress_callback=_progress_callback,
+                        )
+                    )
+                    loop.call_soon_threadsafe(future.set_result, result)
+                except Exception as exc:
+                    loop.call_soon_threadsafe(future.set_exception, exc)
+
+            thread = threading.Thread(target=_thread_target, daemon=True)
+            thread.start()
+            return await future
 
         async def _deliver_late_result(inner: asyncio.Task) -> None:
             """等待 shielded 任务完成，将最终结果推送到 bus，并处理 batch 聚合与非 web 渠道的 announce。"""
