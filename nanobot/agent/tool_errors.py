@@ -24,11 +24,18 @@ def is_retryable_error(exc: BaseException) -> bool:
         return True
     # HTTP 错误（如 aiohttp.ClientResponseError）
     msg = str(exc).lower()
-    if "429" in msg or "timeout" in msg or "connection" in msg:
-        return True
-    if "503" in msg or "502" in msg or "504" in msg or "500" in msg:
-        return True
-    return False
+    error_type = type(exc).__name__.lower()
+    combined = msg + " " + error_type
+
+    # 可重试的关键字模式
+    retryable_keywords = {
+        "429", "timeout", "connection",
+        "503", "502", "504", "500",
+        "overloaded", "rate_limit", "529",
+        "unavailable", "internal_error"
+    }
+
+    return any(kw in combined for kw in retryable_keywords)
 
 
 def format_tool_error(
@@ -77,3 +84,28 @@ def is_structured_error(result: str) -> bool:
 def is_retryable_result(result: str) -> bool:
     """从标准化错误字符串判断是否可重试。"""
     return result.startswith(PREFIX_RETRYABLE)
+
+
+def is_tool_call_result_mismatch_error(exc: BaseException) -> bool:
+    """
+    判断是否为「assistant tool_calls 与 tool 消息不一致」类 API 错误。
+    - MiniMax：400 + 2013 / tool call and result not match
+    - OpenAI/DeepSeek：insufficient tool messages / must be followed by tool messages
+    此类错误可通过补全缺失的 tool 消息或按 tool_calls 顺序重排后重试。
+    """
+    msg = str(exc).lower()
+    if "2013" in msg:
+        return True
+    # MiniMax / 网关
+    if "tool call" in msg and "not match" in msg:
+        return True
+    if "tool_call" in msg and "result" in msg and ("match" in msg or "mismatch" in msg):
+        return True
+    # OpenAI API：An assistant message with 'tool_calls' must be followed by tool messages...
+    if "insufficient tool messages" in msg:
+        return True
+    if "must be followed by" in msg and "tool_calls" in msg:
+        return True
+    if "responding to each" in msg and "tool_call" in msg:
+        return True
+    return False

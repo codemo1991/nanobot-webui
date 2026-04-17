@@ -8,6 +8,8 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.config.loader import get_system_db_path
+
 
 class CalendarRepository:
     """Repository for calendar data, using SQLite storage."""
@@ -44,7 +46,6 @@ class CalendarRepository:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-
         CREATE INDEX IF NOT EXISTS idx_calendar_events_start ON calendar_events(start_time);
         CREATE INDEX IF NOT EXISTS idx_calendar_events_recurrence ON calendar_events(recurrence_id);
 
@@ -64,14 +65,14 @@ class CalendarRepository:
     """
 
     def _init_tables(self) -> None:
-        """Initialize calendar tables."""
+        """Initialize calendar tables in system.db."""
         try:
             conn = self._connect()
             conn.executescript(self._CREATE_SCHEMA)
             conn.executescript(self._INSERT_DEFAULT_SETTINGS)
             conn.commit()
             conn.close()
-            logger.debug("Calendar tables initialized")
+            logger.debug("Calendar tables initialized in system.db")
         except sqlite3.DatabaseError as e:
             logger.error(f"Failed to initialize calendar tables: {e}")
             raise
@@ -253,10 +254,14 @@ class CalendarRepository:
 _calendar_repo: CalendarRepository | None = None
 
 
-def get_calendar_repository(workspace: Path) -> CalendarRepository:
-    """Get or create CalendarRepository instance for the workspace."""
+def get_calendar_repository(workspace: Path | None = None) -> CalendarRepository:
+    """Get or create CalendarRepository instance.
+
+    Calendar data is stored in the global system.db as public/shared data.
+    The workspace parameter is kept for backward compatibility but ignored.
+    """
     global _calendar_repo
-    db_path = workspace / ".nanobot" / "calendar.db"
+    db_path = get_system_db_path()
     if _calendar_repo is None or _calendar_repo.db_path != db_path:
         _calendar_repo = CalendarRepository(db_path)
     return _calendar_repo

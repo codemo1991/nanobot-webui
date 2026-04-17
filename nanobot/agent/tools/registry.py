@@ -1,7 +1,6 @@
 """Tool registry for dynamic tool management."""
 
 import asyncio
-import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -12,6 +11,7 @@ from nanobot.agent.tool_errors import (
     format_invalid_params,
     format_tool_error,
     format_tool_not_found,
+    is_retryable_error,
 )
 from nanobot.agent.tools.base import Tool
 
@@ -78,15 +78,12 @@ class ToolRegistry:
         if not tool:
             return format_tool_not_found(name)
 
-        # Deferred MCP tool: return schema in result so LLM can retry with correct params
+        # Deferred MCP：首次调用时在此加载完整 schema 并立即执行，避免把 [DEFERRED_TOOL_LOADED] 当结果返回给模型/用户
         if getattr(tool, "deferred", False) and name not in self._loaded_deferred_tools:
             self._loaded_deferred_tools.add(name)
-            full_schema = tool.to_schema()
-            func = full_schema.get("function", {})
-            return (
-                f"[DEFERRED_TOOL_LOADED] Deferred MCP tool '{name}' schema loaded. "
-                f"Please call it again with appropriate parameters. "
-                f"Parameters schema: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}"
+            logger.info(
+                "[DeferredMCP] 首次调用 '%s'：已标记 schema 就绪，立即用当前参数执行",
+                name,
             )
 
         try:
@@ -97,6 +94,43 @@ class ToolRegistry:
         except Exception as e:
             logger.exception(f"Tool execution failed: {name}")
             return format_tool_error(name, e)
+
+    async def execute_with_retry(
+        self,
+        name: str,
+        params: dict[str, Any],
+        max_attempts: int = 3,
+    ) -> str:
+        """
+        Execute a tool with automatic retry for retryable errors.
+
+        Args:
+            name: Tool name.
+            params: Tool parameters.
+            max_attempts: Maximum retry attempts (default 3).
+
+        Returns:
+            Tool execution result as string.
+        """
+        last_result = None
+        for attempt in range(1, max_attempts + 1):
+            result = await self.execute(name, params)
+            last_result = result
+
+            # If not a retryable error, return immediately
+            if not is_retryable_result(result):
+                return result
+
+            # Last attempt - don't retry
+            if attempt >= max_attempts:
+                return result
+
+            # Retryable error - backoff and retry
+            backoff = 0.5 * attempt
+            logger.info(f"[ToolRetry] {name} failed (attempt {attempt}/{max_attempts}), retrying in {backoff}s...")
+            await asyncio.sleep(backoff)
+
+        return last_result or format_tool_not_found(name)
 
     def set_thread_pool(self, executor: ThreadPoolExecutor) -> None:
         """设置线程池执行器（用于CPU密集型任务）"""
@@ -123,15 +157,11 @@ class ToolRegistry:
         if not tool:
             return format_tool_not_found(name)
 
-        # Deferred MCP tool: defer loading to avoid executing with wrong params
         if getattr(tool, "deferred", False) and name not in self._loaded_deferred_tools:
             self._loaded_deferred_tools.add(name)
-            full_schema = tool.to_schema()
-            func = full_schema.get("function", {})
-            return (
-                f"[DEFERRED_TOOL_LOADED] Deferred MCP tool '{name}' schema loaded. "
-                f"Please call it again with appropriate parameters. "
-                f"Parameters schema: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}"
+            logger.info(
+                "[DeferredMCP] 首次调用 '%s'（线程池路径）：已标记 schema 就绪，立即执行",
+                name,
             )
 
         try:

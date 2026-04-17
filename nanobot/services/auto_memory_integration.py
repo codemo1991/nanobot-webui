@@ -63,29 +63,35 @@ class AutoMemoryIntegrationService:
     def __init__(
         self,
         workspace: Path,
-        provider: Any,
+        provider: Any = None,
         model: str | None = None,
         lookback_minutes: int = 60,
         max_messages: int = 100,
+        # New architecture: pass provider_manager instead of provider
+        provider_manager: Any = None,
     ):
         """
         初始化自动记忆整合服务。
 
         Args:
             workspace: Workspace 路径
-            provider: LLM Provider
+            provider: LLM Provider (legacy compat)
             model: LLM 模型名称
             lookback_minutes: 每次回溯的时间窗口（分钟）
             max_messages: 每次最多处理的消息数
+            provider_manager: ProviderManager instance (new architecture)
         """
         self.workspace = Path(workspace).resolve()
         self.provider = provider
+        self.provider_manager = provider_manager
         self.model = model or (
-            provider.get_default_model() if hasattr(provider, "get_default_model") else "anthropic/claude-sonnet-4-5"
+            provider.get_default_model() if hasattr(provider, "get_default_model") else "claude-sonnet-4-7"
         )
         self.lookback_minutes = lookback_minutes
         self.max_messages = max_messages
         self._repo = get_memory_repository(self.workspace)
+        self._resolved_provider: Any = None
+        self._resolved_model: str = self.model
 
         # 缓存 SessionManager 实例
         self._session_manager = None
@@ -172,27 +178,44 @@ class AutoMemoryIntegrationService:
             lines.append(f"{role}: {content}")
         return "\n".join(lines)
 
+    async def _resolve_provider(self) -> tuple[Any, str]:
+        """Resolve provider instance and model via ModelRouter."""
+        if self._resolved_provider is not None:
+            return self._resolved_provider, self._resolved_model
+
+        # Legacy: if direct provider is passed, use it
+        if self.provider is not None and hasattr(self.provider, "chat"):
+            self._resolved_provider = self.provider
+            self._resolved_model = self.model
+            return self._resolved_provider, self._resolved_model
+
+        # New architecture: use provider_manager
+        if self.provider_manager is not None:
+            from nanobot.providers.router import ModelRouter
+            from nanobot.config.loader import load_config
+
+            config = load_config()
+            repo = get_config_repository()
+            router = ModelRouter(repo)
+            if hasattr(self.provider_manager, "_providers"):
+                router._providers = self.provider_manager._providers
+            router.update_from_config(config)
+            handle = router.get(self.model)
+            self._resolved_provider = handle.provider
+            self._resolved_model = handle.model
+            return self._resolved_provider, self._resolved_model
+
+        raise RuntimeError("No provider or provider_manager available for AutoMemoryIntegrationService")
+
     async def _extract_memories(self, chat_history: str) -> str:
         """调用 LLM 提取长期记忆"""
-        from nanobot.providers.litellm_provider import LiteLLMProvider
-
         messages = [
             {"role": "system", "content": AUTO_INTEGRATE_PROMPT},
             {"role": "user", "content": chat_history},
         ]
 
-        # 如果 provider 已经有 chat 方法，直接使用
-        if hasattr(self.provider, "chat"):
-            resp = await self.provider.chat(messages=messages, model=self.model, max_tokens=4096)
-            return (resp.content or "").strip()
-
-        # 否则尝试使用 LiteLLMProvider
-        provider = LiteLLMProvider(
-            api_key=self.provider.api_key if hasattr(self.provider, "api_key") else None,
-            api_base=self.provider.api_base if hasattr(self.provider, "api_base") else None,
-            default_model=self.model,
-        )
-        resp = await provider.chat(messages=messages, model=self.model, max_tokens=4096)
+        provider, model = await self._resolve_provider()
+        resp = await provider.chat(messages=messages, model=model, max_tokens=4096)
         return (resp.content or "").strip()
 
     def _parse_extracted_memories(self, text: str, now: datetime) -> list[tuple[str, str]]:

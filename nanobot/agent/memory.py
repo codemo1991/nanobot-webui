@@ -7,6 +7,7 @@ from typing import Any
 from nanobot.utils.helpers import ensure_dir, today_date, estimate_tokens, truncate_to_token_limit
 from nanobot.storage.memory_repository import (
     SCOPE_SELF_IMPROVE,
+    _entry_size,
     get_memory_repository,
     parse_memory_entries_with_dates as _parse_entries,
     entries_to_text_preserve_dates as _entries_to_text,
@@ -54,7 +55,6 @@ def _memory_context_apply_max_tokens(
             continue
         return truncate_to_token_limit(result, max_tokens)
     return truncate_to_token_limit("\n\n".join(p for p in (lt, si, td) if p), max_tokens)
-    return len(d) + len(c) + 20
 
 
 def truncate_entries_to_limit(

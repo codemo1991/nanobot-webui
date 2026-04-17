@@ -27,9 +27,9 @@ from nanobot.agentloop.db import connect_chat, connect_system, get_thread_chat_c
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.bus.queue import MessageBus
 from nanobot.config.defaults import init_default_profiles, init_default_agent_config
-from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, get_system_db_path, load_config, save_config
+from nanobot.config.loader import convert_keys, ensure_initial_config, get_config_repository, get_system_db_path, init_system_providers, load_config, save_config
 from nanobot.config.schema import Config, McpServerConfig
-from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.providers.provider_manager import ProviderManager
 from nanobot.providers.router import ModelRouter
 from nanobot.services.mirror_service import MirrorService
 from nanobot.services.system_status_service import SystemStatusService
@@ -75,6 +75,15 @@ def _sync_smart_profile_default_model(repo: "ConfigRepository", model_id: str) -
         )
 
 
+def _refresh_router_and_agent_model(app: "NanobotWebAPI", model_id: str | None) -> None:
+    """配置库中模型变更后：清 Router 缓存；若指定了 model_id 则热更新 Agent 当前解析模型。"""
+    if hasattr(app, "router") and hasattr(app.router, "clear_cache"):
+        app.router.clear_cache()
+    agent = getattr(app, "agent", None)
+    if model_id and agent is not None and hasattr(agent, "update_model"):
+        agent.update_model(model_id)
+
+
 class NanobotWebAPI:
     """State holder for web API handlers."""
 
@@ -86,18 +95,51 @@ class NanobotWebAPI:
         self._sys = sys
         self.gateway_process = None
         self.start_time = time.time()
-        # core_loop 由 run_server() 的 core_thread 启动后赋值，用于 chat_stream Gateway 模式
+        # core_loop 由 run_server() 的 core_thread 启动后赋值，用于 chat_sync Gateway 模式
         self.core_loop: asyncio.AbstractEventLoop | None = None
         # Logging configured by setup_logging() in CLI main callback
         config = ensure_initial_config()
 
-        # Initialize config repository and ensure default profiles exist
+        # Initialize config repository
         repo = get_config_repository()
+
+        # Initialize system providers in SQLite
+        init_system_providers(repo)
+
+        # Ensure system models are populated in config_models (resilient — won't crash on missing columns)
+        from nanobot.config.loader import ensure_models_populated
+        ensure_models_populated(repo)
+
+        # Ensure default profiles exist
         init_default_profiles(repo)
         init_default_agent_config(repo)
 
+        # Initialize native SDK providers
+        from nanobot.providers.openai_provider import OpenAIProvider
+        from nanobot.providers.anthropic_provider import AnthropicProvider
+        from nanobot.providers.deepseek_provider import DeepSeekProvider
+        from nanobot.providers.azure_provider import AzureProvider
+
+        # Initialize ProviderManager - manages all native SDK provider instances
+        self.provider_manager = ProviderManager()
+
         # Initialize ModelRouter - the new unified model resolution
         self.router = ModelRouter(repo)
+
+        # Instantiate and register all native providers
+        openai_provider = OpenAIProvider()
+        anthropic_provider = AnthropicProvider()
+        deepseek_provider = DeepSeekProvider()
+        azure_provider = AzureProvider()
+        moonshot_provider = OpenAIProvider()
+
+        self.provider_manager.register_all(
+            openai=openai_provider,
+            anthropic=anthropic_provider,
+            deepseek=deepseek_provider,
+            azure=azure_provider,
+            moonshot=moonshot_provider,
+        )
 
         # Check if we have any usable models
         try:
@@ -109,18 +151,10 @@ class NanobotWebAPI:
                 f"No usable model configuration found: {e}. "
                 "Please configure providers and models via the Config page."
             )
-            # Create a dummy router that will fail gracefully
             handle = None
 
-        # 使用 ModelRouter 解析的模型，不再依赖 config.agents.defaults.model
-        model = handle.model if handle else "anthropic/claude-opus-4-6"
-        api_key = config.get_api_key(model)
-        api_base = config.get_api_base(model)
-        provider = LiteLLMProvider(
-            api_key=api_key,
-            api_base=api_base,
-            default_model=model,
-        )
+        # 使用 ModelRouter 解析的模型（原生格式，不再是 litellm 格式）
+        model = handle.model if handle else "claude-opus-4-6"
 
         # Initialize system status service first (needed by AgentLoop)
         # 优先使用 workspace 特定的数据库，否则使用默认数据库
@@ -135,7 +169,7 @@ class NanobotWebAPI:
             init_system_schema(sys_conn)
             sys_conn.close()
         except Exception as e:
-            logger.warning("AgentLoop schema 初始化失败（可忽略，首次使用微内核时会重试）: %s", e)
+            logger.warning(f"AgentLoop schema 初始化失败（可忽略，首次使用微内核时会重试）: {e}")
         workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
         if workspace_db_path.exists():
             status_db_path = workspace_db_path
@@ -157,14 +191,21 @@ class NanobotWebAPI:
         self.agent_template_manager = AgentTemplateManager(workspace_path)
 
         # Pre-register API keys for custom models in templates
-        self._register_template_model_keys(provider, config)
-        # 启动时将所有已配置 provider 的 api_key 注入环境变量，供 profile 解析到的模型使用
-        self._register_all_provider_keys(provider, config)
+        # 启动时从配置加载所有 provider 的 api_key
+        self.provider_manager.update_from_config(config)
+        # 注册到 router，使 router.get() 返回的 ModelHandle 携带 provider 实例
+        self.provider_manager.register_with_router(self.router)
+
+        # Initialize dynamic providers from database
+        from nanobot.config.loader import init_dynamic_providers
+        init_dynamic_providers(repo, self.provider_manager)
+
+        # Sync dynamic providers to router
+        self.provider_manager.sync_with_router(self.router)
 
         self._workspace_path = workspace_path  # 用于 web-ui 图片等文件保存到 workspace/.nanobot/media
         self.agent = AgentLoop(
             bus=MessageBus(),
-            provider=provider,
             workspace=config.workspace_path,
             model=model,
             subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
@@ -179,8 +220,9 @@ class NanobotWebAPI:
             thread_pool_size=getattr(config.agents.defaults, "thread_pool_size", 4),
             status_service=self.status_service,
             agent_template_manager=self.agent_template_manager,
-            # 新架构：传入 ModelRouter
+            # 新架构：传入 ModelRouter + ProviderManager
             router=self.router,
+            provider_manager=self.provider_manager,
             default_profile=self.default_profile,
             # 微内核委托配置
             microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
@@ -203,6 +245,14 @@ class NanobotWebAPI:
         self.mirror = MirrorService(
             workspace=workspace_path,
             sessions_manager=self.sessions,
+        )
+
+        # Browser/WebUI channel — WebSocket server for local web UI
+        from nanobot.channels.browser import BrowserChannel
+        self.browser_channel = BrowserChannel(
+            config=config.channels.browser,
+            bus=self.agent.bus,
+            agent=self.agent,
         )
 
         # 初始化仅用于发送的渠道客户端（供 cron 任务推送回复使用，不启动 inbound 监听）
@@ -305,7 +355,7 @@ class NanobotWebAPI:
         from nanobot.services.auto_memory_integration import AutoMemoryIntegrationService
         self.auto_memory_integration = AutoMemoryIntegrationService(
             workspace=workspace_path,
-            provider=provider,
+            provider_manager=self.provider_manager,
             model=model,
             lookback_minutes=config.memory.lookback_minutes,
             max_messages=config.memory.max_messages,
@@ -315,7 +365,7 @@ class NanobotWebAPI:
         from nanobot.services.memory_maintenance import MemoryMaintenanceService
         self.memory_maintenance = MemoryMaintenanceService(
             workspace=workspace_path,
-            provider=provider,
+            provider_manager=self.provider_manager,
             model=model,
             summarize_interval_min=config.memory.auto_integrate_interval_minutes,
             max_entries=config.memory.max_entries,
@@ -410,13 +460,13 @@ class NanobotWebAPI:
             return None
 
     def _get_effective_model(self) -> str:
-        """从 ModelRouter 解析当前生效的模型，不再使用 config.agents.defaults.model"""
+        """从 ModelRouter 解析当前生效的模型（原生格式）。"""
         if hasattr(self, "router") and hasattr(self, "default_profile"):
             try:
                 return self.router.get(self.default_profile).model
             except Exception:
                 pass
-        return "anthropic/claude-opus-4-6"
+        return "claude-opus-4-6"
 
     def _get_stored_mcp_tools(self) -> dict[str, list[dict[str, Any]]]:
         """Read stored MCP tools from SQLite database, returning a dict mapping mcp_id -> tools list."""
@@ -428,23 +478,6 @@ class NanobotWebAPI:
         """Reinitialize agent and status service with new workspace (hot reload)."""
         config = load_config()
         model = self._get_effective_model()
-        api_key = config.get_api_key(model)
-        api_base = config.get_api_base(model)
-        is_bedrock = model.startswith("bedrock/")
-        if not api_key and not is_bedrock:
-            logger.warning("No API key configured; agent will not be able to process chat until configured.")
-        provider = LiteLLMProvider(
-            api_key=api_key,
-            api_base=api_base,
-            default_model=model,
-        )
-        subagent_model_cfg = (getattr(config.agents.defaults, "subagent_model", "") or "").strip()
-        if subagent_model_cfg:
-            sa_key = config.get_api_key(subagent_model_cfg)
-            if sa_key:
-                provider.ensure_api_key_for_model(
-                    subagent_model_cfg, sa_key, config.get_api_base(subagent_model_cfg)
-                )
         # 使用 workspace 特定的数据库路径
         workspace_db_path = memory_repository.get_workspace_db_path(workspace_path)
         if workspace_db_path.exists():
@@ -463,7 +496,6 @@ class NanobotWebAPI:
 
         self.agent = AgentLoop(
             bus=self.agent.bus,
-            provider=provider,
             workspace=workspace_path,
             model=model,
             subagent_model=getattr(config.agents.defaults, "subagent_model", "") or None,
@@ -476,6 +508,7 @@ class NanobotWebAPI:
             status_service=status_service,
             agent_template_manager=self.agent_template_manager,
             router=self.router,
+            provider_manager=self.provider_manager,
             default_profile=self.default_profile,
             # 微内核委托配置
             microkernel_escalation_enabled=getattr(config.agents.defaults, "microkernel_escalation_enabled", True),
@@ -581,36 +614,6 @@ class NanobotWebAPI:
                 self.gateway_process.kill()
             self.gateway_process = None
 
-    def _register_template_model_keys(self, provider, config) -> None:
-        """Pre-register API keys for custom models configured in templates."""
-        try:
-            custom_models = self.agent_template_manager.get_all_custom_models()
-            for model in custom_models:
-                api_key = config.get_api_key(model)
-                api_base = config.get_api_base(model)
-                if api_key:
-                    provider.ensure_api_key_for_model(model, api_key, api_base)
-                    logger.info(f"Registered API key for template model: {model}")
-                else:
-                    logger.warning(f"No API key found for template model: {model}")
-        except Exception as e:
-            logger.warning(f"Failed to register template model keys: {e}")
-
-    def _register_all_provider_keys(self, provider, config) -> None:
-        """将所有已配置 provider 的 api_key 注入环境变量，供 profile 解析到的模型使用。"""
-        provider_ids = [
-            "anthropic", "openai", "openrouter", "deepseek", "groq",
-            "zhipu", "dashscope", "gemini", "vllm", "ollama", "minimax",
-        ]
-        for pid in provider_ids:
-            pc = getattr(config.providers, pid, None)
-            if pc and getattr(pc, "api_key", None) and hasattr(provider, "ensure_api_key_for_model"):
-                provider.ensure_api_key_for_model(
-                    f"{pid}/placeholder",
-                    pc.api_key,
-                    getattr(pc, "api_base", None),
-                )
-
     def _sync_gateway(self, restart: bool = False) -> None:
         """Start, stop, or restart gateway based on channel configuration."""
         config = load_config()
@@ -654,14 +657,14 @@ class NanobotWebAPI:
 
     @staticmethod
     def to_session_id(key: str) -> str:
-        return key.split(":", 1)[1] if key.startswith("web:") else key
+        return key.split(":", 1)[1] if key.startswith("web:") or key.startswith("browser:") else key
 
     @staticmethod
     def to_session_key(session_id: str) -> str:
-        return f"web:{session_id}"
+        return f"browser:{session_id}"
 
     def list_sessions(self, page: int, page_size: int) -> dict[str, Any]:
-        all_sessions = self.sessions.list_sessions(key_prefix="web:")
+        all_sessions = self.sessions.list_sessions(key_prefix="browser:")
         total = len(all_sessions)
         start = max(0, (page - 1) * page_size)
         end = start + page_size
@@ -706,12 +709,58 @@ class NanobotWebAPI:
     def delete_session(self, session_id: str) -> bool:
         # 先删除会话，如果成功则清理缓冲区
         from nanobot.agent.subagent_progress import SubagentProgressBus
-        origin_key = f"web:{session_id}"
+        origin_key = f"browser:{session_id}"
         result = self.sessions.delete(self.to_session_key(session_id))
         # 只有会话删除成功后才清理缓冲区，防止内存泄漏
         if result:
             SubagentProgressBus.get().clear_buffer(origin_key)
         return result
+
+    def subagent_progress_stream(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
+        """
+        订阅指定 web session 的子 Agent 进度事件队列。
+
+        origin_key = "browser:{session_id}"（4e0e SpawnTool.set_context("browser", session_id) 5bf95e94Ff09
+        返回的 Queue 会持续接收 subagent_start / subagent_progress / subagent_end 事件，
+        直到调用方手动取消订阅。
+        """
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+        origin_key = f"browser:{session_id}"
+        return SubagentProgressBus.get().subscribe(origin_key, replay=True)
+
+    def unsubscribe_subagent_progress(
+        self, session_id: str, q: "queue.Queue[dict[str, Any]]"
+    ) -> None:
+        """取消订阅子 Agent 进度队列。"""
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+        SubagentProgressBus.get().unsubscribe(f"browser:{session_id}", q)
+
+    def _images_paths_to_data_urls(self, image_paths: list[str]) -> list[str]:
+        """将本地图片路径列表转为 base64 data URL，供前端直接显示。"""
+        import base64
+        import mimetypes
+        from pathlib import Path
+
+        out: list[str] = []
+        for path in image_paths:
+            try:
+                p = Path(path)
+                if not p.is_file():
+                    continue
+                mime, _ = mimetypes.guess_type(str(p))
+                if not mime:
+                    ext = p.suffix.lower()
+                    mime = {
+                        ".png": "image/png",
+                        ".gif": "image/gif",
+                        ".webp": "image/webp",
+                        ".bmp": "image/bmp",
+                    }.get(ext, "image/jpeg")
+                b64 = base64.b64encode(p.read_bytes()).decode()
+                out.append(f"data:{mime};base64,{b64}")
+            except Exception as e:
+                logger.warning(f"[get_messages] Failed to read image {path}: {e}")
+        return out
 
     def get_messages(self, session_id: str, before: int | None, limit: int) -> list[dict[str, Any]]:
         key = self.to_session_key(session_id)
@@ -720,34 +769,31 @@ class NanobotWebAPI:
             raise KeyError("session not found")
 
         messages = self.sessions.get_messages(key=key, limit=limit, before_sequence=before)
-        return [
-            {
+        result: list[dict[str, Any]] = []
+        for m in messages:
+            if m.get("internal"):
+                continue
+            msg: dict[str, Any] = {
                 "id": f"msg_{m['sequence']}",
                 "sessionId": session_id,
                 "role": m["role"],
                 "content": m["content"],
                 "createdAt": m["timestamp"],
                 "sequence": m["sequence"],
-                **({"toolSteps": m["tool_steps"]} if m.get("tool_steps") else {}),
-                **(
-                    {
-                        "tokenUsage": {
-                            "promptTokens": int(m["token_usage"].get("prompt_tokens", 0) or 0),
-                            "completionTokens": int(m["token_usage"].get("completion_tokens", 0) or 0),
-                            "totalTokens": int(m["token_usage"].get("total_tokens", 0) or 0),
-                        }
-                    }
-                    if m.get("token_usage")
-                    else {}
-                ),
-                **(
-                    {"images": m["images"]}
-                    if m.get("images")
-                    else {}
-                ),
             }
-            for m in messages
-        ]
+            if m.get("tool_steps"):
+                msg["toolSteps"] = m["tool_steps"]
+            if m.get("token_usage"):
+                tu = m["token_usage"]
+                msg["tokenUsage"] = {
+                    "promptTokens": int(tu.get("prompt_tokens", 0) or 0),
+                    "completionTokens": int(tu.get("completion_tokens", 0) or 0),
+                    "totalTokens": int(tu.get("total_tokens", 0) or 0),
+                }
+            if m.get("images"):
+                msg["images"] = self._images_paths_to_data_urls(m["images"])
+            result.append(msg)
+        return result
 
     def get_session_token_summary(self, session_id: str) -> dict[str, int]:
         key = self.to_session_key(session_id)
@@ -809,59 +855,6 @@ class NanobotWebAPI:
         }
 
     # ==================== Mirror Room Methods ====================
-
-    def mirror_chat_stream(
-        self, session_type: str, session_id: str, content: str
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
-        """Run mirror chat with progress events."""
-        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-
-        def on_progress(evt: dict[str, Any]) -> None:
-            try:
-                evt_queue.put(evt)
-            except Exception:
-                pass
-
-        def run_agent() -> None:
-            loop = None
-            try:
-                # 创建新的事件循环（避免与主线程冲突）
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(
-                    self._mirror_chat_with_progress(session_type, session_id, content, on_progress)
-                )
-                evt_queue.put({"type": "done", **result})
-            except asyncio.CancelledError:
-                evt_queue.put({"type": "error", "message": "cancelled"})
-            except Exception as e:
-                logger.exception("Mirror chat stream failed")
-                evt_queue.put({"type": "error", "message": str(e)})
-            finally:
-                # 等待事件循环内未完成的任务（含微内核、子代理），避免 loop.close() 导致 Task was destroyed / coroutine ignored GeneratorExit
-                if loop:
-                    try:
-                        current = asyncio.current_task()
-                        pending = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not current]
-                        if pending:
-                            logger.info(f"[MirrorChatStream] Waiting for {len(pending)} pending tasks before closing loop")
-                            try:
-                                loop.run_until_complete(asyncio.wait_for(
-                                    asyncio.gather(*pending, return_exceptions=True),
-                                    timeout=130,
-                                ))
-                            except asyncio.TimeoutError:
-                                logger.warning("[MirrorChatStream] Pending tasks timed out after 130s, cancelling")
-                                for t in pending:
-                                    if not t.done():
-                                        t.cancel()
-                                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                        loop.close()
-                    except Exception as e:
-                        logger.debug("Loop close error (ignored): %s", e)
-
-        thread = threading.Thread(target=run_agent, daemon=False)
-        return evt_queue, thread
 
     async def _mirror_chat_with_progress(
         self,
@@ -960,26 +953,6 @@ class NanobotWebAPI:
         self.sessions.save(session)
         return content
 
-    def wu_first_reply_stream(
-        self, session_id: str
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
-        """流式返回悟首次回复。"""
-        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-
-        def run() -> None:
-            try:
-                evt_queue.put({"type": "thinking"})
-                result = asyncio.run(self._wu_first_reply(session_id))
-                evt_queue.put({"type": "done", "content": result})
-            except KeyError:
-                evt_queue.put({"type": "error", "message": "mirror wu session not found"})
-            except Exception as e:
-                logger.exception("Wu first reply failed")
-                evt_queue.put({"type": "error", "message": str(e)})
-
-        thread = threading.Thread(target=run, daemon=False)
-        return evt_queue, thread
-
     async def _bian_first_reply(self, session_id: str) -> str:
         """辩首次回复：有 topic 时开场该辩题，无 topic 时随机给出三个辩题供选。"""
         key = MirrorService._session_key("bian", session_id)
@@ -1025,26 +998,6 @@ class NanobotWebAPI:
         session.add_message("assistant", content)
         self.sessions.save(session)
         return content
-
-    def bian_first_reply_stream(
-        self, session_id: str
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread]:
-        """流式返回辩首次回复。"""
-        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-
-        def run() -> None:
-            try:
-                evt_queue.put({"type": "thinking"})
-                result = asyncio.run(self._bian_first_reply(session_id))
-                evt_queue.put({"type": "done", "content": result})
-            except KeyError:
-                evt_queue.put({"type": "error", "message": "mirror bian session not found"})
-            except Exception as e:
-                logger.exception("Bian first reply failed")
-                evt_queue.put({"type": "error", "message": str(e)})
-
-        thread = threading.Thread(target=run, daemon=False)
-        return evt_queue, thread
 
     async def _run_mirror_analysis(
         self, stype: str, key: str
@@ -1099,7 +1052,7 @@ class NanobotWebAPI:
                     result[k.strip()] = v.strip()
             return result
         except Exception as e:
-            logger.warning("Mirror LLM analysis failed: %s", e)
+            logger.warning(f"Mirror LLM analysis failed: {e}")
             return None
 
     async def _run_shang_analysis(self, record: dict[str, Any]) -> dict[str, Any] | None:
@@ -1168,7 +1121,7 @@ class NanobotWebAPI:
                 analysis["bigFive"] = {"线索": result.get("大五线索", "")}
             return analysis if analysis else None
         except Exception as e:
-            logger.warning("Shang LLM analysis failed: %s", e)
+            logger.warning(f"Shang LLM analysis failed: {e}")
             return None
 
     async def generate_mirror_profile(self) -> dict[str, Any] | None:
@@ -1261,7 +1214,7 @@ class NanobotWebAPI:
             self.mirror.save_profile(profile)
             return profile
         except Exception as e:
-            logger.warning("Mirror profile generation failed: %s", e)
+            logger.warning(f"Mirror profile generation failed: {e}")
             return None
 
     def _parse_profile_from_text(self, text: str) -> dict[str, Any] | None:
@@ -1282,7 +1235,7 @@ class NanobotWebAPI:
         """
         将 base64 data URL 图片保存到当前 workspace 的 .nanobot/media 目录。
         与飞书等渠道一致，统一使用 workspace/.nanobot/media。
-        调用方负责在处理完成后清理这些文件。
+        文件长期保留，不再由调用方自动清理。
         """
         import base64
         import mimetypes
@@ -1328,225 +1281,6 @@ class NanobotWebAPI:
                 logger.warning(f"Failed to save image after {max_retries} attempts: {e}")
         return paths
 
-    def chat_stream(
-        self, session_id: str, content: str, images: list[str] | None = None,
-        tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
-    ) -> tuple[queue.Queue[dict[str, Any]], threading.Thread | None]:
-        """
-        Gateway 模式：将消息发布到 core_loop 的 inbound 队列，通过 on_complete / on_progress
-        回调将事件写入 evt_queue，供 SSE 消费端读取。
-
-        返回 (evt_queue, None)；调用方读取队列直到 {"type": "done"} 或 {"type": "error"}。
-        """
-        evt_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        media_paths = self._save_images_to_temp(images or [])
-
-        # 立即保存用户消息，确保刷新界面时能看到提问（即使 nanobot 仍在回答中）
-        key = self.to_session_key(session_id)
-        session = self.sessions.get_or_create(key)
-        user_kwargs: dict[str, Any] = {}
-        if images:
-            user_kwargs["images"] = images
-        session.add_message("user", content or "[图片]", **user_kwargs)
-        self.sessions.save(session)
-        logger.info(f"[ChatStream] User message saved immediately for session {session_id}")
-
-        from nanobot.web.chat_stream_bus import ChatStreamBus
-        stream_bus = ChatStreamBus.get()
-        origin_key = f"web:{session_id}"
-        # 新对话开始，清空旧缓冲，避免与历史事件混淆
-        stream_bus.clear_buffer(origin_key)
-
-        def _put_evt(evt: dict[str, Any]) -> None:
-            try:
-                evt_queue.put(evt)
-                stream_bus.push(origin_key, evt)
-            except Exception:
-                pass
-
-        def on_progress(evt: dict[str, Any]) -> None:
-            _put_evt(evt)
-
-        def on_complete(response_content: str, error: str | None = None) -> None:
-            """由 AgentLoop.run() 在消息处理结束后调用，触发 SSE done/error 事件。"""
-            for p in media_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if error:
-                _put_evt({"type": "error", "message": error})
-                return
-            _put_evt({
-                "type": "done",
-                "content": response_content,
-                "assistantMessage": self._build_assistant_message(session_id, key),
-            })
-
-        # 发送 start 事件（与旧实现一致，使前端知道流已建立）
-        _put_evt({"type": "start", "session_id": session_id})
-
-        _extra: dict[str, Any] = {"user_message_saved": True}
-        if tool_mode:
-            _extra["tool_mode"] = tool_mode
-        if selected_mcp_servers:
-            _extra["selected_mcp_servers"] = selected_mcp_servers
-
-        from nanobot.bus.events import InboundMessage as _InboundMessage
-        inbound_msg = _InboundMessage(
-            channel="web",
-            sender_id="user",
-            chat_id=session_id,
-            content=content or "",
-            metadata={
-                "progress_callback": on_progress,
-                "on_complete": on_complete,
-                **_extra,
-            },
-            media=media_paths,
-        )
-
-        core_loop = self.core_loop
-        if core_loop is None or not core_loop.is_running():
-            logger.error("[ChatStream] core_loop not ready, falling back to legacy thread mode")
-            # 降级：使用旧线程模式（兼容 core_loop 未就绪的情况）
-            return self._chat_stream_legacy(
-                session_id, content, images, tool_mode, selected_mcp_servers,
-                evt_queue=evt_queue, media_paths=media_paths,
-                on_progress=on_progress, key=key,
-            )
-
-        ok = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
-        if not ok:
-            logger.warning(f"[ChatStream] inbound queue full for session {session_id}")
-            on_complete("", error="服务繁忙，请稍后重试（消息队列已满）")
-
-        logger.info(f"[ChatStream] Message enqueued to core_loop for session {session_id}")
-        return evt_queue, None
-
-    def _chat_stream_legacy(
-        self,
-        session_id: str,
-        content: str,
-        images: list[str] | None,
-        tool_mode: str | None,
-        selected_mcp_servers: list[str] | None,
-        evt_queue: "queue.Queue[dict[str, Any]]",
-        media_paths: list[str],
-        on_progress: Any,
-        key: str,
-    ) -> tuple["queue.Queue[dict[str, Any]]", threading.Thread]:
-        """
-        降级回退：当 core_loop 未就绪时，沿用旧的 threading.Thread + new_event_loop 模式。
-        正常运行时不应进入此路径。
-        """
-        logger.warning("[ChatStream] Using legacy thread mode (core_loop unavailable)")
-
-        def run_agent() -> None:
-            loop = None
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                _extra = {"user_message_saved": True}
-                if tool_mode:
-                    _extra["tool_mode"] = tool_mode
-                if selected_mcp_servers:
-                    _extra["selected_mcp_servers"] = selected_mcp_servers
-                result = loop.run_until_complete(
-                    self._chat_with_progress(
-                        session_id, content, on_progress, media_paths,
-                        extra_metadata=_extra,
-                    )
-                )
-                evt_queue.put({"type": "done", **result})
-            except asyncio.CancelledError:
-                evt_queue.put({"type": "error", "message": "cancelled"})
-            except Exception as e:
-                logger.exception(f"[ChatStream] legacy mode failed: {e}")
-                evt_queue.put({"type": "error", "message": str(e)})
-            finally:
-                if loop:
-                    try:
-                        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
-                        if pending:
-                            # 立即 cancel，给 3s 收尾（MCP 连接关闭等），避免线程长时间残留
-                            for t in pending:
-                                t.cancel()
-                            try:
-                                loop.run_until_complete(asyncio.wait_for(
-                                    asyncio.gather(*pending, return_exceptions=True),
-                                    timeout=3.0,
-                                ))
-                            except (asyncio.TimeoutError, Exception):
-                                pass
-                        loop.close()
-                    except Exception as e:
-                        logger.debug("Loop close error (ignored): %s", e)
-                for p in media_paths:
-                    try:
-                        Path(p).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-        thread = threading.Thread(target=run_agent, daemon=False)
-        return evt_queue, thread
-
-    async def _chat_with_progress(
-        self,
-        session_id: str,
-        content: str,
-        progress_callback: Any,
-        media: list[str] | None = None,
-        extra_metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Internal: run chat with optional progress callback. Used by chat() and legacy mode."""
-        key = self.to_session_key(session_id)
-        self.sessions.get_or_create(key)
-        # 注意：MCP 不再在这里 reload。Gateway 模式下 core_loop 持有稳定的 MCP 连接；
-        # 降级线程模式下保持原有行为（由 loop.py 的 loop-id 检测触发按需 reload）。
-        response = await self.agent.process_direct(
-            content=content,
-            session_key=key,
-            channel="web",
-            chat_id=session_id,
-            progress_callback=progress_callback,
-            media=media or [],
-            extra_metadata=extra_metadata,
-        )
-        return {
-            "content": response,
-            "assistantMessage": self._build_assistant_message(session_id, key),
-        }
-
-    def chat_stream_resume(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
-        """
-        订阅指定 session 的 Chat 流式事件（用于刷新/切换 tab 后重连 SSE）。
-        返回的 Queue 会接收 start / tool_start / tool_end / done / error 等事件，
-        支持 replay 已发生的事件。
-        """
-        from nanobot.web.chat_stream_bus import ChatStreamBus
-        origin_key = f"web:{session_id}"
-        return ChatStreamBus.get().subscribe(origin_key, replay=True)
-
-    def subagent_progress_stream(self, session_id: str) -> "queue.Queue[dict[str, Any]]":
-        """
-        订阅指定 web session 的子 Agent 进度事件队列。
-
-        origin_key = "web:{session_id}"（与 SpawnTool.set_context("web", session_id) 对应）。
-        返回的 Queue 会持续接收 subagent_start / subagent_progress / subagent_end 事件，
-        直到调用方手动取消订阅。
-        """
-        from nanobot.agent.subagent_progress import SubagentProgressBus
-        origin_key = f"web:{session_id}"
-        return SubagentProgressBus.get().subscribe(origin_key, replay=True)
-
-    def unsubscribe_subagent_progress(
-        self, session_id: str, q: "queue.Queue[dict[str, Any]]"
-    ) -> None:
-        """取消订阅子 Agent 进度队列。"""
-        from nanobot.agent.subagent_progress import SubagentProgressBus
-        SubagentProgressBus.get().unsubscribe(f"web:{session_id}", q)
-
     async def chat(
         self, session_id: str, content: str, images: list[str] | None = None,
         tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
@@ -1558,30 +1292,28 @@ class NanobotWebAPI:
             extra["tool_mode"] = tool_mode
         if selected_mcp_servers:
             extra["selected_mcp_servers"] = selected_mcp_servers
-        try:
-            return await self._chat_with_progress(
-                session_id, content, progress_callback=None, media=media_paths, extra_metadata=extra or None,
-            )
-        finally:
-            for p in media_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
+        return await self._chat_with_progress(
+            session_id, content, progress_callback=None, media=media_paths, extra_metadata=extra or None,
+        )
 
     def _build_assistant_message(self, session_id: str, key: str) -> dict[str, Any] | None:
         """从 session 记录中构造 assistantMessage 字典（供 done 事件和 chat_sync 共用）。"""
-        messages = self.sessions.get_messages(key=key, limit=2)
-        assistant = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
+        # 优先从缓存读取最新的 assistant 消息，避免 get_messages 查到旧数据
+        session = self.sessions.get(key)
+        if session and session.messages:
+            assistant = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
+        else:
+            messages = self.sessions.get_messages(key=key, limit=2)
+            assistant = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
         if not assistant:
             return None
         return {
-            "id": f"msg_{assistant['sequence']}",
+            "id": f"msg_{assistant.get('sequence', 0)}",
             "sessionId": session_id,
             "role": assistant["role"],
             "content": assistant["content"],
             "createdAt": assistant["timestamp"],
-            "sequence": assistant["sequence"],
+            "sequence": assistant.get("sequence", 0),
             **({"toolSteps": assistant["tool_steps"]} if assistant.get("tool_steps") else {}),
             **(
                 {
@@ -1624,19 +1356,19 @@ class NanobotWebAPI:
         result_future: concurrent.futures.Future[dict[str, Any]] = concurrent.futures.Future()
 
         def on_complete(response_content: str, error: str | None = None) -> None:
-            for p in media_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
             if result_future.done():
                 return
             if error:
                 result_future.set_exception(RuntimeError(error))
                 return
+            try:
+                assistant_msg = self._build_assistant_message(session_id, key)
+            except Exception as e:
+                logger.warning(f"[chat_sync] 构造 assistantMessage 失败: {e}")
+                assistant_msg = None
             result_future.set_result({
                 "content": response_content,
-                "assistantMessage": self._build_assistant_message(session_id, key),
+                "assistantMessage": assistant_msg,
             })
 
         _extra: dict[str, Any] = {"user_message_saved": True}
@@ -1659,18 +1391,23 @@ class NanobotWebAPI:
         if core_loop is None or not core_loop.is_running():
             # 降级：core_loop 未就绪时使用 asyncio.run
             logger.warning("[chat_sync] core_loop not ready, falling back to asyncio.run")
-            for p in media_paths:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
             return asyncio.run(self._chat_with_progress(
                 session_id, content, progress_callback=None, media=[], extra_metadata=_extra or None,
             ))
 
-        ok = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
+        ok, inbound_reason = self.agent.bus.try_publish_inbound_sync(inbound_msg, core_loop)
         if not ok:
-            raise RuntimeError("服务繁忙，请稍后重试（消息队列已满）")
+            _sync_inbound_msgs = {
+                "queue_full": "服务繁忙，请稍后重试（消息队列已满）",
+                "enqueue_timeout": "执行核暂时无法接收消息，请稍后重试（可能被长任务或阻塞占用）",
+                "loop_none": "执行核未就绪，请稍后重试",
+                "loop_not_running": "执行核未运行，请稍后重试",
+                "loop_status_error": "执行核状态异常，请稍后重试",
+                "enqueue_error": "消息入队失败，请稍后重试",
+            }
+            raise RuntimeError(
+                _sync_inbound_msgs.get(inbound_reason, "服务繁忙，请稍后重试")
+            )
 
         timeout = getattr(self.agent, "message_timeout", 300.0) + 60
         try:
@@ -1724,38 +1461,29 @@ class NanobotWebAPI:
                 "allowFrom": config.channels.dingtalk.allow_from,
             },
         }
-        
-        # Providers (AI) configuration
-        provider_display_names = {
-            "anthropic": "Anthropic",
-            "openai": "OpenAI",
-            "openrouter": "OpenRouter",
-            "deepseek": "DeepSeek",
-            "groq": "Groq",
-            "zhipu": "Zhipu (智谱)",
-            "dashscope": "Qwen (通义)",
-            "gemini": "Gemini",
-            "vllm": "vLLM",
-            "ollama": "Ollama",
-            "minimax": "Minimax",
-        }
+
+        # Providers (AI) configuration — all providers from SQLite (YAML is no longer used)
+        repo = get_config_repository()
         providers = []
-        for provider_name in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
-            provider_config = getattr(config.providers, provider_name)
-            if provider_config.api_key or provider_config.api_base:
-                # Ollama 仅需 api_base 即可启用
-                enabled = bool(provider_config.api_key) or (
-                    provider_name == "ollama" and provider_config.api_base
-                )
-                providers.append({
-                    "id": provider_name,
-                    "name": provider_display_names.get(provider_name, provider_name.capitalize()),
-                    "type": provider_name,
-                    "apiKey": provider_config.api_key or None,  # 配置页需展示真实 key 以便编辑
-                    "apiBase": provider_config.api_base,
-                    "enabled": enabled,
-                })
-        
+        for sp in repo.get_all_providers():
+            entry = {
+                "id": sp["id"],
+                "name": sp["display_name"] or sp["name"],
+                "type": sp["provider_type"],
+                "apiKey": sp["api_key"] or None,
+                "apiBase": sp["api_base"],
+                "enabled": bool(sp["enabled"]),
+                "displayName": sp["display_name"] or sp["name"],
+                "providerType": sp["provider_type"],
+                "isSystem": bool(sp["is_system"]),
+                "sortOrder": sp.get("sort_order", 0),
+                "configJson": sp.get("config_json", "{}"),
+            }
+            if sp["provider_type"] == "azure" or sp["id"] == "azure":
+                entry["apiVersion"] = sp.get("api_version", "2024-12-01-preview")
+                entry["azureDeployment"] = sp.get("azure_deployment", "")
+            providers.append(entry)
+
         # Create default model entry - 使用 ModelRouter 解析的实际模型
         effective_model = self._get_effective_model()
         models = [{
@@ -1839,98 +1567,173 @@ class NanobotWebAPI:
         }
 
     def create_provider(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create/Enable a new AI provider configuration."""
-        config = load_config()
-        provider_type = data.get("type", "").lower()
-        
-        if not provider_type or provider_type not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
-            raise ValueError("Invalid provider type")
-        
-        provider_config = getattr(config.providers, provider_type)
-        provider_config.api_key = data.get("apiKey", "")
-        provider_config.api_base = data.get("apiBase")
-        
-        from nanobot.config.loader import save_config
-        save_config(config)
-        
-        # 立即更新该 provider 的环境变量，供后续 chat 使用
-        if provider_config.api_key and hasattr(self.agent.provider, "ensure_api_key_for_model"):
-            self.agent.provider.ensure_api_key_for_model(
-                f"{provider_type}/placeholder",
-                provider_config.api_key,
-                provider_config.api_base,
-            )
-        
-        enabled = bool(provider_config.api_key) or (
-            provider_type == "ollama" and provider_config.api_base
+        """Create a new AI provider configuration. All providers are stored in SQLite."""
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
+
+        provider_id = data.get("id", "")
+        if not provider_id:
+            raise ValueError("Provider 'id' is required")
+
+        builtin_types = {"anthropic", "openai", "deepseek", "azure"}
+        # For builtins: enabled = True if api_key is provided; for custom: default False
+        if provider_id in builtin_types:
+            provided_key = data.get("apiKey", "")
+            enabled = bool(provided_key)
+        else:
+            enabled = data.get("enabled", False)
+
+        api_key_val = data.get("apiKey", "")
+        api_base_val = data.get("apiBase")
+        api_version_val = data.get("apiVersion", "")
+        azure_deployment_val = data.get("azureDeployment", "")
+
+        repo.set_provider(
+            provider_id=provider_id,
+            name=data.get("displayName", data.get("name", provider_id.capitalize())),
+            display_name=data.get("displayName", data.get("name", provider_id.capitalize())),
+            provider_type=data.get("providerType", provider_id),
+            api_key=api_key_val,
+            api_base=api_base_val,
+            enabled=enabled,
+            priority=data.get("priority", 0),
+            is_system=data.get("isSystem", provider_id in builtin_types),
+            sort_order=data.get("sortOrder", 0),
+            config_json=data.get("configJson", "{}"),
+            api_version=api_version_val,
+            azure_deployment=azure_deployment_val,
         )
+        logger.debug(f"[update_provider] {provider_id}: repo.set_provider done, api_key={bool(api_key_val)}")
+
+        # Create provider instance and clear router cache
+        if api_key_val:
+            self.provider_manager.register_provider(
+                provider_id=provider_id,
+                api_key=api_key_val,
+                api_base=api_base_val,
+                provider_type=data.get("providerType", "openai"),
+            )
+            self.router.clear_cache()
+
         return {
-            "id": provider_type,
-            "name": data.get("name", provider_type.capitalize()),
-            "type": provider_type,
-            "apiBase": provider_config.api_base,
-            "apiKey": provider_config.api_key or None,
+            "id": provider_id,
+            "name": data.get("displayName", data.get("name", provider_id.capitalize())),
+            "type": provider_id,
+            "apiKey": api_key_val or None,
+            "apiBase": api_base_val,
             "enabled": enabled,
+            "displayName": data.get("displayName", data.get("name", provider_id.capitalize())),
+            "providerType": data.get("providerType", provider_id),
+            "isSystem": data.get("isSystem", provider_id in builtin_types),
+            "sortOrder": data.get("sortOrder", 0),
+            "configJson": data.get("configJson", "{}"),
+            "apiVersion": api_version_val,
+            "azureDeployment": azure_deployment_val,
         }
 
     def update_provider(self, provider_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Update AI provider configuration."""
-        config = load_config()
-        
-        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
-            raise KeyError("Provider not found")
-        
-        provider_config = getattr(config.providers, provider_id)
-        if "apiKey" in data and data["apiKey"] != "***":
-            # 占位符 "***" 不覆盖；空串或新值则更新
-            provider_config.api_key = data["apiKey"]
-        if "apiBase" in data:
-            provider_config.api_base = data["apiBase"]
-        
-        from nanobot.config.loader import save_config
-        save_config(config)
-        
-        # 始终更新该 provider 的环境变量（MINIMAX_API_KEY 等），供 LiteLLM 使用
-        # 否则当使用 profile 解析到 minimax 时，env 中无 key 会导致 401
-        if provider_config.api_key and hasattr(self.agent.provider, "ensure_api_key_for_model"):
-            self.agent.provider.ensure_api_key_for_model(
-                f"{provider_id}/placeholder",
-                provider_config.api_key,
-                provider_config.api_base,
-            )
-        # 若当前默认模型使用此 provider，热更新 agent 的 provider 实例配置
-        model_name = self._get_effective_model()
-        if model_name and model_name.split("/")[0] == provider_id:
-            if hasattr(self.agent.provider, "update_config"):
-                api_key = config.get_api_key(model_name)
-                api_base = config.get_api_base(model_name)
-                self.agent.provider.update_config(model_name, api_key, api_base)
-        
-        enabled = bool(provider_config.api_key) or (
-            provider_id == "ollama" and provider_config.api_base
+        """Update AI provider configuration. All providers stored in SQLite."""
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
+
+        builtin_types = {"anthropic", "openai", "deepseek", "azure"}
+        enabled = data.get("enabled", False)
+        api_key_val = data.get("apiKey", "")
+        api_base_val = data.get("apiBase")
+        api_version_val = data.get("apiVersion", "")
+        azure_deployment_val = data.get("azureDeployment", "")
+        logger.debug(f"[update_provider] {provider_id}: apiKey received = {bool(api_key_val)}, apiKey[:6] = {api_key_val[:6] if api_key_val else 'EMPTY'}")
+
+        repo.set_provider(
+            provider_id=provider_id,
+            name=data.get("name", data.get("displayName", provider_id.capitalize())),
+            display_name=data.get("displayName", data.get("name", provider_id.capitalize())),
+            provider_type=data.get("providerType", provider_id),
+            api_key=api_key_val,
+            api_base=api_base_val,
+            enabled=enabled,
+            priority=data.get("priority", 0),
+            is_system=data.get("isSystem", provider_id in builtin_types),
+            sort_order=data.get("sortOrder", 0),
+            config_json=data.get("configJson", "{}"),
+            api_version=api_version_val,
+            azure_deployment=azure_deployment_val,
         )
+        logger.debug(f"[update_provider] {provider_id}: repo.set_provider done, api_key={bool(api_key_val)}")
+
+        # Update provider instance and clear router cache
+        if api_key_val:
+            self.provider_manager.register_provider(
+                provider_id=provider_id,
+                api_key=api_key_val,
+                api_base=api_base_val,
+                provider_type=data.get("providerType", "openai"),
+            )
+            # Also update the router's own provider registry so it picks up the new credentials
+            self.router.update_provider_instance(
+                provider_id=provider_id,
+                api_key=api_key_val,
+                api_base=api_base_val,
+                provider_type=data.get("providerType", "openai"),
+            )
+
         return {
             "id": provider_id,
-            "name": data.get("name", provider_id.capitalize()),
+            "name": data.get("name", data.get("displayName", provider_id.capitalize())),
             "type": provider_id,
-            "apiBase": provider_config.api_base,
-            "apiKey": provider_config.api_key or None,
+            "apiKey": api_key_val or None,
+            "apiBase": api_base_val,
             "enabled": enabled,
+            "displayName": data.get("displayName", data.get("name", provider_id.capitalize())),
+            "providerType": data.get("providerType", provider_id),
+            "isSystem": data.get("isSystem", provider_id in builtin_types),
+            "sortOrder": data.get("sortOrder", 0),
+            "configJson": data.get("configJson", "{}"),
+            "apiVersion": api_version_val,
+            "azureDeployment": azure_deployment_val,
         }
 
     def delete_provider(self, provider_id: str) -> bool:
-        """Disable AI provider configuration."""
-        config = load_config()
-        
-        if provider_id not in ['anthropic', 'openai', 'openrouter', 'deepseek', 'groq', 'zhipu', 'dashscope', 'gemini', 'vllm', 'ollama', 'minimax']:
-            return False
-        
-        provider_config = getattr(config.providers, provider_id)
-        provider_config.api_key = ""
-        provider_config.api_base = None
+        """Delete/disable AI provider configuration."""
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
 
-        save_config(config)
-        return True
+        # Try to delete from SQLite (system providers are protected by is_system=0 guard)
+        deleted = repo.delete_provider(provider_id)
+
+        return deleted
+
+    def batch_disable_providers(self, provider_ids: list[str]) -> int:
+        """Batch disable providers. Returns the number of providers actually disabled."""
+        from nanobot.config.loader import get_config_repository
+        repo = get_config_repository()
+        return repo.batch_disable_providers(provider_ids)
+
+    def test_provider_connection(
+        self,
+        provider_id: str,
+        api_base: str | None = None,
+        api_key: str | None = None,
+    ) -> dict[str, Any]:
+        """服务端探测 OpenAI 兼容 API（含 MiniMax 无 /models 时的对话接口回退）。"""
+        from nanobot.config.loader import get_config_repository
+        from nanobot.providers.openai_compat_probe import probe_openai_compatible_connection
+
+        repo = get_config_repository()
+        p = repo.get_provider(provider_id)
+        if not p:
+            raise ValueError("Provider 不存在")
+
+        base = api_base if api_base is not None else (p.get("api_base") or "")
+        key = api_key if api_key is not None else (p.get("api_key") or "")
+        if not str(base).strip():
+            return {"ok": False, "status": 0, "detail": "请先填写 API Base URL"}
+
+        try:
+            return probe_openai_compatible_connection(str(base), str(key))
+        except Exception as e:
+            logger.warning(f"test_provider_connection {base!r}: {e}")
+            return {"ok": False, "status": 0, "detail": str(e)}
 
     def create_mcp(self, data: dict[str, Any]) -> dict[str, Any]:
         """Create a new MCP server configuration.
@@ -2152,6 +1955,8 @@ class NanobotWebAPI:
         """
         Get MCP list from config, discover tools for each server (connects, lists, disconnects).
         Returns MCP configs enriched with tools information.
+
+        Note: Uses asyncio.gather to process MCPs in parallel to avoid blocking web service.
         """
         from nanobot.config.loader import load_config
         from nanobot.mcp.loader import McpToolLoader, _safe_id
@@ -2164,8 +1969,8 @@ class NanobotWebAPI:
         workspace = config.workspace_path
         loader = McpToolLoader(mcps, workspace)
 
-        results = []
-        for mcp_cfg in mcps:
+        async def _discover_one(mcp_cfg: Any) -> dict[str, Any]:
+            """Discover tools for a single MCP server."""
             mcp_dict = {
                 "id": getattr(mcp_cfg, "id", "") or "",
                 "name": getattr(mcp_cfg, "name", "") or "",
@@ -2180,7 +1985,6 @@ class NanobotWebAPI:
                 "tools": [],
             }
 
-            # Try to discover tools（完整关闭 session + transport，避免 streamable_http 泄漏）
             server_id = mcp_dict["id"] or mcp_dict["name"]
             try:
                 tools = await loader.list_tools_ephemeral(server_id, timeout=12.0)
@@ -2215,9 +2019,22 @@ class NanobotWebAPI:
             except Exception as e:
                 logger.debug(f"MCP {server_id}: tool discovery skipped: {e}")
 
-            results.append(mcp_dict)
+            return mcp_dict
 
-        return results
+        # 并行处理所有 MCP 服务器，避免串行阻塞
+        tasks = [_discover_one(mcp_cfg) for mcp_cfg in mcps]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 过滤掉异常结果，只返回成功的
+        valid_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                mcp_id = getattr(mcps[i], "id", "unknown")
+                logger.warning(f"MCP {mcp_id}: discovery failed with exception: {result}")
+            else:
+                valid_results.append(result)
+
+        return valid_results
 
     async def discover_mcp_tools(self, mcp_id: str) -> list[dict[str, Any]]:
         """
@@ -2674,14 +2491,17 @@ class NanobotWebAPI:
         save_config(config)
 
         # Hot reload: update running agent/provider without restart
-        if hasattr(self.agent.provider, "update_config"):
-            api_key = config.get_api_key(model_name)
-            api_base = config.get_api_base(model_name)
-            self.agent.provider.update_config(model_name, api_key, api_base)
-            if subagent_model and hasattr(self.agent.provider, "ensure_api_key_for_model"):
-                sa_key = config.get_api_key(subagent_model)
-                sa_base = config.get_api_base(subagent_model)
-                self.agent.provider.ensure_api_key_for_model(subagent_model, sa_key, sa_base)
+        self.provider_manager.update_model_config(
+            model_name,
+            api_key=config.get_api_key(model_name),
+            api_base=config.get_api_base(model_name),
+        )
+        if subagent_model:
+            self.provider_manager.update_model_config(
+                subagent_model,
+                api_key=config.get_api_key(subagent_model),
+                api_base=config.get_api_base(subagent_model),
+            )
         self.agent.update_model(model_name)
         if hasattr(self.agent, "update_subagent_model"):
             self.agent.update_subagent_model(subagent_model)
@@ -2899,13 +2719,13 @@ class NanobotWebAPI:
     def reload_agent_templates(self) -> dict[str, Any]:
         """热重载 Agent 模板"""
         success = self.agent_template_manager.reload()
-        # Re-register API keys for custom models after reload
+        # Re-register all provider configs after template reload
         if success:
             try:
                 config = load_config()
-                self._register_template_model_keys(self.agent.provider, config)
+                self.provider_manager.update_from_config(config)
             except Exception as e:
-                logger.warning(f"Failed to re-register template model keys on reload: {e}")
+                logger.warning(f"Failed to update provider config on template reload: {e}")
         return {"success": success}
 
     # ========== 主 Agent System Prompt API ==========
@@ -3235,6 +3055,37 @@ class NanobotWebAPI:
             logger.exception(f"Failed to export config")
             return {}
 
+    def get_workspace_tree(self, path: str | None = None) -> list[dict[str, Any]]:
+        """Get directory tree entries for a workspace path."""
+        workspace = Path(self.agent.workspace).expanduser().resolve()
+        target = workspace
+        if path:
+            raw = Path(path)
+            if raw.is_absolute():
+                target = raw.expanduser().resolve()
+            else:
+                target = (workspace / raw).expanduser().resolve()
+            # Security: block traversal outside workspace
+            try:
+                target.relative_to(workspace)
+            except ValueError:
+                raise ValueError("Path traversal not allowed") from None
+        if not target.exists() or not target.is_dir():
+            raise ValueError(f"Directory does not exist: {target}")
+        entries = []
+        for child in sorted(target.iterdir(), key=lambda c: (c.is_file(), c.name.lower())):
+            try:
+                has_children = child.is_dir() and any(child.iterdir()) if child.is_dir() else False
+            except PermissionError:
+                has_children = child.is_dir()
+            entries.append({
+                "name": child.name,
+                "type": "dir" if child.is_dir() else "file",
+                "absolute_path": str(child.expanduser().resolve()),
+                "has_children": has_children,
+            })
+        return entries
+
     def upload_skill(self, form: cgi.FieldStorage) -> dict[str, Any]:
         """
         Upload a custom skill from folder (multiple files) to workspace/skills/.
@@ -3347,328 +3198,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _handle_chat_stream_resume(
-        self, app: "NanobotWebAPI", session_id: str
-    ) -> None:
-        """
-        重连 Chat SSE 流。当用户刷新或切换 tab 后，可由此端点继续接收推送结果。
-        """
-        logger.info(f"[ChatStream] SSE resume connection for session: {session_id}")
-        evt_queue = app.chat_stream_resume(session_id)
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        idle_timeout = 60  # 60 秒无事件则关闭（replay 后若流已结束会很快收到 done）
-        heartbeat_interval = 30
-        last_event = time.time()
-        last_heartbeat = time.time()
-
-        try:
-            while True:
-                try:
-                    evt = evt_queue.get(timeout=0.5)
-                    last_event = time.time()
-                except queue.Empty:
-                    now = time.time()
-                    if now - last_event >= idle_timeout:
-                        try:
-                            self.wfile.write(b'data: {"type":"timeout"}\n\n')
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            pass
-                        break
-                    if now - last_heartbeat >= heartbeat_interval:
-                        try:
-                            self.wfile.write(b": heartbeat\n\n")
-                            self.wfile.flush()
-                            last_heartbeat = now
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            break
-                    continue
-                try:
-                    payload = _sse_json_dumps(evt)
-                except (TypeError, ValueError, OverflowError) as e:
-                    logger.warning("Chat stream resume SSE serialization failed: %s", e)
-                    continue
-                try:
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
-                if evt.get("type") in ("done", "error"):
-                    break
-        except Exception as e:
-            logger.warning("Chat stream resume error: %s", e)
-        finally:
-            # 退订 ChatStreamBus，防止已消费完毕的 Queue 对象在订阅者列表中无限累积
-            from nanobot.web.chat_stream_bus import ChatStreamBus
-            ChatStreamBus.get().unsubscribe(f"web:{session_id}", evt_queue)
-
-    def _handle_chat_stream(
-        self, app: "NanobotWebAPI", session_id: str, content: str, images: list[str] | None = None,
-        tool_mode: str | None = None, selected_mcp_servers: list[str] | None = None,
-    ) -> None:
-        """Stream chat progress via SSE. Resilient to client disconnect and worker errors."""
-        logger.info(f"Starting chat stream for session {session_id}")
-        evt_queue, thread = app.chat_stream(session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-        # thread=None 表示 Gateway 模式（消息已发布到 core_loop），thread!=None 为降级线程模式
-        if thread is not None:
-            logger.info(f"Chat stream thread created: {thread}")
-            thread.start()
-            logger.info(f"Chat stream thread started: {thread.is_alive()}")
-        else:
-            logger.info(f"Chat stream running in Gateway mode for session {session_id}")
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        heartbeat_interval = 30
-        last_heartbeat = time.time()
-        stream_start = time.time()
-        # Gateway 模式总超时 = message_timeout + 60s 缓冲，防止 on_complete 永久不触发
-        total_timeout = getattr(app.agent, "message_timeout", 300.0) + 60.0
-
-        # 追踪流是否干净结束（done/error 事件已成功送达客户端）
-        # 干净结束时可以安全清理 ChatStreamBus 缓冲；客户端断开则保留以便 resume 重连
-        stream_ended_cleanly = False
-
-        try:
-            loop_count = 0
-            while True:
-                loop_count += 1
-                evt = None
-                try:
-                    evt = evt_queue.get(timeout=0.5)
-                    if isinstance(evt, dict) and evt.get('type'):
-                        logger.debug(f"Got event: {evt.get('type')}")
-                except queue.Empty:
-                    now = time.time()
-                    # Gateway 模式总超时保护：防止 core_loop 异常后 SSE 永久挂起
-                    if thread is None and (now - stream_start) > total_timeout:
-                        logger.warning(
-                            f"[ChatStream] SSE total timeout ({total_timeout}s) for session {session_id}"
-                        )
-                        try:
-                            self.wfile.write('data: {"type":"error","message":"处理超时"}\n\n'.encode("utf-8"))
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            pass
-                        break
-                    # 降级线程模式：线程已结束时尝试获取最后一个事件
-                    if thread is not None and not thread.is_alive():
-                        try:
-                            evt = evt_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    if evt is None:
-                        if now - last_heartbeat >= heartbeat_interval:
-                            try:
-                                self.wfile.write(b": heartbeat\n\n")
-                                self.wfile.flush()
-                                last_heartbeat = now
-                                logger.debug("SSE heartbeat sent")
-                            except (BrokenPipeError, ConnectionResetError, OSError):
-                                logger.debug("Client disconnected (heartbeat), cancelling session")
-                                app.agent.cancel_current_request(channel="web", session_id=session_id)
-                                break
-                        continue
-                try:
-                    payload = _sse_json_dumps(evt)
-                except (TypeError, ValueError, OverflowError) as e:
-                    logger.warning("SSE event serialization failed: %s", e)
-                    if evt.get("type") in ("done", "error"):
-                        try:
-                            if evt.get("type") == "done":
-                                payload = json.dumps(
-                                    {
-                                        "type": "done",
-                                        "content": str(evt.get("content") or ""),
-                                        "assistantMessage": None,
-                                    },
-                                    ensure_ascii=False,
-                                )
-                            else:
-                                payload = json.dumps(
-                                    {
-                                        "type": "error",
-                                        "message": str(evt.get("message") or "响应序列化失败"),
-                                    },
-                                    ensure_ascii=False,
-                                )
-                        except (TypeError, ValueError, OverflowError):
-                            continue
-                    else:
-                        continue
-                line = f"data: {payload}\n\n"
-                try:
-                    self.wfile.write(line.encode("utf-8"))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    logger.debug("Client disconnected during stream, cancelling session")
-                    # 客户端断开：通知 core_loop 取消正在处理的任务
-                    app.agent.cancel_current_request(channel="web", session_id=session_id)
-                    break
-                if evt.get("type") in ("done", "error"):
-                    stream_ended_cleanly = True
-                    break
-            if thread is not None:
-                # legacy 模式：等线程清理完 pending tasks（最多 3s）再加 2s 缓冲
-                thread.join(timeout=5.0)
-        except Exception as e:
-            logger.warning("Chat stream write error: %s", e)
-        finally:
-            if thread is not None and thread.is_alive():
-                # 正常情况不应到达此处（线程 finally 最多耗时 3s，join 给了 5s）
-                logger.warning("Chat stream thread still running after response end (legacy mode), waiting 3s more...")
-                thread.join(timeout=3.0)
-                if thread.is_alive():
-                    logger.error("Chat stream legacy thread failed to terminate within 8s, possible resource leak")
-            # 流正常结束时主动清理 ChatStreamBus 缓冲，防止长期运行内存积累；
-            # 客户端中途断开则保留缓冲，resume 重连时可回放
-            if stream_ended_cleanly:
-                from nanobot.web.chat_stream_bus import ChatStreamBus
-                ChatStreamBus.get().close_session(f"web:{session_id}")
-
-    def _handle_subagent_progress_stream(
-        self, app: "NanobotWebAPI", session_id: str
-    ) -> None:
-        """
-        以 SSE 形式持续推送子 Agent 进度事件。
-
-        订阅 SubagentProgressBus 的 "web:{session_id}" origin_key，
-        将事件实时流给前端；20 分钟无事件后自动关闭并发送 {"type": "timeout"}。
-        late result 场景下 SDK 可能超时后继续运行，延长空闲超时以便用户能收到最终结果。
-        """
-        origin_key = f"web:{session_id}"
-        logger.info(f"[SubagentProgress] SSE connection established for session: {session_id}, origin_key: {origin_key}")
-        evt_queue = app.subagent_progress_stream(session_id)
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        idle_timeout = 1200  # 20 分钟无事件自动关闭（覆盖 Claude Code SDK 超时后 late result 的等待期）
-        heartbeat_interval = 30
-        last_event = time.time()
-        last_heartbeat = time.time()
-
-        try:
-            while True:
-                try:
-                    evt = evt_queue.get(timeout=0.5)
-                    last_event = time.time()
-                except queue.Empty:
-                    now = time.time()
-                    if now - last_event >= idle_timeout:
-                        try:
-                            self.wfile.write(b'data: {"type":"timeout"}\n\n')
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            pass
-                        break
-                    if now - last_heartbeat >= heartbeat_interval:
-                        try:
-                            self.wfile.write(b": heartbeat\n\n")
-                            self.wfile.flush()
-                            last_heartbeat = now
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            break
-                    continue
-
-                try:
-                    payload = _sse_json_dumps(evt)
-                except (TypeError, ValueError, OverflowError) as e:
-                    logger.warning(f"[SubagentProgress] Failed to serialize event: {e}, event: {evt}")
-                    continue
-
-                try:
-                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-                    logger.debug(f"[SubagentProgress] Sent event to frontend: {evt.get('type')}, task_id: {evt.get('task_id')}")
-                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    logger.warning(f"[SubagentProgress] Connection lost for session {session_id}, event not sent: {evt.get('type')}, task_id: {evt.get('task_id')}, error: {e}")
-                    break
-                if evt.get("type") == "stream_done":
-                    logger.info(f"[SubagentProgress] All subagents finished for session {session_id}, closing SSE")
-                    break
-        finally:
-            app.unsubscribe_subagent_progress(session_id, evt_queue)
-            # 注意：不再自动清除缓冲区，保留事件供后续重连时 replay
-            # 缓冲区会在会话真正结束时通过 clear_buffer API 手动清除
-            logger.info(f"[SubagentProgress] SSE connection closed for session: {session_id}, buffer preserved for replay")
-
-    def _handle_mirror_chat_stream(
-        self, app: "NanobotWebAPI", session_type: str, session_id: str, content: str
-    ) -> None:
-        """Stream mirror chat progress via SSE."""
-        evt_queue, thread = app.mirror_chat_stream(session_type, session_id, content)
-        thread.start()
-
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        heartbeat_interval = 30  # 心跳间隔（秒）
-        last_heartbeat = time.time()
-
-        try:
-            loop_count = 0
-            while True:
-                loop_count += 1
-                evt = None
-                try:
-                    evt = evt_queue.get(timeout=0.5)
-                    if isinstance(evt, dict) and evt.get('type'):
-                        logger.debug(f"Got event: {evt.get('type')}")
-                except queue.Empty:
-                    now = time.time()
-                    if not thread.is_alive():
-                        try:
-                            evt = evt_queue.get_nowait()
-                        except queue.Empty:
-                            break
-                    if evt is None:
-                        if now - last_heartbeat >= heartbeat_interval:
-                            try:
-                                self.wfile.write(b": heartbeat\n\n")
-                                self.wfile.flush()
-                                last_heartbeat = now
-                            except (BrokenPipeError, ConnectionResetError, OSError):
-                                logger.debug("Client disconnected, stopping stream")
-                                break
-                        continue
-                try:
-                    payload = _sse_json_dumps(evt)
-                except (TypeError, ValueError, OverflowError) as e:
-                    logger.warning(f"[ChatStream] Failed to serialize mirror event: {e}")
-                    continue
-                line = f"data: {payload}\n\n"
-                try:
-                    self.wfile.write(line.encode("utf-8"))
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
-                if evt.get("type") in ("done", "error"):
-                    break
-            thread.join(timeout=1.0)
-        except Exception:
-            pass
-
     def _serve_static(self, file_path: Path) -> None:
         """Serve a static file."""
         try:
@@ -3722,7 +3251,140 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 }))
                 return
 
-            # 执行链路监控 API
+            # ==================== Trace API ====================
+
+            # GET /api/v1/traces/summary - 聚合指标摘要
+            if path == "/api/v1/traces/summary":
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+                summary = emitter.get_summary()
+                self._write_json(HTTPStatus.OK, _ok(summary))
+                return
+
+            # GET /api/v1/traces/recent - 最近的 spans
+            if path == "/api/v1/traces/recent":
+                try:
+                    limit = int(query.get("limit", ["50"])[0])
+                except (ValueError, TypeError):
+                    limit = 50
+                limit = max(1, min(limit, 200))
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+                spans = emitter.get_recent_spans(limit)
+                result = [{
+                    "trace_id": s.get("trace_id", ""),
+                    "span_id": s.get("span_id", ""),
+                    "name": s.get("name", ""),
+                    "span_type": s.get("span_type", ""),
+                    "status": s.get("status", "ok"),
+                    "duration_ms": s.get("duration_ms"),
+                    "created_at": s.get("start_ms"),
+                } for s in spans]
+                self._write_json(HTTPStatus.OK, _ok(result))
+                return
+
+            # GET /api/v1/traces/{trace_id} - 单个 trace 详情
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "traces" and parts[3]:
+                trace_id = parts[3]
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+                spans = emitter.query_by_trace_id(trace_id, limit=200)
+                self._write_json(HTTPStatus.OK, _ok({
+                    "trace_id": trace_id,
+                    "spans": spans,
+                }))
+                return
+
+            # GET /api/v1/traces/anomalies - 异常告警
+            if path == "/api/v1/traces/anomalies":
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+                spans = emitter.get_recent_spans(limit=1000)
+                from nanobot.tracing.analysis import aggregate_spans
+                metrics = aggregate_spans(spans)
+                try:
+                    from nanobot.tracing.anomaly import AnomalyDetector
+                    detector = AnomalyDetector()
+                    anomalies = detector.detect(metrics)
+                    result = [a.to_dict() for a in anomalies]
+                except Exception as e:
+                    logger.exception("Anomaly detection failed")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("ANOMALY_DETECTION_FAILED", str(e)))
+                    return
+                self._write_json(HTTPStatus.OK, _ok(result))
+                return
+
+            # GET /api/v1/traces/stream - SSE 实时推送
+            if path == "/api/v1/traces/stream":
+                from nanobot.tracing import get_emitter
+                emitter = get_emitter()
+                if emitter is None:
+                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, _err("TRACING_NOT_INITIALIZED", "Tracing 未初始化"))
+                    return
+
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                evt_queue = queue.Queue(maxsize=1000)
+
+                def observer(span: dict[str, Any]) -> None:
+                    try:
+                        evt_queue.put_nowait({"type": "span", "data": span})
+                    except queue.Full:
+                        pass  # drop event rather than block observer
+
+                emitter.add_observer(observer)
+
+                try:
+                    idle_timeout = 300  # 5 分钟空闲超时
+                    heartbeat_interval = 30
+                    last_event = time.time()
+                    last_heartbeat = time.time()
+                    while True:
+                        try:
+                            evt = evt_queue.get(timeout=1.0)
+                            last_event = time.time()
+                            try:
+                                payload = _sse_json_dumps(evt)
+                                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                break
+                        except queue.Empty:
+                            now = time.time()
+                            if now - last_event >= idle_timeout:
+                                break
+                            if now - last_heartbeat >= heartbeat_interval:
+                                try:
+                                    self.wfile.write(b": heartbeat\n\n")
+                                    self.wfile.flush()
+                                    last_heartbeat = now
+                                except (BrokenPipeError, ConnectionResetError, OSError):
+                                    break
+                except Exception as e:
+                    logger.warning(f"Trace stream error: {e}")
+                finally:
+                    emitter.remove_observer(observer)
+                return
+
+            # ==================== 执行链路监控 API ====================
+
             if path == "/api/v1/monitoring/chains":
                 # 查询链路列表
                 session_key = query.get("sessionKey", [None])[0]
@@ -3780,32 +3442,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
                 return
 
-            # GET /api/v1/chat/sessions/{sessionId}/stream  (SSE 重连)
-            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "stream":
-                session_id = parts[4]
-                try:
-                    self._handle_chat_stream_resume(app, session_id)
-                except Exception as exc:
-                    logger.exception("Chat stream resume failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("CHAT_STREAM_RESUME_FAILED", "Chat 流重连失败", str(exc)),
-                    )
-                return
-
-            # GET /api/v1/chat/sessions/{sessionId}/subagent-progress  (SSE)
-            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "subagent-progress":
-                session_id = parts[4]
-                try:
-                    self._handle_subagent_progress_stream(app, session_id)
-                except Exception as exc:
-                    logger.exception("Subagent progress stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("SUBAGENT_PROGRESS_FAILED", "子 Agent 进度流失败", str(exc)),
-                    )
-                return
-
             # GET /api/v1/chat/sessions/{sessionId}/token-summary
             if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "token-summary":
                 session_id = parts[4]
@@ -3813,6 +3449,35 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     self._write_json(HTTPStatus.OK, _ok(app.get_session_token_summary(session_id)))
                 except KeyError:
                     self._write_json(HTTPStatus.NOT_FOUND, _err("CHAT_SESSION_NOT_FOUND", "会话不存在"))
+                return
+
+            # GET /api/v1/chat/sessions/{sessionId}/subagent-progress (SSE) - Deprecated, use WebSocket
+            if len(parts) == 6 and parts[:4] == ["api", "v1", "chat", "sessions"] and parts[5] == "subagent-progress":
+                session_id = parts[4]
+                # SSE 已废弃，所有事件通过 WebSocket 发送
+                self._write_json(HTTPStatus.NOT_FOUND, _err("SSE_DEPRECATED", "Subagent progress is now delivered via WebSocket"))
+                return
+
+            # POST /api/v1/chat/warmup - Pre-warm MCP without processing a message
+            if path == "/api/v1/chat/warmup":
+                try:
+                    # 检查 MCP 是否已初始化
+                    if hasattr(app.agent, '_mcp_init_event') and app.agent._mcp_init_event.is_set():
+                        self._write_json(HTTPStatus.OK, _ok({"status": "already_initialized"}))
+                        return
+
+                    # MCP 未初始化，触发初始化并等待
+                    try:
+                        asyncio.run(asyncio.wait_for(
+                            app.agent._init_mcp_loader(only_server_ids=None),
+                            timeout=10.0
+                        ))
+                        self._write_json(HTTPStatus.OK, _ok({"status": "initialized"}))
+                    except asyncio.TimeoutError:
+                        self._write_json(HTTPStatus.OK, _ok({"status": "timeout"}))
+                except Exception as e:
+                    logger.warning(f"[Warmup] MCP warmup error: {e}")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("WARMUP_ERROR", str(e)))
                 return
 
             # Configuration endpoints
@@ -3843,11 +3508,22 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.OK, _ok(config_data["providers"]))
                 return
 
+            if path == "/api/v1/debug/path":
+                from nanobot.config.loader import get_system_db_path
+                self._write_json(HTTPStatus.OK, _ok({
+                    "system_db": str(get_system_db_path()),
+                    "home": str(Path.home()),
+                    "cwd": str(Path.cwd()),
+                }))
+                return
+
             if path == "/api/v1/models":
                 # New model router API - return detailed model info
+                # Supports optional provider_id filter via query param
+                provider_id = query.get("provider_id", [None])[0] if query else None
                 from nanobot.config.loader import get_config_repository
                 repo = get_config_repository()
-                models = repo.get_all_models()
+                models = repo.get_all_models(provider_id=provider_id)
                 # Convert snake_case to camelCase for frontend compatibility
                 models_camel = [{
                     "id": m["id"],
@@ -3861,6 +3537,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     "qualityRank": m["quality_rank"],
                     "enabled": m["enabled"],
                     "isDefault": m["is_default"],
+                    "modelType": m.get("model_type", "chat"),
+                    "maxTokens": m.get("max_tokens", 4096),
+                    "supportsVision": m.get("supports_vision", False),
+                    "supportsFunctionCalling": m.get("supports_function_calling", True),
+                    "supportsStreaming": m.get("supports_streaming", True),
                 } for m in models]
                 self._write_json(HTTPStatus.OK, _ok(models_camel))
                 return
@@ -3899,6 +3580,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                         "aliases": m.aliases,
                         "capabilities": m.capabilities,
                         "contextWindow": m.context_window,
+                        "modelType": m.model_type,
+                        "maxTokens": m.max_tokens,
+                        "supportsVision": m.supports_vision,
+                        "supportsFunctionCalling": m.supports_function_calling,
+                        "supportsStreaming": m.supports_streaming,
                     } for m in models]))
                 except Exception as e:
                     logger.exception(f"Failed to discover models for {provider_id}")
@@ -3944,6 +3630,18 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/calendar/jobs":
                 jobs = app.get_calendar_jobs()
                 self._write_json(HTTPStatus.OK, _ok(jobs))
+                return
+
+            if path == "/api/v1/workspace/tree":
+                tree_path = query.get("path", [None])[0]
+                try:
+                    tree = app.get_workspace_tree(tree_path)
+                    self._write_json(HTTPStatus.OK, _ok(tree))
+                except ValueError as e:
+                    self._write_json(HTTPStatus.BAD_REQUEST, _err("INVALID_PATH", str(e)))
+                except Exception as e:
+                    logger.exception("Failed to get workspace tree")
+                    self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TREE_ERROR", str(e)))
                 return
 
             if path == "/api/v1/system/status":
@@ -4374,20 +4072,8 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 或 images 不能为空"))
                 return
             session_id = parts[4]
-            use_stream = query.get("stream", [None])[0] == "1"
             tool_mode = body.get("tool_mode")
             selected_mcp_servers = body.get("selected_mcp_servers")
-
-            if use_stream:
-                try:
-                    self._handle_chat_stream(app, session_id, content, images, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-                except Exception as exc:
-                    logger.exception("Chat stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("CHAT_STREAM_FAILED", "流式处理失败", str(exc)),
-                    )
-                return
 
             try:
                 # Gateway 模式：消息入队到 core_loop，避免 asyncio.run 创建新 loop 触发 MCP reload
@@ -4413,8 +4099,15 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 try:
                     body_data = self._read_json()
                     if body_data:
-                        channel = body_data.get("channel", "web")
                         session_id = body_data.get("sessionId")
+                        # WebUI WebSocket 会话键为 browser:{id}；旧客户端未传 channel 时误用 web，导致无法取消
+                        ch = body_data.get("channel")
+                        if ch is not None:
+                            channel = ch
+                        elif session_id:
+                            channel = "browser"
+                        else:
+                            channel = "web"
                 except (json.JSONDecodeError, TypeError):
                     pass
                 app.agent.cancel_current_request(channel=channel, session_id=session_id)
@@ -4448,6 +4141,68 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.CREATED, _ok(data))
             except ValueError as e:
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            return
+
+        # POST /api/v1/providers/batch-disable - Batch disable providers
+        if path == "/api/v1/providers/batch-disable":
+            body = self._read_json()
+            provider_ids = body.get("provider_ids", [])
+            if not isinstance(provider_ids, list):
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "provider_ids must be a list"))
+                return
+            disabled = app.batch_disable_providers(provider_ids)
+            self._write_json(HTTPStatus.OK, _ok({"disabled": disabled}))
+            return
+
+        # POST /api/v1/providers/{providerId}/discover - 检测模型并写入数据库（配置页「检测模型」）
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "providers"] and parts[4] == "discover":
+            provider_id = unquote(parts[3])
+            body = self._read_json() or {}
+            from nanobot.providers.discovery import ModelDiscoveryService
+            from nanobot.config.loader import get_config_repository
+            repo = get_config_repository()
+            discovery = ModelDiscoveryService(repo)
+            try:
+                kw: dict[str, Any] = {}
+                if "apiBase" in body:
+                    kw["api_base"] = body.get("apiBase")
+                if "apiKey" in body:
+                    kw["api_key"] = body.get("apiKey")
+                models = asyncio.run(discovery.discover_and_save(provider_id, **kw))
+                self._write_json(HTTPStatus.OK, _ok([{
+                    "id": m.id,
+                    "name": m.name,
+                    "litellmId": m.litellm_id,
+                    "aliases": m.aliases,
+                    "capabilities": m.capabilities,
+                    "contextWindow": m.context_window,
+                    "modelType": m.model_type,
+                    "maxTokens": m.max_tokens,
+                    "supportsVision": m.supports_vision,
+                    "supportsFunctionCalling": m.supports_function_calling,
+                    "supportsStreaming": m.supports_streaming,
+                } for m in models]))
+            except Exception as e:
+                logger.exception(f"Failed to discover and save models for {provider_id}")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("DISCOVERY_FAILED", str(e)))
+            return
+
+        # POST /api/v1/providers/{providerId}/test - 服务端测试 /models，避免浏览器 CORS
+        if len(parts) == 5 and parts[:3] == ["api", "v1", "providers"] and parts[4] == "test":
+            provider_id = unquote(parts[3])
+            body = self._read_json() or {}
+            try:
+                result = app.test_provider_connection(
+                    provider_id,
+                    api_base=body.get("apiBase") if "apiBase" in body else None,
+                    api_key=body.get("apiKey") if "apiKey" in body else None,
+                )
+                self._write_json(HTTPStatus.OK, _ok(result))
+            except ValueError as e:
+                self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
+            except Exception as e:
+                logger.exception("test_provider_connection")
+                self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("TEST_FAILED", str(e)))
             return
 
         # POST /api/v1/mcps - Create MCP
@@ -4508,7 +4263,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 is_default = body.get("isDefault", False)
                 if is_default:
                     repo.clear_default_for_all_models_except(model_id)
-                    repo.set_config_value("agent", "default_profile", model_id)
                     _sync_smart_profile_default_model(repo, model_id)
                 repo.set_model(
                     model_id=model_id,
@@ -4522,7 +4276,13 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     quality_rank=body.get("qualityRank"),
                     enabled=body.get("enabled", True),
                     is_default=is_default,
+                    model_type=body.get("modelType", "chat"),
+                    max_tokens=body.get("maxTokens", 4096),
+                    supports_vision=body.get("supportsVision", False),
+                    supports_function_calling=body.get("supportsFunctionCalling", True),
+                    supports_streaming=body.get("supportsStreaming", True),
                 )
+                _refresh_router_and_agent_model(app, model_id if is_default else None)
                 self._write_json(HTTPStatus.CREATED, _ok({"success": True}))
             except Exception as e:
                 logger.exception("Failed to create model")
@@ -4574,22 +4334,9 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     enabled=model.get("enabled", True),
                     is_default=True,
                 )
-                # 同步 agent 的 default_profile，使 router 实际使用该模型（否则会继续用 smart 等 profile）
-                repo.set_config_value("agent", "default_profile", model_id)
-                # 同步 smart 场景的 model_chain，将默认模型置于首位
+                # 同步 smart 场景的 model_chain，将默认模型置于首位（router 通过 smart profile 解析）
                 _sync_smart_profile_default_model(repo, model_id)
-                if hasattr(app, "router") and hasattr(app.router, "clear_cache"):
-                    app.router.clear_cache()
-                # 热更新 agent 的模型和 provider 的 api_key
-                if hasattr(app, "agent") and app.agent:
-                    from nanobot.config.loader import load_config
-                    cfg = load_config()
-                    if hasattr(app.agent.provider, "update_config"):
-                        api_key = cfg.get_api_key(model["litellm_id"])
-                        api_base = cfg.get_api_base(model["litellm_id"])
-                        app.agent.provider.update_config(model["litellm_id"], api_key, api_base)
-                    if hasattr(app.agent, "update_model"):
-                        app.agent.update_model(model["litellm_id"])
+                _refresh_router_and_agent_model(app, model_id)
             self._write_json(HTTPStatus.OK, _ok({"success": True}))
             return
 
@@ -4609,7 +4356,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, _err("MIRROR_CREATE_FAILED", str(e)))
             return
 
-        # POST /api/v1/mirror/sessions/{sessionId}/wu-first-reply (stream=1)
+        # POST /api/v1/mirror/sessions/{sessionId}/wu-first-reply
         if (
             len(parts) == 6
             and parts[:3] == ["api", "v1", "mirror"]
@@ -4617,75 +4364,24 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             and parts[5] == "wu-first-reply"
         ):
             session_id = parts[4]
-            use_stream = query.get("stream", [None])[0] == "1"
             key_wu = MirrorService._session_key("wu", session_id)
             if app.sessions.get(key_wu) is None:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "悟会话不存在"))
                 return
-            if use_stream:
-                try:
-                    evt_queue, thread = app.wu_first_reply_stream(session_id)
-                    thread.start()
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "keep-alive")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    heartbeat_interval = 30  # 心跳间隔（秒）
-                    last_heartbeat = time.time()
-                    try:
-                        while True:
-                            evt = None
-                            try:
-                                evt = evt_queue.get(timeout=0.5)
-                            except queue.Empty:
-                                now = time.time()
-                                if not thread.is_alive():
-                                    try:
-                                        evt = evt_queue.get_nowait()
-                                    except queue.Empty:
-                                        break
-                                if evt is None:
-                                    if now - last_heartbeat >= heartbeat_interval:
-                                        try:
-                                            self.wfile.write(b": heartbeat\n\n")
-                                            self.wfile.flush()
-                                            last_heartbeat = now
-                                        except (BrokenPipeError, ConnectionResetError, OSError):
-                                            break
-                                    continue
-                            if evt is None:
-                                continue
-                            payload = _sse_json_dumps(evt)
-                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                            self.wfile.flush()
-                            if evt.get("type") in ("done", "error"):
-                                break
-                        thread.join(timeout=1.0)
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    logger.exception("Wu first reply stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("WU_FIRST_REPLY_FAILED", "悟首次回复失败", str(exc)),
-                    )
-            else:
-                try:
-                    content = asyncio.run(app._wu_first_reply(session_id))
-                    self._write_json(HTTPStatus.OK, _ok({"content": content}))
-                except KeyError:
-                    self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "悟会话不存在"))
-                except Exception as exc:
-                    logger.exception("Wu first reply failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("WU_FIRST_REPLY_FAILED", "悟首次回复失败", str(exc)),
-                    )
+            try:
+                content = asyncio.run(app._wu_first_reply(session_id))
+                self._write_json(HTTPStatus.OK, _ok({"content": content}))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "悟会话不存在"))
+            except Exception as exc:
+                logger.exception("Wu first reply failed")
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    _err("WU_FIRST_REPLY_FAILED", "悟首次回复失败", str(exc)),
+                )
             return
 
-        # POST /api/v1/mirror/sessions/{sessionId}/bian-first-reply (stream=1)
+        # POST /api/v1/mirror/sessions/{sessionId}/bian-first-reply
         if (
             len(parts) == 6
             and parts[:3] == ["api", "v1", "mirror"]
@@ -4693,75 +4389,24 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             and parts[5] == "bian-first-reply"
         ):
             session_id = parts[4]
-            use_stream = query.get("stream", [None])[0] == "1"
             key_bian = MirrorService._session_key("bian", session_id)
             if app.sessions.get(key_bian) is None:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "辩会话不存在"))
                 return
-            if use_stream:
-                try:
-                    evt_queue, thread = app.bian_first_reply_stream(session_id)
-                    thread.start()
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "keep-alive")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    heartbeat_interval = 30  # 心跳间隔（秒）
-                    last_heartbeat = time.time()
-                    try:
-                        while True:
-                            evt = None
-                            try:
-                                evt = evt_queue.get(timeout=0.5)
-                            except queue.Empty:
-                                now = time.time()
-                                if not thread.is_alive():
-                                    try:
-                                        evt = evt_queue.get_nowait()
-                                    except queue.Empty:
-                                        break
-                                if evt is None:
-                                    if now - last_heartbeat >= heartbeat_interval:
-                                        try:
-                                            self.wfile.write(b": heartbeat\n\n")
-                                            self.wfile.flush()
-                                            last_heartbeat = now
-                                        except (BrokenPipeError, ConnectionResetError, OSError):
-                                            break
-                                    continue
-                            if evt is None:
-                                continue
-                            payload = _sse_json_dumps(evt)
-                            self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                            self.wfile.flush()
-                            if evt.get("type") in ("done", "error"):
-                                break
-                        thread.join(timeout=1.0)
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    logger.exception("Bian first reply stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("BIAN_FIRST_REPLY_FAILED", "辩首次回复失败", str(exc)),
-                    )
-            else:
-                try:
-                    content = asyncio.run(app._bian_first_reply(session_id))
-                    self._write_json(HTTPStatus.OK, _ok({"content": content}))
-                except KeyError:
-                    self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "辩会话不存在"))
-                except Exception as exc:
-                    logger.exception("Bian first reply failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("BIAN_FIRST_REPLY_FAILED", "辩首次回复失败", str(exc)),
-                    )
+            try:
+                content = asyncio.run(app._bian_first_reply(session_id))
+                self._write_json(HTTPStatus.OK, _ok({"content": content}))
+            except KeyError:
+                self._write_json(HTTPStatus.NOT_FOUND, _err("MIRROR_SESSION_NOT_FOUND", "辩会话不存在"))
+            except Exception as exc:
+                logger.exception("Bian first reply failed")
+                self._write_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    _err("BIAN_FIRST_REPLY_FAILED", "辩首次回复失败", str(exc)),
+                )
             return
 
-        # POST /api/v1/mirror/sessions/{sessionId}/messages (with optional ?stream=1)
+        # POST /api/v1/mirror/sessions/{sessionId}/messages
         if (
             len(parts) == 6
             and parts[:3] == ["api", "v1", "mirror"]
@@ -4774,7 +4419,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", "content 不能为空"))
                 return
             session_id = parts[4]
-            use_stream = query.get("stream", [None])[0] == "1"
 
             # Session type: prefer from body, else detect by iterating
             stype = body.get("type") if body.get("type") in ("wu", "bian") else None
@@ -4786,17 +4430,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                         break
                 if not stype:
                     stype = "wu"
-
-            if use_stream:
-                try:
-                    self._handle_mirror_chat_stream(app, stype, session_id, content)
-                except Exception as exc:
-                    logger.exception("Mirror chat stream failed")
-                    self._write_json(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        _err("MIRROR_STREAM_FAILED", "镜室流式处理失败", str(exc)),
-                    )
-                return
 
             try:
                 data = asyncio.run(
@@ -4831,7 +4464,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                             )
                             analysis_ok = llm_analysis is not None and bool(llm_analysis)
                         except Exception as e:
-                            logger.warning("Mirror analysis LLM call failed: %s", e)
+                            logger.warning(f"Mirror analysis LLM call failed: {e}")
                         break
                 data = app.mirror.seal_session(session_id, llm_analysis=llm_analysis)
                 data["analysisStatus"] = "success" if analysis_ok else "failed"
@@ -4863,7 +4496,7 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                                     app.sessions.save(session)
                                     analysis_ok = True
                         except Exception as e:
-                            logger.warning("Mirror retry analysis failed: %s", e)
+                            logger.warning(f"Mirror retry analysis failed: {e}")
                         formatted = app.mirror._format_session_obj(session, stype, session_id)
                         formatted["analysisStatus"] = "success" if analysis_ok else "failed"
                         self._write_json(HTTPStatus.OK, _ok(formatted))
@@ -4971,11 +4604,11 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                         if updated:
                             data = updated
                 except Exception as e:
-                    logger.warning("Shang analysis failed (non-blocking): %s", e)
+                    logger.warning(f"Shang analysis failed (non-blocking): {e}")
                 try:
                     app.mirror.write_shang_record_to_memory(data)
                 except Exception as e:
-                    logger.warning("Shang write to memory failed: %s", e)
+                    logger.warning(f"Shang write to memory failed: {e}")
                 self._write_json(HTTPStatus.OK, _ok(data))
             except KeyError:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("SHANG_RECORD_NOT_FOUND", "赏记录不存在"))
@@ -5218,8 +4851,10 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
 
         # DELETE /api/v1/providers/{providerId}
         if len(parts) == 4 and parts[:3] == ["api", "v1", "providers"]:
-            provider_id = parts[3]
-            deleted = app.delete_provider(provider_id)
+            provider_id = unquote(parts[3])
+            from nanobot.config.loader import get_config_repository
+            repo = get_config_repository()
+            deleted = repo.delete_provider(provider_id)
             if deleted:
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
@@ -5233,6 +4868,15 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
             repo = get_config_repository()
             deleted = repo.delete_model(model_id)
             if deleted:
+                _refresh_router_and_agent_model(app, None)
+                try:
+                    for m in repo.get_all_models():
+                        if m.get("is_default") and getattr(app, "agent", None):
+                            if hasattr(app.agent, "update_model"):
+                                app.agent.update_model(m["id"])
+                            break
+                except Exception:
+                    pass
                 self._write_json(HTTPStatus.OK, _ok({"deleted": True}))
             else:
                 self._write_json(HTTPStatus.NOT_FOUND, _err("MODEL_NOT_FOUND", "模型不存在"))
@@ -5428,7 +5072,6 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 is_default = body.get("isDefault", existing.get("is_default", False))
                 if is_default:
                     repo.clear_default_for_all_models_except(model_id)
-                    repo.set_config_value("agent", "default_profile", model_id)
                     _sync_smart_profile_default_model(repo, model_id)
                 repo.set_model(
                     model_id=model_id,
@@ -5442,7 +5085,13 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                     quality_rank=body.get("qualityRank", existing.get("quality_rank")),
                     enabled=body.get("enabled", existing.get("enabled", True)),
                     is_default=is_default,
+                    model_type=body.get("modelType", existing.get("model_type", "chat")),
+                    max_tokens=body.get("maxTokens", existing.get("max_tokens", 4096)),
+                    supports_vision=body.get("supportsVision", existing.get("supports_vision", False)),
+                    supports_function_calling=body.get("supportsFunctionCalling", existing.get("supports_function_calling", True)),
+                    supports_streaming=body.get("supportsStreaming", existing.get("supports_streaming", True)),
                 )
+                _refresh_router_and_agent_model(app, model_id if is_default else None)
                 self._write_json(HTTPStatus.OK, _ok({"success": True}))
             except Exception as e:
                 logger.exception("Failed to update model")
@@ -5477,6 +5126,71 @@ class NanobotAPIHandler(BaseHTTPRequestHandler):
                 self._write_json(HTTPStatus.BAD_REQUEST, _err("VALIDATION_ERROR", str(e)))
             return
 
+    def _handle_subagent_progress_stream(
+        self, app: "NanobotWebAPI", session_id: str
+    ) -> None:
+        """
+        以 SSE 形式持续推送子 Agent 进度事件。
+
+        订阅 SubagentProgressBus 的 "web:{session_id}" origin_key，
+        将事件实时流给前端；20 分钟无事件后自动关闭并发送 {"type": "timeout"}。
+        """
+        origin_key = f"browser:{session_id}"
+        logger.info(f"[SubagentProgress] SSE connection established for session: {session_id}")
+        evt_queue = app.subagent_progress_stream(session_id)
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        idle_timeout = 1200
+        heartbeat_interval = 30
+        last_event = time.time()
+        last_heartbeat = time.time()
+
+        try:
+            while True:
+                try:
+                    evt = evt_queue.get(timeout=0.5)
+                    last_event = time.time()
+                except queue.Empty:
+                    now = time.time()
+                    if now - last_event >= idle_timeout:
+                        try:
+                            self.wfile.write(b'data: {"type":"timeout"}\n\n')
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
+                        break
+                    if now - last_heartbeat >= heartbeat_interval:
+                        try:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                            last_heartbeat = now
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            break
+                    continue
+
+                try:
+                    payload = _sse_json_dumps(evt)
+                except (TypeError, ValueError, OverflowError) as e:
+                    logger.warning(f"[SubagentProgress] Failed to serialize event: {e}")
+                    continue
+
+                try:
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    logger.warning(f"[SubagentProgress] Connection lost for session {session_id}: {e}")
+                    break
+                if evt.get("type") == "stream_done":
+                    break
+        finally:
+            app.unsubscribe_subagent_progress(session_id, evt_queue)
+            logger.info(f"[SubagentProgress] SSE connection closed for session: {session_id}")
 
 
 class NanobotHTTPServer(ThreadingHTTPServer):
@@ -5528,7 +5242,20 @@ async def _core_main(app: "NanobotWebAPI", core_ready: "threading.Event") -> Non
     # 此处已在 run_until_complete 内部执行，is_running() 此时为 True
     app.core_loop = asyncio.get_running_loop()
     core_ready.set()
-    await app.agent.run()
+    try:
+        # Start browser/WebUI channel WebSocket server
+        logger.info("[Browser] Starting WebSocket server...")
+        try:
+            await app.browser_channel.start()
+            logger.info("[Browser] WebSocket server started successfully")
+        except Exception as e:
+            logger.exception(f"[Browser] Failed to start WebSocket server: {e}")
+        await app.agent.run()
+    except Exception as e:
+        logger.error(f"[Core] Agent loop crashed unexpectedly: {e}", exc_info=True)
+        # 标记 core_loop 为不可用，防止后续请求继续尝试使用
+        app.core_loop = None
+        raise  # 重新抛出，让外层 _core_thread_target 的异常处理捕获
 
 
 def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | None = None) -> None:
@@ -5573,25 +5300,6 @@ def run_server(host: str = "127.0.0.1", port: int = 6788, static_dir: Path | Non
         cron_thread, cron_loop = _run_cron_in_thread(app)
     except Exception as e:
         logger.warning(f"Failed to start cron service: {e}")
-
-    # ── ② Cron ChatStreamBus 过期会话 TTL 清理（每小时一次）──
-    # 对于客户端中途断开、从未触发 close_session 的 session，每小时清理一次无活跃订阅且超时的缓冲
-    def _stream_bus_cleanup_loop() -> None:
-        from nanobot.web.chat_stream_bus import ChatStreamBus
-        while True:
-            time.sleep(3600)
-            try:
-                n = ChatStreamBus.get().cleanup_stale_sessions()
-                if n:
-                    logger.debug("[ChatStreamBus] 清理了 %d 个过期会话缓冲", n)
-            except Exception as _e:
-                logger.warning("[ChatStreamBus] cleanup error: %s", _e)
-
-    threading.Thread(
-        target=_stream_bus_cleanup_loop,
-        daemon=True,
-        name="stream-bus-cleanup",
-    ).start()
 
     # ── ③ 确定静态文件目录 ──
     if static_dir is None:

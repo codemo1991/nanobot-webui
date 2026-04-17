@@ -85,9 +85,39 @@ class ConfigRepository:
                     UNIQUE(tool_type, key)
                 );
 
+                CREATE TABLE IF NOT EXISTS config_models (
+                    id TEXT PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    litellm_id TEXT NOT NULL,
+                    aliases TEXT DEFAULT '',
+                    capabilities TEXT DEFAULT '',
+                    context_window INTEGER DEFAULT 128000,
+                    cost_rank INTEGER,
+                    quality_rank INTEGER,
+                    enabled INTEGER DEFAULT 1,
+                    is_default INTEGER DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (provider_id) REFERENCES config_providers(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS config_model_profiles (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    model_chain TEXT NOT NULL,
+                    rules TEXT,
+                    enabled INTEGER DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_config_category ON config(category);
                 CREATE INDEX IF NOT EXISTS idx_config_providers_enabled ON config_providers(enabled);
                 CREATE INDEX IF NOT EXISTS idx_config_channels_enabled ON config_channels(enabled);
+                CREATE INDEX IF NOT EXISTS idx_models_provider ON config_models(provider_id);
+                CREATE INDEX IF NOT EXISTS idx_models_enabled ON config_models(enabled);
+                CREATE INDEX IF NOT EXISTS idx_profiles_enabled ON config_model_profiles(enabled);
                 """
             )
             conn.commit()
@@ -123,70 +153,46 @@ class ConfigRepository:
                     conn.commit()
             except Exception:
                 pass
+            # 迁移：扩展 config_providers 表
+            for col, col_type, default in [
+                ("display_name", "TEXT", "''"),
+                ("provider_type", "TEXT", "'openai'"),
+                ("is_system", "INTEGER", "0"),
+                ("sort_order", "INTEGER", "0"),
+                ("config_json", "TEXT", "'{}'"),
+                ("api_version", "TEXT", "''"),
+                ("azure_deployment", "TEXT", "''"),
+            ]:
+                try:
+                    cols = {d[1] for d in conn.execute("PRAGMA table_info(config_providers)").fetchall()}
+                    if col not in cols:
+                        conn.execute(f"ALTER TABLE config_providers ADD COLUMN {col} {col_type} DEFAULT {default}")
+                        conn.commit()
+                except Exception:
+                    pass
+            # 迁移：扩展 config_models 表（model_type 等列）
+            for col, col_type, default in [
+                ("model_type", "TEXT", "'chat'"),
+                ("max_tokens", "INTEGER", "4096"),
+                ("supports_vision", "INTEGER", "0"),
+                ("supports_function_calling", "INTEGER", "1"),
+                ("supports_streaming", "INTEGER", "1"),
+            ]:
+                try:
+                    cols = {d[1] for d in conn.execute("PRAGMA table_info(config_models)").fetchall()}
+                    if col not in cols:
+                        conn.execute(f"ALTER TABLE config_models ADD COLUMN {col} {col_type} DEFAULT {default}")
+                        conn.commit()
+                        logger.debug(f"Migration added column {col} to config_models")
+                    else:
+                        logger.debug(f"Migration column {col} already exists in config_models")
+                except Exception as e:
+                    logger.warning(f"Migration failed to add column {col} to config_models: {e}")
             conn.close()
             logger.debug("Base config tables initialized")
         except Exception as e:
             logger.exception("Failed to initialize base config tables")
             raise
-
-        # 独立初始化模型相关表，避免外键约束问题影响核心表创建
-        self._init_model_tables()
-
-    def _init_model_tables(self) -> None:
-        """初始化模型相关表（独立方法，便于错误隔离）。"""
-        try:
-            conn = self._connect()
-            cursor = conn.cursor()
-
-            # 模型元数据表
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS config_models (
-                    id TEXT PRIMARY KEY,
-                    provider_id TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    litellm_id TEXT NOT NULL,
-                    aliases TEXT DEFAULT '',
-                    capabilities TEXT DEFAULT '',
-                    context_window INTEGER DEFAULT 128000,
-                    cost_rank INTEGER,
-                    quality_rank INTEGER,
-                    enabled INTEGER DEFAULT 1,
-                    is_default INTEGER DEFAULT 0,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY (provider_id) REFERENCES config_providers(id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-
-            # 模型场景配置表
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS config_model_profiles (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    description TEXT,
-                    model_chain TEXT NOT NULL,
-                    rules TEXT,
-                    enabled INTEGER DEFAULT 1,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-
-            # 创建索引
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_models_provider ON config_models(provider_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_models_enabled ON config_models(enabled)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_profiles_enabled ON config_model_profiles(enabled)")
-
-            conn.commit()
-            conn.close()
-            logger.info("Model config tables initialized (config_models, config_model_profiles)")
-        except Exception as e:
-            # 模型表创建失败不应阻止应用启动，记录错误但继续
-            logger.warning(f"Failed to initialize model tables (non-critical): {e}")
-            logger.debug("Model table init error details", exc_info=True)
 
     def _get_timestamp(self) -> str:
         """获取当前时间戳。"""
@@ -300,6 +306,13 @@ class ConfigRepository:
                     "api_base": row["api_base"],
                     "enabled": bool(row["enabled"]),
                     "priority": row["priority"],
+                    "display_name": row["display_name"] or row["name"],
+                    "provider_type": row["provider_type"] or "openai",
+                    "is_system": bool(row["is_system"]),
+                    "sort_order": row["sort_order"],
+                    "config_json": row["config_json"] or "{}",
+                    "api_version": row["api_version"] or "",
+                    "azure_deployment": row["azure_deployment"] or "",
                 }
         except Exception as e:
             logger.warning(f"Failed to get provider {provider_id}: {e}")
@@ -320,6 +333,13 @@ class ConfigRepository:
                         "api_base": row["api_base"],
                         "enabled": bool(row["enabled"]),
                         "priority": row["priority"],
+                        "display_name": row["display_name"] or row["name"],
+                        "provider_type": row["provider_type"] or "openai",
+                        "is_system": bool(row["is_system"]),
+                        "sort_order": row["sort_order"],
+                        "config_json": row["config_json"] or "{}",
+                        "api_version": row["api_version"] or "",
+                        "azure_deployment": row["azure_deployment"] or "",
                     }
                     for row in rows
                 ]
@@ -329,28 +349,102 @@ class ConfigRepository:
 
     def set_provider(self, provider_id: str, name: str, api_key: str = "",
                      api_base: str | None = None, enabled: bool = False,
-                     priority: int = 0) -> None:
+                     priority: int = 0, display_name: str = "",
+                     provider_type: str = "openai", is_system: bool = False,
+                     sort_order: int = 0, config_json: str = "{}",
+                     api_version: str = "", azure_deployment: str = "") -> None:
         """设置 Provider 配置。"""
+        # 防御：如果 name 看起来像 API key（sk- 开头），说明参数顺序错乱，用 provider_id 替代
+        if name.startswith("sk-") or name.startswith("sk1-") or ":" in name:
+            logger.warning(f"set_provider: name looks like an API key ({name[:10]}...), using provider_id instead")
+            name = provider_id
         updated_at = self._get_timestamp()
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json, api_version, azure_deployment)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         name=excluded.name,
                         api_key=excluded.api_key,
                         api_base=excluded.api_base,
                         enabled=excluded.enabled,
                         priority=excluded.priority,
-                        updated_at=excluded.updated_at
+                        updated_at=excluded.updated_at,
+                        display_name=excluded.display_name,
+                        provider_type=excluded.provider_type,
+                        is_system=excluded.is_system,
+                        sort_order=excluded.sort_order,
+                        config_json=excluded.config_json,
+                        api_version=excluded.api_version,
+                        azure_deployment=excluded.azure_deployment
                     """,
-                    (provider_id, name, api_key, api_base, int(enabled), priority, updated_at)
+                    (provider_id, name, api_key, api_base, int(enabled), priority, updated_at, display_name, provider_type, int(is_system), sort_order, config_json, api_version, azure_deployment)
                 )
         except Exception as e:
             logger.exception(f"Failed to set provider {provider_id}")
             raise
+
+    def delete_provider(self, provider_id: str) -> bool:
+        """删除 Provider（系统预置不可删除）。"""
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "DELETE FROM config_providers WHERE id = ? AND is_system = 0",
+                    (provider_id,)
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.warning(f"Failed to delete provider {provider_id}: {e}")
+            return False
+
+    def batch_disable_providers(self, provider_ids: list[str]) -> int:
+        """批量禁用 Provider。返回实际禁用的数量。"""
+        if not provider_ids:
+            return 0
+        updated_at = self._get_timestamp()
+        try:
+            with self._connect() as conn:
+                placeholders = ",".join("?" * len(provider_ids))
+                cursor = conn.execute(
+                    f"""
+                    UPDATE config_providers
+                    SET enabled = 0, updated_at = ?
+                    WHERE id IN ({placeholders}) AND enabled = 1
+                    """,
+                    [updated_at] + provider_ids
+                )
+                return cursor.rowcount
+        except Exception as e:
+            logger.warning(f"Failed to batch disable providers: {e}")
+            return 0
+
+    def get_system_providers(self) -> list[dict[str, Any]]:
+        """获取所有系统预置 Provider。"""
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM config_providers WHERE is_system = 1 ORDER BY sort_order, name"
+                ).fetchall()
+                return [
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "display_name": row["display_name"] or row["name"],
+                        "provider_type": row["provider_type"] or "openai",
+                        "api_key": "",
+                        "api_base": row["api_base"],
+                        "enabled": bool(row["enabled"]),
+                        "is_system": True,
+                        "sort_order": row["sort_order"],
+                        "config_json": row["config_json"] or "{}",
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.warning(f"Failed to get system providers: {e}")
+            return []
 
     def get_channel(self, channel_id: str) -> dict[str, Any] | None:
         """获取 Channel 配置。"""
@@ -554,16 +648,11 @@ class ConfigRepository:
             raise
 
     def has_config(self) -> bool:
-        """检查是否已有配置数据。"""
+        """检查是否已有用户配置数据（仅检查 config 表，不检查 config_providers）。"""
         try:
             with self._connect() as conn:
                 row = conn.execute("SELECT COUNT(*) as cnt FROM config").fetchone()
-                if row and row["cnt"] > 0:
-                    return True
-                row = conn.execute("SELECT COUNT(*) as cnt FROM config_providers").fetchone()
-                if row and row["cnt"] > 0:
-                    return True
-                return False
+                return row is not None and row["cnt"] > 0
         except Exception:
             return False
 
@@ -625,6 +714,10 @@ class ConfigRepository:
             config["providers"][provider["id"]] = {
                 "apiKey": provider["api_key"],
                 "apiBase": provider["api_base"],
+                "displayName": provider["display_name"],
+                "priority": provider["priority"],
+                "enabled": provider["enabled"],
+                "providerType": provider["provider_type"],
             }
 
         for channel_id, channel_data in self.get_all_channels().items():
@@ -676,28 +769,24 @@ class ConfigRepository:
             self.set_config_value("mirror", self._camel_to_snake(key), value)
 
         providers_config = config_data.get("providers", {})
-        provider_names = {
-            "anthropic": "Anthropic",
-            "openai": "OpenAI",
-            "openrouter": "OpenRouter",
-            "deepseek": "DeepSeek",
-            "groq": "Groq",
-            "zhipu": "Zhipu",
-            "dashscope": "DashScope",
-            "vllm": "vLLM",
-            "ollama": "Ollama",
-            "gemini": "Gemini",
-            "minimax": "Minimax",
-        }
         for provider_id, provider_data in providers_config.items():
             api_key = provider_data.get("apiKey", "")
             api_base = provider_data.get("apiBase")
+            # displayName 从 provider_data 读（来自 load_full_config 从 SQLite 的 display_name 列），
+            # 不要用 hardcoded provider_names 映射（可能过时或被污染）
+            provider_display_name = provider_data.get("displayName", "") or provider_id.capitalize()
             self.set_provider(
                 provider_id=provider_id,
-                name=provider_names.get(provider_id, provider_id),
+                name=provider_display_name,
+                display_name=provider_display_name,
+                provider_type="openai",
+                is_system=False,
+                sort_order=0,
+                config_json="{}",
                 api_key=api_key,
                 api_base=api_base,
                 enabled=bool(api_key),
+                priority=provider_data.get("priority", 0),
             )
 
         channels_config = config_data.get("channels", {})
@@ -771,6 +860,11 @@ class ConfigRepository:
                     "quality_rank": row["quality_rank"],
                     "enabled": bool(row["enabled"]),
                     "is_default": bool(row["is_default"]),
+                    "model_type": row["model_type"] or "chat",
+                    "max_tokens": row["max_tokens"],
+                    "supports_vision": bool(row["supports_vision"]),
+                    "supports_function_calling": bool(row["supports_function_calling"]),
+                    "supports_streaming": bool(row["supports_streaming"]),
                 }
         except Exception as e:
             logger.warning(f"Failed to get model {model_id}: {e}")
@@ -801,6 +895,11 @@ class ConfigRepository:
                         "quality_rank": row["quality_rank"],
                         "enabled": bool(row["enabled"]),
                         "is_default": bool(row["is_default"]),
+                        "model_type": row["model_type"] or "chat",
+                        "max_tokens": row["max_tokens"],
+                        "supports_vision": bool(row["supports_vision"]),
+                        "supports_function_calling": bool(row["supports_function_calling"]),
+                        "supports_streaming": bool(row["supports_streaming"]),
                     }
                 return None
         except Exception as e:
@@ -834,6 +933,11 @@ class ConfigRepository:
                         "quality_rank": row["quality_rank"],
                         "enabled": bool(row["enabled"]),
                         "is_default": bool(row["is_default"]),
+                        "model_type": row["model_type"] or "chat",
+                        "max_tokens": row["max_tokens"],
+                        "supports_vision": bool(row["supports_vision"]),
+                        "supports_function_calling": bool(row["supports_function_calling"]),
+                        "supports_streaming": bool(row["supports_streaming"]),
                     }
                     for row in rows
                 ]
@@ -866,6 +970,11 @@ class ConfigRepository:
                         "quality_rank": row["quality_rank"],
                         "enabled": True,
                         "is_default": bool(row["is_default"]),
+                        "model_type": row["model_type"] or "chat",
+                        "max_tokens": row["max_tokens"],
+                        "supports_vision": bool(row["supports_vision"]),
+                        "supports_function_calling": bool(row["supports_function_calling"]),
+                        "supports_streaming": bool(row["supports_streaming"]),
                     }
                     for row in rows
                 ]
@@ -892,7 +1001,11 @@ class ConfigRepository:
     def set_model(self, model_id: str, provider_id: str, name: str, litellm_id: str,
                   aliases: str = "", capabilities: str = "", context_window: int = 128000,
                   cost_rank: int | None = None, quality_rank: int | None = None,
-                  enabled: bool = True, is_default: bool = False) -> None:
+                  enabled: bool = True, is_default: bool = False,
+                  model_type: str = "chat", max_tokens: int = 4096,
+                  supports_vision: bool = False,
+                  supports_function_calling: bool = True,
+                  supports_streaming: bool = True) -> None:
         """设置模型配置。"""
         updated_at = self._get_timestamp()
         try:
@@ -901,8 +1014,9 @@ class ConfigRepository:
                     """
                     INSERT INTO config_models (id, provider_id, name, litellm_id, aliases,
                         capabilities, context_window, cost_rank, quality_rank, enabled,
-                        is_default, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        is_default, updated_at, model_type, max_tokens,
+                        supports_vision, supports_function_calling, supports_streaming)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         provider_id=excluded.provider_id,
                         name=excluded.name,
@@ -914,11 +1028,18 @@ class ConfigRepository:
                         quality_rank=excluded.quality_rank,
                         enabled=excluded.enabled,
                         is_default=excluded.is_default,
-                        updated_at=excluded.updated_at
+                        updated_at=excluded.updated_at,
+                        model_type=excluded.model_type,
+                        max_tokens=excluded.max_tokens,
+                        supports_vision=excluded.supports_vision,
+                        supports_function_calling=excluded.supports_function_calling,
+                        supports_streaming=excluded.supports_streaming
                     """,
                     (model_id, provider_id, name, litellm_id, aliases, capabilities,
                      context_window, cost_rank, quality_rank, int(enabled), int(is_default),
-                     updated_at)
+                     updated_at, model_type, max_tokens,
+                     int(supports_vision), int(supports_function_calling),
+                     int(supports_streaming))
                 )
         except Exception as e:
             logger.exception(f"Failed to set model {model_id}")

@@ -23,9 +23,20 @@ export interface Session {
 }
 
 export interface ToolStep {
-  name: string
-  arguments: Record<string, unknown> | string
-  result: string
+  id?: string;
+  name: string;
+  arguments: Record<string, unknown> | string;
+  result: string;
+  status?: 'pending' | 'running' | 'waiting' | 'completed' | 'error';
+  progress?: {
+    detail: string;
+    percent?: number;
+    lastUpdate: number;
+  };
+  startTime?: number;
+  endTime?: number;
+  durationMs?: number;
+  outputChunks?: Array<{ chunk: string; isError: boolean; timestamp: number }>;
 }
 
 export interface TokenUsage {
@@ -61,12 +72,23 @@ export interface ChatResponse {
 export type StreamEvent =
   | { type: 'start'; session_id: string }
   | { type: 'thinking' }
-  | { type: 'tool_start'; name: string; arguments: Record<string, unknown> }
-  | { type: 'tool_end'; name: string; arguments: Record<string, unknown>; result: string }
+  | { type: 'delta'; text: string; stream_id?: string }
+  | { type: 'stream_end'; stream_id?: string }
+  | { type: 'tool_start'; id: string; name: string; arguments: Record<string, unknown> }
+  | { type: 'tool_progress'; tool_id: string; status: 'running' | 'waiting'; detail: string; progress_percent?: number }
+  | { type: 'tool_stream_chunk'; tool_id: string; chunk: string; is_error?: boolean }
+  | { type: 'tool_end'; id: string; name: string; result: string }
   | { type: 'claude_code_progress'; task_id: string; subtype: string; content: string; tool_name?: string; timestamp?: string }
   | { type: 'done'; content: string; assistantMessage: Message | null }
+  | { type: 'cancelled'; assistantMessage?: Message | null }
   | { type: 'error'; message: string }
   | { type: 'timeout' }
+  | { type: 'subagent_start'; task_id: string; label: string; backend: string; task: string }
+  | { type: 'subagent_progress'; task_id: string; label: string; subtype: string; content: string; tool_name?: string }
+  | { type: 'subagent_end'; task_id: string; label: string; status: 'ok' | 'error' | 'timeout' | 'cancelled'; summary: string }
+  | { type: 'subagent_summary'; task_id: string; task_ids?: string[]; label: string; llm_summary: string; message_id: string }
+  | { type: 'stream_done' }
+  | { type: 'microkernel_end'; task_id: string; label: string; status: string }
 
 /** 子 Agent 后台进度 SSE 事件（来自 /subagent-progress 端点） */
 export type SubagentProgressEvent =
@@ -137,14 +159,21 @@ export interface ChannelsConfig {
   dingtalk: DingTalkChannel
 }
 
-// AI Model Provider
+// AI Model Provider (native SDK: OpenAI, Anthropic, DeepSeek, Azure OpenAI)
 export interface Provider {
   id: string
   name: string
-  type: 'openai' | 'anthropic' | 'azure' | 'deepseek' | 'openrouter' | 'groq' | 'zhipu' | 'dashscope' | 'gemini' | 'vllm' | 'minimax'
+  displayName?: string
+  /** @deprecated Use providerType instead */
+  type: 'openai' | 'anthropic' | 'deepseek' | 'azure' | string
+  providerType?: string
   apiKey?: string
   apiBase?: string
   enabled: boolean
+  isSystem?: boolean
+  // Azure-specific
+  apiVersion?: string
+  azureDeployment?: string
 }
 
 export interface ModelParameters {
@@ -180,6 +209,8 @@ export interface ModelInfo {
   qualityRank?: number
   enabled: boolean
   isDefault: boolean
+  modelType?: string
+  supportsVision?: boolean
 }
 
 export interface ModelProfile {
@@ -587,4 +618,59 @@ export interface AgentTemplate {
   enabled: boolean
   created_at?: string
   updated_at?: string
+}
+
+// ==================== Trace Types ====================
+
+export interface SpanMetrics {
+  count: number
+  ok_count: number
+  error_count: number
+  success_rate: number
+  error_rate: number
+  avg_duration_ms: number | null
+  p50_duration_ms: number | null
+  p95_duration_ms: number | null
+  p99_duration_ms: number | null
+}
+
+export interface TraceSummary {
+  total_spans: number
+  by_type: Record<string, SpanMetrics>
+  by_tool: Record<string, SpanMetrics>
+  recent_success_rate: number
+  recent_avg_duration_ms: number
+}
+
+export interface RecentSpan {
+  trace_id: string
+  span_id: string
+  name: string
+  span_type: string
+  status: 'ok' | 'error' | 'running'
+  duration_ms: number | null
+  created_at: number
+}
+
+export interface TraceDetail {
+  trace_id: string
+  spans: any[]
+}
+
+export interface Anomaly {
+  anomaly_type: string
+  span_type: string
+  group_key: string
+  actual_value: number
+  threshold: number
+  severity: number
+  suggestion: string
+  span_count: number
+}
+
+export interface WorkspaceTreeEntry {
+  name: string
+  type: 'file' | 'dir'
+  absolute_path: string
+  has_children: boolean
 }

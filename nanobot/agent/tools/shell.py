@@ -11,7 +11,7 @@ from nanobot.agent.tools.base import Tool
 
 class ExecTool(Tool):
     """Tool to execute shell commands."""
-    
+
     def __init__(
         self,
         timeout: int = 60,
@@ -19,7 +19,10 @@ class ExecTool(Tool):
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
+        progress_callback: Any = None,
+        tool_id: str | None = None,
     ):
+        super().__init__(progress_callback=progress_callback, tool_id=tool_id)
         self.timeout = timeout
         self.working_dir = working_dir
         self.deny_patterns = deny_patterns or [
@@ -70,6 +73,9 @@ Use with caution. Dangerous commands are blocked by safety guard."""
         }
     
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
+        # Report start progress
+        self.report_progress("开始执行命令...", 0)
+
         cwd = working_dir or self.working_dir or os.getcwd()
         if self.restrict_to_workspace and self.working_dir:
             workspace_path = Path(self.working_dir).resolve()
@@ -77,11 +83,15 @@ Use with caution. Dangerous commands are blocked by safety guard."""
             try:
                 cwd_path.relative_to(workspace_path)
             except ValueError:
+                self.report_progress("工作目录限制检查失败", 100)
                 return "Error: working_dir must be within the workspace when restrict_to_workspace is enabled"
         guard_error = self._guard_command(command, cwd)
         if guard_error:
+            self.report_progress("安全检查未通过", 100)
             return guard_error
-        
+
+        self.report_progress("正在执行命令...", 30)
+
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -89,39 +99,43 @@ Use with caution. Dangerous commands are blocked by safety guard."""
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
             )
-            
+
             try:
+                self.report_progress("等待命令完成...", 60)
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
                     timeout=self.timeout
                 )
             except asyncio.TimeoutError:
                 process.kill()
+                self.report_progress("命令执行超时", 100)
                 return f"Error: Command timed out after {self.timeout} seconds"
-            
+
             output_parts = []
-            
+
             if stdout:
                 output_parts.append(stdout.decode("utf-8", errors="replace"))
-            
+
             if stderr:
                 stderr_text = stderr.decode("utf-8", errors="replace")
                 if stderr_text.strip():
                     output_parts.append(f"STDERR:\n{stderr_text}")
-            
+
             if process.returncode != 0:
                 output_parts.append(f"\nExit code: {process.returncode}")
-            
+
             result = "\n".join(output_parts) if output_parts else "(no output)"
-            
+
             # Truncate very long output
             max_len = 10000
             if len(result) > max_len:
                 result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
-            
+
+            self.report_progress("命令执行完成", 100)
             return result
-            
+
         except Exception as e:
+            self.report_progress(f"命令执行失败: {str(e)}", 100)
             return f"Error executing command: {str(e)}"
 
     def _guard_command(self, command: str, cwd: str) -> str | None:

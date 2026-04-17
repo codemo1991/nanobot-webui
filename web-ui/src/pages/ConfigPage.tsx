@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Form, Input, InputNumber, Switch, Button, Modal, Select, Card, Space, Tag, List, message, Tabs, Spin, Typography, Row, Col, Table, Alert, Tooltip, AutoComplete } from 'antd'
 import { PlusOutlined, EditOutlined, DeleteOutlined, SettingOutlined, FolderOpenOutlined, UploadOutlined, SwapOutlined, ReloadOutlined } from '@ant-design/icons'
 import { api } from '../api'
 import type { ChannelsConfig, Provider, InstalledSkill, McpServer, AgentConfig, WebConcurrencyConfig, WebMemoryConfig } from '../types'
+import { ProviderList, ProviderDetail, AddProviderModal } from '../components/ProviderSetting'
 import AgentTemplatePage from './AgentTemplatePage'
 import SystemPromptPage from './SystemPromptPage'
 import './ConfigPage.css'
@@ -11,14 +12,15 @@ import './ConfigPage.css'
 const { Title, Text } = Typography
 const { TextArea } = Input
 
+const TabContentWrapper = ({ children }: { children: React.ReactNode }) => (
+  <div className="config-tab-content">{children}</div>
+)
+
 export default function ConfigPage() {
   const [activeTab, setActiveTab] = useState('providers')
 
   const { t } = useTranslation()
-  const TabContentWrapper = ({ children }: { children: React.ReactNode }) => (
-    <div className="config-tab-content">{children}</div>
-  )
-  const items = [
+  const items = useMemo(() => [
     { key: 'channels', label: t('config.channels'), children: <TabContentWrapper><ChannelsConfig /></TabContentWrapper> },
     { key: 'providers', label: t('config.providers'), children: <TabContentWrapper><ProvidersConfig /></TabContentWrapper> },
     { key: 'models', label: t('config.models'), children: <TabContentWrapper><ModelsConfig /></TabContentWrapper> },
@@ -27,7 +29,7 @@ export default function ConfigPage() {
     { key: 'agent-templates', label: 'Agent 模板', children: <TabContentWrapper><AgentTemplatePage /></TabContentWrapper> },
     { key: 'system-prompt', label: '主 Agent 提示词', children: <TabContentWrapper><SystemPromptPage /></TabContentWrapper> },
     { key: 'system', label: t('config.system'), children: <TabContentWrapper><SystemConfig /></TabContentWrapper> },
-  ]
+  ], [t])
 
   return (
     <div className="config-page">
@@ -284,162 +286,68 @@ function ChannelsConfig() {
 
 // --- Providers (AI) Configuration ---
 
-
 function ProvidersConfig() {
-  const { t } = useTranslation()
-  const [loading, setLoading] = useState(false)
+  const [selectedProvider, setSelectedProvider] = useState<Provider | null>(null)
+  const [addModalVisible, setAddModalVisible] = useState(false)
   const [providers, setProviders] = useState<Provider[]>([])
-  const [modalVisible, setModalVisible] = useState(false)
-  const [editingProviderId, setEditingProviderId] = useState<string | null>(null)
-  const [form] = Form.useForm()
 
-  useEffect(() => {
-    loadProviders()
-  }, [])
-  
-  // ... (loadProviders, handleCreate, handleEdit, handleDelete same as before)
-  const loadProviders = async () => {
+  const handleRefresh = async () => {
     try {
-      setLoading(true)
-      const data = await api.getProviders()
-      setProviders(data)
-    } catch (error) {
-      message.error(t('config.provider.loadFailed'))
-      console.error(error)
-    } finally {
-      setLoading(false)
+      const fresh = await api.getProviders()
+      setProviders(fresh || [])
+      if (selectedProvider) {
+        const updated = fresh?.find(p => p.id === selectedProvider.id)
+        if (updated) setSelectedProvider(updated)
+      }
+    } catch {
+      // Silently ignore refresh errors
     }
   }
 
-  const handleCreate = () => {
-    setEditingProviderId(null)
-    form.resetFields()
-    form.setFieldsValue({ type: 'openai' })
-    setModalVisible(true)
+  const handleSelect = (p: Provider) => {
+    setSelectedProvider(p)
   }
 
-  const handleEdit = (provider: Provider) => {
-    setEditingProviderId(provider.id)
-    form.setFieldsValue({
-      type: provider.type,
-      name: provider.name,
-      apiKey: provider.apiKey || '',
-      apiBase: provider.apiBase
-    })
-    setModalVisible(true)
+  const handleAdded = () => {
+    handleRefresh()
   }
-
-  const handleDelete = (id: string) => {
-    Modal.confirm({
-      title: t('config.provider.confirmDisable'),
-      content: t('config.provider.confirmDisableContent'),
-      onOk: async () => {
-        try {
-          await api.deleteProvider(id)
-          message.success(t('config.provider.disabled'))
-          loadProviders()
-        } catch (error) {
-          message.error(t('config.provider.opFailed'))
-        }
-      }
-    })
-  }
-
-  const handleSave = async () => {
-    try {
-      const values = await form.validateFields()
-      const providerData = {
-        ...values,
-        enabled: true
-      } as any
-      
-      if (editingProviderId) {
-        await api.updateProvider(editingProviderId, providerData)
-      } else {
-        await api.createProvider(providerData)
-      }
-      message.success(t('config.provider.saveSuccess'))
-      setModalVisible(false)
-      loadProviders()
-    } catch (error) {
-      console.error(error)
-      message.error(t('config.provider.saveFailed'))
-    }
-  }
-
-  const providerOptions = [
-    { value: 'anthropic', label: 'Anthropic' },
-    { value: 'openai', label: 'OpenAI' },
-    { value: 'openrouter', label: 'OpenRouter' },
-    { value: 'deepseek', label: 'DeepSeek' },
-    { value: 'minimax', label: 'Minimax' },
-    { value: 'groq', label: 'Groq' },
-    { value: 'zhipu', label: 'Zhipu (智谱)' },
-    { value: 'dashscope', label: 'Qwen (通义 / DashScope)' },
-    { value: 'gemini', label: 'Gemini' },
-    { value: 'vllm', label: 'vLLM' },
-    { value: 'ollama', label: 'Ollama (本地)' },
-    { value: 'moonshot', label: 'Moonshot (Kimi)' },
-  ]
 
   return (
     <div className="config-panel">
-      <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-        <Text type="secondary">支持: {providerOptions.map(p => p.label).join('、')}</Text>
-        <Button type="primary" icon={<PlusOutlined />} onClick={handleCreate}>{t('config.provider.add')}</Button>
+      <div style={{ display: 'flex', height: 520 }}>
+        <div style={{ width: '38%', minWidth: 280 }}>
+          <ProviderList
+            providers={providers}
+            onProvidersChange={setProviders}
+            onSelect={handleSelect}
+            selectedId={selectedProvider?.id}
+            onRefresh={handleRefresh}
+            onAddClick={() => setAddModalVisible(true)}
+          />
+        </div>
+        <div style={{ width: '62%' }}>
+          {selectedProvider ? (
+            <ProviderDetail provider={selectedProvider} onUpdate={handleRefresh} />
+          ) : (
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              height: '100%',
+              color: '#999',
+              fontSize: 14,
+            }}>
+              请从左侧选择一个 Provider
+            </div>
+          )}
+        </div>
       </div>
 
-      <List
-        grid={{ gutter: 16, column: 2 }}
-        dataSource={providers}
-        loading={loading}
-        renderItem={(item: Provider) => (
-          <List.Item>
-            <Card 
-              title={item.name} 
-              extra={
-                <Space>
-                  <Button type="text" icon={<EditOutlined />} onClick={() => handleEdit(item)} />
-                  <Button type="text" danger icon={<DeleteOutlined />} onClick={() => handleDelete(item.id)} />
-                </Space>
-              }
-            >
-              <Space direction="vertical" style={{ width: '100%' }}>
-                <Text>Type: <Tag>{item.type}</Tag></Text>
-                <Text>Status: <Tag color={item.enabled ? 'success' : 'default'}>{item.enabled ? 'Enabled' : 'Disabled'}</Tag></Text>
-                <Text type="secondary">API Key: {item.apiKey ? '已配置' : '未配置'}</Text>
-                {item.apiBase && <Text type="secondary" ellipsis>Base URL: {item.apiBase}</Text>}
-              </Space>
-            </Card>
-          </List.Item>
-        )}
+      <AddProviderModal
+        open={addModalVisible}
+        onClose={() => setAddModalVisible(false)}
+        onAdded={handleAdded}
       />
-
-      <Modal
-        title={editingProviderId ? t('config.provider.edit') : t('config.provider.add')}
-        open={modalVisible}
-        onOk={handleSave}
-        onCancel={() => setModalVisible(false)}
-      >
-        <Form form={form} layout="vertical">
-          <Form.Item name="type" label="Provider Type" rules={[{ required: true }]}>
-            <Select
-              disabled={!!editingProviderId}
-              placeholder="选择类型 (如 DeepSeek、Zhipu、Qwen)"
-              options={providerOptions}
-            />
-          </Form.Item>
-          <Form.Item name="name" label="名称">
-            <Input placeholder="例如: My OpenAI" />
-          </Form.Item>
-          <Form.Item name="apiKey" label="API Key">
-            <Input.Password placeholder="sk-..." />
-          </Form.Item>
-          <Form.Item name="apiBase" label="Base URL (可选)">
-            <Input placeholder="https://api.example.com/v1" />
-          </Form.Item>
-        </Form>
-      </Modal>
     </div>
   )
 }
@@ -453,6 +361,12 @@ function SystemConfig() {
   const [workspaceModalVisible, setWorkspaceModalVisible] = useState(false)
   const [workspaceValue, setWorkspaceValue] = useState('')
   const [currentWorkspace, setCurrentWorkspace] = useState('')
+  const workspaceFolderInputRef = useRef<HTMLInputElement>(null)
+
+  const handleSelectWorkspaceFolder = () => {
+    workspaceFolderInputRef.current?.click()
+  }
+
   const [agentForm] = Form.useForm()
   const [concurrencyForm] = Form.useForm()
   const [memoryForm] = Form.useForm()
@@ -603,7 +517,38 @@ function SystemConfig() {
     }
     try {
       setLoading(true)
-      await api.switchWorkspace(workspaceValue.trim())
+      const result = await api.switchWorkspace(workspaceValue.trim()) as any
+      if (result?.needPrompt) {
+        Modal.confirm({
+          title: t('config.workspace.copyTitle') || '是否复制配置数据？',
+          content: result.hasDefaultDb
+            ? (t('config.workspace.copyContent') || '目标工作空间暂无数据。是否复制当前工作空间的配置（Agent 模板、日历、主提示词、记忆等）？\n注意：聊天记录始终独立，不会随配置复制。')
+            : (t('config.workspace.copyContentNoDefault') || '目标工作空间暂无数据，当前也没有默认数据可复制。将创建一个空白工作空间。'),
+          okText: result.hasDefaultDb
+            ? (t('config.workspace.copyYes') || '复制配置并切换')
+            : (t('config.workspace.copyYesNoDefault') || '空白切换'),
+          cancelText: result.hasDefaultDb
+            ? (t('config.workspace.copyNo') || '空白切换')
+            : undefined,
+          onOk: async () => {
+            await api.switchWorkspace(workspaceValue.trim(), true)
+            message.success(t('config.workspace.switchSuccess'))
+            setWorkspaceModalVisible(false)
+            setWorkspaceValue('')
+            window.location.reload()
+          },
+          onCancel: result.hasDefaultDb
+            ? async () => {
+                await api.switchWorkspace(workspaceValue.trim(), false)
+                message.success(t('config.workspace.switchSuccess'))
+                setWorkspaceModalVisible(false)
+                setWorkspaceValue('')
+                window.location.reload()
+              }
+            : undefined,
+        })
+        return
+      }
       message.success(t('config.workspace.switchSuccess'))
       setWorkspaceModalVisible(false)
       setWorkspaceValue('')
@@ -892,10 +837,61 @@ function SystemConfig() {
               label={t('config.workspace.path') || '路径'}
               required
             >
-              <Input
-                value={workspaceValue}
-                onChange={(e) => setWorkspaceValue(e.target.value)}
-                placeholder={t('config.workspace.pathPlaceholder') || '例如: ~/my-workspace'}
+              <Space.Compact style={{ width: '100%' }}>
+                <Input
+                  value={workspaceValue}
+                  onChange={(e) => setWorkspaceValue(e.target.value)}
+                  placeholder={t('config.workspace.pathPlaceholder') || '例如: ~/my-workspace'}
+                />
+                <Button
+                  icon={<FolderOpenOutlined />}
+                  onClick={handleSelectWorkspaceFolder}
+                >
+                  {t('config.workspace.selectFolder') || '选择文件夹'}
+                </Button>
+              </Space.Compact>
+              <Text type="secondary" style={{ fontSize: 12, marginTop: 4, display: 'block' }}>
+                {t('config.workspace.folderBrowserHint') || '部分浏览器可能仅显示文件夹名称，请手动补全为绝对路径。'}
+              </Text>
+              <Space size="small" style={{ marginTop: 8, flexWrap: 'wrap' }}>
+                <Button size="small" onClick={() => setWorkspaceValue('~/.nanobot/workspace')}>
+                  {t('config.workspace.defaultPath') || '默认路径'}
+                </Button>
+                {currentWorkspace && (
+                  <Button size="small" onClick={() => setWorkspaceValue(currentWorkspace)}>
+                    {t('config.workspace.currentPath') || '当前路径'}
+                  </Button>
+                )}
+              </Space>
+              <input
+                type="file"
+                ref={workspaceFolderInputRef}
+                {...({ webkitdirectory: '', directory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                multiple
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  const files = e.target.files
+                  if (files && files.length > 0) {
+                    const firstFile = files[0] as any
+                    if (firstFile.path) {
+                      const fullPath = String(firstFile.path).replace(/\\/g, '/')
+                      if (firstFile.webkitRelativePath) {
+                        const relPath = String(firstFile.webkitRelativePath)
+                        const folderName = relPath.split('/')[0]
+                        // 从绝对路径中精确截取用户选择的根目录
+                        const rootDirPath = fullPath.substring(0, fullPath.length - relPath.length + folderName.length)
+                        setWorkspaceValue(rootDirPath)
+                      } else {
+                        const dirPath = fullPath.substring(0, fullPath.lastIndexOf('/'))
+                        setWorkspaceValue(dirPath)
+                      }
+                    } else if (firstFile.webkitRelativePath) {
+                      const folderName = firstFile.webkitRelativePath.split('/')[0]
+                      setWorkspaceValue(folderName)
+                    }
+                  }
+                  e.target.value = ''
+                }}
               />
             </Form.Item>
           </Form>
@@ -914,6 +910,23 @@ function ModelsConfig() {
   const [profiles, setProfiles] = useState<import('../types').ModelProfile[]>([])
   const [providers, setProviders] = useState<import('../types').Provider[]>([])
   const [activeTab, setActiveTab] = useState('profiles')
+
+  // Options for Select: enabled models (with custom input support via mode="tags")
+  const enabledModelOptions = useMemo(() => {
+    const enabledProviderIds = new Set(providers.filter(p => p.enabled).map(p => p.id))
+    return models
+      .filter(m => m.enabled && enabledProviderIds.has(m.providerId))
+      .map(m => ({ value: m.id, label: `${m.name} (${m.id})` }))
+  }, [models, providers])
+
+  // Models from enabled providers only
+  const visibleModels = useMemo(
+    () => {
+      const enabledProviderIds = new Set(providers.filter(p => p.enabled).map(p => p.id))
+      return models.filter(m => enabledProviderIds.has(m.providerId))
+    },
+    [models, providers]
+  )
   const [modelModalVisible, setModelModalVisible] = useState(false)
   const [profileModalVisible, setProfileModalVisible] = useState(false)
   const [globalDefaultModalVisible, setGlobalDefaultModalVisible] = useState(false)
@@ -1063,12 +1076,8 @@ function ModelsConfig() {
 
   const handleEditProfile = (profile: import('../types').ModelProfile) => {
     setEditingProfile(profile)
-    // 将逗号分隔的 modelChain 转换为数组
-    const modelChainArray = profile.modelChain ? profile.modelChain.split(',').filter(Boolean) : []
-    profileForm.setFieldsValue({
-      ...profile,
-      modelChain: modelChainArray
-    })
+    const chain = profile.modelChain ? profile.modelChain.split(',').filter(Boolean) : []
+    profileForm.setFieldsValue({ ...profile, modelChain: chain })
     setProfileModalVisible(true)
   }
 
@@ -1276,7 +1285,7 @@ function ModelsConfig() {
               }
             >
               <Table
-                dataSource={models}
+                dataSource={visibleModels}
                 columns={modelColumns}
                 rowKey="id"
                 pagination={false}
@@ -1306,7 +1315,7 @@ function ModelsConfig() {
                 modelForm.setFieldValue('litellmId', prefix || undefined)
               }}
             >
-              {providers.map(p => (
+              {providers.filter(p => p.enabled).map(p => (
                 <Select.Option key={p.id} value={p.id}>{p.name}</Select.Option>
               ))}
             </Select>
@@ -1385,14 +1394,11 @@ function ModelsConfig() {
             help="按优先级顺序选择模型，排在最前的优先使用"
           >
             <Select
-              mode="multiple"
-              placeholder="请选择模型（按优先级排序）"
-              options={models.filter(m => m.enabled).map(m => ({
-                value: m.id,
-                label: `${m.name} (${m.id})`,
-              }))}
+              mode="tags"
+              placeholder="请选择模型或直接输入模型 ID"
+              options={enabledModelOptions}
               showSearch
-              optionFilterProp="label"
+              filterOption={(input, option) => (option?.label as string)?.toLowerCase().includes(input.toLowerCase())}
             />
           </Form.Item>
           <Form.Item name="enabled" valuePropName="checked">
@@ -1423,14 +1429,11 @@ function ModelsConfig() {
             rules={[{ required: true, message: '请至少选择一个模型' }]}
           >
             <Select
-              mode="multiple"
-              placeholder="请选择模型"
-              options={models.filter(m => m.enabled).map(m => ({
-                value: m.id,
-                label: `${m.name} (${m.id})`,
-              }))}
+              mode="tags"
+              placeholder="请选择模型或直接输入模型 ID"
+              options={enabledModelOptions}
               showSearch
-              optionFilterProp="label"
+              filterOption={(input, option) => (option?.label as string)?.toLowerCase().includes(input.toLowerCase())}
             />
           </Form.Item>
         </Form>
@@ -1554,10 +1557,15 @@ function McpConfig() {
   const normalizeMcpItem = (raw: unknown, explicitId?: string): McpServer | null => {
     if (!raw || typeof raw !== 'object') return null
     const o = raw as Record<string, unknown>
-    let id = explicitId || (typeof o.id === 'string' ? o.id.trim() : undefined)
+    const rawId = explicitId || (typeof o.id === 'string' ? o.id.trim() : undefined)
+    let id = rawId
     // Sanitize ID: replace invalid chars with underscore (same as backend)
     if (id) {
       id = id.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '')
+    }
+    // If sanitization emptied the id (e.g., pure Chinese chars), fall back to a safe derivation
+    if (!id && rawId) {
+      id = rawId.replace(/\s+/g, '-').toLowerCase().replace(/[^a-z0-9._-]/g, '') || 'mcp'
     }
     let name = typeof o.name === 'string' ? o.name.trim() : undefined
     const transportRaw = typeof o.transport === 'string' ? o.transport : typeof o.type === 'string' ? o.type : 'stdio'
@@ -1573,7 +1581,7 @@ function McpConfig() {
       url = typeof o.url === 'string' ? o.url.trim() : undefined
       if (!url) return null
     }
-    if (!name) name = id || 'unnamed'
+    if (!name) name = rawId || id || 'unnamed'
     if (!id) id = name.replace(/\s+/g, '-').toLowerCase().replace(/[^a-z0-9._-]/g, '') || 'mcp'
     // Extract env, headers, and tools
     const env = (o.env && typeof o.env === 'object') ? o.env as Record<string, string> : undefined

@@ -19,11 +19,14 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.router import ModelRouter, ModelHandle
-from nanobot.agent.context import ContextBuilder
+from nanobot.providers.provider_manager import ProviderManager
+from nanobot.agent.context import ContextBuilder, repair_openai_tool_messages
+from nanobot.agent.dsml_tool_parser import coerce_llm_response_dsml_tool_calls
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.memory import RememberTool
 from nanobot.agent.tools.persist_self_improvement import PersistSelfImprovementTool
+from nanobot.agent.tools.skill_manager import SkillManagerTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
@@ -32,10 +35,16 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.self_update import SelfUpdateTool
 from nanobot.agent.tools.get_subagent_results import GetSubagentResultsTool
 from nanobot.agent.tools.delegate_microkernel import DelegateMicrokernelTool
-from nanobot.agent.tool_errors import format_tool_error
+from nanobot.agent.tool_errors import (
+    format_tool_error,
+    is_retryable_error,
+    is_tool_call_result_mismatch_error,
+)
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.consolidator import Consolidator
 from nanobot.session.manager import SessionManager
 from nanobot.tracing import span, trace_context
+from nanobot.utils.helpers import parse_session_key, sanitize_args_for_log
 
 # Forward declaration to avoid circular imports
 SystemStatusService = "SystemStatusService"
@@ -121,6 +130,24 @@ EXPAND_RATIO = 1.2
 _STOP_SENTINEL = object()
 
 
+def _accumulate_llm_usage_into(usage: dict[str, Any] | None, acc: dict[str, int]) -> None:
+    """将单次 LLM 调用的 usage 累加到 acc。
+
+    OpenAI 系为 prompt_tokens/completion_tokens；Anthropic 等为 input_tokens/output_tokens。
+    若仅有 total_tokens / tokens_used，则只累加总数（与旧行为一致）。
+    """
+    if not usage:
+        return
+    pt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    tt = int(usage.get("total_tokens") or usage.get("tokens_used") or 0)
+    if tt <= 0 and (pt > 0 or ct > 0):
+        tt = pt + ct
+    acc["prompt_tokens"] += max(0, pt)
+    acc["completion_tokens"] += max(0, ct)
+    acc["total_tokens"] += max(0, tt)
+
+
 @dataclass
 class _CancelProbe:
     """
@@ -147,6 +174,7 @@ class AgentLoop:
         bus: MessageBus,
         workspace: Path,
         provider: LLMProvider | None = None,
+        provider_manager: "ProviderManager | None" = None,
         model: str | None = None,
         subagent_model: str | None = None,
         max_iterations: int = 40,
@@ -189,23 +217,29 @@ class AgentLoop:
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
+        self.provider_manager = provider_manager
         self.router = router
         self._default_profile = default_profile
         self.workspace = workspace
 
         # 新架构：使用 router 获取默认模型
+        self._model_chain: list[str] = []
         if router:
             try:
                 handle = router.get(default_profile)
                 self.model = handle.model
                 self._current_handle = handle
+                # 获取 model_chain 用于运行时故障转移
+                self._model_chain = self._resolve_model_chain(router, default_profile)
+                if len(self._model_chain) > 1:
+                    logger.info(f"[ModelFailover] 启用故障转移: {self._model_chain}")
             except Exception as e:
                 logger.warning(f"Failed to resolve default profile '{default_profile}': {e}")
                 # 回退到旧方式
-                self.model = model or (provider.get_default_model() if provider else "anthropic/claude-opus-4-6")
+                self.model = model or (provider.get_default_model() if provider else "claude-opus-4-6")
                 self._current_handle = None
         else:
-            self.model = model or (provider.get_default_model() if provider else "anthropic/claude-opus-4-6")
+            self.model = model or (provider.get_default_model() if provider else "claude-opus-4-6")
             self._current_handle = None
 
         self.subagent_model = subagent_model or ""
@@ -231,6 +265,7 @@ class AgentLoop:
         self._enable_smart_parallel = enable_smart_parallel
         self._smart_parallel_model = smart_parallel_model
         self._status_service = status_service
+        self._tool_execution_times: dict[int, float] = {}
 
         # 微内核委托配置
         self._microkernel_escalation_enabled = microkernel_escalation_enabled
@@ -292,8 +327,17 @@ class AgentLoop:
         from nanobot.agent.backends import claude_code as cc_backend
         cc_backend.register(self.claude_code_manager)
 
+        # 新架构下 provider 可能为 None，需从 router 解析一个 provider 传给 SubagentManager
+        subagent_provider = provider
+        if subagent_provider is None and router is not None:
+            try:
+                handle = router.get(default_profile)
+                subagent_provider = handle.provider
+            except Exception as e:
+                logger.warning(f"[AgentLoop] Failed to resolve provider from router for subagent: {e}")
+
         self.subagents = SubagentManager(
-            provider=provider,
+            provider=subagent_provider,
             workspace=workspace,
             bus=bus,
             model=self.model,
@@ -315,6 +359,20 @@ class AgentLoop:
         if subagent_model:
             self.subagents.model = subagent_model
 
+        # 初始化 Consolidator（运行时 token-budget 归档）
+        consolidator_provider = self.provider
+        if consolidator_provider is None and self.router is not None:
+            try:
+                consolidator_provider = self.router.get(self.model).provider
+            except Exception:
+                pass
+        self._consolidator = Consolidator(
+            provider=consolidator_provider,
+            model=self.model,
+            context_window=getattr(self, "context_window_tokens", 65536),
+            max_completion=getattr(self, "max_tokens", 8192),
+        )
+
         self._running = False
         self._loop: asyncio.AbstractEventLoop | None = None  # 由 run() 启动时赋值
         self._mcp_loaded = False
@@ -334,6 +392,12 @@ class AgentLoop:
         self._chain_monitor = ExecutionChainMonitor.get_instance(db_path)
         self._chain_monitor.set_repository(repo)
         logger.info(f'[ExecutionChain] Monitor initialized with db: {db_path}')
+
+        # Skill review configuration
+        self._skill_review_enabled = True         # 总开关
+        self._skill_review_turn_interval = 10   # 每 N 轮自动触发 review（0=禁用）
+        self._user_turn_count = 0              # 用户轮次计数器
+        self._pending_manual_review = False     # 手动触发标志（用户说"总结经验"等）
 
         self._register_default_tools()
         # MCP 加载移到 run() 里直接 await，避免 create_task 调度到从未运行的 loop
@@ -800,7 +864,7 @@ class AgentLoop:
             try:
                 kernel.conn.close()
             except Exception as close_err:
-                logger.debug("关闭 kernel 连接时异常（可忽略）: %s", close_err)
+                logger.debug(f"关闭 kernel 连接时异常（可忽略）: {close_err}")
 
     async def _on_microkernel_done(
         self,
@@ -890,7 +954,7 @@ class AgentLoop:
         # 同一批多个 spawn(vision) 只保留第一个（同一图片只需一次视觉分析）
         vision_deduped = spawn_vision[:1]
         if len(spawn_vision) > 1:
-            logger.info("[AgentLoop] Vision spawn deduplicated in conflict group: keeping first only (%d -> 1)", len(spawn_vision))
+            logger.info(f"[AgentLoop] Vision spawn deduplicated in conflict group: keeping first only ({len(spawn_vision)} -> 1)")
 
         # 串行组 1: vision 先行，再 exec；其余工具各成一组
         group1 = vision_deduped + exec_image
@@ -898,6 +962,45 @@ class AgentLoop:
         for tc in others:
             groups.append([tc])
         return groups
+
+    async def _gather_awaitables_with_cancel_poll(
+        self,
+        awaitables: list,
+        session_key: str | None,
+        *,
+        interval: float = 1.0,
+        return_exceptions: bool = False,
+    ) -> list:
+        """并行等待多个 awaitable，期间轮询用户取消；避免 asyncio.gather 长时间阻塞无法响应停止。"""
+        if not awaitables:
+            return []
+        tasks = [asyncio.ensure_future(a) for a in awaitables]
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, timeout=interval, return_when=asyncio.FIRST_COMPLETED
+                )
+                if done:
+                    # Yield control so progress callbacks (e.g., WebSocket drain) can run promptly
+                    await asyncio.sleep(0)
+                await self._check_cancelled(session_key)
+            if return_exceptions:
+                out: list = []
+                for t in tasks:
+                    exc = t.exception()
+                    if exc is not None:
+                        out.append(exc)
+                    else:
+                        out.append(t.result())
+                return out
+            return [t.result() for t in tasks]
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def _execute_tool_parallel(
         self,
@@ -952,9 +1055,9 @@ class AgentLoop:
 
         use_vision_first = bool(spawn_vision and (spawn_others or exec_others))
         if use_vision_first:
-            # vision + 其他工具共存时始终缓冲 progress，避免体验割裂
+            # vision + 其他工具共存时按阶段缓冲并推送 progress，避免体验割裂同时保持进度可见
             use_buffered_progress = True
-            logger.info("[AgentLoop] Vision-first batch: vision runs first, progress %s", "buffered" if use_buffered_progress else "immediate")
+            logger.info(f'[AgentLoop] Vision-first batch: vision runs first, progress per-stage')
             if self._status_service:
                 try:
                     for _ in tool_calls:
@@ -972,6 +1075,16 @@ class AgentLoop:
                     buf.append(evt)
                 return buffered
 
+            def _flush_buffered() -> None:
+                nonlocal buffered
+                if use_buffered_progress and progress and buffered:
+                    for evt in buffered:
+                        try:
+                            progress(evt)
+                        except Exception:
+                            pass
+                    buffered = []
+
             _run_progress = _make_buffered_progress(buffered)
 
             # 阶段 1: 执行 vision（只执行第一个，dedup）
@@ -979,6 +1092,7 @@ class AgentLoop:
                 await self._check_cancelled(session_key)
                 result = await self._execute_single_tool(tool_call, _run_progress)
                 results.append((tool_call, result))
+            _flush_buffered()
 
             # 阶段 2: 若有 spawn(非 vision)，等待 vision 完成并注入结果
             if spawn_others:
@@ -990,14 +1104,8 @@ class AgentLoop:
                 await self._check_cancelled(session_key)
                 result = await self._execute_single_tool(tool_call, _run_progress)
                 results.append((tool_call, result))
+            _flush_buffered()
 
-            # 统一推送缓冲的 progress 事件
-            if use_buffered_progress and progress and buffered:
-                for evt in buffered:
-                    try:
-                        progress(evt)
-                    except Exception:
-                        pass
             return results
 
         # vision-exec 冲突检测：有图片且同时存在 spawn(vision) 与 exec(图片相关) 时，串行分组（vision 先行）
@@ -1040,9 +1148,10 @@ class AgentLoop:
                             r = await self._execute_single_tool(group[0], progress)
                             results.append((group[0], r))
                         else:
-                            # 组内并行：与主并行路径保持一致
-                            group_results = await asyncio.gather(
-                                *[self._execute_single_tool(tc, progress) for tc in group],
+                            # 组内并行：与主并行路径保持一致（可响应停止）
+                            group_results = await self._gather_awaitables_with_cancel_poll(
+                                [self._execute_single_tool(tc, progress) for tc in group],
+                                session_key,
                                 return_exceptions=True,
                             )
                             for tc, r in zip(group, group_results):
@@ -1092,10 +1201,11 @@ class AgentLoop:
                 logger.exception(f"Tool execution failed in parallel: {tc.name}")
                 return (tc, format_tool_error(tc.name, e))
 
-        # 使用 asyncio.gather 并行执行，捕获异常避免整体失败
-        results = await asyncio.gather(
-            *[execute_with_progress(tc) for tc in tool_calls],
-            return_exceptions=True
+        # 并行执行，捕获异常避免整体失败；轮询取消，避免长时间工具阻塞停止
+        results = await self._gather_awaitables_with_cancel_poll(
+            [execute_with_progress(tc) for tc in tool_calls],
+            session_key,
+            return_exceptions=True,
         )
 
         # 处理异常结果（gather return_exceptions=True 时，协程未捕获的异常会作为 Exception 返回）
@@ -1156,14 +1266,17 @@ class AgentLoop:
         # 循环检测
         call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
         logger.info(f"[ToolExecution] Starting tool: {tool_call.name}")
-        logger.debug(f"Executing tool: {tool_call.name} with arguments: {json.dumps(tool_call.arguments)}")
+        logger.debug(f"Executing tool: {tool_call.name} with arguments: {json.dumps(sanitize_args_for_log(tool_call.arguments))}")
+
+        # 为工具执行生成唯一 ID（用于前端关联进度事件）
+        tool_exec_id: str | None = str(uuid.uuid4())[:8] if progress else None
 
         if progress:
             try:
-                evt = {"type": "tool_start", "name": tool_call.name, "arguments": tool_call.arguments}
+                evt = {"type": "tool_start", "id": tool_exec_id, "name": tool_call.name, "arguments": tool_call.arguments}
                 progress(evt)
                 progress({**evt, "type": "tool_execution_start"})  # 细粒度事件流
-                logger.info(f"[ToolProgress] Sent tool_start event: {tool_call.name}")
+                logger.info(f"[ToolProgress] Sent tool_start event: {tool_call.name} (id={tool_exec_id})")
             except Exception:
                 pass
         else:
@@ -1210,6 +1323,7 @@ class AgentLoop:
 
         # execution_time 计算在 span 外，以便后续日志和指标记录使用
         execution_time = time.time() - tool_start_time
+        self._tool_execution_times[id(tool_call)] = execution_time
         tool_span.set_attr("duration_s", round(execution_time, 3))
         tool_span.set_attr("result_preview", str(result)[:200] if result else None)
         logger.info(f"[ToolExecution] Tool '{tool_call.name}' completed in {execution_time:.2f}s, error: {tool_execution_error is not None}")
@@ -1231,7 +1345,7 @@ class AgentLoop:
         if progress:
             try:
                 truncated = _truncate(result)
-                evt = {"type": "tool_end", "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated}
+                evt = {"type": "tool_end", "id": tool_exec_id, "name": tool_call.name, "arguments": tool_call.arguments, "result": truncated}
                 if not is_spawn_vision:
                     progress(evt)
                 progress({**evt, "type": "tool_execution_end"})  # 细粒度事件流
@@ -1272,11 +1386,7 @@ class AgentLoop:
             self._mcp_server_scopes[server_id] = [s.lower() for s in scope]
 
         tools = getattr(mcp_cfg, "tools", None) or []
-        logger.debug(
-            "[MCP] register server=%s yaml_tools=%s",
-            server_id,
-            len(tools),
-        )
+        logger.debug(f"[MCP] register server={server_id} yaml_tools={len(tools)}")
 
         if tools:
             lazy_tools: dict[str, McpLazyToolAdapter] = {}
@@ -1303,14 +1413,25 @@ class AgentLoop:
                 lazy_tools[tool_name] = adapter
                 self.tools.register(adapter)
 
-            logger.info("MCP %s: registered %d lazy tools (yaml)", server_id, len(lazy_tools))
+            logger.info(f"MCP {server_id}: registered {len(lazy_tools)} lazy tools (yaml)")
             return
 
+        # 没有 yaml tools：使用持久连接一次性发现工具（避免 init 时 connect+disconnect 再首次调用再 connect 的 double-connect）
         discovered: list[dict[str, Any]] = []
         try:
-            discovered = await self._discover_mcp_tools(server_id, mcp_cfg)
+            conn_result = await self.mcp_loader.connect_lazy(server_id, timeout=30.0)
+            if conn_result is not None:
+                _, mcp_tools = conn_result
+                discovered = [
+                    {
+                        "name": t.name,
+                        "description": getattr(t, "description", "") or f"MCP tool {t.name}",
+                        "parameters": getattr(t, "inputSchema", None) or {"type": "object", "properties": {}},
+                    }
+                    for t in (mcp_tools or [])
+                ]
         except Exception as e:
-            logger.warning("MCP %s: tool discovery error: %s", server_id, e)
+            logger.warning(f"MCP {server_id}: tool discovery error: {e}")
 
         if discovered:
             mcp_cfg.tools = discovered
@@ -1330,9 +1451,9 @@ class AgentLoop:
                     scope=list(getattr(mcp_cfg, "scope", None) or []),
                     tools=discovered,
                 )
-                logger.info("MCP %s: discovered %d tools, saved to config + SQLite", server_id, len(discovered))
+                logger.info(f"MCP {server_id}: discovered {len(discovered)} tools, saved to config + SQLite")
             except Exception as save_err:
-                logger.warning("MCP %s: failed to persist tools: %s", server_id, save_err)
+                logger.warning(f"MCP {server_id}: failed to persist tools: {save_err}")
 
             lazy_tools = {}
             for tool_spec in discovered:
@@ -1347,7 +1468,7 @@ class AgentLoop:
                 )
                 lazy_tools[tool_name] = adapter
                 self.tools.register(adapter)
-            logger.info("MCP %s: registered %d lazy tools (discovered)", server_id, len(lazy_tools))
+            logger.info(f"MCP {server_id}: registered {len(lazy_tools)} lazy tools (discovered)")
             return
 
         try:
@@ -1355,7 +1476,7 @@ class AgentLoop:
             stored = repo.get_mcp(mcp_cfg.id)
             stored_tools = (stored.get("tools") or []) if stored else []
             if stored_tools:
-                logger.info("MCP %s: using %d tools from SQLite fallback", server_id, len(stored_tools))
+                logger.info(f"MCP {server_id}: using {len(stored_tools)} tools from SQLite fallback")
                 mcp_cfg.tools = stored_tools
                 lazy_tools = {}
                 for tool_spec in stored_tools:
@@ -1372,11 +1493,11 @@ class AgentLoop:
                     )
                     lazy_tools[tool_name] = adapter
                     self.tools.register(adapter)
-                logger.info("MCP %s: registered %d lazy tools (SQLite)", server_id, len(lazy_tools))
+                logger.info(f"MCP {server_id}: registered {len(lazy_tools)} lazy tools (SQLite)")
             else:
-                logger.debug("MCP %s: no tools in yaml/discovery/SQLite, skip registration", server_id)
+                logger.debug(f"MCP {server_id}: no tools in yaml/discovery/SQLite, skip registration")
         except Exception as fallback_err:
-            logger.debug("MCP %s: SQLite fallback error: %s", server_id, fallback_err)
+            logger.debug(f"MCP {server_id}: SQLite fallback error: {fallback_err}")
 
     async def _init_mcp_loader(self, only_server_ids: set[str] | None = None) -> None:
         """
@@ -1390,7 +1511,7 @@ class AgentLoop:
 
         _loop_id = id(_asyncio.get_running_loop())
         logger.debug(
-            "[MCP] _init_mcp_loader loop=%s only=%s already_registered=%s",
+            "[MCP] _init_mcp_loader loop={} only={} already_registered={}",
             _loop_id,
             None if only_server_ids is None else sorted(only_server_ids)[:12],
             sorted(self._mcp_registered_server_ids),
@@ -1406,7 +1527,8 @@ class AgentLoop:
                 return
 
             if self.mcp_loader is None:
-                self.mcp_loader = McpToolLoader(mcps, self.workspace)
+                self.mcp_loader = McpToolLoader(mcps, self.workspace, sampling_callback=self._mcp_sampling_callback)
+                self.mcp_loader._tools_registry = self.tools
 
             if only_server_ids is not None and len(only_server_ids) == 0:
                 logger.info("[MCP] specified 模式未选中 MCP，跳过发现与注册")
@@ -1427,14 +1549,10 @@ class AgentLoop:
                 added += 1
 
             mcp_tool_names = [n for n in self.tools.tool_names if n.startswith("mcp_")]
-            logger.info(
-                "[MCP] _init_mcp_loader: +%d server(s) this pass, %d mcp tool(s) total",
-                added,
-                len(mcp_tool_names),
-            )
+            logger.info(f"[MCP] _init_mcp_loader: +{added} server(s) this pass, {len(mcp_tool_names)} mcp tool(s) total")
 
         except Exception as e:
-            logger.warning("MCP loader init skipped: %s", e, exc_info=True)
+            logger.warning(f"MCP loader init skipped: {e}", exc_info=True)
         finally:
             import asyncio as _asyncio
 
@@ -1447,7 +1565,7 @@ class AgentLoop:
             if self.mcp_loader is not None and _mcp_count > 0:
                 self._mcp_loop_id = _loop_id_fin
             logger.info(
-                "[MCP] _init_mcp_loader done, loop=%s, mcp_tools=%s, registered_servers=%s",
+                "[MCP] _init_mcp_loader done, loop={}, mcp_tools={}, registered_servers={}",
                 _loop_id_fin,
                 _mcp_count,
                 sorted(self._mcp_registered_server_ids),
@@ -1473,12 +1591,9 @@ class AgentLoop:
                 timeout=mcp_init_timeout,
             )
         except asyncio.TimeoutError:
-            logger.warning(
-                "[MCP] 按需初始化超时（%.0fs），继续处理（可能没有部分 MCP 工具）",
-                mcp_init_timeout,
-            )
+            logger.warning(f"[MCP] 按需初始化超时（{mcp_init_timeout:.0f}s），继续处理（可能没有部分 MCP 工具）")
         except Exception as e:
-            logger.warning("[MCP] 按需初始化失败: %s", e)
+            logger.warning(f"[MCP] 按需初始化失败: {e}")
 
     async def _discover_mcp_tools(self, server_id: str, mcp_cfg: Any) -> list[dict[str, Any]]:
         """
@@ -1503,6 +1618,91 @@ class AgentLoop:
         except Exception as e:
             logger.warning(f"MCP {server_id}: discovery error: {e}")
             return []
+
+    async def _mcp_sampling_callback(self, context, params):
+        """MCP sampling callback - routes server-initiated LLM requests to our provider.
+
+        Runs on the MCP background loop; offloads the actual LLM call to the main agent loop.
+        """
+        main_loop = getattr(self, "_loop", None)
+        if main_loop is None or main_loop.is_closed():
+            raise RuntimeError("Main agent loop not available for MCP sampling")
+
+        messages = []
+        for msg in getattr(params, "messages", []):
+            role = getattr(msg, "role", "user")
+            content = ""
+            msg_content = getattr(msg, "content", None)
+            if isinstance(msg_content, str):
+                content = msg_content
+            elif hasattr(msg_content, "text"):
+                content = str(msg_content.text)
+            elif isinstance(msg_content, list):
+                parts = []
+                for block in msg_content:
+                    if hasattr(block, "text"):
+                        parts.append(str(block.text))
+                content = "\n".join(parts)
+            if content:
+                messages.append({"role": role, "content": content})
+
+        system_prompt = getattr(params, "systemPrompt", None)
+        if system_prompt:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+
+        max_tokens = getattr(params, "maxTokens", 4096)
+
+        model = self.model
+        prefs = getattr(params, "modelPreferences", None)
+        if prefs:
+            hints = getattr(prefs, "hints", None) or []
+            for hint in hints:
+                hint_name = getattr(hint, "name", None)
+                if hint_name:
+                    model = str(hint_name)
+                    break
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._call_sampling_llm(messages, max_tokens, model=model),
+            main_loop,
+        )
+        return await asyncio.wrap_future(future)
+
+    async def _call_sampling_llm(self, messages: list[dict[str, str]], max_tokens: int, model: str | None = None):
+        """Call LLM for MCP sampling on the main agent loop."""
+        try:
+            from mcp.types import CreateMessageResult, TextContent
+        except ImportError:
+            raise RuntimeError("mcp package not available for sampling result formatting")
+
+        effective_model = model or self.model
+        provider = self.provider
+        _api_base = None
+        if provider is None and self.router:
+            try:
+                handle = self.router.get(effective_model)
+                provider = handle.provider
+                _api_base = handle.api_base
+            except Exception as exc:
+                raise RuntimeError(f"No provider available for MCP sampling: {exc}")
+
+        if provider is None:
+            raise RuntimeError("No LLM provider available for MCP sampling")
+
+        response = await provider.chat(
+            model=effective_model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.7,
+            api_base=_api_base,
+        )
+        content = getattr(response, "content", "") or ""
+        return CreateMessageResult(
+            role="assistant",
+            content=TextContent(type="text", text=str(content)),
+            model=effective_model,
+            stopReason="endTurn",
+        )
 
     def _safe_mcp_id(self, name: str) -> str:
         """Convert MCP name to safe ID."""
@@ -1550,6 +1750,7 @@ class AgentLoop:
     def update_model(self, model: str) -> None:
         """Update default model at runtime (hot config)."""
         self.model = model
+        self._model_chain = [model]
         if not self.subagent_model:
             self.subagents.model = model
 
@@ -1557,6 +1758,16 @@ class AgentLoop:
         """Update subagent model at runtime (hot config). Empty string means use main model."""
         self.subagent_model = subagent_model
         self.subagents.model = subagent_model if subagent_model else self.model
+
+    def _get_vision_model(self) -> str | None:
+        """Resolve the dedicated vision profile model, if configured."""
+        if not self.router:
+            return None
+        try:
+            handle = self.router.get("vision")
+            return handle.model
+        except Exception:
+            return None
 
     def _is_vision_model(self, model: str) -> bool:
         """Check if a model supports vision/images."""
@@ -1566,11 +1777,26 @@ class AgentLoop:
         vision_keywords = ["vision", "vl", "qwen-vl", "gpt-4v", "gpt-4o", "claude-3-opus", "claude-3-sonnet", "claude-3-5", "claude-4"]
         return any(kw in model_lower for kw in vision_keywords)
 
-    def _is_dashscope_model(self, model: str) -> bool:
-        """Check if model is DashScope/Qwen (LiteLLM has known bug #16007 that drops images)."""
-        if not model:
+    def _is_image_unsupported_error(self, error_text: str) -> bool:
+        """Detect whether an LLM error is due to the model not supporting image input."""
+        if not error_text:
             return False
-        return any(k in model.lower() for k in ("dashscope", "qwen"))
+        text_lower = error_text.lower()
+        keywords = [
+            "does not support images",
+            "does not support vision",
+            "image_url is not supported",
+            "invalid content: content parts must be strings",
+            "unsupported image type",
+            "unsupported message content type",
+            "不支持图片",
+            "不支持视觉",
+            "无法识别图片内容",
+            "model does not support",
+            "this model only supports text",
+            "only text inputs are supported",
+        ]
+        return any(kw in text_lower for kw in keywords)
 
     def _is_image_file(self, path: str) -> bool:
         """Check if a file is an image based on extension or mime type."""
@@ -1590,7 +1816,27 @@ class AgentLoop:
         # Fallback: check common audio extensions
         return str(path).lower().endswith(('.mp3', '.wav', '.ogg', '.m4a', '.opus', '.webm', '.aac'))
 
-    async def _wait_for_subagents(self, task_ids: list[str], timeout: float = 120.0) -> None:
+    def _build_user_message_kwargs_from_media_paths(self, media: list[str] | None) -> dict[str, Any]:
+        """从本地媒体路径构建用户消息的附加字段，仅保存图片路径（不再存 base64，避免数据库膨胀）。"""
+        out: dict[str, Any] = {}
+        if not media:
+            return out
+
+        user_images: list[str] = []
+        for media_path in media:
+            if not self._is_image_file(media_path):
+                continue
+            user_images.append(media_path)
+        if user_images:
+            out["images"] = user_images
+        return out
+
+    async def _wait_for_subagents(
+        self,
+        task_ids: list[str],
+        timeout: float = 120.0,
+        session_key: str | None = None,
+    ) -> None:
         """等待指定的所有子 Agent 任务完成。"""
         if not task_ids or not self.subagents:
             return
@@ -1614,6 +1860,7 @@ class AgentLoop:
                 logger.info(f"[BatchMode] All subagent tasks completed: {task_ids}")
                 break
 
+            await self._check_cancelled(session_key)
             # 等待一段时间再检查
             await asyncio.sleep(check_interval)
 
@@ -1645,10 +1892,10 @@ class AgentLoop:
             return False
 
         try:
-            await self._wait_for_subagents([vision_task_id], timeout=120.0)
-            logger.info("[VisionInject] Vision spawn %s completed, injecting into spawn_others", vision_task_id)
+            await self._wait_for_subagents([vision_task_id], timeout=120.0, session_key=session_key)
+            logger.info(f"[VisionInject] Vision spawn {vision_task_id} completed, injecting into spawn_others")
         except asyncio.TimeoutError:
-            logger.warning("[VisionInject] Timeout waiting for vision spawn %s", vision_task_id)
+            logger.warning(f"[VisionInject] Timeout waiting for vision spawn {vision_task_id}")
             return False
 
         if vision_task_id not in session.subagent_results:
@@ -1678,7 +1925,7 @@ class AgentLoop:
                 f"[图片来源分析结果（来自 {vision_label}）]\n"
                 f"{vision_result}"
             )
-            session.add_message("user", inject_content)
+            session.add_message("user", inject_content, internal=True)
             self.sessions.save(session)
             logger.info("[VisionInject] Saved vision inject to session")
 
@@ -1775,6 +2022,8 @@ class AgentLoop:
         # Memory tool (用户说「记住」时必须调用，否则不会真正写入)
         self.tools.register(RememberTool(workspace=ws))
         self.tools.register(PersistSelfImprovementTool(workspace=ws))
+        # Skill management tool (允许 agent 创建/编辑/删除可复用的 skills)
+        self.tools.register(SkillManagerTool(workspace=ws, context=self.context))
 
         # Shell tool
         self.tools.register(ExecTool(
@@ -1819,9 +2068,22 @@ class AgentLoop:
         self.subagents.set_main_loop(self._loop)
         logger.info("Agent loop started")
 
-        # MCP 初始化延迟到第一条 tool_mode != 'disable' 的消息到来时执行，
-        # 避免用户全程使用 disable 模式时浪费 30s 启动时间。
-        # _ensure_mcp_loaded() 保证只初始化一次。
+        # Eager MCP init on startup: start in background so connections are
+        # ready before the first user message arrives.
+        if not self._mcp_loaded:
+            try:
+                from nanobot.config.loader import load_config
+                _startup_cfg = load_config()
+                if getattr(_startup_cfg, "mcps", None):
+                    asyncio.create_task(
+                        self._ensure_mcp_loaded_for_mode("auto", None)
+                    )
+                    logger.info("[MCP] Eager initialization started in background")
+            except Exception as _e:
+                logger.debug(f"[MCP] Eager init skipped: {_e}")
+
+        # 原有按需初始化逻辑仍然保留作为兜底：
+        # 若上述 background task 未完成，第一条消息会等待它结束。
 
         while self._running:
             # 使用哨兵替代 1s 超时轮询：无消息时完全阻塞，CPU 占用接近 0
@@ -1829,10 +2091,11 @@ class AgentLoop:
             if raw is _STOP_SENTINEL:
                 break
             if isinstance(raw, _CancelProbe):
-                # 探针：若对应 session 的取消标记已被清理（即消息已开始处理），
-                # 则此探针无需任何操作；否则移除孤立的取消标记。
-                self._cancelled_sessions.discard(raw.session_key)
-                logger.debug(f"[AgentLoop] 取消探针已处理: {raw.session_key}")
+                # 探针仅用于唤醒可能阻塞在 inbound.get() 上的 run()；不得在此处 discard
+                # _cancelled_sessions：WebSocket 的 process_direct 在同进程内直接 await _process_message，
+                # 若此处清除标记，正在执行的 LLM 轮询将永远看不到取消（与用户日志一致）。
+                # 取消位仅应由 _check_cancelled 消费，或由新请求 process_direct 开头的 _reset_cancel_event 清理。
+                logger.debug(f"[AgentLoop] 取消探针已接收（保留取消标记）: {raw.session_key}")
                 continue
             msg: InboundMessage = raw
 
@@ -1859,16 +2122,10 @@ class AgentLoop:
                         except Exception as _e:
                             logger.warning(f"[AgentLoop] on_complete callback failed: {_e}")
                     elif response:
-                        logger.info(
-                            "[AgentLoop] Publishing reply to %s:%s (content_len=%d)",
-                            response.channel, response.chat_id, len(response.content or ""),
-                        )
+                        logger.info(f'[AgentLoop] Publishing reply to {response.channel}:{response.chat_id} (content_len={len(response.content or "")})')
                         await self.bus.publish_outbound(response)
                     else:
-                        logger.warning(
-                            "[AgentLoop] _process_message returned None, no reply for %s:%s",
-                            msg.channel, msg.chat_id,
-                        )
+                        logger.warning(f"[AgentLoop] _process_message returned None, no reply for {msg.channel}:{msg.chat_id}")
                 except asyncio.CancelledError:
                     # 区分两种来源：
                     # 1. stop() → _running=False + _STOP_SENTINEL（不走此路径，sentinel 在 get() 处拦截）
@@ -1885,7 +2142,7 @@ class AgentLoop:
                     try:
                         _sk = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
                         _sess = self.sessions.get_or_create(_sk)
-                        _sess.add_message("assistant", "[已停止]")
+                        _sess.add_message("assistant", "用户已取消操作。")
                         self.sessions.save(_sess)
                     except Exception as _e:
                         logger.warning(f"[AgentLoop] Failed to save cancel placeholder: {_e}")
@@ -1899,7 +2156,7 @@ class AgentLoop:
                             await self.bus.publish_outbound(OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
-                                content="[已停止]",
+                                content="用户已取消操作。",
                             ))
                         except Exception as _e:
                             logger.warning(f"[AgentLoop] publish_outbound (cancelled) failed: {_e}")
@@ -2004,7 +2261,7 @@ class AgentLoop:
         """Check if cancellation was requested for this session and raise if so."""
         if session_key and session_key in self._cancelled_sessions:
             self._cancelled_sessions.discard(session_key)
-            logger.info("Cancellation detected for session %s, raising CancelledError", session_key)
+            logger.info(f"Cancellation detected for session {session_key}, raising CancelledError")
             raise asyncio.CancelledError("Request cancelled by user")
         if not session_key and self._cancel_event.is_set():
             self._cancel_event.clear()
@@ -2021,13 +2278,14 @@ class AgentLoop:
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a single inbound message.
-        
+
         Args:
             msg: The inbound message to process.
-        
+
         Returns:
             The response message, or None if no response needed.
         """
+        logger.info(f'[SkillReviewer] _process_message ENTRY: channel={msg.channel}, content={(msg.content or "")[:30]}')
         # 开始执行链路监控
         chain = self._chain_monitor.start_chain(
             session_key=msg.session_key,
@@ -2143,6 +2401,16 @@ class AgentLoop:
         # If the last assistant message has the LIMIT_REACHED_MARKER and the user
         # is asking to continue or expand capacity, handle accordingly.
         current_message = msg.content
+        # Skill review: manual trigger — user says "总结经验" etc.
+        _review_keywords = {"总结经验", "复盘", "retrospective", "总结教训",
+                           "从经验中学习", "自我完善", "分析今天的经验"}
+        self._pending_manual_review = any(
+            kw in (msg.content or "").lower() for kw in _review_keywords
+        )
+        if self._pending_manual_review:
+            logger.info("[SkillReviewer] Keyword detected in user message, _pending_manual_review=True")
+        logger.info(f"[SkillReviewer] keyword detection done, pending={self._pending_manual_review}, about to process message")
+        self._user_turn_count += 1
         _user_cmd = msg.content.strip()
         _is_continue = _user_cmd.lower() in CONTINUE_KEYWORDS
         _is_expand = _user_cmd in EXPAND_KEYWORDS
@@ -2155,10 +2423,7 @@ class AgentLoop:
             if last_assistant and LIMIT_REACHED_MARKER in str(last_assistant.get("content", "")):
                 if _is_expand:
                     expanded = max(int(self.max_iterations * EXPAND_RATIO), self.max_iterations + 1)
-                    logger.info(
-                        "User requested capacity expansion: max_iterations %d -> %d",
-                        self.max_iterations, expanded,
-                    )
+                    logger.info(f"User requested capacity expansion: max_iterations {self.max_iterations} -> {expanded}")
                     self.update_agent_params(max_iterations=expanded)
                 else:
                     logger.info("Detected continue command after limit-reached pause; resetting iteration budget")
@@ -2169,8 +2434,19 @@ class AgentLoop:
 
         # Build initial messages (use get_history for LLM-formatted messages)
         mirror_attack_level = msg.metadata.get("attack_level") if msg.metadata else None
+        # Web 渠道在 chat_stream() 中已提前保存了用户消息，session.get_history() 返回的
+        # 历史已包含本条消息；而 build_messages() 还会再 append 一次 current_message，
+        # 导致末尾出现两条内容相同的用户消息。
+        # 修复：当 user_message_saved=True 时，先从历史中去掉最后那条（已保存的）
+        # 用户消息，让 build_messages 统一追加，避免重复。
+        _user_message_saved = bool(
+            (msg.metadata or {}).get("user_message_saved")
+        )
+        raw_history = session.get_history(max_messages=self.max_history_messages)
+        if _user_message_saved and raw_history and raw_history[-1].get("role") == "user":
+            raw_history = raw_history[:-1]
         messages = self.context.build_messages(
-            history=session.get_history(max_messages=self.max_history_messages),
+            history=raw_history,
             current_message=current_message,
             media=msg.media if msg.media else None,
             channel=msg.channel,
@@ -2188,54 +2464,24 @@ class AgentLoop:
             logger.info(f"[Audio] Found {len(audio_files)} audio files, expecting model to choose appropriate subagent template")
 
         if image_files:
-            main_model_supports_vision = self._is_vision_model(self.model)
-            # LiteLLM 存在 Bug #16007：DashScope 图文混排时丢弃图片，仅传递文本
-            # 对 DashScope 模型强制使用 inline recognition 以 bypass LiteLLM
-            # 主模型不支持视觉 或 DashScope（LiteLLM Bug #16007 会丢图）时，用 vision 子 agent
-            use_vision_subagent = (
-                (not main_model_supports_vision)
-                or (main_model_supports_vision and self._is_dashscope_model(self.model))
-            )
-
-            if main_model_supports_vision and not self._is_dashscope_model(self.model):
-                # 主模型支持视觉且非 DashScope，直接发送图片
-                logger.info("[Image] Main model supports vision, letting model handle images directly")
-            elif use_vision_subagent:
-                # 使用 vision 子 agent 分析（模板 model/system_prompt 可配置，支持不同视觉解读风格）
-                logger.info("[Image] Using vision subagent for analysis (template configurable)")
-                await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
-                progress_cb = msg.metadata.get("progress_callback")
-                if progress_cb:
-                    try:
-                        progress_cb({"type": "tool_start", "name": "image_recognition", "arguments": {"images": len(image_files)}})
-                    except Exception:
-                        pass
-                session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
-                channel, chat_id = (session_key.split(":", 1) + [session_key])[:2]
-                task_text = msg.content.strip() or "请详细分析这些图片的内容。"
-                img_desc = await self.subagents.run_vision_analysis(
-                    task=task_text, media=image_files,
-                    origin_channel=channel, origin_chat_id=chat_id,
-                )
-                if progress_cb:
-                    try:
-                        progress_cb({"type": "tool_end", "name": "image_recognition", "arguments": {}, "result": (img_desc or "")[:200]})
-                    except Exception:
-                        pass
-                last_user = messages[-1] if messages and messages[-1].get("role") == "user" else None
-                if last_user:
-                    if img_desc and img_desc.strip():
-                        text_content = msg.content.strip() or "请描述这张图片。"
-                        last_user["content"] = f"{text_content}\n\n[Vision 子 Agent 分析结果]\n{img_desc.strip()}"
-                    else:
-                        last_user["content"] = f"{msg.content}\n\n[图片分析失败，请检查 vision 模板配置或 DashScope API Key]"
+            logger.info(f"[Image] Found {len(image_files)} image file(s), will pass base64 to main agent first")
         
+        # 运行时归档：如果历史消息过长，先压缩旧消息
+        if self._consolidator:
+            try:
+                await self._consolidator.maybe_consolidate(session)
+            except Exception as e:
+                logger.warning(f"[Consolidator] Failed to consolidate: {e}")
+
         # Agent loop
+        logger.info(f"[SkillReviewer] about to start agent loop, pending={self._pending_manual_review}")
         sk = msg.session_key
         iteration = 0
         final_content = None
+        last_reasoning_content: str | None = None
         exit_reason: str | None = None  # "time" | "iterations" | "loop" | None=normal
         tool_steps: list[dict[str, Any]] = []
+        vision_fallback_done = False
         usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         loop_start = time.monotonic()
         tool_result_max_len = self.tool_result_max_length
@@ -2263,11 +2509,7 @@ class AgentLoop:
             return "I've completed processing but have no response to give."
 
         def _accumulate_usage(usage: dict[str, Any] | None) -> None:
-            if not usage:
-                return
-            usage_acc["prompt_tokens"] += max(0, int(usage.get("prompt_tokens", 0) or 0))
-            usage_acc["completion_tokens"] += max(0, int(usage.get("completion_tokens", 0) or 0))
-            usage_acc["total_tokens"] += max(0, int(usage.get("total_tokens", 0) or 0))
+            _accumulate_llm_usage_into(usage, usage_acc)
 
         def _emit(evt: dict[str, Any]) -> None:
             """安全发送进度事件（细粒度事件流，兼容 pi-agent 风格）。"""
@@ -2275,8 +2517,8 @@ class AgentLoop:
             if progress:
                 try:
                     progress(evt)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[_emit] progress_callback raised: {e}")
 
         # 细粒度事件流：agent_start
         _emit({"type": "agent_start", "iteration": 0})
@@ -2297,7 +2539,7 @@ class AgentLoop:
             if self.max_execution_time > 0:
                 elapsed = time.monotonic() - loop_start
                 if elapsed >= self.max_execution_time:
-                    logger.info("Max execution time %ds reached (elapsed %.0fs)", self.max_execution_time, elapsed)
+                    logger.info(f"Max execution time {self.max_execution_time}s reached (elapsed {elapsed:.0f}s)")
                     exit_reason = "time"
                     _emit({"type": "turn_end", "iteration": iteration})
                     break
@@ -2317,7 +2559,9 @@ class AgentLoop:
                 if running_spawns_needing_inject:
                     logger.info(f"[SubagentInject] Waiting for vision spawns before LLM call: {running_spawns_needing_inject}")
                     try:
-                        await self._wait_for_subagents(running_spawns_needing_inject, timeout=120.0)
+                        await self._wait_for_subagents(
+                            running_spawns_needing_inject, timeout=120.0, session_key=sk
+                        )
                         logger.info("[SubagentInject] Vision spawn tasks completed")
                     except asyncio.TimeoutError:
                         logger.warning("[SubagentInject] Timeout waiting for vision spawn tasks")
@@ -2342,25 +2586,25 @@ class AgentLoop:
                     inject_content = "\n".join(parts)
                     messages.append({"role": "user", "content": inject_content})
                     # 同步到 session，确保后续 build_messages 能看到注入的内容
-                    session.add_message("user", inject_content)
+                    session.add_message("user", inject_content, internal=True)
                     self.sessions.save(session)
                     logger.info(f"[SubagentInject] Injected {len(to_inject)} subagent results into messages: {to_inject}")
 
             # 细粒度事件流：thinking
             _emit({"type": "thinking"})
-            # Call LLM（单次最长 120 秒，等待期间每 2 秒检查一次取消）
+            # Call LLM（单次最长 120 秒，等待期间约每 1 秒检查一次取消）
             _LLM_CALL_TIMEOUT = 120
-            _CANCEL_CHECK_INTERVAL = 2.0
+            _CANCEL_CHECK_INTERVAL = 1.0
             tool_mode = msg_tool_mode
             selected_mcp_servers = msg_selected_mcp
             selected_tools = self._select_tools_for_message(msg.content, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
             async with span("llm.inference", attrs={"model": self.model}) as llm_span:
                 try:
                     llm_task = asyncio.create_task(
-                        self.provider.chat(
+                        self._call_llm_with_failover(
                             messages=messages,
                             tools=selected_tools,
-                            model=self.model,
+                            stream_callback=lambda chunk: _emit({"type": "delta", "text": chunk}),
                         )
                     )
                     loop_start_llm = time.monotonic()
@@ -2394,7 +2638,8 @@ class AgentLoop:
                             else:
                                 self._cancel_event.clear()
                             raise asyncio.CancelledError("Request cancelled by user")
-                    response = await llm_task
+                    response, _ = await llm_task
+                    _emit({"type": "stream_end"})
                 except asyncio.CancelledError:
                     raise
                 except asyncio.TimeoutError:
@@ -2429,10 +2674,7 @@ class AgentLoop:
                     tool_steps, response.has_tool_calls
                 )
                 if should_escalate:
-                    logger.info(
-                        "[AgentLoop] Microkernel escalation: %s (steps=%d, effective=%d)",
-                        reason, len(tool_steps), effective_threshold,
-                    )
+                    logger.info(f"[AgentLoop] Microkernel escalation: {reason} (steps={len(tool_steps)}, effective={effective_threshold})")
                     attempted_summary = [
                         {"name": s["name"], "result_preview": str(s.get("result", ""))[:200]}
                         for s in tool_steps[-effective_threshold:]
@@ -2477,8 +2719,9 @@ class AgentLoop:
                     for tc in tool_calls_deduped
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+                    messages, response.content, tool_call_dicts, reasoning_content=response.reasoning_content
                 )
+                last_reasoning_content = response.reasoning_content
 
                 # Execute tools and collect steps for UI display
                 loop_detected = False
@@ -2504,10 +2747,16 @@ class AgentLoop:
                                 messages, tc.id, tc.name,
                                 "已跳过：本回合已执行过类似的视觉分析任务，请使用之前的识别结果。",
                             )
+                            _duration = self._tool_execution_times.pop(id(tc), 0)
+                            _end = int(time.time() * 1000)
+                            _start = _end - max(int(_duration * 1000), 1)
                             tool_steps.append({
                                 "name": tc.name,
                                 "arguments": tc.arguments,
                                 "result": "已跳过：本回合已执行过类似的视觉分析任务，请使用之前的识别结果。",
+                                "status": "completed",
+                                "startTime": _start,
+                                "endTime": _end,
                             })
                     loop_detected = True
                     exit_reason = "loop"
@@ -2539,7 +2788,9 @@ class AgentLoop:
                     if running_spawns_needing_inject:
                         logger.info(f"[BatchMode] Waiting for vision spawns before next LLM call: {running_spawns_needing_inject}")
                         try:
-                            await self._wait_for_subagents(running_spawns_needing_inject, timeout=120.0)
+                            await self._wait_for_subagents(
+                                running_spawns_needing_inject, timeout=120.0, session_key=sk
+                            )
                             logger.info(f"[BatchMode] Vision spawn tasks completed before next LLM call")
                         except asyncio.TimeoutError:
                             logger.warning(f"[BatchMode] Timeout waiting for vision spawn tasks")
@@ -2581,10 +2832,10 @@ class AgentLoop:
                     spawn_results = []
                     exec_results = []
 
-                    # 方案 C：有 vision + 其他工具时，整批完成后统一推送（缓冲与图片文件无关）
+                    # 方案 C：有 vision + 其他工具时，按阶段缓冲并推送（避免体验割裂，同时保证阶段内进度可见）
                     use_buffered = bool(spawn_vision and (exec_image or spawn_other or exec_other))
                     if use_buffered:
-                        logger.info("[BatchMode] Vision-first: buffering progress until batch done")
+                        logger.info("[BatchMode] Vision-first: buffering progress per stage")
                     buffered_evts: list[dict[str, Any]] = []
 
                     def _batch_progress(evt: dict[str, Any]) -> None:
@@ -2592,6 +2843,16 @@ class AgentLoop:
                             buffered_evts.append(evt)
                         elif progress:
                             progress(evt)
+
+                    def _flush_buffered_events() -> None:
+                        nonlocal buffered_evts
+                        if use_buffered and progress and buffered_evts:
+                            for evt in buffered_evts:
+                                try:
+                                    progress(evt)
+                                except Exception:
+                                    pass
+                            buffered_evts = []
 
                     _progress = progress if not use_buffered else _batch_progress
 
@@ -2605,6 +2866,7 @@ class AgentLoop:
                             spawned_task_ids.append(task_id)
                             spawned_task_templates[task_id] = (tc.arguments or {}).get("template", "minimal")
                             logger.info(f"[BatchMode] Spawn vision completed: {task_id}")
+                    _flush_buffered_events()
 
                     # 阶段 2: spawn(vision) 有结果后，exec(图片相关) 才能执行
                     spawn_vision_has_result = any(
@@ -2624,6 +2886,7 @@ class AgentLoop:
                                 result = await self._execute_single_tool(tc, _progress)
                                 exec_results.append((tc, result))
                                 logger.info(f"[BatchMode] Exec image completed")
+                    _flush_buffered_events()
 
                     # 阶段 2.5: 若有 spawn_vision 和 spawn_other，等待 vision 完成并注入结果
                     # 使用统一的 helper，避免与 _execute_tool_parallel 路径重复
@@ -2636,7 +2899,9 @@ class AgentLoop:
                         parallel_tasks.append(self._execute_single_tool(tc, _progress))
 
                     if parallel_tasks:
-                        parallel_results = await asyncio.gather(*parallel_tasks)
+                        parallel_results = await self._gather_awaitables_with_cancel_poll(
+                            parallel_tasks, sk
+                        )
                         for tc, result in zip(spawn_other + exec_other, parallel_results):
                             if tc.name == "spawn":
                                 spawn_results.append((tc, result))
@@ -2649,17 +2914,10 @@ class AgentLoop:
                             else:
                                 exec_results.append((tc, result))
                                 logger.info(f"[BatchMode] Exec other completed")
+                    _flush_buffered_events()
 
                     # 合并所有结果
                     exec_results = spawn_results + exec_results
-
-                    # 方案 C：整批完成后统一推送
-                    if use_buffered and progress and buffered_evts:
-                        for evt in buffered_evts:
-                            try:
-                                progress(evt)
-                            except Exception:
-                                pass
                 else:
                     # 正常模式：并行/串行执行
                     exec_results = await self._execute_tool_parallel(
@@ -2690,10 +2948,16 @@ class AgentLoop:
                             messages, tool_call.id, tool_call.name, result
                         )
                         # 记录到 tool_steps（用于后续综合）
+                        _duration = self._tool_execution_times.pop(id(tool_call), 0)
+                        _end = int(time.time() * 1000)
+                        _start = _end - max(int(_duration * 1000), 1)
                         tool_steps.append({
                             "name": tool_call.name,
                             "arguments": tool_call.arguments,
                             "result": _truncate(result),
+                            "status": "completed",
+                            "startTime": _start,
+                            "endTime": _end,
                         })
                         # 非 Batch 路径也需记录 task_id，否则 Round 2 无法等待/注入（vision -> claude_code 链式调用）
                         task_id_match = re.search(r'\(id: ([^)]+)\)|session \[([^\]]+)\]', result)
@@ -2710,10 +2974,16 @@ class AgentLoop:
                         messages = self.context.add_tool_result(
                             messages, tool_call.id, tool_call.name, result
                         )
+                        _duration = self._tool_execution_times.pop(id(tool_call), 0)
+                        _end = int(time.time() * 1000)
+                        _start = _end - max(int(_duration * 1000), 1)
                         tool_steps.append({
                             "name": tool_call.name,
                             "arguments": tool_call.arguments,
                             "result": _truncate(result),
+                            "status": "completed",
+                            "startTime": _start,
+                            "endTime": _end,
                         })
                         continue
 
@@ -2722,14 +2992,14 @@ class AgentLoop:
                     if len(tool_steps) >= 1:
                         last_key = (tool_steps[-1]["name"], json.dumps(tool_steps[-1]["arguments"], sort_keys=True))
                         if call_key == last_key:
-                            logger.info("Loop detected: identical tool call %s, forcing synthesis", tool_call.name)
+                            logger.info(f"Loop detected: identical tool call {tool_call.name}, forcing synthesis")
                             loop_detected = True
                             break
                     # spawn 专项：语义相似重复 或 本轮 spawn 数量过多
                     if tool_call.name == "spawn":
                         spawn_count = sum(1 for s in tool_steps if s.get("name") == "spawn")
                         if spawn_count >= 5:
-                            logger.info("Loop detected: too many spawns in this turn (%d), forcing synthesis", spawn_count)
+                            logger.info(f"Loop detected: too many spawns in this turn ({spawn_count}), forcing synthesis")
                             loop_detected = True
                         else:
                             args = getattr(tool_call, "arguments", {}) or {}
@@ -2756,22 +3026,69 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
                     truncated = _truncate(result)
+                    _duration = self._tool_execution_times.pop(id(tool_call), 0)
+                    _end = int(time.time() * 1000)
+                    _start = _end - max(int(_duration * 1000), 1)
                     tool_steps.append({
                         "name": tool_call.name,
                         "arguments": tool_call.arguments,
                         "result": truncated,
+                        "status": "completed",
+                        "startTime": _start,
+                        "endTime": _end,
                     })
 
                 if loop_detected:
                     exit_reason = "loop"
                     _emit({"type": "turn_end", "iteration": iteration})
+                    final_content = "[检测到重复工具调用，已停止循环。请尝试更具体地描述您的需求。]"
                     break
 
                 # 有 tool calls 且未 break：本轮结束，继续下一轮
                 _emit({"type": "turn_end", "iteration": iteration})
             else:
+                # Vision fallback: if main agent failed because it doesn't support images,
+                # run vision subagent and retry with text description.
+                if image_files and not vision_fallback_done:
+                    error_text = str(getattr(response, "content", "") or "")
+                    finish_reason = getattr(response, "finish_reason", None) or ""
+                    if finish_reason == "error" and self._is_image_unsupported_error(error_text):
+                        logger.info("[Image] Main agent failed with image-unsupported error, falling back to vision subagent")
+                        await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
+                        progress_cb = msg.metadata.get("progress_callback")
+                        img_tool_id = str(uuid.uuid4())[:8] if progress_cb else None
+                        if progress_cb:
+                            try:
+                                progress_cb({"type": "tool_start", "id": img_tool_id, "name": "image_recognition_fallback", "arguments": {"images": len(image_files)}})
+                            except Exception:
+                                pass
+                        session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
+                        channel, chat_id = (session_key.split(":", 1) + [session_key])[:2]
+                        task_text = msg.content.strip() or "请详细分析这些图片的内容。"
+                        img_desc = await self.subagents.run_vision_analysis(
+                            task=task_text, media=image_files,
+                            origin_channel=channel, origin_chat_id=chat_id,
+                            model=self._get_vision_model(),
+                        )
+                        if progress_cb:
+                            try:
+                                progress_cb({"type": "tool_end", "id": img_tool_id, "name": "image_recognition_fallback", "arguments": {}, "result": (img_desc or "")[:200]})
+                            except Exception:
+                                pass
+                        last_user = messages[-1] if messages and messages[-1].get("role") == "user" else None
+                        if last_user:
+                            if img_desc and img_desc.strip():
+                                text_content = msg.content.strip() or "请描述这张图片。"
+                                last_user["content"] = f"{text_content}\n\n[Vision 子 Agent 分析结果]\n{img_desc.strip()}"
+                            else:
+                                last_user["content"] = f"{msg.content}\n\n[图片分析失败，请检查 vision 模板配置或 DashScope API Key]"
+                        vision_fallback_done = True
+                        _emit({"type": "turn_end", "iteration": iteration})
+                        continue
+
                 # No tool calls, we're done
                 final_content = response.content
+                last_reasoning_content = response.reasoning_content
                 _emit({"type": "turn_end", "iteration": iteration})
                 break
 
@@ -2793,7 +3110,7 @@ class AgentLoop:
             if running_vision_ids and self.subagents:
                 logger.info(f"[BatchMode] Waiting for vision spawns before return: {running_vision_ids}")
                 try:
-                    await self._wait_for_subagents(running_vision_ids, timeout=120.0)
+                    await self._wait_for_subagents(running_vision_ids, timeout=120.0, session_key=sk)
                     logger.info(f"[BatchMode] Vision spawns completed, injecting results")
                     # 注入已完成且尚未注入的子 Agent 结果
                     to_inject = [
@@ -2813,7 +3130,7 @@ class AgentLoop:
                         inject_content = "\n".join(parts)
                         messages.append({"role": "user", "content": inject_content})
                         # 关键：同步到 session，确保后续 LLM 调用的 build_messages 能看到注入的内容
-                        session.add_message("user", inject_content)
+                        session.add_message("user", inject_content, internal=True)
                         self.sessions.save(session)
                         logger.info(f"[BatchMode] Injected {len(to_inject)} subagent results before return")
                 except asyncio.TimeoutError:
@@ -2823,6 +3140,7 @@ class AgentLoop:
                 # 没有 vision 需要等待，直接返回（其他类型的 spawn 结果会通过 announce 机制处理）
                 logger.info(f"[BatchMode] Non-blocking mode: spawn {len(spawned_task_ids)} tasks, returning immediately")
                 final_content = response.content if response.content else f"任务已启动，正在后台处理中 (id: {spawned_task_ids[0]})..."
+                last_reasoning_content = response.reasoning_content
                 exit_reason = "spawn_nonblocking"
             # 如果有注入过结果，_injected_subagent_task_ids 非空，继续下面的综合流程（不覆盖 response.content）
 
@@ -2843,10 +3161,10 @@ class AgentLoop:
                 _SYNTHESIS_TIMEOUT = 60
                 try:
                     synth_task = asyncio.create_task(
-                        self.provider.chat(
+                        self._call_llm_with_failover(
                             messages=messages,
                             tools=None,
-                            model=self.model,
+                            stream_callback=lambda chunk: _emit({"type": "delta", "text": chunk}),
                         )
                     )
                     synth_start = time.monotonic()
@@ -2874,7 +3192,8 @@ class AgentLoop:
                                 pass
                             self._cancel_event.clear()
                             raise asyncio.CancelledError("Request cancelled by user")
-                    synth = await synth_task
+                    synth, _ = await synth_task
+                    _emit({"type": "stream_end"})
                     _accumulate_usage(synth.usage)
                     # 记录 LLM 调用指标
                     if self._status_service and synth.usage:
@@ -2890,10 +3209,10 @@ class AgentLoop:
                     else:
                         final_content = _make_fallback_from_tools(tool_steps)
                 except asyncio.TimeoutError:
-                    logger.warning("Final synthesis call timed out after %ds", _SYNTHESIS_TIMEOUT)
+                    logger.warning(f"Final synthesis call timed out after {_SYNTHESIS_TIMEOUT}s")
                     final_content = _make_fallback_from_tools(tool_steps)
                 except Exception as e:
-                    logger.warning("Final synthesis call failed: %s", e)
+                    logger.warning(f"Final synthesis call failed: {e}")
                     final_content = _make_fallback_from_tools(tool_steps)
 
         # Append user-visible limit notice so the user knows why the agent stopped
@@ -2934,31 +3253,9 @@ class AgentLoop:
         # Web 渠道在请求开始时已保存用户消息，此处跳过避免重复
         user_message_saved = msg.metadata.get("user_message_saved") if msg.metadata else False
 
-        # 分离图片和音频文件，只处理图片
-        if msg.media:
-            import base64
-            user_images: list[str] = []
-            for media_path in msg.media:
-                # 只处理图片文件
-                if not self._is_image_file(media_path):
-                    continue
-                try:
-                    with open(media_path, "rb") as f:
-                        img_data = base64.b64encode(f.read()).decode("utf-8")
-                        ext = Path(media_path).suffix.lower()
-                        mime_type = "image/jpeg"
-                        if ext in [".png"]:
-                            mime_type = "image/png"
-                        elif ext in [".gif"]:
-                            mime_type = "image/gif"
-                        elif ext in [".webp"]:
-                            mime_type = "image/webp"
-                        user_images.append(f"data:{mime_type};base64,{img_data}")
-                except Exception as e:
-                    logger.warning(f"Failed to read media file {media_path}: {e}")
-            if user_images:
-                user_message_kwargs["images"] = user_images
-        
+        if not user_message_saved and msg.media:
+            user_message_kwargs.update(self._build_user_message_kwargs_from_media_paths(msg.media))
+
         if not user_message_saved:
             session.add_message("user", msg.content, **user_message_kwargs)
             self.sessions.save(session)
@@ -2967,6 +3264,7 @@ class AgentLoop:
             final_content,
             tool_steps=tool_steps,
             token_usage=usage_acc.copy(),
+            reasoning_content=last_reasoning_content,
         )
         self.sessions.save(session)
         self.sessions.increment_token_usage(
@@ -2978,7 +3276,8 @@ class AgentLoop:
 
         # 兜底逻辑：如果主模型不支持视觉且配置了 subagent_model，但模型没有 spawn vision 子agent
         # 则使用 inline image recognition 作为兜底（只对图片）
-        if image_files and not self._is_vision_model(self.model) and self.subagent_model and self.subagent_model != self.model:
+        # 如果已经在 agent loop 中通过 vision_fallback 处理过，则跳过避免重复
+        if image_files and not vision_fallback_done and not self._is_vision_model(self.model) and self.subagent_model and self.subagent_model != self.model:
             # 检查是否已经 spawn 了 vision 子agent
             spawned_vision = any(
                 step.get("name") == "spawn" and "vision" in str(step.get("arguments", {}))
@@ -2989,9 +3288,10 @@ class AgentLoop:
                 logger.info("[Image] Model didn't spawn vision subagent, using vision subagent as fallback")
                 await self._check_cancelled(getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}"))
                 progress_cb = msg.metadata.get("progress_callback")
+                img_tool_id = str(uuid.uuid4())[:8] if progress_cb else None
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_start", "name": "image_recognition_fallback", "arguments": {"images": len(image_files)}})
+                        progress_cb({"type": "tool_start", "id": img_tool_id, "name": "image_recognition_fallback", "arguments": {"images": len(image_files)}})
                     except Exception:
                         pass
                 session_key = getattr(msg, "session_key", f"{msg.channel}:{msg.chat_id}")
@@ -2999,13 +3299,14 @@ class AgentLoop:
                 img_desc = await self.subagents.run_vision_analysis(
                     task=msg.content.strip() or "请详细分析这些图片的内容。",
                     media=image_files, origin_channel=channel, origin_chat_id=chat_id,
+                    model=self._get_vision_model(),
                 )
                 if img_desc and img_desc.strip():
                     final_content = f"{final_content or ''}\n\n---\n\n[Vision 子 Agent 分析结果]\n{img_desc.strip()}"
 
                 if progress_cb:
                     try:
-                        progress_cb({"type": "tool_end", "name": "image_reccognition_fallback", "arguments": {}, "result": (img_desc or "")[:200]})
+                        progress_cb({"type": "tool_end", "id": img_tool_id, "name": "image_reccognition_fallback", "arguments": {}, "result": (img_desc or "")[:200]})
                     except Exception:
                         pass
 
@@ -3015,12 +3316,19 @@ class AgentLoop:
         except Exception as e:
             logger.error(f"[ExecutionChain] Failed to end chain: {e}")
 
+        # Skill review trigger — fire for ALL message types (text and image)
+        self._maybe_trigger_skill_review(session, session.get_history(max_messages=self.max_history_messages))
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
-            content=final_content
+            content=final_content,
+            metadata={
+                "tool_steps": tool_steps,
+                "reasoning_content": last_reasoning_content or "",
+            },
         )
-    
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
@@ -3088,6 +3396,7 @@ class AgentLoop:
         # Agent loop (limited for announce handling)
         iteration = 0
         final_content = None
+        last_reasoning_content: str | None = None
         tool_steps: list[dict[str, Any]] = []
         usage_acc = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         loop_start = time.monotonic()
@@ -3109,11 +3418,7 @@ class AgentLoop:
             return "Background task completed."
 
         def _accumulate_usage(usage: dict[str, Any] | None) -> None:
-            if not usage:
-                return
-            usage_acc["prompt_tokens"] += max(0, int(usage.get("prompt_tokens", 0) or 0))
-            usage_acc["completion_tokens"] += max(0, int(usage.get("completion_tokens", 0) or 0))
-            usage_acc["total_tokens"] += max(0, int(usage.get("total_tokens", 0) or 0))
+            _accumulate_llm_usage_into(usage, usage_acc)
 
         # 与 _process_message 一致：从消息或会话恢复 tool_mode / MCP 选择
         msg_tool_mode = msg.metadata.get("tool_mode") if msg.metadata else None
@@ -3139,19 +3444,19 @@ class AgentLoop:
             if self.max_execution_time > 0:
                 elapsed = time.monotonic() - loop_start
                 if elapsed >= self.max_execution_time:
-                    logger.info("System msg: max execution time %ds reached", self.max_execution_time)
+                    logger.info(f"System msg: max execution time {self.max_execution_time}s reached")
                     break
 
             selected_tools = self._select_tools_for_message(msg.content, tool_mode=tool_mode, selected_mcp_servers=selected_mcp_servers)
-            # 与主流程一致：LLM 调用期间每 2 秒轮询取消
+            # 与主流程一致：LLM 调用期间轮询取消
             _LLM_CALL_TIMEOUT = 120
-            _CANCEL_CHECK_INTERVAL = 2.0
+            _CANCEL_CHECK_INTERVAL = 1.0
             try:
                 llm_task = asyncio.create_task(
-                    self.provider.chat(
+                    self._call_llm_with_failover(
                         messages=messages,
                         tools=selected_tools,
-                        model=self.model
+                        stream_callback=lambda chunk: _emit({"type": "delta", "text": chunk}),
                     )
                 )
                 loop_start_llm = time.monotonic()
@@ -3181,7 +3486,8 @@ class AgentLoop:
                             pass
                         self._cancelled_sessions.discard(session_key)
                         raise asyncio.CancelledError("Request cancelled by user")
-                response = await llm_task
+                response, _ = await llm_task
+                _emit({"type": "stream_end"})
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
@@ -3216,15 +3522,16 @@ class AgentLoop:
                     for tc in tool_calls_deduped
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+                    messages, response.content, tool_call_dicts, reasoning_content=response.reasoning_content
                 )
+                last_reasoning_content = response.reasoning_content
 
                 for tool_call in tool_calls_deduped:
                     call_key = (tool_call.name, json.dumps(tool_call.arguments, sort_keys=True))
                     if len(tool_steps) >= 1:
                         last_key = (tool_steps[-1]["name"], json.dumps(tool_steps[-1]["arguments"], sort_keys=True))
                         if call_key == last_key:
-                            logger.info("System msg: loop detected %s", tool_call.name)
+                            logger.info(f"System msg: loop detected {tool_call.name}")
                             loop_detected = True
                             break
                     # spawn 专项：检查语义相似的重复
@@ -3234,31 +3541,42 @@ class AgentLoop:
                             logger.info("System msg: spawn for similar task already executed, skipping")
                             loop_detected = True
                             break
-                    args_str = json.dumps(tool_call.arguments)
+                    args_str = json.dumps(sanitize_args_for_log(tool_call.arguments))
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    _duration = self._tool_execution_times.pop(id(tool_call), 0)
+                    _end = int(time.time() * 1000)
+                    _start = _end - max(int(_duration * 1000), 1)
                     tool_steps.append({
                         "name": tool_call.name,
                         "arguments": tool_call.arguments,
                         "result": _truncate(result),
+                        "status": "completed",
+                        "startTime": _start,
+                        "endTime": _end,
                     })
                 if loop_detected:
+                    exit_reason = "loop"
+                    _emit({"type": "turn_end", "iteration": iteration})
+                    final_content = "[检测到重复工具调用，已停止循环。请尝试更具体地描述您的需求。]"
                     break
             else:
                 final_content = response.content
+                last_reasoning_content = response.reasoning_content
                 break
 
         if final_content is None:
             try:
                 logger.info("System msg: max iterations, requesting final synthesis (no tools)")
-                synth = await self.provider.chat(
+                synth, _ = await self._call_llm_with_failover(
                     messages=messages,
                     tools=None,
-                    model=self.model,
+                    stream_callback=lambda chunk: _emit({"type": "delta", "text": chunk}),
                 )
+                _emit({"type": "stream_end"})
                 _accumulate_usage(synth.usage)
                 # 记录 LLM 调用指标
                 if self._status_service and synth.usage:
@@ -3274,7 +3592,7 @@ class AgentLoop:
                 else:
                     final_content = _make_fallback_from_tools(tool_steps)
             except Exception as e:
-                logger.warning("Final synthesis failed: %s", e)
+                logger.warning(f"Final synthesis failed: {e}")
                 final_content = _make_fallback_from_tools(tool_steps)
 
         # Save to session (mark as system message in history)
@@ -3291,6 +3609,7 @@ class AgentLoop:
             final_content,
             tool_steps=tool_steps,
             token_usage=usage_acc.copy(),
+            reasoning_content=last_reasoning_content,
         )
         self.sessions.save(session)
         self.sessions.increment_token_usage(
@@ -3299,7 +3618,10 @@ class AgentLoop:
             completion_tokens=usage_acc["completion_tokens"],
             total_tokens=usage_acc["total_tokens"],
         )
-        
+
+        # Skill review trigger — after session is saved, spawn background review
+        self._maybe_trigger_skill_review(session, session.get_history(max_messages=self.max_history_messages))
+
         # 结束执行链路监控
         try:
             self._chain_monitor.end_chain(status="completed")
@@ -3307,9 +3629,13 @@ class AgentLoop:
             logger.error(f"[ExecutionChain] Failed to end chain: {e}")
 
         return OutboundMessage(
-            channel=origin_channel,
-            chat_id=origin_chat_id,
-            content=final_content
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=final_content,
+            metadata={
+                "tool_steps": tool_steps,
+                "reasoning_content": last_reasoning_content or "",
+            },
         )
     
     async def process_direct(
@@ -3321,9 +3647,10 @@ class AgentLoop:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         extra_metadata: dict[str, Any] | None = None,
         media: list[str] | None = None,
-    ) -> str:
+        raise_on_cancel: bool = False,
+    ) -> "OutboundMessage | None":
         """
-        Process a message directly (for CLI or cron usage).
+        Process a message directly (for CLI or browser WebSocket usage).
 
         Args:
             content: The message content.
@@ -3333,24 +3660,30 @@ class AgentLoop:
             progress_callback: Optional callback for streaming progress (tool_start, tool_end, etc.).
             extra_metadata: Optional extra metadata (e.g. attack_level for mirror bian sessions).
             media: Optional list of local file paths for images to include in the message.
+            raise_on_cancel: 为 True 时向上抛出 CancelledError，供 Browser WebSocket 发送 cancelled 事件（默认吞掉保持兼容）。
 
         Returns:
             The agent's response.
         """
-        # MCP 工具已在 run_server 主线程中通过后台线程初始化完成，
-        # 这里只做安全检查（如果超时会话内有延迟，仍等待但不阻塞）
-        if not self._mcp_init_event.is_set():
-            logger.debug("[MCP] Web API: MCP not yet initialized, waiting...")
-            # threading.Event.wait() is blocking, run in thread pool
-            initialized = await asyncio.to_thread(self._mcp_init_event.wait, timeout=5.0)
-            if not initialized:
-                logger.warning("[MCP] Web API: MCP init still pending after 5s, triggering on-demand init")
-                # 5秒后仍未初始化，说明 run_server 的后台线程可能超时/失败
-                # 在当前事件循环中直接触发一次加载（on-demand fallback）
-                try:
-                    await self._init_mcp_loader(only_server_ids=None)
-                except Exception as e:
-                    logger.warning(f"[MCP] Web API on-demand init failed: {e}")
+        # 仅在需要 MCP 时等待后台初始化或按需加载；tool_mode=disable 时不等待、不连接 MCP
+        _early_tool_mode = (extra_metadata or {}).get("tool_mode")
+        if _early_tool_mode != "disable":
+            # MCP 工具已在 run_server 主线程中通过后台线程初始化完成，
+            # 这里只做安全检查（如果超时会话内有延迟，仍等待但不阻塞）
+            if not self._mcp_init_event.is_set():
+                logger.debug("[MCP] Web API: MCP not yet initialized, waiting...")
+                # threading.Event.wait() is blocking, run in thread pool
+                initialized = await asyncio.to_thread(self._mcp_init_event.wait, timeout=5.0)
+                if not initialized:
+                    logger.warning("[MCP] Web API: MCP init still pending after 5s, triggering on-demand init")
+                    # 5秒后仍未初始化，说明 run_server 的后台线程可能超时/失败
+                    # 在当前事件循环中直接触发一次加载（on-demand fallback）
+                    try:
+                        await self._init_mcp_loader(only_server_ids=None)
+                    except Exception as e:
+                        logger.warning(f"[MCP] Web API on-demand init failed: {e}")
+        else:
+            logger.debug("[MCP] tool_mode=disable: skip MCP init wait and on-demand load (process_direct)")
 
         self._reset_cancel_event(session_key)
         
@@ -3368,6 +3701,24 @@ class AgentLoop:
         if extra_metadata:
             metadata.update(extra_metadata)
 
+        # 纯图无文：由 _handle_image_only 内部落库用户消息
+        if media and not content:
+            return await self._handle_image_only(media, session_key, channel, chat_id)
+
+        # Browser WebSocket：收到即落库（与 HTTP chat_sync 的 user_message_saved 对齐），取消时也不丢用户输入
+        if channel == "browser" and (content.strip() or (media or [])):
+            session = self.sessions.get_or_create(session_key)
+            user_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            ukw = self._build_user_message_kwargs_from_media_paths(media or [])
+            session.add_message(
+                "user",
+                content or "[图片]",
+                token_usage=user_token_usage,
+                **ukw,
+            )
+            self.sessions.save(session)
+            metadata["user_message_saved"] = True
+
         msg = InboundMessage(
             channel=channel,
             sender_id="user",
@@ -3377,23 +3728,96 @@ class AgentLoop:
             media=media or [],
         )
 
-        if media and not content:
-            return await self._handle_image_only(media, session_key, channel, chat_id)
-
         try:
             await self._check_cancelled(session_key)
             response = await self._process_message(msg)
-            return response.content if response else ""
+            return response
         except asyncio.CancelledError:
             logger.info("Agent request was cancelled")
-            return ""
-        finally:
-            # 异常/取消时确保结束执行链路并持久化节点（正常返回时 _process_message 已调用）
             try:
-                self._chain_monitor.end_chain(status="completed")
+                sess = self.sessions.get_or_create(session_key)
+                sess.add_message("assistant", "用户已取消操作。")
+                self.sessions.save(sess)
             except Exception as e:
-                logger.error(f"[ExecutionChain] Failed to end chain: {e}")
+                logger.warning(f"[process_direct] Failed to persist cancel notice: {e}")
+            try:
+                self._chain_monitor.end_chain(status="cancelled")
+            except Exception as e:
+                logger.error(f"[ExecutionChain] Failed to end chain on cancel: {e}")
+            if raise_on_cancel:
+                raise
+            return None
     
+    # ---- Skill Review ----
+
+    def _maybe_trigger_skill_review(
+        self,
+        session,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Check if skill review should be triggered and spawn background review.
+
+        Trigger conditions:
+        - Manual: user said "总结经验" etc. (_pending_manual_review = True) — always works
+        - Automatic: every N user turns (_user_turn_count >= interval) — requires interval > 0
+        """
+        logger.info(f'[SkillReviewer] === BEFORE trigger: pending={getattr(self, "_pending_manual_review", None)}, turn_count={getattr(self, "_user_turn_count", None)}, enabled={getattr(self, "_skill_review_enabled", None)}, interval={getattr(self, "_skill_review_turn_interval", None)} ===')
+        if not getattr(self, "_skill_review_enabled", True):
+            return
+
+        is_manual = getattr(self, "_pending_manual_review", False)
+        interval = getattr(self, "_skill_review_turn_interval", 0)
+
+        # Manual trigger always works; automatic trigger requires interval > 0
+        should_review = is_manual or (interval > 0 and getattr(self, "_user_turn_count", 0) >= interval)
+        if not should_review:
+            return
+
+        # Reset state
+        self._pending_manual_review = False
+        if is_manual:
+            logger.info("[SkillReviewer] Manual review triggered (user said '总结经验' or similar).")
+        if getattr(self, "_user_turn_count", 0) >= interval:
+            self._user_turn_count = 0
+
+        # Resolve provider from router (web mode uses router + provider_manager, not self.provider)
+        effective_model = self.subagent_model or self.model
+        provider_instance = None
+        if self.router:
+            try:
+                handle = self.router.get(effective_model)
+                provider_instance = handle.provider
+            except Exception:
+                pass
+        if provider_instance is None:
+            provider_instance = self.provider
+
+        # Schedule background review on the main event loop (avoid cross-loop HTTP client issues)
+        try:
+            from nanobot.agent.skill_reviewer import run_skill_review
+            loop = getattr(self, "_loop", None)
+            if loop is None:
+                logger.warning("[SkillReviewer] Agent loop not running, skipping review.")
+                return
+            def _on_review_done(t: asyncio.Task) -> None:
+                if not t.cancelled() and t.exception():
+                    logger.warning(f"[SkillReviewer] Background review task failed: {t.exception()}")
+
+            task = loop.create_task(
+                run_skill_review(
+                    provider=provider_instance,
+                    model=effective_model,
+                    workspace=self.workspace,
+                    context=self.context,
+                    messages=messages,
+                )
+            )
+            task.add_done_callback(_on_review_done)
+        except Exception as e:
+            logger.warning(f"[SkillReviewer] Failed to schedule review: {e}")
+
+    # ---- Image Handling ----
+
     async def _handle_image_only(
         self,
         media: list[str],
@@ -3443,6 +3867,7 @@ class AgentLoop:
             media=media,
             origin_channel=channel,
             origin_chat_id=chat_id,
+            model=self._get_vision_model(),
         )
         if desc:
             if session:
@@ -3450,3 +3875,159 @@ class AgentLoop:
                 self.sessions.save(session)
             return desc
         return "无法识别图片内容，请检查 vision 模板配置或 DashScope API Key。"
+
+    def _resolve_model_chain(self, router: ModelRouter, profile_id: str) -> list[str]:
+        """从 router 获取 profile 的 model_chain，按优先级排序。仅返回 DB 中存在的模型。"""
+        try:
+            profile = router.repo.get_model_profile(profile_id)
+            if profile:
+                model_chain = profile.get("model_chain", "")
+                if model_chain:
+                    ids = [m.strip() for m in model_chain.split(",") if m.strip()]
+                    valid = []
+                    for mid in ids:
+                        if router.repo.get_model(mid):
+                            valid.append(mid)
+                        else:
+                            logger.debug(f"[ModelFailover] model_chain 中的模型 {mid} 不存在于 DB，已跳过")
+                    if valid:
+                        return valid
+        except Exception as e:
+            logger.warning(f"[ModelFailover] 获取 model_chain 失败: {e}")
+
+        return [self.model] if self.model else []
+
+    async def _call_llm_with_failover(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        max_attempts_per_model: int = 2,
+        stream_callback: Any | None = None,
+    ) -> tuple[Any, str]:
+        """调用 LLM 并支持模型故障转移。返回 (response, used_model)。"""
+        from nanobot.providers.base import LLMResponse
+
+        models_to_try = self._model_chain if self._model_chain else [self.model]
+        last_error = None
+        error_messages = []
+
+        for idx, model_id in enumerate(models_to_try):
+            provider_instance = None
+            native_model = None
+            _api_base = None
+
+            try:
+                if self.router:
+                    handle = self.router.get(model_id)
+                    provider_instance = handle.provider
+                    native_model = handle.model
+                    _api_base = handle.api_base
+                else:
+                    provider_instance = self.provider
+                    native_model = model_id
+            except Exception as e:
+                logger.warning(f"[ModelFailover] 解析模型 {model_id} 失败: {e}")
+                if self.provider is None:
+                    logger.debug(f"[ModelFailover] 无可用回退 provider，跳过模型 {model_id}")
+                    error_messages.append(f"{model_id}: {e}")
+                    continue
+                provider_instance = self.provider
+                native_model = model_id
+                logger.debug(f"[ModelFailover] 使用回退 provider: model={native_model}")
+
+            if provider_instance is None:
+                logger.warning(f"[ModelFailover] 模型 {model_id} 无 provider 实例，跳过")
+                error_messages.append(f"{model_id}: no provider instance")
+                continue
+
+            for attempt in range(max_attempts_per_model):
+                try:
+                    while True:
+                        try:
+                            logger.debug(f"[ModelFailover] 尝试模型 {model_id} (attempt {attempt + 1})")
+                            response = await provider_instance.chat(
+                                messages=messages,
+                                tools=tools,
+                                model=native_model,
+                                api_base=_api_base,
+                                stream_callback=stream_callback,
+                            )
+                            break
+                        except Exception as inner_e:
+                            if is_tool_call_result_mismatch_error(inner_e):
+                                new_msgs, fixed = repair_openai_tool_messages(messages)
+                                if fixed:
+                                    messages[:] = new_msgs
+                                    logger.warning(
+                                        "[ModelFailover] tool_calls 与 tool 消息不一致（如 MiniMax 2013），"
+                                        "已补全/重排后自动重试同一模型"
+                                    )
+                                    continue
+                            raise inner_e
+
+                    # 部分模型把工具调用以 DSML 写在 content 里而非 tool_calls，转为可执行请求
+                    response = coerce_llm_response_dsml_tool_calls(response)
+
+                    if idx > 0:
+                        logger.info(f"[ModelFailover] 故障转移成功: {models_to_try[0]} -> {model_id}")
+                    return response, native_model
+
+                except Exception as e:
+                    last_error = e
+
+                    # 带图失败时，尝试去掉图片后重试一次
+                    from nanobot.providers.base import LLMProvider
+                    stripped = LLMProvider._strip_image_content(messages)
+                    if stripped is not None:
+                        logger.warning(
+                            f"[ModelFailover] 模型 {model_id} 失败 ({type(e).__name__})，"
+                            "尝试去掉图片后重试..."
+                        )
+                        try:
+                            response = await provider_instance.chat(
+                                messages=stripped,
+                                tools=tools,
+                                model=native_model,
+                                api_base=_api_base,
+                                stream_callback=stream_callback,
+                            )
+                            response = coerce_llm_response_dsml_tool_calls(response)
+                            if idx > 0:
+                                logger.info(f"[ModelFailover] 故障转移成功: {models_to_try[0]} -> {model_id}")
+                            return response, native_model
+                        except Exception as retry_e:
+                            last_error = retry_e
+                            logger.warning(
+                                f"[ModelFailover] 去图重试仍失败 ({type(retry_e).__name__}): "
+                                f"{str(retry_e)[:100]}"
+                            )
+
+                    if is_retryable_error(last_error):
+                        error_type = type(last_error).__name__
+                        logger.warning(
+                            f"[ModelFailover] 模型 {model_id} 失败 ({error_type}): "
+                            f"{str(last_error)[:100]}"
+                        )
+                        if idx == len(models_to_try) - 1 and attempt == max_attempts_per_model - 1:
+                            # 所有模型都失败，返回错误响应
+                            error_msg = f"所有模型均不可用。尝试的模型: {', '.join(models_to_try)}。错误: {str(last_error)[:200]}"
+                            logger.error(f"[ModelFailover] {error_msg}")
+                            return LLMResponse(
+                                content=f"模型服务暂时不可用，请检查配置或稍后重试。详情: {str(last_error)[:150]}",
+                                finish_reason="error",
+                            ), native_model or model_id
+                        break
+                    else:
+                        # 不可恢复的错误，记录并尝试下一个模型
+                        error_type = type(last_error).__name__
+                        logger.warning(f"[ModelFailover] 模型 {model_id} 不可恢复错误 ({error_type}): {str(last_error)[:100]}")
+                        error_messages.append(f"{model_id}: {last_error}")
+                        break
+
+        # 所有模型都无法使用，返回错误响应
+        error_summary = "; ".join(error_messages) if error_messages else str(last_error)
+        logger.error(f"[ModelFailover] 所有模型都失败: {error_summary[:200]}")
+        return LLMResponse(
+            content=f"模型服务不可用。请检查模型配置或 API 密钥。",
+            finish_reason="error",
+        ), self.model or "unknown"

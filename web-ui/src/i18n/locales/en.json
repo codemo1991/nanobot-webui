@@ -8,7 +8,8 @@
     "save": "Save",
     "delete": "Delete",
     "edit": "Edit",
-    "loading": "Loading..."
+    "loading": "Loading...",
+    "insert": "Insert"
   },
   "nav": {
     "chat": "Chat",
@@ -17,7 +18,8 @@
     "cron": "Cron Jobs",
     "config": "Settings",
     "system": "System Status",
-    "login": "Login"
+    "login": "Login",
+    "trace": "Trace"
   },
   "cron": {
     "title": "Cron Jobs",
@@ -117,6 +119,7 @@
     "defaultTitle": "New Chat",
     "thinkingOrTool": "Thinking or calling tools…",
     "thinking": "Thinking…",
+    "reasoningCollapsed": "Reasoning",
     "callingTool": "Calling tool…",
     "toolArguments": "Arguments",
     "toolResult": "Result",
@@ -164,7 +167,12 @@
       "pendingTasksTitle": "Background Tasks Running",
       "pendingTasksContent": "There are {{count}} Claude Code tasks running in the background. Sending new messages may affect task execution.\n\nFirst task: {{prompt}}",
       "sendAnyway": "Send Anyway"
-    }
+    },
+    "filePicker": "Select File or Folder",
+    "filePickerTitle": "Select File or Folder",
+    "emptyWorkspace": "Workspace is empty",
+    "loadWorkspaceError": "Failed to load workspace",
+    "selectedPath": "Selected"
   },
   "system": {
     "title": "System Status",
@@ -320,7 +328,17 @@
       "pathPlaceholder": "e.g., ~/my-workspace",
       "pathRequired": "Please enter workspace path",
       "switchSuccess": "Workspace switched successfully, page will reload",
-      "switchFailed": "Workspace switch failed"
+      "switchFailed": "Workspace switch failed",
+      "selectFolder": "Select Folder",
+      "folderBrowserHint": "Some browsers may only show the folder name. Please manually enter the absolute path (e.g., C:\\Users\\xxx\\workspace).",
+      "defaultPath": "Default Path",
+      "currentPath": "Current Path",
+      "copyTitle": "Copy configuration?",
+      "copyContent": "The target workspace has no data yet. Copy current workspace configuration (agent templates, calendar, main prompt, memory, etc.)?\nNote: chat history always remains isolated and will not be copied.",
+      "copyContentNoDefault": "The target workspace has no data, and there is no default data to copy. A blank workspace will be created.",
+      "copyYes": "Copy & Switch",
+      "copyYesNoDefault": "Blank Switch",
+      "copyNo": "Blank Switch"
     },
     "configure": "Configure",
     "enabled": "Enabled",
@@ -719,5 +737,16 @@
     "paused": "Job paused",
     "enabled": "Job enabled",
     "triggered": "Job triggered"
+  },
+  "trace": {
+    "title": "Trace Monitor",
+    "totalSpans": "Total Spans",
+    "successRate": "Success Rate",
+    "avgLatency": "Avg Latency",
+    "activeRequests": "Active",
+    "overview": "Overview",
+    "recentRequests": "Recent",
+    "anomalies": "Anomalies",
+    "noAnomalies": "No anomalies"
   }
 }

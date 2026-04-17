@@ -89,6 +89,10 @@ def init_tracing(
         enabled=enabled,
     )
     set_emitter(_emitter)
+    if enabled:
+        from loguru import logger
+
+        logger.info("[Tracing] JSONL 输出目录: {}", _emitter.trace_dir)
     return _emitter
 
 

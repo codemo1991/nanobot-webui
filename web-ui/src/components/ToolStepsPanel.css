@@ -1,0 +1,13 @@
+.tool-steps-list {
+  padding: 8px 0;
+}
+
+.tool-steps-outer-collapse {
+  margin: 8px 0;
+}
+
+.tool-steps-summary {
+  display: inline-flex;
+  align-items: center;
+  font-size: 14px;
+}

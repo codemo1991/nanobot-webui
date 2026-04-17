@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Callable, Awaitable
+import threading
+from typing import Callable, Awaitable
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
-
-if TYPE_CHECKING:
-    from concurrent.futures import Future
-
 
 class MessageBus:
     """
@@ -22,7 +19,7 @@ class MessageBus:
     """
 
     def __init__(self, max_inbound: int = 200):
-        # maxsize 防止无限积压；超出时 try_publish_inbound_sync 返回 False（HTTP 429）
+        # maxsize 防止无限积压；超出时 try_publish_inbound_sync 返回 (False, "queue_full")
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=max_inbound)
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
         self._outbound_subscribers: dict[str, list[Callable[[OutboundMessage], Awaitable[None]]]] = {}
@@ -40,28 +37,93 @@ class MessageBus:
 
     def try_publish_inbound_sync(
         self, msg: InboundMessage, loop: asyncio.AbstractEventLoop
-    ) -> bool:
+    ) -> tuple[bool, str]:
         """
         从 HTTP 工作线程安全地将消息入队（线程安全，非协程）。
-        队满时返回 False，调用方应向客户端返回 HTTP 429。
-        """
-        from concurrent.futures import Future as _Future
-        future: _Future[bool] = asyncio.run_coroutine_threadsafe(
-            self._try_put(msg), loop
-        )
-        try:
-            return future.result(timeout=1.0)
-        except Exception as e:
-            logger.warning(f"[MessageBus] try_publish_inbound_sync failed: {e}")
-            return False
 
-    async def _try_put(self, msg: InboundMessage) -> bool:
-        """非阻塞入队，队满返回 False。"""
+        返回 (True, "") 表示成功；(False, reason) 中 reason 取值：
+        - queue_full：入站队列已满
+        - enqueue_timeout：在超时时间内 event loop 未执行入队协程（常见于 loop 被同步阻塞）
+        - loop_none / loop_not_running / loop_status_error：loop 无效
+        - enqueue_error：future 完成时出现其它异常
+
+        使用 call_soon_threadsafe 而非 run_coroutine_threadsafe：与 SubagentManager._publish_inbound_safe
+        一致，更易唤醒阻塞于 selector 的 loop；入队逻辑为同步 put_nowait。
+        """
+        def _depth() -> int:
+            try:
+                return self.inbound.qsize()
+            except Exception:
+                return -1
+
+        maxsz = getattr(self.inbound, "maxsize", 0) or 0
+
+        # 前置检查：loop 是否有效
+        if loop is None:
+            logger.warning("[MessageBus] try_publish_inbound_sync: loop is None")
+            return False, "loop_none"
         try:
-            self.inbound.put_nowait(msg)
-            return True
-        except asyncio.QueueFull:
-            return False
+            is_running = loop.is_running()
+        except Exception as e:
+            logger.warning(f"[MessageBus] try_publish_inbound_sync: loop.is_running() failed: {e!r}")
+            return False, "loop_status_error"
+        if not is_running:
+            logger.warning("[MessageBus] try_publish_inbound_sync: loop not running")
+            return False, "loop_not_running"
+
+        # 前置检查：队列是否已满（快速路径，避免不必要的线程调度）
+        try:
+            if self.inbound.full():
+                logger.warning(
+                    "[MessageBus] try_publish_inbound_sync: 入站队列已满 "
+                    f"(depth≈{_depth()}/{maxsz})"
+                )
+                return False, "queue_full"
+        except Exception:
+            pass  # 检查失败时继续尝试入队
+
+        _SYNC_PUT_TIMEOUT = 30.0
+        done = threading.Event()
+        outcome: list[bool | None | BaseException] = [None]
+
+        def _do_put() -> None:
+            try:
+                self.inbound.put_nowait(msg)
+                outcome[0] = True
+            except asyncio.QueueFull:
+                outcome[0] = False
+            except BaseException as e:
+                outcome[0] = e
+            finally:
+                done.set()
+
+        try:
+            loop.call_soon_threadsafe(_do_put)
+        except Exception as e:
+            logger.warning(f"[MessageBus] call_soon_threadsafe 失败: {type(e).__name__}: {e!r}")
+            return False, "enqueue_error"
+
+        if not done.wait(timeout=_SYNC_PUT_TIMEOUT):
+            logger.warning(
+                "[MessageBus] try_publish_inbound_sync: 等待 event loop 执行入队超时 "
+                f"({_SYNC_PUT_TIMEOUT}s), inbound_depth≈{_depth()}/{maxsz} — "
+                "多为 core loop 长时间未让出（同步阻塞）而非单纯队满"
+            )
+            return False, "enqueue_timeout"
+
+        res = outcome[0]
+        if res is True:
+            return True, ""
+        if res is False:
+            logger.warning(
+                "[MessageBus] try_publish_inbound_sync: put_nowait 失败（队满，竞态） "
+                f"depth≈{_depth()}/{maxsz}"
+            )
+            return False, "queue_full"
+        if isinstance(res, BaseException):
+            logger.warning(f"[MessageBus] try_publish_inbound_sync 入队异常: {type(res).__name__}: {res!r}")
+            return False, "enqueue_error"
+        return False, "enqueue_error"
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""

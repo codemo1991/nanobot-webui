@@ -27,9 +27,31 @@ LOG_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
     "<level>{level: <8}</level> | "
     "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-    "<level>{extra[trace_id]}</level>"
-    "<level>{message}</level>"
+    "{extra[trace_id]}"
+    "{message}"
 )
+
+
+def _ensure_trace_id(record: dict[str, Any]) -> bool:
+    """为每条日志补全 extra['trace_id']，避免 LOG_FORMAT 缺键。
+
+    优先使用 loguru 已绑定的 trace_id；若为空则读取 nanobot.tracing 的当前
+    上下文（trace_context / span 激活时）。此前 trace_context 里对 logger.patch
+    的用法不会作用到全局 logger，此处统一从 contextvars 注入。
+    """
+    record.setdefault("extra", {})
+    extra = record["extra"]
+    try:
+        if not extra.get("trace_id"):
+            from nanobot.tracing.context import get_current_trace_id
+
+            ctx_tid = get_current_trace_id()
+            if ctx_tid:
+                extra["trace_id"] = ctx_tid
+        extra.setdefault("trace_id", "")
+    except Exception:
+        extra.setdefault("trace_id", "")
+    return True
 
 def _buffer_sink(message: Any) -> None:
     """将日志写入内存缓冲，供 get_buffered_logs 读取，避免读文件占用导致轮换失败。
@@ -88,6 +110,7 @@ def setup_logging(
         format=LOG_FORMAT,
         level=level,
         colorize=True,
+        filter=_ensure_trace_id,
     )
 
     # File: DEBUG and above (capture all for debugging), with rotation
@@ -105,10 +128,11 @@ def setup_logging(
             retention="5 days",
             encoding="utf-8",
             enqueue=_USE_ENQUEUE,  # Windows 下避免轮换时 PermissionError [WinError 32]
+            filter=_ensure_trace_id,
         )
     except Exception as e:
         logger.warning(f"Could not add log file sink to {log_path}: {e}")
-    logger.add(_buffer_sink, level="DEBUG")  # 内存缓冲，get_logs 不读文件
+    logger.add(_buffer_sink, level="DEBUG", filter=_ensure_trace_id)  # 内存缓冲，get_logs 不读文件
 
     if capture_unhandled:
         sys.excepthook = _excepthook
@@ -136,6 +160,7 @@ def reconfigure_logging(level: str) -> None:
         format=LOG_FORMAT,
         level=level,
         colorize=True,
+        filter=_ensure_trace_id,
     )
 
     # Re-add file sink (always DEBUG)
@@ -148,8 +173,9 @@ def reconfigure_logging(level: str) -> None:
             retention="5 days",
             encoding="utf-8",
             enqueue=_USE_ENQUEUE,
+            filter=_ensure_trace_id,
         )
-        logger.add(_buffer_sink, level="DEBUG")
+        logger.add(_buffer_sink, level="DEBUG", filter=_ensure_trace_id)
     except Exception:
         pass  # 文件 sink 可能已存在，忽略错误
 

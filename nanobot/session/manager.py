@@ -29,6 +29,7 @@ class Session:
     metadata: dict[str, Any] = field(default_factory=dict)
     # 存储子agent执行结果 {task_id: {label, result, timestamp}}
     subagent_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    last_consolidated: int = 0  # 已被 Consolidator 归档的消息数
     
     def add_message(self, role: str, content: str, max_length: int | None = None, **kwargs: Any) -> None:
         """Add a message to the session.
@@ -54,6 +55,7 @@ class Session:
     def get_history(self, max_messages: int = 50) -> list[dict[str, Any]]:
         """
         Get message history for LLM context.
+        Only returns unconsolidated messages (those after last_consolidated).
         
         Args:
             max_messages: Maximum messages to return.
@@ -61,11 +63,24 @@ class Session:
         Returns:
             List of messages in LLM format.
         """
-        # Get recent messages
-        recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
+        unconsolidated = self.messages[self.last_consolidated:]
+        recent = unconsolidated[-max_messages:] if len(unconsolidated) > max_messages else unconsolidated
         
-        # Convert to LLM format (just role and content)
-        return [{"role": m["role"], "content": m["content"]} for m in recent]
+        # Convert to LLM format, preserving fields required for multi-turn tool calling
+        # and reasoning models (tool_calls, reasoning_content, name, tool_call_id)
+        result: list[dict[str, Any]] = []
+        for m in recent:
+            msg: dict[str, Any] = {"role": m["role"], "content": m["content"]}
+            if "tool_calls" in m:
+                msg["tool_calls"] = m["tool_calls"]
+            if "reasoning_content" in m:
+                msg["reasoning_content"] = m["reasoning_content"]
+            if "tool_call_id" in m:
+                msg["tool_call_id"] = m["tool_call_id"]
+            if "name" in m:
+                msg["name"] = m["name"]
+            result.append(msg)
+        return result
     
     def clear(self) -> None:
         """Clear all messages in the session."""
@@ -91,6 +106,7 @@ class SessionManager:
         else:
             data_dir = Path.home() / ".nanobot"
         self.db_path = data_dir / "chat.db"
+        ensure_dir(data_dir)
         self._cache: OrderedDict[str, Session] = OrderedDict()
         self._locks: dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
@@ -268,6 +284,8 @@ class SessionManager:
             if subagent_results:
                 logger.info(f"[SessionManager] Loaded subagent_results: {list(subagent_results.keys())} for session {key}")
 
+            last_consolidated = metadata.pop("_last_consolidated", 0)
+
             return Session(
                 key=key,
                 messages=messages,
@@ -275,6 +293,7 @@ class SessionManager:
                 updated_at=updated_at,
                 metadata=metadata,
                 subagent_results=subagent_results,
+                last_consolidated=last_consolidated,
             )
         except Exception as e:
             logger.warning(f"Failed to load session {key}: {e}", exc_info=True)
@@ -294,6 +313,7 @@ class SessionManager:
         if session.subagent_results:
             save_metadata["_subagent_results"] = session.subagent_results
             logger.info(f"[SessionManager] Saving subagent_results: {list(session.subagent_results.keys())}")
+        save_metadata["_last_consolidated"] = session.last_consolidated
 
         with self._connect() as conn:
             conn.execute("PRAGMA foreign_keys = ON")

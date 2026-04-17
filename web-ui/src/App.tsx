@@ -7,6 +7,7 @@ import CalendarPage from './pages/CalendarPage'
 import CronPage from './pages/CronPage'
 import ConfigPage from './pages/ConfigPage'
 import SystemPage from './pages/SystemPage'
+import TracePage from './pages/TracePage'
 import LoginPage from './pages/LoginPage'
 
 function App() {
@@ -21,6 +22,7 @@ function App() {
           <Route path="calendar" element={<CalendarPage />} />
           <Route path="cron" element={<CronPage />} />
           <Route path="config" element={<ConfigPage />} />
+          <Route path="trace" element={<TracePage />} />
           <Route path="system" element={<SystemPage />} />
         </Route>
       </Routes>

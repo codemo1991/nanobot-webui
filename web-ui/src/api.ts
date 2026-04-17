@@ -1,5 +1,6 @@
 import i18n from './i18n'
-import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, SubagentProgressEvent, TokenUsage, Task, TaskListResponse } from './types'
+import type { ApiResponse, Session, SessionListResponse, Message, ChatResponse, StreamEvent, SubagentProgressEvent, TokenUsage, Task, TaskListResponse, TraceSummary, RecentSpan, TraceDetail, Anomaly } from './types'
+import { useWebSocket } from './hooks/useWebSocket';
 
 const API_BASE = '/api/v1'
 
@@ -95,7 +96,14 @@ export const api = {
   stopAgent: (sessionId?: string) =>
     request<{ stopped: boolean }>('/chat/stop', {
       method: 'POST',
-      body: sessionId ? JSON.stringify({ sessionId }) : undefined,
+      // 必须与 WebSocket 会话键 browser:{sessionId} 一致，否则 cancel_current_request 无法命中
+      body: sessionId ? JSON.stringify({ sessionId, channel: 'browser' }) : undefined,
+    }),
+
+  // Pre-warm MCP to eliminate first-message latency
+  warmup: () =>
+    request<{ status: 'already_initialized' | 'initialized' | 'timeout' }>('/chat/warmup', {
+      method: 'POST',
     }),
 
   /** Stream chat with SSE; calls onEvent for each progress event. Rejects on error. */
@@ -170,47 +178,85 @@ export const api = {
     onEvent: (evt: StreamEvent) => void,
     signal?: AbortSignal
   ): Promise<ChatResponse | null> {
-    const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/stream`, { signal })
-    if (!res.ok) throw new Error('Stream reconnect failed')
-    const reader = res.body?.getReader()
-    if (!reader) throw new Error('Stream not supported')
-    const dec = new TextDecoder()
-    let buf = ''
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (value) buf += dec.decode(value, { stream: true })
-        const lines = buf.split('\n\n')
-        buf = done ? '' : (lines.pop() ?? '')
-        for (const block of lines) {
-          const dataParts = block.split('\n')
-            .filter(line => line.startsWith('data:'))
-            .map(line => line.slice(5).trimStart())
-          const dataStr = dataParts.join('\n')
-          if (!dataStr || dataStr === ': heartbeat') continue
-          try {
-            const evt = JSON.parse(dataStr) as StreamEvent
-            onEvent(evt)
-            if (evt.type === 'done') {
-              return {
-                content: 'content' in evt ? evt.content ?? '' : '',
-                assistantMessage: 'assistantMessage' in evt ? evt.assistantMessage ?? null : null,
-              }
-            }
-            if (evt.type === 'error') {
-              throw new Error('message' in evt ? evt.message : 'Stream error')
-            }
-            if (evt.type === 'timeout') return null
-          } catch (e) {
-            if (e instanceof Error && e.message === 'Stream error') throw e
-          }
-        }
-        if (done) break
+    const MAX_RETRIES = 3
+    const RETRY_DELAYS = [1000, 2000, 3000] // 线性递增间隔
+
+    const doSubscribe = async (): Promise<ChatResponse | null> => {
+      const res = await fetch(`${API_BASE}/chat/sessions/${sessionId}/stream`, { signal })
+      if (!res.ok) {
+        // 附加 status 到 error 以便 retry 逻辑判断
+        const err = new Error(`Stream reconnect failed: HTTP ${res.status}`) as Error & { status?: number }
+        err.status = res.status
+        throw err
       }
-    } finally {
-      reader.releaseLock()
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('Stream not supported')
+      const dec = new TextDecoder()
+      let buf = ''
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (value) buf += dec.decode(value, { stream: true })
+          const lines = buf.split('\n\n')
+          buf = done ? '' : (lines.pop() ?? '')
+          for (const block of lines) {
+            const dataParts = block.split('\n')
+              .filter(line => line.startsWith('data:'))
+              .map(line => line.slice(5).trimStart())
+            const dataStr = dataParts.join('\n')
+            if (!dataStr || dataStr === ': heartbeat') continue
+            try {
+              const evt = JSON.parse(dataStr) as StreamEvent
+              onEvent(evt)
+              if (evt.type === 'done') {
+                return {
+                  content: 'content' in evt ? evt.content ?? '' : '',
+                  assistantMessage: 'assistantMessage' in evt ? evt.assistantMessage ?? null : null,
+                }
+              }
+              if (evt.type === 'error') {
+                throw new Error('message' in evt ? evt.message : 'Stream error')
+              }
+              if (evt.type === 'timeout') return null
+            } catch (e) {
+              if (e instanceof Error && e.message === 'Stream error') throw e
+            }
+          }
+          if (done) break
+        }
+      } finally {
+        reader.releaseLock()
+      }
+      return null
     }
-    return null
+
+    // 重连循环
+    let lastError: Error | null = null
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      // 检查是否已取消
+      if (signal?.aborted) throw new Error('Stream cancelled')
+
+      try {
+        return await doSubscribe()
+      } catch (e) {
+        lastError = e instanceof Error ? e : new Error(String(e))
+
+        // 不重连的情况
+        if (signal?.aborted) throw lastError
+        const httpStatus = (lastError as Error & { status?: number }).status
+        if (httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500) {
+          throw lastError
+        }
+
+        // 还有重试机会，等待后重试
+        if (attempt < MAX_RETRIES - 1) {
+          console.warn(`[ChatStream] Connection failed (attempt ${attempt + 1}/${MAX_RETRIES}), retrying in ${RETRY_DELAYS[attempt]}ms...`, lastError.message)
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt]))
+        }
+      }
+    }
+
+    throw lastError
   },
 
   // Configuration
@@ -263,7 +309,7 @@ export const api = {
   // AI Providers
   getProviders: () => request<import('./types').Provider[]>('/providers'),
   
-  createProvider: (provider: Omit<import('./types').Provider, 'id'>) =>
+  createProvider: (provider: Partial<import('./types').Provider> & { id: string }) =>
     request<import('./types').Provider>('/providers', {
       method: 'POST',
       body: JSON.stringify(provider),
@@ -274,6 +320,12 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(provider),
     }),
+
+  batchDisableProviders: (providerIds: string[]) =>
+    request<{ disabled: number }>('/providers/batch-disable', {
+      method: 'POST',
+      body: JSON.stringify({ provider_ids: providerIds }),
+    }),
   
   deleteProvider: (providerId: string) =>
     request<{ deleted: boolean }>(`/providers/${providerId}`, {
@@ -281,7 +333,10 @@ export const api = {
     }),
 
   // Models
-  getModels: () => request<import('./types').Model[]>('/models'),
+  getModels: (providerId?: string) =>
+    request<import('./types').ModelInfo[]>(
+      providerId ? `/models?provider_id=${encodeURIComponent(providerId)}` : '/models'
+    ),
   
   createModel: (model: Omit<import('./types').Model, 'id'>) =>
     request<import('./types').Model>('/models', {
@@ -305,11 +360,34 @@ export const api = {
       method: 'POST',
     }),
 
-  // Model Discovery - 仅查询可用模型（不保存），供添加模型时 LiteLLM ID 下拉选择
+  // Model Discovery — GET：仅查询（不保存），供配置页下拉；POST：检测并写入数据库
   discoverModels: (providerId: string) =>
     request<import('./types').DiscoveredModel[]>(`/providers/${providerId}/discover`, {
       method: 'GET',
     }),
+
+  /** 检测模型并持久化；可选传入表单中的 apiBase/apiKey（未点保存时也能检测） */
+  discoverAndSaveProviderModels: (
+    providerId: string,
+    body?: { apiBase?: string; apiKey?: string }
+  ) =>
+    request<import('./types').DiscoveredModel[]>(`/providers/${encodeURIComponent(providerId)}/discover`, {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+    }),
+
+  /** 服务端探测 {apiBase}/models，避免浏览器直连第三方 API 的 CORS */
+  testProviderConnection: (
+    providerId: string,
+    body?: { apiBase?: string; apiKey?: string }
+  ) =>
+    request<{ ok: boolean; status: number; detail: string }>(
+      `/providers/${encodeURIComponent(providerId)}/test`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body ?? {}),
+      }
+    ),
 
   // Model Profiles (New)
   getModelProfiles: () =>
@@ -487,6 +565,10 @@ export const api = {
     request<{ deleted: boolean }>(`/skills/${skillId}`, {
       method: 'DELETE',
     }),
+
+  // Workspace
+  getWorkspaceTree: (path?: string) =>
+    request<import('./types').WorkspaceTreeEntry[]>(`/workspace/tree${path ? `?path=${encodeURIComponent(path)}` : ''}`),
 
   // System
   getSystemStatus: () => request<import('./types').SystemStatus>('/system/status'),
@@ -761,8 +843,8 @@ export const api = {
     }),
 
   /**
-   * 订阅子 Agent 后台进度 SSE 流。
-   * 调用方传入 onEvent 回调，连接保持到 signal 中止或服务端发送 timeout 事件。
+   * @deprecated SSE 已废弃，子 Agent 进度现在通过 WebSocket 发送。
+   * 此函数保留用于向后兼容，但不再被调用。
    */
   async subagentProgressStream(
     sessionId: string,
@@ -812,4 +894,136 @@ export const api = {
       reader.releaseLock()
     }
   },
+
+  // ==================== Trace APIs ====================
+
+  getTraceSummary: () =>
+    request<TraceSummary>('/traces/summary'),
+
+  getTraceRecent: (limit = 50) =>
+    request<RecentSpan[]>(`/traces/recent?limit=${limit}`),
+
+  getTraceDetail: (traceId: string) =>
+    request<TraceDetail>(`/traces/${traceId}`),
+
+  getTraceAnomalies: () =>
+    request<Anomaly[]>('/traces/anomalies'),
+
+  /** 订阅 Trace SSE 流 */
+  async subscribeTraceStream(
+    onEvent: (evt: { type: string; data: any }) => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    const MAX_RETRIES = 3
+    const RETRY_DELAYS = [1000, 2000, 3000]
+
+    const doSubscribe = async () => {
+      const res = await fetch(`${API_BASE}/traces/stream`, {
+        headers: { Accept: 'text/event-stream' },
+        signal,
+      })
+      if (!res.ok) {
+        const err = new Error(`Trace stream failed: HTTP ${res.status}`) as Error & { status?: number }
+        err.status = res.status
+        throw err
+      }
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('Stream not supported')
+      const dec = new TextDecoder()
+      let buf = ''
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += dec.decode(value, { stream: true })
+          const lines = buf.split('\n\n')
+          buf = lines.pop() ?? ''
+          for (const line of lines) {
+            const dataLine = line.split('\n').find(l => l.startsWith('data:'))
+            if (!dataLine) continue
+            const dataStr = dataLine.slice(5).trim()
+            if (!dataStr) continue
+            try {
+              const evt = JSON.parse(dataStr)
+              onEvent(evt)
+            } catch { /* skip */ }
+          }
+        }
+      } finally {
+        reader.releaseLock()
+      }
+    }
+
+    // 重连循环
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      if (signal?.aborted) throw new Error('Stream cancelled')
+      try {
+        await doSubscribe()
+        return
+      } catch (e) {
+        const err = e instanceof Error ? e : new Error(String(e))
+        if (signal?.aborted) throw err
+        const httpStatus = (err as Error & { status?: number }).status
+        if (httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500) {
+          throw err
+        }
+        if (attempt < MAX_RETRIES - 1) {
+          console.warn(`[TraceStream] Connection failed (attempt ${attempt + 1}/${MAX_RETRIES}), retrying...`)
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAYS[attempt]))
+        }
+      }
+    }
+    throw new Error('Trace stream failed after all retries')
+  },
 }
+
+// ==================== WebSocket ====================
+
+// WebSocket configuration
+const WS_BASE_URL = `ws://${window.location.hostname}:8765`;
+
+// WebSocket event interface
+export interface WsEvent {
+  type: string;
+  event?: {
+    type: string;
+    content?: string;
+    [key: string]: any;
+  };
+  error?: string;
+}
+
+// Create WebSocket chat connection
+export function createWebSocketChat(options: {
+  sessionId: string;
+  onEvent: (event: WsEvent) => void;
+  onConnect?: () => void;
+  onDisconnect?: () => void;
+  onError?: (error: Event) => void;
+}) {
+  const { sessionId, onEvent, onConnect, onDisconnect, onError } = options;
+
+  return useWebSocket({
+    url: `${WS_BASE_URL}/ws/${sessionId}`,
+    onMessage: onEvent,
+    onConnect,
+    onDisconnect,
+    onError,
+  });
+}
+
+// Send chat message via WebSocket
+export function wsSendMessage(
+  send: (data: object) => void,
+  content: string,
+  media?: string[]
+) {
+  send({
+    type: 'message',
+    content,
+    media,
+  });
+}
+
+// Re-export useWebSocket for direct usage
+export { useWebSocket };

@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 
 
 def ensure_dir(path: Path) -> Path:
@@ -156,3 +157,17 @@ def truncate_to_token_limit(text: str, max_tokens: int, suffix: str = "...") -> 
         return text[:max(1, int(max_tokens * 2))]
     
     return truncated + suffix
+
+
+def sanitize_args_for_log(args: Any) -> Any:
+    """递归清理参数中的 base64 数据 URL，仅保留长度信息，避免日志过大。"""
+    if isinstance(args, dict):
+        return {k: sanitize_args_for_log(v) for k, v in args.items()}
+    if isinstance(args, list):
+        return [sanitize_args_for_log(v) for v in args]
+    if isinstance(args, str):
+        if args.startswith("data:") and len(args) > 1000:
+            return f"<base64 data, len={len(args)}>"
+        if len(args) > 5000:
+            return args[:200] + "…"
+    return args

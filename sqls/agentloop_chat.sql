@@ -168,3 +168,4 @@ CREATE TABLE IF NOT EXISTS agentloop_events (
 
 CREATE INDEX IF NOT EXISTS idx_agentloop_events_trace
 ON agentloop_events(trace_id, created_at);
+

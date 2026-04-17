@@ -73,7 +73,7 @@ def ensure_model_api_key(
     确保模型 API Key 已加载并注入到 provider / 环境变量。
 
     供 subagent native 路径、dashscope_vision 等调用。
-    仅对 DashScope/Qwen 模型执行 env 注入（LiteLLM 优先读 env）。
+    仅对 DashScope/Qwen 模型执行 env 注入。
 
     Args:
         model: 模型名称

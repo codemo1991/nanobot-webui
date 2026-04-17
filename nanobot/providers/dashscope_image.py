@@ -53,7 +53,7 @@ def generate_image(
                 json=payload,
             )
             if resp.status_code != 200:
-                logger.warning("Qwen-Image failed: %s", resp.text)
+                logger.warning(f"Qwen-Image failed: {resp.text}")
                 return None
             data = resp.json()
         choices = (data.get("output") or {}).get("choices") or []
@@ -65,7 +65,7 @@ def generate_image(
                 return item["image"]
         return None
     except Exception as e:
-        logger.warning("Qwen-Image request failed: %s", e)
+        logger.warning(f"Qwen-Image request failed: {e}")
         return None
 
 
@@ -80,7 +80,7 @@ def download_and_save_image(url: str, save_path: str) -> bool:
             Path(save_path).write_bytes(resp.content)
             return True
     except Exception as e:
-        logger.warning("Image download failed: %s", e)
+        logger.warning(f"Image download failed: {e}")
         return False
 
 

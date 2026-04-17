@@ -38,7 +38,131 @@ def ensure_system_db_initialized() -> None:
     # ConfigRepository 和 CronRepository 的 __init__ 会执行 _init_tables，自动建表
     ConfigRepository(system_db)
     CronRepository(system_db)
-    logger.debug("System DB initialized: %s", system_db)
+    logger.debug(f"System DB initialized: {system_db}")
+
+
+def init_system_providers(repo: "ConfigRepository") -> None:
+    """Initialize system providers (is_system=True, user cannot delete).
+
+    Writes to SQLite as the authoritative source. Existing SQLite records
+    are preserved (ON CONFLICT DO UPDATE with api_key/api_base only when
+    the new value is non-empty).
+    """
+    from nanobot.providers.system_providers import SYSTEM_PROVIDERS
+
+    logger.info(f"Initializing {len(SYSTEM_PROVIDERS)} system providers...")
+    total_models = 0
+    for sp in SYSTEM_PROVIDERS:
+        sp_id = sp["id"]
+        now = repo._get_timestamp()
+        with repo._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO config_providers (id, name, api_key, api_base, enabled, priority, updated_at, display_name, provider_type, is_system, sort_order, config_json, api_version, azure_deployment)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    api_key=CASE WHEN excluded.api_key != '' THEN excluded.api_key ELSE api_key END,
+                    api_base=CASE WHEN excluded.api_base IS NOT NULL AND excluded.api_base != '' THEN excluded.api_base ELSE api_base END,
+                    display_name=excluded.display_name,
+                    api_version=CASE WHEN excluded.api_version != '' THEN excluded.api_version ELSE api_version END,
+                    azure_deployment=CASE WHEN excluded.azure_deployment != '' THEN excluded.azure_deployment ELSE azure_deployment END
+                """,
+                (sp_id, sp_id, "", sp.get("api_base"), 1, 0, now,
+                 sp["display_name"], sp["provider_type"], 1, 0, "{}", "", ""),
+            )
+        # Write default models only if they don't exist (preserve user modifications)
+        for m in sp.get("models", []):
+            existing = repo.get_model(m["id"])
+            if existing:
+                continue  # Skip existing models to preserve user modifications
+            repo.set_model(
+                model_id=m["id"],
+                provider_id=sp_id,
+                name=m["name"],
+                litellm_id=m["id"],
+                model_type=m.get("model_type", "chat"),
+                context_window=m.get("context_window", 128000),
+                max_tokens=m.get("max_tokens", 4096),
+                supports_vision=m.get("supports_vision", False),
+                supports_function_calling=m.get("supports_function_calling", True),
+                supports_streaming=True,
+                is_default=(m["id"] == sp.get("default_model")),
+            )
+            total_models += 1
+    logger.info(f"System providers initialized: {len(SYSTEM_PROVIDERS)} providers, {total_models} models")
+
+
+def init_dynamic_providers(
+    repo: "ConfigRepository",
+    provider_manager: "ProviderManager",
+) -> None:
+    """
+    Initialize all enabled providers from database as dynamic instances.
+
+    This registers all providers (including system providers from
+    system_providers.py and user-created providers) with the
+    ProviderManager so they can be used for model routing.
+    """
+    providers = repo.get_all_providers()
+
+    for p in providers:
+        if not p.get("enabled"):
+            continue
+
+        provider_id = p["id"]
+        api_key = p.get("api_key", "")
+        api_base = p.get("api_base")
+        provider_type = p.get("provider_type", "openai")
+
+        if not api_key:
+            logger.debug(f"Skipping provider '{provider_id}': enabled but no API key set")
+            continue
+
+        provider_manager.register_provider(
+            provider_id=provider_id,
+            api_key=api_key,
+            api_base=api_base,
+            provider_type=provider_type,
+        )
+
+    count = sum(1 for p in providers if p.get("enabled") and p.get("api_key"))
+    logger.debug(f"Dynamic providers initialized from database: {count} providers")
+
+
+def ensure_models_populated(repo: "ConfigRepository") -> None:
+    """确保 config_models 表有系统模型数据。容错：列缺失时不崩溃，仅记录警告。"""
+    from nanobot.providers.system_providers import SYSTEM_PROVIDERS
+
+    total = 0
+    skipped = 0
+    for sp in SYSTEM_PROVIDERS:
+        for m in sp.get("models", []):
+            try:
+                # Only insert if model doesn't exist (preserve user modifications)
+                existing = repo.get_model(m["id"])
+                if existing:
+                    continue
+                repo.set_model(
+                    model_id=m["id"],
+                    provider_id=sp["id"],
+                    name=m["name"],
+                    litellm_id=m["id"],
+                    model_type=m.get("model_type", "chat"),
+                    context_window=m.get("context_window", 128000),
+                    max_tokens=m.get("max_tokens", 4096),
+                    supports_vision=m.get("supports_vision", False),
+                    supports_function_calling=m.get("supports_function_calling", True),
+                    supports_streaming=True,
+                    is_default=(m["id"] == sp.get("default_model")),
+                )
+                total += 1
+            except Exception as e:
+                logger.warning(f"ensure_models_populated: set_model({m['id']}) failed: {e}")
+                skipped += 1
+    if skipped > 0:
+        logger.warning(f"ensure_models_populated: {skipped} models skipped due to errors, {total} inserted")
+    else:
+        logger.debug(f"ensure_models_populated: {total} models ready")
 
 
 def ensure_initial_config() -> Config:
@@ -49,7 +173,11 @@ def ensure_initial_config() -> Config:
     ensure_system_db_initialized()
     repo = get_config_repository()
 
+    # Only check config table (not config_providers) to determine if user config exists.
+    # config_providers is populated by init_system_providers, so checking it would
+    # always return True after init_system_providers is called.
     if not repo.has_config():
+        init_system_providers(repo)
         config = Config()
         save_config(config)
         ws_path = config.workspace_path
@@ -59,6 +187,7 @@ def ensure_initial_config() -> Config:
         )
         return config
 
+    init_system_providers(repo)
     return load_config()
 
 
@@ -77,12 +206,16 @@ def get_effective_model() -> str:
     try:
         return router.get(default_profile).model
     except (KeyError, ValueError, AttributeError, TypeError, ModelNotFoundError) as e:
-        logger.debug("get_effective_model fallback: %s", e)
+        logger.debug(f"get_effective_model fallback: {e}")
         return "anthropic/claude-opus-4-6"
 
 
 def load_config() -> Config:
-    """Load configuration from SQLite."""
+    """Load configuration from SQLite.
+
+    Applies schema defaults for new fields added after initial installation
+    (e.g., browser channel enabled flag).
+    """
     repo = get_config_repository()
     try:
         config_data = repo.load_full_config()
@@ -90,6 +223,16 @@ def load_config() -> Config:
         # 移除 Config schema 中不存在的扩展字段，避免 Pydantic 校验失败
         for key in ("models", "model_profiles"):
             data.pop(key, None)
+
+        # Apply schema defaults for missing browser channel config
+        # browser channel was added later with schema default enabled=True,
+        # but old configs may have enabled=False stored. Always use True.
+        if "channels" not in data:
+            data["channels"] = {}
+        if "browser" not in data["channels"]:
+            data["channels"]["browser"] = {}
+        data["channels"]["browser"]["enabled"] = True
+
         return Config.model_validate(data)
     except Exception as e:
         logger.warning(f"Failed to load config from SQLite: {e}, using defaults")

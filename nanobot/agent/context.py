@@ -18,6 +18,16 @@ TOKEN_BUDGET_DEFAULTS = {
     "total": 5000,
 }
 
+SKILLS_GUIDANCE = (
+    "## Skill Creation Guidance\n"
+    "After completing a complex task (5+ tool calls), fixing a tricky error, "
+    "or discovering a non-trivial workflow, save the approach as a "
+    "skill with skill_manage so you can reuse it next time.\n"
+    "When using a skill and finding it outdated, incomplete, or wrong, "
+    "patch it immediately with skill_manage(action='patch') — don't wait to be asked.\n"
+    "Skills are stored at {workspace}/skills/ and persist across sessions."
+)
+
 # 主 Agent 默认身份内容（不含 runtime_suffix），用于启动时初始化 DB 及内置回退
 # Media Handling 部分由 ContextBuilder 动态构建模板描述
 DEFAULT_IDENTITY_CONTENT = """# nanobot 🐈
@@ -31,6 +41,7 @@ You are nanobot, a helpful AI assistant.
 - When user says "记住/remember", call the remember tool to persist the information (global long-term memory)
 - After self-improving-agent / retrospective: you MUST call **persist_self_improvement** for each lesson to store in SQLite (scope=self_improve); editing skill JSON alone does not write to DB
 - For normal conversation, respond with text directly. Only use the 'message' tool for cross-channel messaging.
+- When the user message contains `<file>/path</file>`, it means they explicitly selected that file or folder from the workspace picker.
 
 ## When to Use spawn (Subagent)
 
@@ -66,7 +77,7 @@ class ContextBuilder:
         self.skills = SkillsLoader(workspace)
         self.token_budget = {**TOKEN_BUDGET_DEFAULTS, **(token_budget or {})}
         self._agent_template_manager = agent_template_manager
-    
+
     def update_token_budget(self, **kwargs: int) -> None:
         """Update token budget settings at runtime."""
         self.token_budget.update(kwargs)
@@ -167,7 +178,13 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
 (✓ = available, ✗ = missing dependencies)
 
 {skills_summary}""")
-        
+
+        # Skill creation guidance — shown once user has created at least one skill
+        skills_dir = self.workspace / "skills"
+        if skills_dir.exists():
+            guidance = SKILLS_GUIDANCE.replace("{workspace}", str(self.workspace))
+            parts.append(guidance)
+
         return "\n\n---\n\n".join(parts)
     
     def _get_identity(self) -> str:
@@ -241,7 +258,11 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
                 parts.append(f"## {filename}\n\n{content}")
         
         return "\n\n".join(parts) if parts else ""
-    
+
+    def invalidate_skill_snapshot(self) -> None:
+        """No-op: actual cache refresh is done via skills.refresh_cache() in SkillManagerTool."""
+        pass
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -378,7 +399,8 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
         self,
         messages: list[dict[str, Any]],
         content: str | None,
-        tool_calls: list[dict[str, Any]] | None = None
+        tool_calls: list[dict[str, Any]] | None = None,
+        reasoning_content: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Add an assistant message to the message list.
@@ -387,6 +409,7 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
             messages: Current message list.
             content: Message content.
             tool_calls: Optional tool calls.
+            reasoning_content: Optional reasoning content (DeepSeek / Moonshot / Kimi).
         
         Returns:
             Updated message list.
@@ -395,6 +418,89 @@ Each line lists `SKILL.md` and **dir** (the skill folder; use for `memory/`, `re
         
         if tool_calls:
             msg["tool_calls"] = tool_calls
+        if reasoning_content:
+            msg["reasoning_content"] = reasoning_content
         
         messages.append(msg)
         return messages
+
+
+def repair_openai_tool_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    """
+    修复 OpenAI 格式的 tool 消息链，满足「每条 assistant.tool_calls 均有对应 tool 消息」且顺序与 id 一致。
+
+    - 为缺失的 tool_call_id 插入占位 tool 消息（MiniMax 2013）
+    - 按 tool_calls 顺序重排紧随其后的 tool 消息，丢弃多余或重复的 tool 行
+
+    Returns:
+        (新消息列表, 是否发生了修改)
+    """
+    out: list[dict[str, Any]] = []
+    changed = False
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            out.append(m)
+            i += 1
+            continue
+
+        tcs = m["tool_calls"]
+        if not tcs:
+            out.append(m)
+            i += 1
+            continue
+
+        out.append(m)
+        j = i + 1
+        tool_block: list[dict[str, Any]] = []
+        while j < len(messages) and messages[j].get("role") == "tool":
+            tool_block.append(messages[j])
+            j += 1
+
+        by_id: dict[str, dict[str, Any]] = {}
+        for t in tool_block:
+            tid = str(t.get("tool_call_id", "") or "")
+            if tid and tid not in by_id:
+                by_id[tid] = t
+
+        merged: list[dict[str, Any]] = []
+        for tc in tcs:
+            tid = str(tc.get("id", "") or "")
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = (fn.get("name") if isinstance(fn, dict) else None) or "unknown"
+            if tid in by_id:
+                orig = by_id[tid]
+                if str(orig.get("tool_call_id", "") or "") != tid:
+                    merged.append(
+                        {
+                            **orig,
+                            "tool_call_id": tid,
+                            "name": orig.get("name") or name,
+                        }
+                    )
+                    changed = True
+                else:
+                    merged.append(orig)
+            else:
+                merged.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "name": name,
+                        "content": (
+                            "[系统补全] 该工具调用缺少对应的 tool 返回消息，已插入占位以满足 API 要求。"
+                            "请根据上下文继续回答，必要时可重新调用工具。"
+                        ),
+                    }
+                )
+                changed = True
+
+        orig_ids = [str(t.get("tool_call_id", "") or "") for t in tool_block]
+        merged_ids = [str(t.get("tool_call_id", "") or "") for t in merged]
+        if orig_ids != merged_ids or len(tool_block) != len(merged):
+            changed = True
+
+        out.extend(merged)
+        i = j
+    return out, changed

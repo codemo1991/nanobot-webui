@@ -1,0 +1,112 @@
+<h2>当前工具卡片 vs 理想状态</h2>
+<p class="subtitle">左：现状 — 仅有参数，无结果无状态 | 右：目标 — 完整展示</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">现状（ChatPage）</div>
+    <div class="mockup-body">
+      <div style="background:#f5f5f5;border:1px solid #ddd;border-radius:6px;padding:12px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="color:#8c8c8c;font-size:16px">⏱</span>
+          <span style="font-size:12px;color:#888">⚙ exec</span>
+          <span style="background:#ddd;color:#666;font-size:10px;padding:1px 6px;border-radius:3px">等待中</span>
+        </div>
+        <div style="margin-left:24px">
+          <div style="font-size:11px;color:#999;margin-bottom:4px">参数</div>
+          <pre style="background:#f0f0f0;padding:6px;border-radius:4px;font-size:10px;margin:0">{
+  "command": "ls -la",
+  "cwd": "/project"
+}</pre>
+        </div>
+        <!-- 结果区域空白 -->
+      </div>
+
+      <div style="background:#f5f5f5;border:1px solid #52c41a;border-radius:6px;padding:12px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="color:#52c41a;font-size:16px">✅</span>
+          <span style="font-size:12px;color:#888">⚙ read_file</span>
+          <span style="background:#f6ffed;color:#52c41a;font-size:10px;padding:1px 6px;border-radius:3px">已完成</span>
+          <span style="font-size:10px;color:#999">0.8s</span>
+        </div>
+        <div style="margin-left:24px">
+          <div style="font-size:11px;color:#999;margin-bottom:4px">参数</div>
+          <pre style="background:#f0f0f0;padding:6px;border-radius:4px;font-size:10px;margin:0">{
+  "path": "src/app.py"
+}</pre>
+        </div>
+        <!-- 执行结果区域空白 -->
+      </div>
+
+      <div style="background:#fff;border:1px solid #1890ff;padding:16px;border-radius:6px">
+        <div style="display:flex;gap:8px;align-items:flex-start">
+          <span style="font-size:20px">🤖</span>
+          <div style="font-size:13px;color:#333">最终回复内容...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">目标（完整信息）</div>
+    <div class="mockup-body">
+      <div style="background:#f5f5f5;border:1px solid #1890ff;border-radius:6px;padding:12px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="color:#1890ff;font-size:16px">⟳</span>
+          <span style="font-size:12px;color:#333">⚙ exec</span>
+          <span style="background:#e6f7ff;color:#1890ff;font-size:10px;padding:1px 6px;border-radius:3px">运行中</span>
+          <div style="flex:1"></div>
+          <div style="width:100px;height:4px;background:#e6f7ff;border-radius:2px">
+            <div style="width:60%;height:100%;background:#1890ff;border-radius:2px"></div>
+          </div>
+        </div>
+        <div style="margin-left:24px">
+          <div style="font-size:11px;color:#999;margin-bottom:4px">参数</div>
+          <pre style="background:#f0f0f0;padding:6px;border-radius:4px;font-size:10px;margin:0">{
+  "command": "npm run build",
+  "cwd": "/project"
+}</pre>
+
+          <div style="font-size:11px;color:#999;margin:8px 0 4px">实时输出</div>
+          <pre style="background:#1e1e1e;color:#d4d4d4;padding:6px;border-radius:4px;font-size:10px;margin:0;font-family:monospace">$ npm run build
+✓ Compiled successfully
+  42 modules transformed</pre>
+        </div>
+      </div>
+
+      <div style="background:#f5f5f5;border:1px solid #52c41a;border-radius:6px;padding:12px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="color:#52c41a;font-size:16px">✅</span>
+          <span style="font-size:12px;color:#333">⚙ read_file</span>
+          <span style="background:#f6ffed;color:#52c41a;font-size:10px;padding:1px 6px;border-radius:3px">已完成</span>
+          <span style="font-size:10px;color:#999">0.8s</span>
+        </div>
+        <div style="margin-left:24px">
+          <div style="font-size:11px;color:#999;margin-bottom:4px">参数</div>
+          <pre style="background:#f0f0f0;padding:6px;border-radius:4px;font-size:10px;margin:0">{
+  "path": "src/app.py"
+}</pre>
+
+          <div style="font-size:11px;color:#999;margin:8px 0 4px">执行结果</div>
+          <pre style="background:#f0f0f0;padding:6px;border-radius:4px;font-size:10px;margin:0;max-height:120px;overflow:hidden">  1│ from fastapi import FastAPI
+  2│ import uvicorn
+  3│
+  4│ app = FastAPI()
+  5│
+  6│ @app.get("/")
+  7│ async def root():
+  8│     return {"status": "ok"}</pre>
+          <div style="font-size:10px;color:#52c41a;margin-top:4px">✓ 2000 字符（完整）</div>
+        </div>
+      </div>
+
+      <div style="background:#fff;border:1px solid #1890ff;padding:16px;border-radius:6px">
+        <div style="display:flex;gap:8px;align-items:flex-start">
+          <span style="font-size:20px">🤖</span>
+          <div style="font-size:13px;color:#333">最终回复内容...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p style="margin-top:16px;font-size:13px;color:#666;text-align:center">左侧：当前代码实际渲染效果 — 工具卡片展开后没有"执行结果"区域 | 右侧：我们要达到的效果</p>

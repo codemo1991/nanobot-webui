@@ -73,7 +73,7 @@ async def run_mirror_analysis(
                 result[k.strip()] = v.strip()
         return result
     except Exception as e:
-        logger.warning("Mirror LLM analysis failed: %s", e)
+        logger.warning(f"Mirror LLM analysis failed: {e}")
         return None
 
 
@@ -113,7 +113,7 @@ def seal_stale_sessions(
 
     if dry_run:
         for stype, sid, created_date in pending:
-            logger.info("Would seal: %s %s (created %s)", stype, sid, created_date)
+            logger.info(f"Would seal: {stype} {sid} (created {created_date})")
         return len(pending)
 
     async def _seal_all() -> None:
@@ -124,7 +124,7 @@ def seal_stale_sessions(
             try:
                 mirror.seal_session(session_id, llm_analysis=llm_analysis)
                 sealed_count += 1
-                logger.info("Sealed stale %s session %s", stype, session_id)
+                logger.info(f"Sealed stale {stype} session {session_id}")
             except KeyError:
                 pass
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import mimetypes
 import threading
@@ -28,6 +29,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool, EditFileTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
+from nanobot.utils.helpers import sanitize_args_for_log
 from nanobot.agent.prompts import get_template, build_system_prompt, get_tools_for_template
 from nanobot.config.subagent_summary_prompts_loader import (
     get_batch_system_prompt,
@@ -261,10 +263,16 @@ class SubagentManager:
         media: list[str],
         origin_channel: str = "web",
         origin_chat_id: str = "direct",
+        model: str | None = None,
+        timeout: float = 120.0,
     ) -> str | None:
         """
         同步运行 vision 子 agent 进行图片分析，使用子 agent 配置（模板 model、backend、system_prompt）。
         供主 loop 在需要图片分析时调用，避免 inline recognition 固定单一解读方式。
+
+        Args:
+            model: 可选，外部指定的模型 ID（优先级最高）。
+            timeout: 主线程等待结果的最大秒数。
 
         Returns:
             图片分析结果文本，失败时返回 None。
@@ -275,13 +283,15 @@ class SubagentManager:
         origin_key = f"{origin_channel}:{origin_chat_id}"
         task_id = f"vision-inline-{uuid.uuid4().hex[:8]}"
 
-        # 使用 vision 模板的 model，或 subagent 默认 model
-        effective_model = self.model
-        if self._agent_template_manager:
+        # 优先级：外部指定 model > vision 模板 model > subagent 默认 model
+        effective_model = model or self.model
+        if not model and self._agent_template_manager:
             tm = self._agent_template_manager.get_model_for_template("vision")
             if tm:
                 effective_model = tm
-                logger.info("[run_vision_analysis] Using vision template model: %s", effective_model)
+                logger.info(f"[run_vision_analysis] Using vision template model: {effective_model}")
+        if model:
+            logger.info(f"[run_vision_analysis] Using explicit vision model: {effective_model}")
 
         backend = self._backend_resolver.resolve("vision", "native", media=media, model=effective_model)
         # 若 backend 为 native 但 model 非视觉模型，尝试用 dashscope_vision 兜底（需有 API key）
@@ -301,26 +311,61 @@ class SubagentManager:
                     backend = "dashscope_vision"
                     effective_model = "qwen-vl-plus"
                     logger.info("[run_vision_analysis] Original model doesn't support vision, fallback to dashscope_vision (qwen-vl-plus)")
-        logger.info("[run_vision_analysis] task_id=%s, backend=%s, model=%s", task_id, backend, effective_model)
+        logger.info(f"[run_vision_analysis] task_id={task_id}, backend={backend}, model={effective_model}")
 
-        runner = self._backend_registry.get(backend)
-        if runner and backend != "native":
-            await runner(
-                task_id, task, task[:50], origin,
-                template="vision", batch_id=None, subagent_manager=self,
-                media=media, model=effective_model,
-            )
-        else:
-            await self._run_subagent(
-                task_id, task, task[:50], origin,
-                template="vision", media=media, backend="native",
-            )
+        # 在独立线程中运行，避免被主请求取消/超时所中断
+        loop = asyncio.get_running_loop()
+        future: concurrent.futures.Future[str | None] = concurrent.futures.Future()
+        self._running_tasks[task_id] = (origin_key, None)
 
-        if self.sessions:
-            session = self.sessions.get_or_create(origin_key)
-            if task_id in session.subagent_results:
-                return session.subagent_results[task_id].get("result")
-        return None
+        def _run_in_thread():
+            sub_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(sub_loop)
+            try:
+                runner = self._backend_registry.get(backend)
+                if runner and backend != "native":
+                    sub_loop.run_until_complete(
+                        runner(
+                            task_id, task, task[:50], origin,
+                            template="vision", batch_id=None, subagent_manager=self,
+                            media=media, model=effective_model,
+                        )
+                    )
+                else:
+                    sub_loop.run_until_complete(
+                        self._run_subagent(
+                            task_id, task, task[:50], origin,
+                            template="vision", media=media, backend="native",
+                        )
+                    )
+                if self.sessions:
+                    session = self.sessions.get_or_create(origin_key)
+                    result = session.subagent_results.get(task_id, {}).get("result")
+                    future.set_result(result)
+                else:
+                    future.set_result(None)
+            except Exception as e:
+                logger.error(f"[run_vision_analysis] Thread failed: {e}")
+                future.set_exception(e)
+            finally:
+                self._running_tasks.pop(task_id, None)
+                sub_loop.close()
+
+        threading.Thread(target=_run_in_thread, daemon=True).start()
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future, loop=loop),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[run_vision_analysis] Timeout after {timeout}s")
+            self._running_tasks.pop(task_id, None)
+            return None
+        except asyncio.CancelledError:
+            logger.info(f"[run_vision_analysis] Cancelled by parent")
+            self._running_tasks.pop(task_id, None)
+            raise
 
     async def spawn(
         self,
@@ -477,11 +522,7 @@ class SubagentManager:
                         logger.info(f"[SubagentProgress] Pushed stream_done for origin_key: {origin_key}")
                     except Exception as e:
                         logger.warning(f"[SubagentProgress] Failed to push stream_done: {e}")
-                # 给 LiteLLM LoggingWorker 时间处理待处理日志，避免 Event loop is closed 等错误
-                try:
-                    loop.run_until_complete(asyncio.sleep(0.5))
-                except Exception:
-                    pass
+                # Close the event loop
                 loop.close()
 
         thread = threading.Thread(target=run_in_thread, daemon=True)
@@ -1116,6 +1157,11 @@ class SubagentManager:
         """Internal implementation of subagent execution (traced)."""
         logger.info(f"Subagent [{task_id}] starting task: {label} (template: {template}, backend: {backend}, memory: {enable_memory}), manager id: {id(self)}")
 
+        # Guard: provider must be available for native backend
+        if self.provider is None:
+            logger.error(f"Subagent [{task_id}] aborted: no LLM provider available")
+            raise RuntimeError("No LLM provider available for subagent execution")
+
         # Determine the effective model: template's model or fallback to self.model
         effective_model = self.model
         if self._agent_template_manager and template:
@@ -1318,7 +1364,7 @@ class SubagentManager:
 
                     voice_direct_result = None
                     for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments)
+                        args_str = json.dumps(sanitize_args_for_log(tool_call.arguments))
                         logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
                         result = await tools.execute(tool_call.name, tool_call.arguments)
                         messages.append({
@@ -1601,19 +1647,6 @@ class SubagentManager:
         })
         logger.info(f"[SubagentBatch] Pushed batch summary for {batch_id}")
 
-        # 推送到 ChatStreamBus，让前端聊天界面刷新显示 batch 总结消息
-        if origin.get("channel") == "web":
-            from nanobot.web.chat_stream_bus import ChatStreamBus
-            chat_bus = ChatStreamBus.get()
-            chat_bus.push(origin_key, {
-                "type": "assistant_message",
-                "content": llm_summary,
-                "source": "subagent_batch_summary",
-                "batch_id": batch_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            logger.info(f"[SubagentBatch] Pushed assistant_message to ChatStreamBus for batch {batch_id}")
-
     async def _announce_batch_result(
         self,
         batch_results: list[tuple[str, dict[str, Any]]],
@@ -1776,19 +1809,6 @@ class SubagentManager:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         logger.info(f"[SubagentSummary] Pushed subagent_summary for task {task_id}")
-
-        # 推送到 ChatStreamBus，让前端聊天界面刷新显示子 agent 总结消息
-        if origin.get("channel") == "web":
-            from nanobot.web.chat_stream_bus import ChatStreamBus
-            chat_bus = ChatStreamBus.get()
-            chat_bus.push(origin_key, {
-                "type": "assistant_message",
-                "content": llm_summary,
-                "source": "subagent_summary",
-                "task_id": task_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            logger.info(f"[SubagentSummary] Pushed assistant_message to ChatStreamBus for task {task_id}")
 
         if clear_buffer:
             # 裁剪为仅保留最后 5 个事件（subagent_end/summary/stream_done 等），
@@ -1958,11 +1978,11 @@ class SubagentManager:
                 data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             if content and content.strip():
-                logger.info("DashScope subagent image call completed (model: %s)", model_name)
+                logger.info(f"DashScope subagent image call completed (model: {model_name})")
                 return content.strip()
             return None
         except Exception as e:
-            logger.warning("DashScope subagent image call failed (model: %s): %s", model_name, e)
+            logger.warning(f"DashScope subagent image call failed (model: {model_name}): {e}")
             return None
 
     def get_running_count(self) -> int:

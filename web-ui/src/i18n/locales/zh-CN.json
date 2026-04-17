@@ -8,7 +8,8 @@
     "save": "保存",
     "delete": "删除",
     "edit": "编辑",
-    "loading": "加载中..."
+    "loading": "加载中...",
+    "insert": "插入"
   },
   "nav": {
     "chat": "聊天",
@@ -17,7 +18,8 @@
     "cron": "定时任务",
     "config": "设置",
     "system": "系统状态",
-    "login": "登录"
+    "login": "登录",
+    "trace": "Trace 监控"
   },
   "cron": {
     "title": "定时任务",
@@ -117,6 +119,7 @@
     "defaultTitle": "新对话",
     "thinkingOrTool": "正在思考或调用工具…",
     "thinking": "正在思考…",
+    "reasoningCollapsed": "思考过程",
     "callingTool": "正在调用工具…",
     "toolArguments": "调用参数",
     "toolResult": "返回结果",
@@ -164,7 +167,12 @@
       "pendingTasksTitle": "后台任务进行中",
       "pendingTasksContent": "当前有 {{count}} 个 Claude Code 任务正在后台运行，继续发送消息可能会影响任务执行。\n\n第一个任务：{{prompt}}",
       "sendAnyway": "仍要发送"
-    }
+    },
+    "filePicker": "选择文件或文件夹",
+    "filePickerTitle": "选择文件或文件夹",
+    "emptyWorkspace": "工作区为空",
+    "loadWorkspaceError": "加载工作区失败",
+    "selectedPath": "已选择"
   },
   "system": {
     "title": "系统状态",
@@ -320,7 +328,17 @@
       "pathPlaceholder": "例如: ~/my-workspace",
       "pathRequired": "请输入工作目录路径",
       "switchSuccess": "工作目录切换成功，页面将刷新",
-      "switchFailed": "工作目录切换失败"
+      "switchFailed": "工作目录切换失败",
+      "selectFolder": "选择文件夹",
+      "folderBrowserHint": "若浏览器仅显示文件夹名称，请手动补全为绝对路径（如 C:\\Users\\xxx\\workspace）。",
+      "defaultPath": "默认路径",
+      "currentPath": "当前路径",
+      "copyTitle": "是否复制配置数据？",
+      "copyContent": "目标工作空间暂无数据。是否复制当前工作空间的配置（Agent 模板、日历、主提示词、记忆等）？\n注意：聊天记录始终独立，不会随配置复制。",
+      "copyContentNoDefault": "目标工作空间暂无数据，当前也没有默认数据可复制。将创建一个空白工作空间。",
+      "copyYes": "复制配置并切换",
+      "copyYesNoDefault": "空白切换",
+      "copyNo": "空白切换"
     },
     "configure": "配置",
     "enabled": "已启用",
@@ -719,5 +737,16 @@
     "paused": "任务已暂停",
     "enabled": "任务已启用",
     "triggered": "任务已触发"
+  },
+  "trace": {
+    "title": "Trace 监控",
+    "totalSpans": "总请求数",
+    "successRate": "成功率",
+    "avgLatency": "平均延迟",
+    "activeRequests": "活跃请求",
+    "overview": "概览",
+    "recentRequests": "最近请求",
+    "anomalies": "异常告警",
+    "noAnomalies": "暂无异常"
   }
 }

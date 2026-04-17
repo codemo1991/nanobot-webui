@@ -1,7 +1,10 @@
 """Base class for agent tools."""
 
+import uuid
 from abc import ABC, abstractmethod
 from typing import Any
+
+from nanobot.agent.tools.progress import ToolProgressCallback, ToolProgressThrottler
 
 
 class Tool(ABC):
@@ -20,7 +23,60 @@ class Tool(ABC):
         "array": list,
         "object": dict,
     }
-    
+
+    def __init__(
+        self,
+        progress_callback: ToolProgressCallback | None = None,
+        tool_id: str | None = None,
+    ) -> None:
+        """
+        Initialize the tool.
+
+        Args:
+            progress_callback: Optional callback for progress updates.
+            tool_id: Optional unique identifier for this tool instance.
+                    If not provided, a UUID will be generated.
+        """
+        self._progress_callback = progress_callback
+        self._tool_id = tool_id or str(uuid.uuid4())
+        self._progress_throttler = ToolProgressThrottler(min_interval=1.0)
+
+    @property
+    def tool_id(self) -> str:
+        """Unique identifier for this tool instance."""
+        return self._tool_id
+
+    def report_progress(self, detail: str, percent: int | None = None) -> None:
+        """
+        Report progress update for this tool.
+
+        Args:
+            detail: Human-readable progress message.
+            percent: Optional progress percentage (0-100).
+        """
+        if self._progress_callback is None:
+            return
+
+        if not self._progress_throttler.should_push(self._tool_id):
+            return
+
+        # Convert percent (0-100) to progress (0.0-1.0)
+        progress = percent / 100.0 if percent is not None else None
+        self._progress_callback(self._tool_id, detail, progress)
+
+    def report_stream_chunk(self, chunk: str, is_error: bool = False) -> None:
+        """
+        Report a stream chunk from the tool execution.
+
+        This is a placeholder method for future streaming support.
+
+        Args:
+            chunk: The output chunk.
+            is_error: Whether this chunk represents error output.
+        """
+        # Placeholder for future streaming implementation
+        pass
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -36,6 +92,26 @@ class Tool(ABC):
     def deferred(self) -> bool:
         """If True, tool schema is not injected in initial LLM context (loaded on-demand)."""
         return False
+
+    @property
+    def is_concurrency_safe(self) -> bool:
+        """Whether the tool can be safely executed concurrently with other tools."""
+        return True
+
+    @property
+    def is_read_only(self) -> bool:
+        """Whether the tool only reads data and doesn't modify state (safe for retries)."""
+        return False
+
+    @property
+    def is_destructive(self) -> bool:
+        """Whether the tool performs destructive operations."""
+        return False
+
+    @property
+    def danger_level(self) -> int:
+        """Risk level 0-10: 0=safe, 10=extremely dangerous (e.g., delete, execute)."""
+        return 0
 
     @property
     @abstractmethod

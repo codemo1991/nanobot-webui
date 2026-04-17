@@ -226,6 +226,24 @@ def test_emitter_jsonl_file_written(tmp_path: Path) -> None:
     assert record["name"] == "file.test"
 
 
+def test_get_recent_spans_includes_disk_after_flush(tmp_path: Path) -> None:
+    """flush 会清空 buffer，但 Trace API 应仍能从 JSONL 读到最近 span。"""
+    emitter = init_tracing(
+        trace_dir=str(tmp_path / "traces"),
+        rotation="1 MB",
+        retention_days=1,
+        buffer_size=1,
+    )
+    s = Span(trace_id="disk-visible", name="after.flush")
+    emitter.emit(s)
+    emitter.flush()
+    recent = emitter.get_recent_spans(50)
+    assert len(recent) >= 1
+    assert recent[-1]["trace_id"] == "disk-visible"
+    assert recent[-1]["name"] == "after.flush"
+    emitter.close()
+
+
 def test_emitter_query_by_trace_id(tmp_path: Path) -> None:
     emitter = init_tracing(
         trace_dir=str(tmp_path / "traces"),

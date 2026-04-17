@@ -85,4 +85,4 @@ async def test_registry_returns_validation_error() -> None:
     reg = ToolRegistry()
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
-    assert "Invalid parameters" in result
+    assert "参数无效" in result

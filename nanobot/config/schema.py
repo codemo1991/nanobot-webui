@@ -49,6 +49,15 @@ class QQConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public)
 
 
+class BrowserConfig(BaseModel):
+    """Browser/WebUI channel configuration using WebSocket."""
+    enabled: bool = True  # Web UI 默认启用
+    host: str = "127.0.0.1"  # WebSocket server host
+    port: int = 8765  # WebSocket server port
+    agent_timeout: float = 300.0  # Agent call timeout in seconds
+    allow_from: list[str] = Field(default_factory=list)  # Allowed session IDs (empty = public)
+
+
 class DingTalkConfig(BaseModel):
     """DingTalk channel configuration using Stream Mode."""
     enabled: bool = False
@@ -65,6 +74,7 @@ class ChannelsConfig(BaseModel):
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
 
 
 class AgentDefaults(BaseModel):
@@ -109,19 +119,29 @@ class ProviderConfig(BaseModel):
     api_base: str | None = None
 
 
+class AzureProviderConfig(BaseModel):
+    """Azure OpenAI provider configuration."""
+    api_key: str = ""
+    api_base: str | None = None
+    api_version: str = "2024-12-01-preview"
+    azure_deployment: str = ""
+
+
 class ProvidersConfig(BaseModel):
-    """Configuration for LLM providers."""
-    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
+    """Configuration for LLM providers (native SDK + legacy for DashScope API)."""
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
-    openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
+    anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)
-    groq: ProviderConfig = Field(default_factory=ProviderConfig)
-    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
-    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)  # Qwen via Aliyun DashScope
-    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
-    ollama: ProviderConfig = Field(default_factory=ProviderConfig)  # 本地 Ollama，OpenAI 兼容 API
+    azure: AzureProviderConfig = Field(default_factory=AzureProviderConfig)
+    # Legacy providers used for API calls (DashScope for vision/ASR, etc.)
+    dashscope: ProviderConfig = Field(default_factory=ProviderConfig)
     gemini: ProviderConfig = Field(default_factory=ProviderConfig)
+    zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
+    groq: ProviderConfig = Field(default_factory=ProviderConfig)
+    ollama: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    vllm: ProviderConfig = Field(default_factory=ProviderConfig)
+    moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
 class MirrorConfig(BaseModel):
@@ -251,11 +271,12 @@ class Config(BaseSettings):
         ("vllm/", "vllm"): "vllm",
         ("ollama/", "ollama"): "ollama",
         ("minimax/", "minimax"): "minimax",
+        ("moonshot/", "kimi", "moonshot"): "moonshot",
     }
     
     _FALLBACK_PROVIDER_ORDER: list[str] = [
         "openrouter", "deepseek", "anthropic", "openai",
-        "gemini", "zhipu", "dashscope", "groq", "vllm", "ollama", "minimax"
+        "gemini", "zhipu", "dashscope", "groq", "vllm", "ollama", "minimax", "moonshot"
     ]
     
     _MODEL_API_BASE_MAP: dict[str, str | None] = {
@@ -270,6 +291,7 @@ class Config(BaseSettings):
         "vllm": None,
         "ollama": "http://localhost:11434/v1",  # Ollama 默认 OpenAI 兼容端点
         "minimax": "https://api.minimax.chat/v1",
+        "moonshot": "https://api.moonshot.ai/v1",
     }
 
     def _get_provider_for_model(self, model: str | None) -> str | None:
