@@ -1485,6 +1485,9 @@ function ChatPage() {
     setStreamingToolSteps([])
     setStreamingThinking(false)
     setClaudeCodeProgress('')
+    // 清理上一轮的流式缓存，防止旧 toolSteps/thinking 被错误恢复或合并到新消息
+    bgSessionStatesRef.current.delete(sessionId)
+    clearStreamingState(sessionId)
     // 将此会话加入流式集合（支持并行多会话）
     setStreamingSessionIds(prev => new Set([...prev, sessionId]))
     isStreamingRef.current = true
@@ -1510,9 +1513,9 @@ function ChatPage() {
     // 记录发送前条数：用于 loadMessages 判断服务端是否已落库「用户+助手」以补收漏掉的 done
     streamBaselineBySessionRef.current.set(sessionId, messages.length)
     setMessages(prev => {
-      // 清理上一轮可能残留的 temp-assistant（避免新一轮流式追加到旧消息上）
-      const cleaned = prev.filter(m => m.id !== 'temp-assistant')
-      return [...cleaned, tempUserMsg]
+      // 只清理上一轮可能残留的 temp-assistant（流式未正常结束时的兜底）
+      // 真实的 assistant 消息不应被删除，避免「上一回答消失」
+      return prev.filter(m => !(m.id.startsWith('temp-') && m.role === 'assistant')).concat(tempUserMsg)
     })
 
     if (imagesToSend.length > 0) {

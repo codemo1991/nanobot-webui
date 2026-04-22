@@ -82,7 +82,7 @@ class ToolRegistry:
         if getattr(tool, "deferred", False) and name not in self._loaded_deferred_tools:
             self._loaded_deferred_tools.add(name)
             logger.info(
-                "[DeferredMCP] 首次调用 '%s'：已标记 schema 就绪，立即用当前参数执行",
+                "[DeferredMCP] 首次调用 '{}'：已标记 schema 就绪，立即用当前参数执行",
                 name,
             )
 
@@ -160,7 +160,7 @@ class ToolRegistry:
         if getattr(tool, "deferred", False) and name not in self._loaded_deferred_tools:
             self._loaded_deferred_tools.add(name)
             logger.info(
-                "[DeferredMCP] 首次调用 '%s'（线程池路径）：已标记 schema 就绪，立即执行",
+                "[DeferredMCP] 首次调用 '{}'（线程池路径）：已标记 schema 就绪，立即执行",
                 name,
             )
 

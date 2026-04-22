@@ -1433,6 +1433,7 @@ class AgentLoop:
             return
 
         # 没有 yaml tools：使用持久连接一次性发现工具（避免 init 时 connect+disconnect 再首次调用再 connect 的 double-connect）
+        from nanobot.agent.tools.mcp import _sanitize_mcp_schema
         discovered: list[dict[str, Any]] = []
         try:
             conn_result = await self.mcp_loader.connect_lazy(server_id, timeout=30.0)
@@ -1442,7 +1443,9 @@ class AgentLoop:
                     {
                         "name": t.name,
                         "description": getattr(t, "description", "") or f"MCP tool {t.name}",
-                        "parameters": getattr(t, "inputSchema", None) or {"type": "object", "properties": {}},
+                        "parameters": _sanitize_mcp_schema(
+                            getattr(t, "inputSchema", None) or {"type": "object", "properties": {}}
+                        ),
                     }
                     for t in (mcp_tools or [])
                 ]
@@ -1617,6 +1620,7 @@ class AgentLoop:
         发现后不保持连接，由 McpLazyToolAdapter 在实际调用时再连接。
         返回工具配置列表，或空列表（连接失败/无工具）。
         """
+        from nanobot.agent.tools.mcp import _sanitize_mcp_schema
         if not self.mcp_loader:
             return []
         try:
@@ -1627,7 +1631,9 @@ class AgentLoop:
                 {
                     "name": t.name,
                     "description": getattr(t, "description", "") or f"MCP tool {t.name}",
-                    "parameters": getattr(t, "inputSchema", None) or {"type": "object", "properties": {}},
+                    "parameters": _sanitize_mcp_schema(
+                        getattr(t, "inputSchema", None) or {"type": "object", "properties": {}}
+                    ),
                 }
                 for t in tools
             ]

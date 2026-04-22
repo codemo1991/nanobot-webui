@@ -17,6 +17,44 @@ def _sanitize_tool_name(name: str) -> str:
     return _SAFE_NAME_PATTERN.sub("_", name) or "unnamed"
 
 
+def _sanitize_mcp_schema(params: dict[str, Any]) -> dict[str, Any]:
+    """
+    Sanitize MCP tool parameters schema for LLM API compatibility.
+
+    Some MCP servers return schemas where `required` lists properties
+    that don't exist in `properties`. Strict providers (Moonshot, etc.)
+    reject these schemas. This function removes invalid required entries.
+    """
+    if not isinstance(params, dict):
+        return {"type": "object", "properties": {}}
+
+    # Work on a copy to avoid mutating the original
+    sanitized = dict(params)
+    props = sanitized.get("properties") or {}
+    if not isinstance(props, dict):
+        props = {}
+        sanitized["properties"] = props
+
+    required = sanitized.get("required")
+    if isinstance(required, list):
+        valid_required = [r for r in required if r in props]
+        removed = [r for r in required if r not in props]
+        if removed:
+            logger.warning(
+                f"[MCP Schema] Removed invalid required properties not in properties: {removed}"
+            )
+        if valid_required:
+            sanitized["required"] = valid_required
+        else:
+            sanitized.pop("required", None)
+
+    # Ensure type is present
+    if "type" not in sanitized:
+        sanitized["type"] = "object"
+
+    return sanitized
+
+
 class McpLazyToolAdapter(Tool):
     """
     懒加载 MCP 工具适配器。
@@ -41,7 +79,7 @@ class McpLazyToolAdapter(Tool):
         self._server_id = _sanitize_tool_name(server_id)
         self._tool_name = tool_name
         self._description = description or f"MCP tool {tool_name} from {server_id}"
-        self._parameters = parameters if isinstance(parameters, dict) else {"type": "object", "properties": {}}
+        self._parameters = _sanitize_mcp_schema(parameters) if isinstance(parameters, dict) else {"type": "object", "properties": {}}
         self._mcp_loader = mcp_loader
         self._lazy_tools = lazy_tools
         self._disposed = False
@@ -65,9 +103,8 @@ class McpLazyToolAdapter(Tool):
 
     @property
     def parameters(self) -> dict[str, Any]:
-        if "type" not in self._parameters:
-            self._parameters.setdefault("type", "object")
-        return self._parameters
+        # Always sanitize on access to catch any mutations or updates
+        return _sanitize_mcp_schema(self._parameters)
 
     async def _ensure_connected(self) -> bool:
         """确保 MCP 连接已建立。返回是否连接成功。"""
@@ -126,7 +163,7 @@ class McpLazyToolAdapter(Tool):
                         f"更新 schema (was {'empty' if is_empty else 'incomplete'}, "
                         f"now has properties: {list(new_props.keys())})"
                     )
-                    self._parameters = new_params
+                    self._parameters = _sanitize_mcp_schema(new_params)
                 break
 
     async def execute(self, **kwargs: Any) -> str:
