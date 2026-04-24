@@ -408,7 +408,7 @@ function ChatPage() {
   const [bgAgents, setBgAgents] = useState<Array<{
     taskId: string
     label: string
-    status: 'running' | 'done' | 'error' | 'timeout' | 'cancelled'
+    status: 'running' | 'done' | 'error' | 'timeout' | 'cancelled' | 'backgrounded'
     progress: string
     backend: string
     result?: string  // 完整结果
@@ -655,9 +655,9 @@ function ChatPage() {
     onMessage: handleWsMessage,
     onConnect: () => {
       console.log('[WebSocket] Connected')
-      // 切回本会话并重连后补拉消息：若长任务在浏览其他会话时已完成，可能漏收 done
+      // 重连后总是补拉消息：若 done/microkernel_end 在断线时丢失，reload 可恢复状态
       const sid = currentSessionIdRef.current
-      if (sid && streamingSessionIdsRef.current.has(sid)) {
+      if (sid) {
         void loadMessagesRef.current(sid)
       }
     },
@@ -824,10 +824,49 @@ function ChatPage() {
           : a
       ))
       refreshStreamDoneRef.current(sessionId)
+    } else if (evt.type === 'microkernel_backgrounded') {
+      setBgAgents(prev => {
+        if (prev.find(a => a.taskId === evt.task_id)) {
+          return prev.map(a =>
+            a.taskId === evt.task_id ? { ...a, status: 'backgrounded' as const, disconnected: false } : a
+          )
+        }
+        return [...prev, {
+          taskId: evt.task_id,
+          label: evt.label || '微内核',
+          status: 'backgrounded' as const,
+          progress: evt.task ? evt.task.slice(0, 80) : '',
+          backend: evt.backend || 'native',
+        }]
+      })
     } else if (evt.type === 'microkernel_end') {
-      setBgAgents(prev => prev.map(a =>
-        a.taskId === evt.task_id ? { ...a, status: 'done' as const, disconnected: false } : a
-      ))
+      const mkStatusMap: Record<string, typeof bgAgents[number]['status']> = {
+        ok: 'done', error: 'error', cancelled: 'cancelled',
+      }
+      setBgAgents(prev => {
+        const exists = prev.find(a => a.taskId === evt.task_id)
+        if (exists) {
+          return prev.map(a =>
+            a.taskId === evt.task_id ? { ...a, status: mkStatusMap[evt.status] ?? 'done', result: evt.result, disconnected: false } : a
+          )
+        }
+        // 晚到/断线重连场景：之前没收到 microkernel_backgrounded，直接收到 end
+        return [...prev, {
+          taskId: evt.task_id,
+          label: evt.label || '微内核',
+          status: mkStatusMap[evt.status] ?? 'done',
+          progress: evt.summary ? evt.summary.slice(0, 80) : '',
+          backend: evt.backend || 'native',
+          result: evt.result,
+          disconnected: false,
+        }]
+      })
+      // 微内核完成时刷新消息列表，确保用户看到新注入的助手消息
+      refreshStreamDoneRef.current(sessionId)
+      // 浏览器通知（页面在后台时提醒用户）
+      if (evt.status === 'ok') {
+        notifyTaskComplete(evt.task_id, evt.result || undefined)
+      }
     } else if (evt.type === 'stream_done') {
       // 所有子 agent 已结束，标记（后续由 auto-clear 机制清理）
       bgAgentsStreamFinishedRef.current = true
@@ -1297,17 +1336,18 @@ function ChatPage() {
 
       // 切换会话时当前会话的 WebSocket 会断开，done 可能未送达；若 DB 已有人机各一条新消息则对齐流式状态
       const baseline = streamBaselineBySessionRef.current.get(sessionId)
-      if (
-        baseline !== undefined &&
+      const shouldReconcile =
         streamingSessionIdsRef.current.has(sessionId) &&
         currentSessionIdRef.current === sessionId &&
-        data.length >= baseline + 2
-      ) {
+        data.length > 0 &&
+        data[data.length - 1].role === 'assistant' &&
+        !String(data[data.length - 1].id).startsWith('temp-')
+      if (shouldReconcile) {
         const last = data[data.length - 1]
         const lastUser = [...data].reverse().find(m => m.role === 'user')
+        const hasEnoughMessages = baseline !== undefined ? data.length >= baseline + 2 : !!lastUser
         if (
-          last.role === 'assistant' &&
-          !String(last.id).startsWith('temp-') &&
+          hasEnoughMessages &&
           lastUser &&
           last.sequence > lastUser.sequence
         ) {
@@ -1947,6 +1987,7 @@ function ChatPage() {
               <div key={agent.taskId} className={`bg-agent-item ${agent.status}`}>
                 <div className="bg-agent-title">
                   {agent.status === 'running' && <Spin size="small" style={{ marginRight: 6 }} />}
+                  {agent.status === 'backgrounded' && <span style={{ marginRight: 6 }}>🌙</span>}
                   {agent.status === 'done' && <span style={{ marginRight: 6 }}>✅</span>}
                   {agent.status === 'timeout' && <span style={{ marginRight: 6 }}>⏳</span>}
                   {agent.status === 'error' && <span style={{ marginRight: 6 }}>❌</span>}

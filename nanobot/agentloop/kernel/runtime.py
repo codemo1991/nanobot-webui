@@ -30,10 +30,12 @@ _HEARTBEAT_INTERVAL = 60.0
 class Runtime:
     """任务执行运行时。"""
 
-    def __init__(self, conn, registry, workspace: Path | None = None):
+    def __init__(self, conn, registry, workspace: Path | None = None, provider=None, model: str | None = None):
         self.conn = conn
         self.registry = registry
         self.workspace = workspace
+        self.provider = provider
+        self.model = model
         self._done_callback: Callable | None = None
         # Fix #4: 任务就绪通知回调，由 Kernel 注入，新 READY 任务出现时触发
         self._task_ready_callback: Callable | None = None
@@ -131,6 +133,10 @@ class Runtime:
         }
         if self.workspace is not None:
             ctx["workspace"] = self.workspace
+        if self.provider is not None:
+            ctx["provider"] = self.provider
+        if self.model is not None:
+            ctx["model"] = self.model
         return ctx
 
     def write_output_artifact(self, task: dict, output_artifact: dict | None) -> str | None:
@@ -158,12 +164,18 @@ class Runtime:
         parent_artifact_id: str | None = None,
         parent_artifact_type: str | None = None,
     ) -> None:
-        """spawn 子任务，并为需要父产出的子任务注入 READ 依赖。"""
+        """spawn 子任务，并为需要父产出的子任务注入 READ 依赖。
+
+        Fix: 子任务创建时状态为 WAITING_ARTIFACTS，确保所有 required 依赖就绪后才变为 READY，
+        避免 final_reducer 等任务在兄弟产出完成前就提前执行。
+        """
         ts = now_ts()
+        child_ids: list[str] = []
 
         with tx(self.conn, immediate=True):
             for spec in specs:
                 child_id = new_id("tk")
+                child_ids.append(child_id)
 
                 self.conn.execute(
                     """
@@ -173,7 +185,7 @@ class Runtime:
                         attempt_no, max_retries, expected_children, finished_children, join_policy,
                         input_schema, output_schema, request_payload, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, 'READY',
+                    VALUES (?, ?, ?, ?, ?, ?, 'WAITING_ARTIFACTS',
                             ?, ?, ?, ?, ?, ?,
                             0, ?, 0, 0, 'ALL',
                             ?, ?, ?, ?, ?)
@@ -222,13 +234,37 @@ class Runtime:
                         required=True,
                     )
 
+            # 检查哪些子任务的所有 required 依赖已就绪，推进为 READY
+            for child_id in child_ids:
+                unmet = self.conn.execute(
+                    """
+                    SELECT 1
+                    FROM agentloop_task_artifact_deps d
+                    JOIN agentloop_artifacts a ON a.artifact_id = d.artifact_id
+                    WHERE d.task_id = ?
+                      AND d.mode = 'READ'
+                      AND d.required = 1
+                      AND a.status <> 'READY'
+                    LIMIT 1
+                    """,
+                    (child_id,),
+                ).fetchone()
+                if not unmet:
+                    self.conn.execute(
+                        "UPDATE agentloop_tasks SET state = 'READY', updated_at = ? WHERE task_id = ?",
+                        (ts, child_id),
+                    )
+
         # Fix #4: 子任务已 READY，通知 worker 立即检查
         self._notify_task_ready()
 
     def _inject_sibling_deps(
         self, task: dict, artifact_id: str, artifact_type: str | None
     ) -> None:
-        """任务完成后，为等待该 artifact 的兄弟任务注入 READ 依赖。"""
+        """任务完成后，为等待该 artifact 的兄弟任务注入 READ 依赖。
+
+        Fix: 注入依赖后，调用 mark_waiting_artifacts_tasks_ready 推进受影响的 WAITING_ARTIFACTS 兄弟任务。
+        """
         parent_id = task.get("parent_task_id")
         if not parent_id or not artifact_id or not artifact_type:
             return
@@ -247,6 +283,9 @@ class Runtime:
                 if sib["state"] in ("READY", "WAITING_ARTIFACTS") and sib["input_schema"]:
                     alias = None if "search_result" in artifact_type else artifact_type
                     add_read_dep(self.conn, sib["task_id"], artifact_id, alias=alias, required=True)
+
+        # Fix: 新注入依赖后，检查哪些 WAITING_ARTIFACTS 的兄弟任务可以推进为 READY
+        mark_waiting_artifacts_tasks_ready(self.conn, artifact_id)
 
     def after_task_done(
         self, task: dict, artifact_id: str | None, artifact_type: str | None

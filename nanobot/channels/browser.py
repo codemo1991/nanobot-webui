@@ -33,6 +33,8 @@ class BrowserChannel(BaseChannel):
     ):
         super().__init__(config, bus)
         self.agent = agent
+        # 强制覆盖持久化配置中的旧超时值，彻底取消 300s 限制
+        config.agent_timeout = 0.0
         self.ws_manager = WebSocketManager()
         self._server_task: asyncio.Task | None = None
         self._app: FastAPI | None = None

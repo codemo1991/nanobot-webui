@@ -1409,7 +1409,9 @@ class NanobotWebAPI:
                 _sync_inbound_msgs.get(inbound_reason, "服务繁忙，请稍后重试")
             )
 
-        timeout = getattr(self.agent, "message_timeout", 300.0) + 60
+        msg_timeout = getattr(self.agent, "message_timeout", 300.0)
+        # msg_timeout == 0 表示不限制超时
+        timeout = msg_timeout + 60 if msg_timeout > 0 else None
         try:
             return result_future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:

@@ -68,6 +68,7 @@ class SubagentManager:
         agent_template_manager: "AgentTemplateManager | None" = None,
         backend_registry: "BackendRegistry | None" = None,
         backend_resolver: "BackendResolver | None" = None,
+        parent_tools_registry: "ToolRegistry | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.session.manager import SessionManager
@@ -86,6 +87,7 @@ class SubagentManager:
         self._session_tasks: dict[str, set[str]] = {}  # origin_key -> set[task_id]
         self._status_service = status_service
         self._agent_template_manager = agent_template_manager
+        self._parent_tools_registry = parent_tools_registry
 
         # 并发控制
         self._max_concurrent_subagents = max_concurrent_subagents
@@ -689,6 +691,9 @@ class SubagentManager:
             future = loop.create_future()
 
             def _thread_target() -> None:
+                # 清除 CLAUDECODE，防止 Claude Code CLI 检测到"嵌套会话"而拒绝启动
+                #（"cannot be launched inside another Claude Code session"）
+                os.environ.pop("CLAUDECODE", None)
                 try:
                     result = asyncio.run(
                         self._claude_code_manager.run_task(
@@ -700,9 +705,16 @@ class SubagentManager:
                             progress_callback=_progress_callback,
                         )
                     )
-                    loop.call_soon_threadsafe(future.set_result, result)
+                    if not loop.is_closed():
+                        loop.call_soon_threadsafe(future.set_result, result)
+                    else:
+                        logger.warning(f"[SubagentProgress] Claude Code thread finished but loop closed for task {task_id}")
                 except Exception as exc:
-                    loop.call_soon_threadsafe(future.set_exception, exc)
+                    logger.error(f"[SubagentProgress] Claude Code thread error for task {task_id}: {exc}")
+                    if not loop.is_closed():
+                        loop.call_soon_threadsafe(future.set_exception, exc)
+                    else:
+                        logger.warning(f"[SubagentProgress] Cannot propagate exception, loop closed for task {task_id}")
 
             thread = threading.Thread(target=_thread_target, daemon=True)
             thread.start()
@@ -1337,10 +1349,13 @@ class SubagentManager:
             else:
                 messages.append(self._build_user_message_with_media(task, media))
 
-            max_iterations = 15
+            max_iterations = 8
             iteration = 0
             final_result: str | None = None
             cancelled_by_user = False
+            subagent_start_ts = time.monotonic()
+            _SUBAGENT_TOTAL_TIMEOUT = 300.0
+
             # 使用 config 工具统一加载并注入模型 API Key（DashScope 等多级回退）
             from nanobot.config.model_api_key import ensure_model_api_key
             sa_key, sa_base = ensure_model_api_key(effective_model, provider=self.provider)
@@ -1351,6 +1366,23 @@ class SubagentManager:
 
             while iteration < max_iterations:
                 iteration += 1
+
+                # 总超时检查
+                elapsed_total = time.monotonic() - subagent_start_ts
+                if elapsed_total > _SUBAGENT_TOTAL_TIMEOUT:
+                    logger.warning(f"Subagent [{task_id}] total timeout ({_SUBAGENT_TOTAL_TIMEOUT}s)")
+                    final_result = f"任务执行超时（已超过 {_SUBAGENT_TOTAL_TIMEOUT} 秒）。"
+                    break
+
+                # 推送迭代进度，让前端有反馈
+                bus.push(origin_key, {
+                    "type": "subagent_progress",
+                    "task_id": task_id,
+                    "label": label,
+                    "content": f"第 {iteration}/{max_iterations} 轮思考中...",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+
                 # 检查是否被用户取消
                 if origin_key in self._session_cancelled:
                     self._session_cancelled.discard(origin_key)
@@ -2002,6 +2034,16 @@ class SubagentManager:
         if "voice_transcribe" in tool_names:
             from nanobot.agent.tools.voice_transcribe import VoiceTranscribeTool
             tools.register(VoiceTranscribeTool())
+
+        # Fix: 从主 Agent 的工具注册表中复制 MCP 工具，让子 agent 也能调用 MCP
+        if self._parent_tools_registry is not None:
+            mcp_tools_copied = 0
+            for name, tool in self._parent_tools_registry._tools.items():
+                if name.startswith("mcp_") and not tools.has(name):
+                    tools.register(tool)
+                    mcp_tools_copied += 1
+            if mcp_tools_copied:
+                logger.info(f"[SubagentTools] Copied {mcp_tools_copied} MCP tools from parent registry for template '{template}'")
 
         # 缓存工具实例
         self._tools_cache[template] = tools

@@ -20,7 +20,7 @@ _MAIN_POLL_INTERVAL = 2.0
 # worker 等待任务就绪事件的超时（兜底间隔，避免 event 丢失时永久阻塞）
 _WORKER_WAIT_TIMEOUT = 2.0
 # 僵死 RUNNING 任务的判定阈值（秒）—— 任务有心跳续租后可适当放大
-_STALE_RUNNING_SECONDS = 300
+_STALE_RUNNING_SECONDS = 3600
 # 维护任务执行间隔（秒）
 _MAINTENANCE_INTERVAL = 60.0
 
@@ -33,11 +33,13 @@ class Kernel:
         HTTP handler 等其他线程应通过 db.get_thread_chat_conn(workspace) 获取线程安全连接。
     """
 
-    def __init__(self, conn, registry, runtime, workspace: Path | None = None):
+    def __init__(self, conn, registry, runtime, workspace: Path | None = None, provider=None, model: str | None = None):
         self.conn = conn
         self.registry = registry
         self.runtime = runtime
         self.workspace = workspace
+        self.provider = provider
+        self.model = model
         self.shutdown = False
         # 任务就绪通知事件：新 READY 任务出现时设置，驱动 worker 立即醒来
         self._task_ready_event: asyncio.Event | None = None
@@ -82,6 +84,7 @@ class Kernel:
         worker_count: int = 4,
         poll_interval: float = _MAIN_POLL_INTERVAL,
         timeout_seconds: Optional[float] = 600.0,
+        progress_callback: Optional[callable] = None,
     ) -> bool:
         """运行直到 trace 完成或超时，返回是否成功完成。
 
@@ -101,7 +104,7 @@ class Kernel:
         self.runtime.set_task_ready_callback(lambda: self._task_ready_event.set())
 
         workers = [
-            asyncio.create_task(self._worker_loop(i)) for i in range(worker_count)
+            asyncio.create_task(self._worker_loop(i, progress_callback)) for i in range(worker_count)
         ]
         maintenance = asyncio.create_task(self._maintenance_loop())
 
@@ -152,7 +155,7 @@ class Kernel:
         ).fetchone()
         return row is not None and row["status"] == "DONE"
 
-    async def _worker_loop(self, worker_idx: int) -> None:
+    async def _worker_loop(self, worker_idx: int, progress_callback: Optional[callable] = None) -> None:
         """Worker 协程：循环领取并执行任务。
 
         Fix #4: 有任务就绪时通过 _task_ready_event 立即唤醒，避免 100ms 盲轮询。
@@ -182,11 +185,27 @@ class Kernel:
             logger.info(f'[Kernel worker-{worker_idx}] 领取任务: {task["task_id"]}, cap={task["capability_name"]}, kind={task["task_kind"]}')
             mark_task_running(self.conn, task["task_id"])
 
+            if progress_callback:
+                try:
+                    progress_callback("task_start", task)
+                except Exception:
+                    pass
+
             try:
                 await self.runtime.execute_task(task)
                 logger.info(f'[Kernel worker-{worker_idx}] 任务执行完成: {task["task_id"]}')
+                if progress_callback:
+                    try:
+                        progress_callback("task_done", task)
+                    except Exception:
+                        pass
             except Exception as exc:
                 logger.exception(f'任务 {task["task_id"]} 执行异常: {exc}')
+                if progress_callback:
+                    try:
+                        progress_callback("task_fail", task, error=str(exc))
+                    except Exception:
+                        pass
                 self.runtime.handle_task_exception(task, exc)
 
     async def _maintenance_loop(self) -> None:
@@ -224,6 +243,8 @@ def create_kernel(
     registry=None,
     runtime=None,
     brave_api_key: str | None = None,
+    provider=None,
+    model: str | None = None,
 ):
     """创建并初始化 Kernel 实例。"""
     conn = connect_chat(workspace)
@@ -239,6 +260,6 @@ def create_kernel(
 
     if runtime is None:
         from nanobot.agentloop.kernel.runtime import Runtime
-        runtime = Runtime(conn, registry, workspace=workspace)
+        runtime = Runtime(conn, registry, workspace=workspace, provider=provider, model=model)
 
-    return Kernel(conn, registry, runtime, workspace)
+    return Kernel(conn, registry, runtime, workspace, provider=provider, model=model)

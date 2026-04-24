@@ -158,6 +158,10 @@ class _CancelProbe:
     session_key: str
 
 
+# 全局默认消息处理超时（秒）；0 表示不限制
+DEFAULT_MESSAGE_TIMEOUT: float = 0.0
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -185,7 +189,7 @@ class AgentLoop:
         filesystem_config: "FilesystemToolConfig | None" = None,
         claude_code_config: "ClaudeCodeConfig | None" = None,
         cron_service: "CronService | None" = None,
-        message_timeout: float = 300.0,
+        message_timeout: float = DEFAULT_MESSAGE_TIMEOUT,  # 0 = 无超时
         max_history_messages: int = 30,
         tool_result_max_length: int = 2000,
         smart_tool_selection: bool = True,
@@ -276,6 +280,8 @@ class AgentLoop:
         self._microkernel_threshold_medium = microkernel_threshold_medium
         self._microkernel_threshold_complex = microkernel_threshold_complex
 
+        self._microkernel_tasks: dict[str, asyncio.Task] = {}  # trace_id -> shielded kernel task
+
         # 初始化智能并行判断器
         self._smart_parallel_decider = None
         if enable_smart_parallel:
@@ -354,6 +360,7 @@ class AgentLoop:
             agent_template_manager=agent_template_manager,
             backend_registry=self._backend_registry,
             backend_resolver=self._backend_resolver,
+            parent_tools_registry=self.tools,
         )
         logger.info(f"[AgentLoop] AgentLoop id: {id(self)}, SubagentManager id: {id(self.subagents)}")
 
@@ -799,36 +806,132 @@ class AgentLoop:
         channel: str,
         chat_id: str,
     ) -> str:
-        """委托任务给微内核，返回 trace_id。"""
+        """委托任务给微内核，返回 trace_id。
+
+        使用 asyncio.shield + wait_for 实现超时后台化：
+        - 在 _microkernel_timeout_seconds 内完成：同步注入结果
+        - 超时：将 shielded task 转入后台，返回 trace_id
+        """
         from nanobot.agentloop.kernel.kernel import create_kernel
+        from nanobot.agent.subagent_progress import SubagentProgressBus
 
         logger.info(f"[Microkernel] _delegate_to_microkernel 被调用, goal={goal[:100]}")
         kernel = create_kernel(
             workspace=self.workspace,
             brave_api_key=getattr(self, "brave_api_key", None),
+            provider=self.provider,
+            model=self.model,
         )
         trace_id, _ = await kernel.submit(
             user_input=goal,
             initial_artifacts=initial_artifacts or None,
             attempted_steps=attempted_steps,
         )
-        logger.info(f"[Microkernel] kernel.submit 完成, trace_id={trace_id}, 在独立线程中运行 kernel")
-        # 在独立线程中运行 kernel，避免 ProactorEventLoop 不调度 create_task 的问题
-        from threading import Thread
+        logger.info(f"[Microkernel] kernel.submit 完成, trace_id={trace_id}")
 
-        def _run_kernel_thread() -> None:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        origin_key = f"{channel}:{chat_id}"
+        # 立即推送 subagent_start，让前端知道微内核已开始执行
+        SubagentProgressBus.get().push(origin_key, {
+            "type": "subagent_start",
+            "task_id": f"mk_{trace_id}",
+            "label": "微内核",
+            "backend": "native",
+            "task": goal[:200],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        # 启动 shielded task：内核运行不受外层 cancel 影响
+        shielded = asyncio.create_task(
+            self._run_kernel_and_notify(kernel, trace_id, goal, channel, chat_id)
+        )
+        self._microkernel_tasks[trace_id] = shielded
+
+        origin_key = f"{channel}:{chat_id}"
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shielded),
+                timeout=self._microkernel_timeout_seconds,
+            )
+            logger.info(f"[Microkernel] 微内核在超时前完成, trace_id={trace_id}")
+            return trace_id
+        except asyncio.TimeoutError:
+            logger.info(
+                f"[Microkernel] 微内核前台等待超时 ({self._microkernel_timeout_seconds}s)，"
+                f"转入后台, trace_id={trace_id}"
+            )
+            # 记录到 session metadata 以便 cancel 时定位和崩溃恢复
+            session = self.sessions.get_or_create(origin_key)
+            bg_traces = session.metadata.setdefault("microkernel_background_traces", [])
+            if trace_id not in bg_traces:
+                bg_traces.append(trace_id)
+            # 持久化 goal，用于崩溃恢复时重建上下文
+            session.metadata.setdefault("microkernel_trace_goals", {})[trace_id] = goal
+            self.sessions.save(session)
+
+            # 推送后台化事件（前端可据此更新 UI）
+            bus = SubagentProgressBus.get()
+            bus.push(origin_key, {
+                "type": "microkernel_backgrounded",
+                "trace_id": trace_id,
+                "task_id": f"mk_{trace_id}",
+                "label": "微内核",
+                "backend": "native",
+                "task": goal[:200],
+                "status": "backgrounded",
+                "summary": f"任务已转入后台执行 (trace_id: {trace_id})",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+            # 启动后台等待任务，late result 完成后自动注入
+            asyncio.create_task(
+                self._wait_microkernel_late_result(shielded, trace_id, goal, channel, chat_id)
+            )
+            return trace_id
+
+    async def _poll_microkernel_progress(
+        self,
+        kernel: Any,
+        trace_id: str,
+        origin_key: str,
+        goal: str,
+        interval: float = 3.0,
+    ) -> None:
+        """定期查询微内核任务状态并推送进度事件到 SubagentProgressBus。"""
+        from nanobot.agent.subagent_progress import SubagentProgressBus
+
+        bus = SubagentProgressBus.get()
+        last_reported = 0
+        while True:
+            await asyncio.sleep(interval)
             try:
-                loop.run_until_complete(
-                    self._run_kernel_and_notify(kernel, trace_id, goal, channel, chat_id)
-                )
-            finally:
-                loop.close()
-
-        Thread(target=_run_kernel_thread, daemon=False).start()
-        logger.info(f"[Microkernel] 后台线程已启动, trace_id={trace_id}")
-        return trace_id
+                row = kernel.conn.execute(
+                    "SELECT status FROM agentloop_traces WHERE trace_id = ?", (trace_id,)
+                ).fetchone()
+                if not row or row["status"] in ("DONE", "FAILED", "CANCELED"):
+                    break
+                count = kernel.conn.execute(
+                    "SELECT COUNT(*) as c FROM agentloop_tasks WHERE trace_id = ?", (trace_id,)
+                ).fetchone()["c"]
+                running = kernel.conn.execute(
+                    "SELECT COUNT(*) as c FROM agentloop_tasks WHERE trace_id = ? AND state = 'RUNNING'",
+                    (trace_id,),
+                ).fetchone()["c"]
+                done = kernel.conn.execute(
+                    "SELECT COUNT(*) as c FROM agentloop_tasks WHERE trace_id = ? AND state = 'DONE'",
+                    (trace_id,),
+                ).fetchone()["c"]
+                if count > last_reported or running > 0:
+                    last_reported = count
+                    bus.push(origin_key, {
+                        "type": "subagent_progress",
+                        "task_id": f"mk_{trace_id}",
+                        "label": "微内核",
+                        "content": f"已调度 {count} 个任务 ({done} 完成, {running} 运行中)",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+            except Exception as e:
+                logger.debug(f"[Microkernel] 进度轮询异常: {e}, trace_id={trace_id}")
+                break
 
     async def _run_kernel_and_notify(
         self,
@@ -838,14 +941,80 @@ class AgentLoop:
         channel: str,
         chat_id: str,
     ) -> None:
-        """运行微内核直至完成，然后通知用户。"""
+        """运行微内核直至完成，然后通知用户。此函数在 shielded task 中运行。"""
         logger.info(f"[Microkernel] _run_kernel_and_notify 开始, trace_id={trace_id}")
+        origin_key = f"{channel}:{chat_id}"
+        def _kernel_progress(event_type: str, task: dict, **kwargs) -> None:
+            """微内核 worker 任务级进度回调。
+            
+            为每个任务推送独立的 subagent_start/end 事件，让前端按任务展示进度卡片。
+            同时推送 trace 级 subagent_progress，用于整体进度文本。
+            """
+            try:
+                cap = task.get("capability_name", "unknown")
+                task_id = task.get("task_id", "")
+                per_task_id = f"mk_{trace_id}_{task_id}"
+                detail = kwargs.get("error", "")
+                if event_type == "task_start":
+                    bus.push(origin_key, {
+                        "type": "subagent_start",
+                        "task_id": per_task_id,
+                        "label": cap,
+                        "backend": "native",
+                        "task": f"{cap} ({task_id})",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    bus.push(origin_key, {
+                        "type": "subagent_progress",
+                        "task_id": f"mk_{trace_id}",
+                        "label": "微内核",
+                        "content": f"开始执行: {cap} ({task_id})",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                elif event_type == "task_done":
+                    bus.push(origin_key, {
+                        "type": "subagent_end",
+                        "task_id": per_task_id,
+                        "label": cap,
+                        "status": "ok",
+                        "summary": f"完成: {cap}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    bus.push(origin_key, {
+                        "type": "subagent_progress",
+                        "task_id": f"mk_{trace_id}",
+                        "label": "微内核",
+                        "content": f"完成: {cap} ({task_id})",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                elif event_type == "task_fail":
+                    bus.push(origin_key, {
+                        "type": "subagent_end",
+                        "task_id": per_task_id,
+                        "label": cap,
+                        "status": "error",
+                        "summary": f"失败: {cap} - {detail}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    bus.push(origin_key, {
+                        "type": "subagent_progress",
+                        "task_id": f"mk_{trace_id}",
+                        "label": "微内核",
+                        "content": f"失败: {cap} ({task_id}) - {detail}",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+            except Exception:
+                pass
+
+        progress_task = asyncio.create_task(
+            self._poll_microkernel_progress(kernel, trace_id, origin_key, goal)
+        )
         try:
-            logger.info(f"[Microkernel] 调用 run_until_done, trace_id={trace_id}")
             await kernel.run_until_done(
                 trace_id,
                 worker_count=4,
-                timeout_seconds=self._microkernel_timeout_seconds,
+                timeout_seconds=None,  # 不设 trace 级超时，由外层 wait_for 控制
+                progress_callback=_kernel_progress,
             )
             logger.info(f"[Microkernel] run_until_done 完成, 查询结果, trace_id={trace_id}")
             row = kernel.conn.execute(
@@ -855,6 +1024,7 @@ class AgentLoop:
                 WHERE t.trace_id = ?
                   AND t.output_schema = 'final_result_v1'
                   AND t.state = 'DONE'
+                  AND t.result_artifact_id IS NOT NULL
                 ORDER BY t.finished_at DESC
                 LIMIT 1
                 """,
@@ -869,7 +1039,10 @@ class AgentLoop:
                 if payload:
                     val = payload.get("final_text") or payload.get("result") or payload.get("summary")
                     final_result = str(val) if val is not None else None
-            logger.info(f"[Microkernel] final_result={final_result is not None}, 调用 _on_microkernel_done, trace_id={trace_id}")
+            logger.info(
+                f"[Microkernel] final_result={final_result is not None}, "
+                f"调用 _on_microkernel_done, trace_id={trace_id}"
+            )
             await self._on_microkernel_done(trace_id, goal, final_result, channel, chat_id, status="ok")
             logger.info(f"[Microkernel] _on_microkernel_done 完成, trace_id={trace_id}")
         except Exception as e:
@@ -878,10 +1051,121 @@ class AgentLoop:
                 trace_id, goal, f"微内核执行失败: {str(e)}", channel, chat_id, status="error"
             )
         finally:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+            self._microkernel_tasks.pop(trace_id, None)
             try:
                 kernel.conn.close()
             except Exception as close_err:
                 logger.debug(f"关闭 kernel 连接时异常（可忽略）: {close_err}")
+
+    async def _wait_microkernel_late_result(
+        self,
+        shielded: asyncio.Task,
+        trace_id: str,
+        goal: str,
+        channel: str,
+        chat_id: str,
+    ) -> None:
+        """后台等待 shielded task 完成。
+
+        _run_kernel_and_notify 内部已处理正常完成时的 _on_microkernel_done，
+        这里仅捕获 shielded task 本身被取消或未捕获异常的情况。
+        """
+        logger.info(f"[Microkernel] _wait_microkernel_late_result 开始, trace_id={trace_id}")
+        try:
+            await shielded
+            logger.info(f"[Microkernel] 后台任务已完成, trace_id={trace_id}")
+        except asyncio.CancelledError:
+            logger.info(f"[Microkernel] 后台任务被取消, trace_id={trace_id}")
+            await self._on_microkernel_done(
+                trace_id, goal, "微内核任务已取消", channel, chat_id, status="cancelled"
+            )
+        except Exception as e:
+            logger.exception(f"[Microkernel] 后台任务异常: {e}, trace_id={trace_id}")
+            await self._on_microkernel_done(
+                trace_id, goal, f"微内核后台执行失败: {str(e)}", channel, chat_id, status="error"
+            )
+
+    async def _recover_background_microkernels(self) -> None:
+        """启动时恢复：扫描各 session 中标记为后台运行的微内核 trace。
+
+        - 已完成的 trace（DONE/FAILED/CANCELED）：重新查询结果并注入 session
+        - 仍在 RUNNING 的 trace：启动新 kernel 实例继续等待
+        """
+        logger.info("[Microkernel] 启动恢复后台微内核任务...")
+        from nanobot.agentloop.kernel.kernel import create_kernel
+
+        recovered = 0
+        try:
+            session_infos = self.sessions.list_sessions()
+        except Exception as e:
+            logger.warning(f"[Microkernel] 无法列出 session 进行恢复: {e}")
+            return
+
+        for info in session_infos:
+            metadata = info.get("metadata") or {}
+            bg_traces = list(metadata.get("microkernel_background_traces", []))
+            if not bg_traces:
+                continue
+
+            session_key = info["key"]
+            channel, chat_id = (session_key.split(":", 1) + [session_key])[:2]
+            trace_goals = metadata.get("microkernel_trace_goals", {})
+
+            for trace_id in bg_traces:
+                goal = trace_goals.get(trace_id, "恢复任务")
+                try:
+                    kernel = create_kernel(
+                        workspace=self.workspace,
+                        brave_api_key=getattr(self, "brave_api_key", None),
+                    )
+                    row = kernel.conn.execute(
+                        "SELECT status FROM agentloop_traces WHERE trace_id = ?", (trace_id,)
+                    ).fetchone()
+
+                    if not row:
+                        logger.warning(f"[Microkernel] 恢复时 trace 不存在: {trace_id}")
+                        session = self.sessions.get_or_create(session_key)
+                        _bg = session.metadata.get("microkernel_background_traces", [])
+                        if trace_id in _bg:
+                            _bg.remove(trace_id)
+                            session.metadata["microkernel_background_traces"] = _bg
+                            self.sessions.save(session)
+                        continue
+
+                    status = row["status"]
+                    if status in ("DONE", "FAILED", "CANCELED"):
+                        logger.info(f"[Microkernel] 恢复已完成 trace: {trace_id}, status={status}")
+                        await self._run_kernel_and_notify(
+                            kernel, trace_id, goal, channel, chat_id
+                        )
+                        recovered += 1
+                    elif status == "RUNNING":
+                        if trace_id in self._microkernel_tasks:
+                            logger.info(f"[Microkernel] 恢复时跳过已在追踪的 trace: {trace_id}")
+                            continue
+                        logger.info(f"[Microkernel] 恢复 RUNNING trace: {trace_id}")
+                        shielded = asyncio.create_task(
+                            self._run_kernel_and_notify(kernel, trace_id, goal, channel, chat_id)
+                        )
+                        self._microkernel_tasks[trace_id] = shielded
+                        asyncio.create_task(
+                            self._wait_microkernel_late_result(
+                                shielded, trace_id, goal, channel, chat_id
+                            )
+                        )
+                        recovered += 1
+                    else:
+                        logger.info(f"[Microkernel] 忽略未知状态 trace: {trace_id}, status={status}")
+                except Exception as e:
+                    logger.exception(f"[Microkernel] 恢复 trace {trace_id} 失败: {e}")
+
+        if recovered:
+            logger.info(f"[Microkernel] 共恢复 {recovered} 个后台微内核任务")
 
     async def _on_microkernel_done(
         self,
@@ -892,12 +1176,34 @@ class AgentLoop:
         chat_id: str,
         status: str = "ok",
     ) -> None:
-        """微内核完成后写入 session 并推送通知。"""
+        """微内核完成后写入 session 并推送通知。包含防重入保护。"""
         logger.info(f"[Microkernel] _on_microkernel_done 被调用, trace_id={trace_id}, status={status}")
         from nanobot.agent.subagent_progress import SubagentProgressBus
 
         origin_key = f"{channel}:{chat_id}"
         session = self.sessions.get_or_create(origin_key)
+
+        # 防重入：避免同一 trace_id 多次注入消息
+        done_key = "microkernel_done_traces"
+        done_traces: set[str] = set(session.metadata.get(done_key, []))
+        if trace_id in done_traces:
+            logger.info(f"[Microkernel] _on_microkernel_done 跳过重复调用, trace_id={trace_id}")
+            return
+        done_traces.add(trace_id)
+        session.metadata[done_key] = list(done_traces)
+
+        # 从后台追踪列表中移除
+        bg_traces = session.metadata.get("microkernel_background_traces", [])
+        if trace_id in bg_traces:
+            bg_traces.remove(trace_id)
+            session.metadata["microkernel_background_traces"] = bg_traces
+
+        # 清理已完成的 trace goal，防止 metadata 无限增长
+        trace_goals = session.metadata.get("microkernel_trace_goals", {})
+        if trace_id in trace_goals:
+            del trace_goals[trace_id]
+            session.metadata["microkernel_trace_goals"] = trace_goals
+
         result_text = final_result or (
             "微内核执行完成，但未获取到结果摘要。" if status == "ok" else "微内核执行失败。"
         )
@@ -910,9 +1216,22 @@ class AgentLoop:
             "status": status,
             "trace_id": trace_id,
         }
+        # 构建更美观的消息，包含结果状态标记
+        if status == "ok":
+            status_emoji = "✅"
+            status_label = "已完成"
+        elif status == "error":
+            status_emoji = "❌"
+            status_label = "执行失败"
+        else:
+            status_emoji = "⚠️"
+            status_label = "已取消"
+        msg_header = f"{status_emoji} 微内核任务{status_label}"
+        # 如果结果较长，保留更多内容
+        msg_body = result_text[:3000] if len(result_text) > 3000 else result_text
         session.add_message(
             "assistant",
-            f"✅ 微内核任务已完成 (trace_id: {trace_id})\n\n{result_text[:1500]}",
+            f"{msg_header}\n\n{msg_body}",
         )
         self.sessions.save(session)
 
@@ -922,6 +1241,7 @@ class AgentLoop:
             "trace_id": trace_id,
             "task_id": mk_key,
             "label": "微内核",
+            "backend": "native",
             "status": status,
             "summary": result_text[:300],
             "result": result_text,
@@ -929,7 +1249,7 @@ class AgentLoop:
         })
 
         await self.bus.publish_outbound(
-            OutboundMessage(channel=channel, chat_id=chat_id, content=f"✅ 微内核任务已完成\n\n{result_text[:2000]}")
+            OutboundMessage(channel=channel, chat_id=chat_id, content=f"{status_emoji} 微内核任务已完成\n\n{result_text[:4000]}")
         )
 
     def _resolve_vision_exec_groups(
@@ -2107,6 +2427,12 @@ class AgentLoop:
         # 原有按需初始化逻辑仍然保留作为兜底：
         # 若上述 background task 未完成，第一条消息会等待它结束。
 
+        # 启动时恢复崩溃前遗留的后台微内核任务（后台执行，不阻塞主循环）
+        try:
+            asyncio.create_task(self._recover_background_microkernels())
+        except Exception as _e:
+            logger.warning(f"[Microkernel] 启动恢复失败: {_e}")
+
         while self._running:
             # 使用哨兵替代 1s 超时轮询：无消息时完全阻塞，CPU 占用接近 0
             raw = await self.bus.inbound.get()
@@ -2306,6 +2632,21 @@ class AgentLoop:
             cc_cancelled = self.claude_code_manager.cancel_by_session(channel, session_id)
             if cc_cancelled > 0:
                 logger.info(f"Cancelled {cc_cancelled} Claude Code tasks for session {channel}:{session_id}")
+
+        # 取消该 session 的微内核后台任务
+        if session_id:
+            origin_key = f"{channel}:{session_id}"
+            session = self.sessions.get_or_create(origin_key)
+            bg_traces = list(session.metadata.get("microkernel_background_traces", []))
+            mk_cancelled = 0
+            for trace_id in bg_traces:
+                task = self._microkernel_tasks.get(trace_id)
+                if task and not task.done():
+                    task.cancel()
+                    mk_cancelled += 1
+                    logger.info(f"[Microkernel] Cancelled background task trace_id={trace_id} for session {origin_key}")
+            if mk_cancelled > 0:
+                logger.info(f"Cancelled {mk_cancelled} microkernel background tasks for session {origin_key}")
 
     async def _check_cancelled(self, session_key: str | None = None) -> None:
         """Check if cancellation was requested for this session and raise if so."""

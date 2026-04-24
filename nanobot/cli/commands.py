@@ -1091,6 +1091,7 @@ def agentloop(
                 """
                 SELECT t.result_artifact_id FROM agentloop_tasks t
                 WHERE t.trace_id = ? AND t.output_schema = 'final_result_v1' AND t.state = 'DONE'
+                  AND t.result_artifact_id IS NOT NULL
                 ORDER BY t.finished_at DESC LIMIT 1
                 """,
                 (trace_id,),

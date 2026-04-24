@@ -34,7 +34,11 @@ class WebSearchCapability(Capability):
                     error_code="WEB_SEARCH_ERROR",
                     error_message=result,
                 )
-            # WebSearchTool 返回格式：每项为 "1. 标题" 行，下一行可能为 URL；无此格式时回退为单条
+            # WebSearchTool 返回格式：
+            # 1. 标题
+            #    URL
+            #    description
+            # 无此格式时回退为单条
             items = []
             lines = result.split("\n")
             i = 0
@@ -43,13 +47,19 @@ class WebSearchCapability(Capability):
                 if line and len(line) >= 2 and line[0].isdigit() and line[1] == ".":
                     title = line.split(".", 1)[1].strip()[:200] if "." in line[:4] else line[:200]
                     url = ""
+                    snippet = ""
+                    # 下一行可能是 URL
                     if i + 1 < len(lines) and lines[i + 1].strip().startswith("http"):
                         url = lines[i + 1].strip()
                         i += 1
-                    items.append({"title": title, "url": url, "score": 0.9})
+                        # 再下一行可能是 description
+                        if i + 1 < len(lines) and not lines[i + 1].strip().startswith("http") and not (len(lines[i + 1].strip()) >= 2 and lines[i + 1].strip()[0].isdigit() and lines[i + 1].strip()[1] == "."):
+                            snippet = lines[i + 1].strip()[:500]
+                            i += 1
+                    items.append({"title": title, "url": url, "snippet": snippet, "score": 0.9})
                 i += 1
             if not items:
-                items = [{"title": result[:200], "url": "", "score": 0.5}]
+                items = [{"title": result[:200], "url": "", "snippet": "", "score": 0.5}]
             return CapabilityResult(
                 status="DONE",
                 output_artifact={

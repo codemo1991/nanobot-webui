@@ -217,6 +217,13 @@ class ClaudeCodeManager:
         # 显式注入到 SDK 进程环境，防止 SDK 的 stream-json 启动模式跳过文件读取
         self._inject_claude_settings_env(sdk_env)
 
+        # 禁止将 CLAUDECODE 传递给子进程，否则 Claude Code CLI 会拒绝启动
+        #（"cannot be launched inside another Claude Code session"）
+        sdk_env.pop("CLAUDECODE", None)
+        # 同时清除当前进程 os.environ 中的 CLAUDECODE（SDK 内部会用 os.environ 填充子进程环境）
+        # 注意：这不影响父 Claude Code CLI 会话，仅阻止子进程检测到嵌套
+        os.environ.pop("CLAUDECODE", None)
+
         # 若仍没有认证信息，尝试从 nanobot 配置库读取 Anthropic API Key
         has_auth = any(k in sdk_env for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"))
         if not has_auth and not os.environ.get("ANTHROPIC_API_KEY"):
